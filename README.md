@@ -13,6 +13,8 @@
 - **Token 消耗与 5h 配额估算**：按今日/7天/30天统计当前会话与全局各模型消耗，自动估算参考 API 费用与 5 小时配额余量。
 - **实时生成速率与真实模型对照**：展示实时/平均 `tok/s`、Prompt Cache 缓存命中率，以及上游真实返回模型与前端选定模型的一致性核验。
 - **会话管理与 Prompt 规则**：支持跟随最新会话/锁定会话、活动/未读/收藏会话一键切换，内置多套 Prompt 规则与自定义 Markdown 规则（带安全校验）。
+- 
+<img width="1920" height="1080" alt="cfe47dc0153eabfd1e7e2512c6199019" src="https://github.com/user-attachments/assets/f45a5312-cacb-4816-a047-f77c683f0cf0" />
 
 ### 2. 掌握（Multi-Agent Mastery）
 - **会话进程总览**：按活动运行中、任务结束未读（翠绿）、任务结束已读（沉静灰）清晰分层，右侧进度环实时同步主 Agent 进度。
@@ -22,9 +24,17 @@
   - **自身模型模式（默认开启 · 每分钟 · 思维低）**：通过官方 `PreInvocation` Hook 仅在尾部轻量化追加提示，几乎不破坏原会话 KV 缓存命中率；自动输出约 30 字开场思考与 10 字以内通俗进度总结。
   - **第三方模型模式**：支持 OpenAI / Anthropic 双协议自定义接口、本机保存 API Key、实时拉取 `/models` 与连通测速。
 
+<img width="1920" height="1080" alt="91061725f97fd1d4087d2f940c8c2fba" src="https://github.com/user-attachments/assets/2294b5e6-d128-41d6-96fe-4483f32cc8af" />
+<img width="1920" height="1080" alt="77423415c71d65d4cfba6332449db742" src="https://github.com/user-attachments/assets/38066d89-9ad9-4fb1-9163-c2bfa0466fb5" />
+<img width="836" height="420" alt="7a51323271d83629f0c8e4796d1ca484" src="https://github.com/user-attachments/assets/dbf75067-ef77-415d-99ad-52062f2e4b8d" />
+
+
 ### 3. 美化（Theme & Backdrop Studio）
 - **撞色主题引擎**：内置「极昼原版」等 5 套精选方案，支持 6 项核心色自定义、方案保存、随宿主明暗自动反色。
 - **图片壁纸 & Windows 整机壁纸**：内置 5 张高清壁纸（默认启用「星海夜行电车」），支持自定义上传图片、透明度/模糊度/暗度遮罩/圆角调节；Windows 下自动通过系统自带 `.NET` 编译轻量伴侣程序，提供 **方案一：贴背微透（默认 25%）**、**方案二：CDP 高清纯 CSS** 以及 **输入框上下文圆环 + 实时速度悬浮 HUD**（自动适配双屏多 DPI）。
+
+<img width="1920" height="1080" alt="ff9e0805cd6335cbb0a53afd3a58fc51" src="https://github.com/user-attachments/assets/d69f30ed-d0e4-417b-889b-2e02ed64dec6" />
+
 
 ---
 
