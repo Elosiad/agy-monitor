@@ -115,3 +115,4 @@ npm run pack
 ## License
 
 [MIT](./LICENSE)
+友情链接：<a href="Linux.do">LinuxDo</a>
