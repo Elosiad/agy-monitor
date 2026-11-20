@@ -37,4 +37,16 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   // 5. Z-order occlusion walk covers deep Windows desktop stacks (>= 128 steps)
   const zMatch = src.match(/while\s*\(prev\s*!=\s*IntPtr\.Zero\s*&&\s*steps\s*<\s*(\d+)\)/);
   assert.ok(zMatch && Number(zMatch[1]) >= 128, 'Z-order occlusion walk must inspect at least 128 top-level windows');
+
+  // 6. Native 100%-opaque WPF ImageLightboxWindow guards (non-locking load, advertised support, orphan sweep & dispose cleanup)
+  assert.match(src, /internal\s+sealed\s+class\s+ImageLightboxWindow\s*:\s*Window/, 'ImageLightboxWindow class missing');
+  assert.match(src, /"supportsLightbox"\s*,\s*true/, 'WriteStatusFile must advertise supportsLightbox=true');
+  assert.match(src, /IsTargetFile\(name,\s*"lightbox_cmd\.json"\)/, 'FileSystemWatcher must react to lightbox_cmd.json');
+  assert.match(src, /w\s+is\s+ImageLightboxWindow/, 'SweepOrphanedWindows must sweep orphaned ImageLightboxWindow instances');
+  const openLbIdx = src.indexOf('private void OpenNativeLightbox(');
+  assert.ok(openLbIdx > 0, 'OpenNativeLightbox method missing');
+  const lbBlock = src.slice(openLbIdx, openLbIdx + 2800);
+  const lbAssign = lbBlock.indexOf('_lightbox = win;');
+  const lbShow = lbBlock.indexOf('win.Show();');
+  assert.ok(lbAssign > 0 && lbShow > 0 && lbAssign < lbShow, '_lightbox must be bound before win.Show()');
 });

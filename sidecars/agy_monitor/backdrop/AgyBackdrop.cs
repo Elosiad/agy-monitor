@@ -587,6 +587,559 @@ namespace AgyBackdropCompanion
         }
     }
 
+    internal sealed class ImageLightboxWindow : Window
+    {
+        private readonly IntPtr _ownerHwnd;
+        private readonly Border _rootFrame;
+        private readonly Grid _stageGrid;
+        private readonly Border _imageFrame;
+        private readonly System.Windows.Controls.Image _image;
+        private readonly ScaleTransform _scaleTransform = new ScaleTransform(1.0, 1.0);
+        private readonly TranslateTransform _translateTransform = new TranslateTransform(0.0, 0.0);
+        private readonly TextBlock _nameText;
+        private readonly TextBlock _dimText;
+        private readonly TextBlock _zoomPctText;
+
+        private IntPtr _hwnd = IntPtr.Zero;
+        private string _filePath = "";
+        private double _scale = 1.0;
+        private bool _dragging = false;
+        private System.Windows.Point _dragStart;
+        private double _dragOriginX = 0.0;
+        private double _dragOriginY = 0.0;
+
+        public IntPtr Handle { get { return _hwnd; } }
+
+        public ImageLightboxWindow(IntPtr ownerHwnd)
+        {
+            _ownerHwnd = ownerHwnd;
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = System.Windows.Media.Brushes.Transparent;
+            ShowInTaskbar = false;
+            ShowActivated = true;
+            Focusable = true;
+            ResizeMode = ResizeMode.NoResize;
+            UseLayoutRounding = true;
+            TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
+            TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
+
+            var uiFont = new System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI");
+            var monoFont = new System.Windows.Media.FontFamily("Consolas, Segoe UI, Microsoft YaHei UI");
+
+            _image = new System.Windows.Controls.Image
+            {
+                Stretch = Stretch.Uniform,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.HighQuality);
+
+            var txGroup = new TransformGroup();
+            txGroup.Children.Add(_scaleTransform);
+            txGroup.Children.Add(_translateTransform);
+
+            _imageFrame = new Border
+            {
+                CornerRadius = new CornerRadius(10),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(20, 22, 29)),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(46, 255, 255, 255)),
+                ClipToBounds = true,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                RenderTransformOrigin = new System.Windows.Point(0.5, 0.5),
+                RenderTransform = txGroup,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                Effect = new DropShadowEffect
+                {
+                    BlurRadius = 32,
+                    ShadowDepth = 8,
+                    Opacity = 0.72,
+                    Color = Colors.Black
+                },
+                Child = _image
+            };
+
+            _imageFrame.MouseLeftButtonDown += OnImageMouseDown;
+            _imageFrame.MouseMove += OnImageMouseMove;
+            _imageFrame.MouseLeftButtonUp += OnImageMouseUp;
+            _imageFrame.LostMouseCapture += delegate { EndDrag(); };
+
+            _stageGrid = new Grid
+            {
+                ClipToBounds = true,
+                Background = System.Windows.Media.Brushes.Transparent,
+                Margin = new Thickness(28, 36, 28, 76)
+            };
+            _stageGrid.Children.Add(_imageFrame);
+            _stageGrid.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                if (e.OriginalSource == _stageGrid)
+                {
+                    e.Handled = true;
+                    Close();
+                }
+            };
+
+            // Top-right circular close button
+            Border closeBtn = MakePillButton(
+                "×",
+                uiFont,
+                18,
+                FontWeights.Normal,
+                System.Windows.Media.Color.FromArgb(230, 42, 46, 61),
+                System.Windows.Media.Color.FromArgb(245, 62, 68, 88),
+                System.Windows.Media.Color.FromArgb(62, 255, 255, 255),
+                System.Windows.Media.Color.FromRgb(234, 233, 240),
+                17,
+                new Thickness(0)
+            );
+            closeBtn.Width = 34;
+            closeBtn.Height = 34;
+            closeBtn.HorizontalAlignment = System.Windows.HorizontalAlignment.Right;
+            closeBtn.VerticalAlignment = VerticalAlignment.Top;
+            closeBtn.Margin = new Thickness(0, 18, 18, 0);
+            closeBtn.ToolTip = "关闭预览 (Esc)";
+            closeBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                Close();
+            };
+
+            // Bottom floating capsule bar
+            _nameText = new TextBlock
+            {
+                Text = "",
+                FontFamily = monoFont,
+                FontSize = 11.5,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 220, 228)),
+                VerticalAlignment = VerticalAlignment.Center,
+                MaxWidth = 220,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+
+            _dimText = new TextBlock
+            {
+                Text = "",
+                FontFamily = monoFont,
+                FontSize = 10.5,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(138, 140, 154)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(6, 0, 0, 0)
+            };
+
+            var zoomOutBtn = MakePillButton(
+                "−",
+                uiFont,
+                13,
+                FontWeights.SemiBold,
+                System.Windows.Media.Color.FromArgb(0, 0, 0, 0),
+                System.Windows.Media.Color.FromArgb(220, 56, 62, 82),
+                System.Windows.Media.Color.FromArgb(0, 0, 0, 0),
+                System.Windows.Media.Color.FromRgb(226, 226, 234),
+                6,
+                new Thickness(0)
+            );
+            zoomOutBtn.Width = 24;
+            zoomOutBtn.Height = 22;
+            zoomOutBtn.ToolTip = "缩小 (-)";
+            zoomOutBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                SetZoom(_scale / 1.25);
+            };
+
+            _zoomPctText = new TextBlock
+            {
+                Text = "100%",
+                FontFamily = monoFont,
+                FontSize = 11,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 226, 234)),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center
+            };
+            var zoomResetBtn = new Border
+            {
+                Height = 22,
+                MinWidth = 44,
+                Padding = new Thickness(6, 0, 6, 0),
+                CornerRadius = new CornerRadius(6),
+                Background = System.Windows.Media.Brushes.Transparent,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                ToolTip = "还原 100% (0)",
+                Child = _zoomPctText
+            };
+            zoomResetBtn.MouseEnter += delegate { zoomResetBtn.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(220, 56, 62, 82)); };
+            zoomResetBtn.MouseLeave += delegate { zoomResetBtn.Background = System.Windows.Media.Brushes.Transparent; };
+            zoomResetBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                SetZoom(1.0);
+            };
+
+            var zoomInBtn = MakePillButton(
+                "+",
+                uiFont,
+                13,
+                FontWeights.SemiBold,
+                System.Windows.Media.Color.FromArgb(0, 0, 0, 0),
+                System.Windows.Media.Color.FromArgb(220, 56, 62, 82),
+                System.Windows.Media.Color.FromArgb(0, 0, 0, 0),
+                System.Windows.Media.Color.FromRgb(226, 226, 234),
+                6,
+                new Thickness(0)
+            );
+            zoomInBtn.Width = 24;
+            zoomInBtn.Height = 22;
+            zoomInBtn.ToolTip = "放大 (+)";
+            zoomInBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                SetZoom(_scale * 1.25);
+            };
+
+            var zoomRow = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            zoomRow.Children.Add(zoomOutBtn);
+            zoomRow.Children.Add(zoomResetBtn);
+            zoomRow.Children.Add(zoomInBtn);
+
+            var zoomCapsule = new Border
+            {
+                CornerRadius = new CornerRadius(8),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(20, 22, 30)),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(30, 255, 255, 255)),
+                Padding = new Thickness(2),
+                Margin = new Thickness(10, 0, 10, 0),
+                Child = zoomRow
+            };
+
+            var openFileBtn = MakePillButton(
+                "打开文件",
+                uiFont,
+                11.5,
+                FontWeights.Medium,
+                System.Windows.Media.Color.FromRgb(38, 42, 56),
+                System.Windows.Media.Color.FromRgb(52, 58, 76),
+                System.Windows.Media.Color.FromArgb(46, 255, 255, 255),
+                System.Windows.Media.Color.FromRgb(234, 233, 240),
+                12,
+                new Thickness(11, 4, 11, 4)
+            );
+            openFileBtn.ToolTip = "使用系统默认程序打开图片";
+            openFileBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                OpenTargetFile();
+            };
+
+            var openFolderBtn = MakePillButton(
+                "打开所在位置 ↗",
+                uiFont,
+                11.5,
+                FontWeights.SemiBold,
+                System.Windows.Media.Color.FromRgb(28, 74, 56),
+                System.Windows.Media.Color.FromRgb(36, 98, 74),
+                System.Windows.Media.Color.FromArgb(145, 66, 198, 138),
+                System.Windows.Media.Color.FromRgb(118, 245, 184),
+                12,
+                new Thickness(12, 4, 12, 4)
+            );
+            openFolderBtn.Margin = new Thickness(7, 0, 0, 0);
+            openFolderBtn.ToolTip = "在文件管理器中定位并选中该文件";
+            openFolderBtn.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                OpenTargetFolder();
+            };
+
+            var barStack = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            barStack.Children.Add(_nameText);
+            barStack.Children.Add(_dimText);
+            barStack.Children.Add(zoomCapsule);
+            barStack.Children.Add(openFileBtn);
+            barStack.Children.Add(openFolderBtn);
+
+            var bottomBar = new Border
+            {
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(20, 0, 20, 20),
+                Padding = new Thickness(12, 6, 10, 6),
+                CornerRadius = new CornerRadius(14),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(245, 26, 29, 40)),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(46, 255, 255, 255)),
+                Effect = new DropShadowEffect
+                {
+                    BlurRadius = 22,
+                    ShadowDepth = 4,
+                    Opacity = 0.65,
+                    Color = Colors.Black
+                },
+                Child = barStack
+            };
+            bottomBar.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; };
+
+            var rootGrid = new Grid();
+            rootGrid.Children.Add(_stageGrid);
+            rootGrid.Children.Add(bottomBar);
+            rootGrid.Children.Add(closeBtn);
+
+            _rootFrame = new Border
+            {
+                CornerRadius = new CornerRadius(10),
+                ClipToBounds = true,
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(236, 15, 17, 24)),
+                Child = rootGrid
+            };
+            _rootFrame.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                if (e.OriginalSource == _rootFrame || e.OriginalSource == rootGrid)
+                {
+                    e.Handled = true;
+                    Close();
+                }
+            };
+
+            Content = _rootFrame;
+
+            PreviewMouseWheel += OnLightboxMouseWheel;
+            PreviewKeyDown += OnLightboxKeyDown;
+
+            SourceInitialized += delegate
+            {
+                _hwnd = new WindowInteropHelper(this).Handle;
+                long ex = Native.GetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE);
+                ex |= Native.WS_EX_TOOLWINDOW;
+                Native.SetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE, ex);
+                if (_ownerHwnd != IntPtr.Zero && Native.IsWindow(_ownerHwnd))
+                {
+                    Native.SetWindowLongPtrCompat(_hwnd, Native.GWLP_HWNDPARENT, _ownerHwnd.ToInt64());
+                }
+            };
+        }
+
+        private static Border MakePillButton(
+            string text,
+            System.Windows.Media.FontFamily font,
+            double fontSize,
+            FontWeight weight,
+            System.Windows.Media.Color bg,
+            System.Windows.Media.Color hoverBg,
+            System.Windows.Media.Color border,
+            System.Windows.Media.Color fg,
+            double radius,
+            Thickness padding)
+        {
+            var tb = new TextBlock
+            {
+                Text = text,
+                FontFamily = font,
+                FontSize = fontSize,
+                FontWeight = weight,
+                Foreground = new SolidColorBrush(fg),
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var normalBrush = new SolidColorBrush(bg);
+            var hoverBrush = new SolidColorBrush(hoverBg);
+            var btn = new Border
+            {
+                CornerRadius = new CornerRadius(radius),
+                Background = normalBrush,
+                BorderThickness = border.A > 0 ? new Thickness(1) : new Thickness(0),
+                BorderBrush = new SolidColorBrush(border),
+                Padding = padding,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                Child = tb
+            };
+            btn.MouseEnter += delegate { btn.Background = hoverBrush; };
+            btn.MouseLeave += delegate { btn.Background = normalBrush; };
+            return btn;
+        }
+
+        public bool LoadImage(string filePath, string label)
+        {
+            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return false;
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(filePath);
+                if (bytes.Length == 0 || bytes.Length > 15 * 1024 * 1024) return false;
+                BitmapImage bmp = new BitmapImage();
+                using (var ms = new MemoryStream(bytes))
+                {
+                    bmp.BeginInit();
+                    bmp.CacheOption = BitmapCacheOption.OnLoad;
+                    bmp.StreamSource = ms;
+                    bmp.EndInit();
+                }
+                bmp.Freeze();
+                _filePath = filePath;
+                _image.Source = bmp;
+                _nameText.Text = string.IsNullOrEmpty(label) ? System.IO.Path.GetFileName(filePath) : label;
+                _nameText.ToolTip = filePath;
+                _dimText.Text = string.Format("{0}×{1}", bmp.PixelWidth, bmp.PixelHeight);
+                SetZoom(1.0);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public void PositionOverBounds(Native.RECT winRect, double dpiScale, bool isMaximized, int radius)
+        {
+            double safeScale = Math.Max(0.5, dpiScale);
+            int physW = Math.Max(320, winRect.Right - winRect.Left);
+            int physH = Math.Max(240, winRect.Bottom - winRect.Top);
+            double dipW = physW / safeScale;
+            double dipH = physH / safeScale;
+
+            _rootFrame.CornerRadius = isMaximized ? new CornerRadius(0) : new CornerRadius(Math.Max(0, Math.Min(18, radius)));
+            _image.MaxWidth = Math.Max(180.0, dipW - 96.0);
+            _image.MaxHeight = Math.Max(120.0, dipH - 136.0);
+
+            Left = winRect.Left / safeScale;
+            Top = winRect.Top / safeScale;
+            Width = dipW;
+            Height = dipH;
+
+            if (_hwnd != IntPtr.Zero && Native.IsWindow(_hwnd))
+            {
+                Native.SetWindowPos(_hwnd, IntPtr.Zero, winRect.Left, winRect.Top, physW, physH, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            }
+        }
+
+        private void SetZoom(double nextScale)
+        {
+            _scale = Math.Max(0.25, Math.Min(5.0, nextScale));
+            if (_scale <= 1.02)
+            {
+                _translateTransform.X = 0.0;
+                _translateTransform.Y = 0.0;
+                _imageFrame.Cursor = System.Windows.Input.Cursors.Hand;
+            }
+            else
+            {
+                _imageFrame.Cursor = System.Windows.Input.Cursors.SizeAll;
+            }
+            _scaleTransform.ScaleX = _scale;
+            _scaleTransform.ScaleY = _scale;
+            _zoomPctText.Text = string.Format("{0}%", (int)Math.Round(_scale * 100.0));
+        }
+
+        private void OnLightboxMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            e.Handled = true;
+            double factor = e.Delta > 0 ? 1.15 : (1.0 / 1.15);
+            SetZoom(_scale * factor);
+        }
+
+        private void OnLightboxKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape)
+            {
+                e.Handled = true;
+                Close();
+            }
+            else if (e.Key == Key.Add || e.Key == Key.OemPlus)
+            {
+                e.Handled = true;
+                SetZoom(_scale * 1.25);
+            }
+            else if (e.Key == Key.Subtract || e.Key == Key.OemMinus)
+            {
+                e.Handled = true;
+                SetZoom(_scale / 1.25);
+            }
+            else if (e.Key == Key.D0 || e.Key == Key.NumPad0)
+            {
+                e.Handled = true;
+                SetZoom(1.0);
+            }
+        }
+
+        private void OnImageMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            e.Handled = true;
+            if (e.ClickCount == 2)
+            {
+                SetZoom(_scale > 1.1 ? 1.0 : 2.0);
+                return;
+            }
+            if (_scale > 1.02)
+            {
+                _dragging = true;
+                _dragStart = e.GetPosition(this);
+                _dragOriginX = _translateTransform.X;
+                _dragOriginY = _translateTransform.Y;
+                _imageFrame.CaptureMouse();
+            }
+        }
+
+        private void OnImageMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
+        {
+            if (!_dragging) return;
+            System.Windows.Point cur = e.GetPosition(this);
+            _translateTransform.X = _dragOriginX + (cur.X - _dragStart.X);
+            _translateTransform.Y = _dragOriginY + (cur.Y - _dragStart.Y);
+        }
+
+        private void OnImageMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            EndDrag();
+        }
+
+        private void EndDrag()
+        {
+            if (!_dragging) return;
+            _dragging = false;
+            try { _imageFrame.ReleaseMouseCapture(); } catch { }
+        }
+
+        private void OpenTargetFile()
+        {
+            if (string.IsNullOrEmpty(_filePath) || !File.Exists(_filePath)) return;
+            try
+            {
+                Process.Start(new ProcessStartInfo(_filePath) { UseShellExecute = true });
+            }
+            catch { }
+        }
+
+        private void OpenTargetFolder()
+        {
+            if (string.IsNullOrEmpty(_filePath)) return;
+            try
+            {
+                if (File.Exists(_filePath))
+                {
+                    Process.Start("explorer.exe", "/select,\"" + _filePath + "\"");
+                }
+                else
+                {
+                    string parent = System.IO.Path.GetDirectoryName(_filePath);
+                    if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
+                    {
+                        Process.Start("explorer.exe", "\"" + parent + "\"");
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
     internal sealed class HudOverlayWindow : Window
     {
         public const double DipWidth = 360.0;
@@ -1812,6 +2365,7 @@ namespace AgyBackdropCompanion
         private readonly string _hudTelemetryPath;
         private readonly string _hudActiveViewPath;
         private readonly string _statusPath;
+        private readonly string _lightboxCmdPath;
         private readonly Dispatcher _dispatcher;
         private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
         private readonly Dictionary<IntPtr, TrackedHostWindow> _tracked = new Dictionary<IntPtr, TrackedHostWindow>();
@@ -1840,6 +2394,11 @@ namespace AgyBackdropCompanion
         private long _lastThemesLength = -1;
         private DateTime _lastHudWriteUtc = DateTime.MinValue;
         private long _lastHudLength = -1;
+        private DateTime _lastLightboxCmdWriteUtc = DateTime.MinValue;
+        private long _lastLightboxCmdLength = -1;
+        private string _lastLightboxCmdId = "";
+        private ImageLightboxWindow _lightbox = null;
+        private IntPtr _lightboxOwnerHwnd = IntPtr.Zero;
         private int _configVersion = 0;
         private DateTime _lastStatusWriteUtc = DateTime.MinValue;
         private DateTime _fastTrackUntilUtc = DateTime.MinValue;
@@ -1864,12 +2423,23 @@ namespace AgyBackdropCompanion
             _hudTelemetryPath = System.IO.Path.Combine(_dataDir, "hud_telemetry.json");
             _hudActiveViewPath = System.IO.Path.Combine(_dataDir, "hud_active_view.json");
             _statusPath = System.IO.Path.Combine(_dataDir, "backdrop_status.json");
+            _lightboxCmdPath = System.IO.Path.Combine(_dataDir, "lightbox_cmd.json");
             _dispatcher = dispatcher;
         }
 
         public void Start()
         {
             Directory.CreateDirectory(_dataDir);
+            try
+            {
+                if (File.Exists(_lightboxCmdPath))
+                {
+                    var fi = new FileInfo(_lightboxCmdPath);
+                    _lastLightboxCmdWriteUtc = fi.LastWriteTimeUtc;
+                    _lastLightboxCmdLength = fi.Length;
+                }
+            }
+            catch { }
             InitTray();
             ReloadThemeConfig(true);
             ReloadHudTelemetry();
@@ -2404,6 +2974,14 @@ namespace AgyBackdropCompanion
                     PushHudTelemetryToWindows();
                 }));
             }
+            else if (IsTargetFile(name, "lightbox_cmd.json"))
+            {
+                _dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (_disposed) return;
+                    HandleLightboxCommandFile();
+                }));
+            }
         }
 
         private void CheckDataFilesTimestamp()
@@ -2436,6 +3014,151 @@ namespace AgyBackdropCompanion
                 }
             }
             catch { }
+
+            try
+            {
+                if (File.Exists(_lightboxCmdPath))
+                {
+                    var info = new FileInfo(_lightboxCmdPath);
+                    if (info.LastWriteTimeUtc != _lastLightboxCmdWriteUtc || info.Length != _lastLightboxCmdLength)
+                    {
+                        HandleLightboxCommandFile();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static bool IsAllowedRasterPath(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath)) return false;
+            string ext = System.IO.Path.GetExtension(filePath);
+            if (string.IsNullOrEmpty(ext)) return false;
+            ext = ext.ToLowerInvariant();
+            return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".gif" || ext == ".bmp";
+        }
+
+        private IntPtr PickTargetHostForLightbox()
+        {
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg != IntPtr.Zero && _tracked.ContainsKey(fg) && Native.IsWindowVisible(fg) && !Native.IsIconic(fg))
+            {
+                return fg;
+            }
+            foreach (TrackedHostWindow item in _tracked.Values)
+            {
+                if (Native.IsWindow(item.Hwnd) && Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd))
+                {
+                    return item.Hwnd;
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        private void HandleLightboxCommandFile()
+        {
+            try
+            {
+                if (!File.Exists(_lightboxCmdPath)) return;
+                var info = new FileInfo(_lightboxCmdPath);
+                string raw = ReadTextWithRetry(_lightboxCmdPath);
+                _lastLightboxCmdWriteUtc = info.LastWriteTimeUtc;
+                _lastLightboxCmdLength = info.Length;
+                if (string.IsNullOrEmpty(raw)) return;
+
+                var doc = _json.DeserializeObject(raw) as Dictionary<string, object>;
+                if (doc == null) return;
+
+                string cmdId = ReadString(doc, "id", "");
+                if (!string.IsNullOrEmpty(cmdId) && string.Equals(cmdId, _lastLightboxCmdId, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                long tsMs = ReadLong(doc, "ts", 0);
+                long nowMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                if (tsMs > 0 && Math.Abs(nowMs - tsMs) > 20000)
+                {
+                    _lastLightboxCmdId = cmdId;
+                    return;
+                }
+
+                string imgPath = ReadString(doc, "path", "");
+                string label = ReadString(doc, "label", "");
+                _lastLightboxCmdId = cmdId;
+
+                if (!IsAllowedRasterPath(imgPath) || !File.Exists(imgPath)) return;
+                OpenNativeLightbox(imgPath, label);
+            }
+            catch { }
+        }
+
+        private void OpenNativeLightbox(string imgPath, string label)
+        {
+            IntPtr ownerHwnd = PickTargetHostForLightbox();
+            if (ownerHwnd == IntPtr.Zero) return;
+
+            Native.RECT winRect;
+            if (!Native.TryGetVisibleBounds(ownerHwnd, out winRect)) return;
+
+            double dpiScale = Native.GetWindowDpiScale(ownerHwnd);
+            bool isMaximized = Native.IsZoomed(ownerHwnd);
+
+            if (_lightbox != null && _lightboxOwnerHwnd != ownerHwnd)
+            {
+                ImageLightboxWindow oldBox = _lightbox;
+                _lightbox = null;
+                _lightboxOwnerHwnd = IntPtr.Zero;
+                ForceCloseOwnedWindow(oldBox);
+            }
+
+            if (_lightbox == null)
+            {
+                var win = new ImageLightboxWindow(ownerHwnd);
+                // Bind BEFORE Show() so re-entrant events or SweepOrphanedWindows always recognize it
+                _lightbox = win;
+                _lightboxOwnerHwnd = ownerHwnd;
+                win.Closed += delegate
+                {
+                    if (_lightbox == win)
+                    {
+                        _lightbox = null;
+                        _lightboxOwnerHwnd = IntPtr.Zero;
+                        if (!_disposed && _debounceTimer != null && !_debounceTimer.IsEnabled)
+                        {
+                            _debounceTimer.Start();
+                        }
+                    }
+                };
+                if (!win.LoadImage(imgPath, label))
+                {
+                    _lightbox = null;
+                    _lightboxOwnerHwnd = IntPtr.Zero;
+                    ForceCloseOwnedWindow(win);
+                    return;
+                }
+                win.PositionOverBounds(winRect, dpiScale, isMaximized, _config.radius);
+                win.Show();
+                win.PositionOverBounds(winRect, dpiScale, isMaximized, _config.radius);
+                win.Activate();
+                win.Focus();
+            }
+            else
+            {
+                if (!_lightbox.LoadImage(imgPath, label))
+                {
+                    return;
+                }
+                _lightbox.PositionOverBounds(winRect, dpiScale, isMaximized, _config.radius);
+                if (!_lightbox.IsVisible) _lightbox.Show();
+                _lightbox.Activate();
+                _lightbox.Focus();
+            }
+
+            foreach (TrackedHostWindow item in _tracked.Values)
+            {
+                HideHudIfVisible(item);
+            }
         }
 
         private static string ReadTextWithRetry(string filePath)
@@ -2677,11 +3400,12 @@ namespace AgyBackdropCompanion
                     if (item.Hud != null) active.Add(item.Hud);
                     if (item.Backdrop != null) active.Add(item.Backdrop);
                 }
+                if (_lightbox != null) active.Add(_lightbox);
 
                 var orphans = new List<Window>();
                 foreach (Window w in app.Windows)
                 {
-                    if ((w is HudOverlayWindow || w is BackdropSurfaceWindow) && !active.Contains(w))
+                    if ((w is HudOverlayWindow || w is BackdropSurfaceWindow || w is ImageLightboxWindow) && !active.Contains(w))
                     {
                         orphans.Add(w);
                     }
@@ -2699,7 +3423,8 @@ namespace AgyBackdropCompanion
         {
             if (item == null || !Native.IsWindow(item.Hwnd)) return;
 
-            bool wantHud = _config.hudEnabled && _hudEnabledByTray && !_pausedByTray && !_hudTelemetry.cdpHudActive;
+            bool lightboxOpen = _lightbox != null && _lightbox.IsVisible;
+            bool wantHud = _config.hudEnabled && _hudEnabledByTray && !_pausedByTray && !_hudTelemetry.cdpHudActive && !lightboxOpen;
             bool hostVisible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
             bool validBounds = (winRect.Right - winRect.Left) >= 300 && (winRect.Bottom - winRect.Top) >= 240;
 
@@ -3092,6 +3817,7 @@ namespace AgyBackdropCompanion
                     { "pid", Process.GetCurrentProcess().Id },
                     { "running", running },
                     { "activeEffect", activeEffect },
+                    { "supportsLightbox", true },
                     { "paused", _pausedByTray },
                     { "trackedCount", _tracked.Count },
                     { "appliedAlpha", alpha },
@@ -3155,6 +3881,13 @@ namespace AgyBackdropCompanion
                 RestoreHostWindow(item, true);
             }
             _tracked.Clear();
+            if (_lightbox != null)
+            {
+                ImageLightboxWindow closingLightbox = _lightbox;
+                _lightbox = null;
+                _lightboxOwnerHwnd = IntPtr.Zero;
+                ForceCloseOwnedWindow(closingLightbox);
+            }
             SweepOrphanedWindows();
 
             WriteStatusFile(false);

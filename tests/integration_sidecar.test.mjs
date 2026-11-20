@@ -584,6 +584,49 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
   );
   assert.equal(blockedNonImg.status, 403);
 
+  // 9. Mastery lightbox-preview endpoint (webview fallback + native WPF IPC when companion supportsLightbox + 403 non-image guard)
+  const lbWebviewRes = await jsonPost('/api/mastery/lightbox-preview', {
+    targetPath: sampleImgPath,
+    label: 'preview_test.png',
+  });
+  assert.equal(lbWebviewRes.status, 200);
+  const lbWebviewData = await lbWebviewRes.json();
+  assert.equal(lbWebviewData.ok, true);
+  assert.equal(lbWebviewData.mode, 'webview');
+
+  if (process.platform === 'win32') {
+    fs.writeFileSync(
+      handle.paths.backdropStatusFile,
+      JSON.stringify({
+        pid: process.pid,
+        running: true,
+        activeEffect: true,
+        supportsLightbox: true,
+        paused: false,
+        trackedCount: 1,
+        updatedAtMs: Date.now(),
+      }),
+      'utf8',
+    );
+    const lbNativeRes = await jsonPost('/api/mastery/lightbox-preview', {
+      targetPath: sampleImgPath,
+      label: 'preview_test.png',
+    });
+    assert.equal(lbNativeRes.status, 200);
+    const lbNativeData = await lbNativeRes.json();
+    assert.equal(lbNativeData.ok, true);
+    assert.equal(lbNativeData.mode, 'native');
+    const writtenCmd = JSON.parse(fs.readFileSync(handle.paths.lightboxCmdFile, 'utf8'));
+    assert.equal(writtenCmd.path, sampleImgPath);
+    assert.equal(writtenCmd.label, 'preview_test.png');
+    fs.rmSync(handle.paths.backdropStatusFile, { force: true });
+  }
+
+  const lbBlockedRes = await jsonPost('/api/mastery/lightbox-preview', {
+    targetPath: path.join(cfgDir, 'config.json'),
+  });
+  assert.equal(lbBlockedRes.status, 403);
+
   // Confirm ZERO host_injector.js, ZERO config.json modification, ZERO .pbtxt modification
   assert.equal(fs.existsSync(path.join(handle.paths.pluginDataDir, 'host_injector.js')), false);
   assert.equal(fs.readFileSync(path.join(cfgDir, 'config.json'), 'utf8'), hostCfgRaw);

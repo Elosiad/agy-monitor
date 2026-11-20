@@ -130,6 +130,7 @@ export function resolvePaths(overrides = {}) {
     backdropExeFile: path.join(pluginDataDir, 'bin', 'agy_backdrop.exe'),
     backdropHashFile: path.join(pluginDataDir, 'bin', 'agy_backdrop.sha1'),
     backdropStatusFile: path.join(pluginDataDir, 'backdrop_status.json'),
+    lightboxCmdFile: path.join(pluginDataDir, 'lightbox_cmd.json'),
     hudTelemetryFile: path.join(pluginDataDir, 'hud_telemetry.json'),
     hudActiveViewFile: path.join(pluginDataDir, 'hud_active_view.json'),
     backdropLauncherVbs: path.join(pluginDataDir, 'launch_backdrop.vbs'),

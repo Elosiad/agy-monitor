@@ -1184,6 +1184,54 @@ export function createMonitorHandlers({
     }
   });
 
+  register('POST', '/api/mastery/lightbox-preview', async (data = {}) => {
+    const rawTarget =
+      typeof data.targetPath === 'string'
+        ? data.targetPath
+        : typeof data.path === 'string'
+          ? data.path
+          : '';
+    const rawLabel = typeof data.label === 'string' ? data.label.trim().slice(0, 180) : '';
+    const resolved = resolveLocalTargetPath(rawTarget);
+    if (!resolved) {
+      return errorResponse(ResponseCtor, 400, '无效的图片路径');
+    }
+    const ext = path.extname(resolved).toLowerCase();
+    const isBmp = ext === '.bmp';
+    if (!ALLOWED_RASTER_EXT_MIME.has(ext) && !isBmp) {
+      return errorResponse(ResponseCtor, 403, '仅允许预览常见位图图片格式');
+    }
+    try {
+      const st = await fs.stat(resolved);
+      if (!st.isFile() || st.size <= 0 || st.size > 15 * 1024 * 1024) {
+        return errorResponse(ResponseCtor, 404, '图片文件不存在或超出预览大小限制');
+      }
+    } catch {
+      return errorResponse(ResponseCtor, 404, '图片文件不存在或无法读取');
+    }
+
+    if (process.platform === 'win32' && resolvedPaths.lightboxCmdFile) {
+      try {
+        const themes = await store.getThemes();
+        const status = await getBackdropStatus(resolvedPaths, themes);
+        if (status.running && status.supportsLightbox && status.trackedCount > 0) {
+          const cmd = {
+            id: `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+            ts: Date.now(),
+            path: resolved,
+            label: rawLabel || path.basename(resolved),
+          };
+          await atomicWriteJson(resolvedPaths.lightboxCmdFile, cmd);
+          return { ok: true, mode: 'native', path: resolved, id: cmd.id };
+        }
+      } catch {
+        // Fall through cleanly to in-sidecar webview lightbox
+      }
+    }
+
+    return { ok: true, mode: 'webview', path: resolved };
+  });
+
   register('POST', '/api/mastery/config', async (data = {}) => {
     try {
       const updated = await store.updateMasteryConfig(data);

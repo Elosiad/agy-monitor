@@ -4723,52 +4723,120 @@ html[lang="en"] .prompt-selector-row {
   opacity: 0.85;
 }
 
-/* 内嵌本地图片预览卡片（点击打开所在目录） */
+/* 内嵌本地图片清晰预览（保持原比例不裁切，去冗余文件名底栏，悬停现放大角标，点击进实心大图弹窗） */
 .mad-md-img-wrap {
-  display: block;
-  margin: 4px 0;
+  display: inline-flex;
+  vertical-align: top;
+  margin: 2px 0;
   max-width: 100%;
 }
 
 .mad-md-img-card {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  max-width: min(100%, 340px);
-  padding: 5px;
-  border-radius: 9px;
-  background: var(--bg-control);
-  border: 1px solid var(--border-subtle);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  max-width: min(100%, 280px);
+  padding: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-canvas);
+  border: 1px solid color-mix(in srgb, var(--text-primary) 24%, transparent);
+  box-shadow: var(--shadow-soft);
   cursor: zoom-in;
-  text-align: left;
-  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color 0.15s ease, transform 0.14s ease, box-shadow 0.15s ease;
 }
 
 .mad-md-img-card:hover {
-  background: var(--bg-control-hover);
-  border-color: color-mix(in srgb, var(--accent-blue) 52%, transparent);
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--accent-blue) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent-blue) 74%, transparent);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--accent-blue) 24%, transparent);
+  transform: translateY(-1px);
 }
 
 .mad-md-img-el {
   display: block;
   max-width: 100%;
-  max-height: 200px;
-  min-height: 44px;
+  max-height: 172px;
   width: auto;
   height: auto;
   object-fit: contain;
-  border-radius: 6px;
   background: var(--bg-canvas);
 }
 
-/* 掌握页图片放大预览弹窗（仿原生全屏暗化浮层 + 底部悬浮胶囊栏） */
+.mad-brief-images {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.mad-brief-images .mad-md-img-wrap {
+  max-width: min(calc(50% - 4px), 216px);
+}
+
+.mad-brief-images .mad-md-img-wrap:only-child {
+  max-width: min(100%, 288px);
+}
+
+.mad-brief-images .mad-md-img-card {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.mad-brief-images .mad-md-img-el {
+  max-width: 100%;
+  max-height: 136px;
+  min-height: 54px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+
+.mad-brief-images .mad-md-img-wrap:only-child .mad-md-img-el {
+  max-height: 180px;
+}
+
+/* 方案一贴背微透窗下对内嵌图做轻量对比度与边框补偿，避免暗色截图融入壁纸 */
+body.host-backdrop-shared .mad-md-img-card {
+  border-color: color-mix(in srgb, var(--text-primary) 34%, transparent);
+  box-shadow: var(--shadow-elevated);
+}
+
+body.host-backdrop-shared .mad-md-img-el {
+  filter: brightness(1.12) contrast(1.12) saturate(1.06);
+}
+
+.mad-md-img-zoom-badge {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--bg-canvas) 90%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-primary) 28%, transparent);
+  color: var(--text-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.14s ease;
+}
+
+.mad-md-img-card:hover .mad-md-img-zoom-badge {
+  opacity: 1;
+}
+
+/* 掌握页图片放大预览弹窗（兜底内嵌版；Windows 伴侣在线时优先弹 100% 实心全窗原生弹窗） */
 .mad-lightbox-backdrop {
   position: fixed;
   inset: 0;
   z-index: 1300;
-  background: color-mix(in srgb, var(--bg-canvas) 82%, transparent);
-  backdrop-filter: blur(12px);
+  background: color-mix(in srgb, var(--bg-canvas) 97%, transparent);
+  backdrop-filter: blur(16px);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -4826,10 +4894,16 @@ html[lang="en"] .prompt-selector-row {
   height: auto;
   object-fit: contain;
   border-radius: 10px;
+  background: var(--bg-canvas);
+  border: 1px solid color-mix(in srgb, var(--text-primary) 22%, transparent);
   box-shadow: var(--shadow-elevated);
   transform-origin: center center;
   transition: transform 0.08s ease-out;
   cursor: zoom-in;
+}
+
+body.host-backdrop-shared .mad-lightbox-img {
+  filter: brightness(1.08) contrast(1.08);
 }
 
 .mad-lightbox-img.is-zoomed {

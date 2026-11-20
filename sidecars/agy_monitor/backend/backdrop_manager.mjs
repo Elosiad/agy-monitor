@@ -271,6 +271,7 @@ export async function getBackdropStatus(paths, themes = {}) {
     canAutoLaunch: desk.canAutoLaunch,
     running,
     activeEffect: running && Boolean(raw?.activeEffect),
+    supportsLightbox: running && Boolean(raw?.supportsLightbox),
     paused: running && Boolean(raw?.paused),
     trackedCount: running ? Number(raw?.trackedCount || 0) : 0,
     appliedAlpha: running ? Number(raw?.appliedAlpha || 255) : 255,

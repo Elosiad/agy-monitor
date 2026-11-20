@@ -283,27 +283,20 @@ function createLocalImagePreview(label, rawTarget, ctx) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "mad-md-img-card";
-  btn.title = `点击预览大图：${displayPath}`;
+  btn.title = `${cleanLabel}（点击放大预览）`;
 
   const img = document.createElement("img");
   img.className = "mad-md-img-el";
   img.alt = cleanLabel;
   img.loading = "lazy";
 
-  const foot = document.createElement("span");
-  foot.className = "mad-md-img-foot";
-  foot.appendChild(buildPathIconSvg(true));
-  const nameSpan = document.createElement("span");
-  nameSpan.className = "mad-md-img-name";
-  nameSpan.textContent = cleanLabel;
-  const hintSpan = document.createElement("span");
-  hintSpan.className = "mad-md-img-hint";
-  hintSpan.textContent = "点击放大预览";
-  foot.appendChild(nameSpan);
-  foot.appendChild(hintSpan);
+  const zoomBadge = document.createElement("span");
+  zoomBadge.className = "mad-md-img-zoom-badge";
+  zoomBadge.setAttribute("aria-hidden", "true");
+  zoomBadge.appendChild(buildActionIconSvg("search"));
 
   btn.appendChild(img);
-  btn.appendChild(foot);
+  btn.appendChild(zoomBadge);
 
   let loadedUrl = "";
   btn.addEventListener("click", (e) => {
@@ -1160,7 +1153,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     applyLightboxTransform();
   };
 
-  const openImageLightbox = ({ url, targetPath, label } = {}) => {
+  const openWebviewLightbox = ({ url, targetPath, label } = {}) => {
     if (!lightboxBackdrop || !lightboxImg || !url) {
       if (targetPath) void openLocalPath(targetPath, { mode: "folder" });
       return;
@@ -1179,6 +1172,29 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     }
     applyLightboxTransform();
     lightboxBackdrop.hidden = false;
+  };
+
+  const openImageLightbox = ({ url, targetPath, label } = {}) => {
+    const cleanPath = String(targetPath || "").trim();
+    const cleanLabel = label || extractFileUriLabel(cleanPath);
+    if (cleanPath && typeof apiFetch === "function") {
+      void callJson(apiFetch, "/api/mastery/lightbox-preview", {
+        method: "POST",
+        body: JSON.stringify({ targetPath: cleanPath, label: cleanLabel }),
+      })
+        .then((res) => {
+          if (destroyed) return;
+          if (res?.mode === "native") return;
+          openWebviewLightbox({ url, targetPath: cleanPath, label: cleanLabel });
+        })
+        .catch(() => {
+          if (!destroyed) {
+            openWebviewLightbox({ url, targetPath: cleanPath, label: cleanLabel });
+          }
+        });
+      return;
+    }
+    openWebviewLightbox({ url, targetPath: cleanPath, label: cleanLabel });
   };
 
   const closeImageLightbox = () => {
@@ -2193,11 +2209,24 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     document,
     "keydown",
     (e) => {
-      if (e.key !== "Escape") return;
       if (lightboxBackdrop && !lightboxBackdrop.hidden) {
-        e.stopImmediatePropagation?.();
-        closeImageLightbox();
-      } else if (modalBackdrop && !modalBackdrop.hidden) {
+        if (e.key === "Escape") {
+          e.stopImmediatePropagation?.();
+          closeImageLightbox();
+        } else if (e.key === "+" || e.key === "=") {
+          e.preventDefault();
+          setLightboxZoom(lightboxScale * 1.25);
+        } else if (e.key === "-") {
+          e.preventDefault();
+          setLightboxZoom(lightboxScale / 1.25);
+        } else if (e.key === "0") {
+          e.preventDefault();
+          setLightboxZoom(1);
+        }
+        return;
+      }
+      if (e.key !== "Escape") return;
+      if (modalBackdrop && !modalBackdrop.hidden) {
         e.stopImmediatePropagation?.();
         closeThirdPartyModal();
       } else if (detailViewEl && !detailViewEl.hidden) {
