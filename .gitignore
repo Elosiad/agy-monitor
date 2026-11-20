@@ -1,0 +1,22 @@
+# Release artifacts & local build outputs
+dist/
+*.zip
+
+# Dependencies & runtime caches
+node_modules/
+*.log
+*.tmp
+*.bak
+
+# Compiled native companions (built automatically at install/runtime)
+*.exe
+*.sha1
+
+# OS & editor clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+.env
+.env.*

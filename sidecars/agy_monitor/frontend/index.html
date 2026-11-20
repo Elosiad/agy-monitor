@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Antigravity Monitor</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="aux-pane-shell" id="auxPaneShell">
+    <div class="workspace-wallpaper-layer" id="workspaceWallpaperLayer" aria-hidden="true"></div>
+
+    <div class="right-pane-canvas" id="rightPaneCanvas">
+      <main class="monitor-dashboard" id="monitorDashboard" aria-label="Antigravity 上下文监控面板">
+        <!-- 顶部三级功能导航：通用 / 掌握 / 美化 -->
+        <nav class="monitor-subnav" aria-label="插件功能导航" data-i18n-aria="nav.ariaLabel">
+          <div class="subnav-tabs-group" role="tablist">
+            <button class="subnav-tab is-active" type="button" role="tab" data-subnav="general" aria-selected="true">
+              <span data-i18n="nav.general">通用</span>
+            </button>
+            <button class="subnav-tab" type="button" role="tab" data-subnav="mastery" aria-selected="false">
+              <span data-i18n="nav.mastery">掌握</span>
+            </button>
+            <button class="subnav-tab" type="button" role="tab" data-subnav="theme" aria-selected="false">
+              <span data-i18n="nav.theme">美化</span>
+            </button>
+          </div>
+
+          <div class="subnav-meta-right">
+            <button
+              class="follow-mode-btn is-following"
+              id="followModeBtn"
+              type="button"
+              aria-pressed="true"
+              title="点击切换「跟随最新顶层会话」或「锁定当前会话」"
+              data-i18n-title="status.followLatestTitle"
+            >
+              <span class="follow-mode-dot" aria-hidden="true"></span>
+              <span class="follow-mode-label" id="followModeLabel" data-i18n="status.followLatest">跟随最新会话</span>
+            </button>
+            <span class="active-conv-pill" id="activeConvChip" title="">
+              <span class="active-conv-dot" aria-hidden="true"></span>
+              <span class="active-conv-name" id="activeConvName" data-i18n="status.syncing">同步中…</span>
+            </span>
+            <button
+              class="subnav-refresh-btn"
+              id="manualRefreshBtn"
+              type="button"
+              title="立即刷新（触发增量重扫）"
+              aria-label="立即刷新（触发增量重扫）"
+              data-i18n-title="nav.refreshTitle"
+              data-i18n-aria="nav.refreshTitle"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M13.3 8a5.3 5.3 0 1 1-1.45-3.65M13.3 2.8v2.7h-2.7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </nav>
+
+        <!-- 通用面板主体 -->
+        <div class="monitor-tab-panel" id="panelGeneral" data-subnav-panel="general">
+          <div class="dashboard-top-grid">
+            <!-- 顶部左侧：上下文占用饼图 -->
+            <section class="metric-card context-pie-card" aria-label="上下文占用情况" data-i18n-aria="pie.ariaLabel">
+              <div class="card-header">
+                <h2 class="card-title" data-i18n="pie.title">上下文占用</h2>
+                <div class="window-selector" id="windowSelector">
+                  <button
+                    class="card-badge"
+                    id="windowBadgeBtn"
+                    type="button"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                    title="切换上下文窗口上限"
+                    data-i18n-title="pie.windowTitle"
+                  >
+                    <span id="windowBadgeLabel">512k 窗口</span>
+                    <svg class="card-badge-chevron" width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M4.2 6.2 8 10l3.8-3.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                  <div class="window-dropdown" id="windowDropdown" role="listbox" aria-label="选择上下文窗口大小" hidden>
+                    <button class="window-option" type="button" role="option" data-window="256k" data-cap="256000" aria-selected="false">
+                      <span class="window-option-name">256k</span>
+                      <span class="window-option-meta">256,000</span>
+                    </button>
+                    <button class="window-option is-active" type="button" role="option" data-window="512k" data-cap="512000" aria-selected="true">
+                      <span class="window-option-name">512k</span>
+                      <span class="window-option-meta">512,000</span>
+                    </button>
+                    <button class="window-option" type="button" role="option" data-window="1M" data-cap="1000000" aria-selected="false">
+                      <span class="window-option-name">1M</span>
+                      <span class="window-option-meta">1,000,000</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="pie-stage" id="pieStage">
+                <svg class="context-pie-svg" id="contextPieSvg" viewBox="0 0 160 160" width="124" height="124" role="img" aria-label="上下文占用饼图"></svg>
+                <div class="pie-tooltip" id="pieTooltip" role="status" aria-hidden="true">
+                  <div class="pie-tooltip-title">
+                    <span class="pie-tooltip-dot" id="pieTooltipDot"></span>
+                    <span id="pieTooltipLabel"></span>
+                  </div>
+                  <div class="pie-tooltip-values">
+                    <span class="pie-tooltip-num" id="pieTooltipCount"></span>
+                    <span class="pie-tooltip-pct" id="pieTooltipPct"></span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="context-summary-line" id="contextSummaryLine">0 / 512,000 (0%)</div>
+              <div class="pie-legend" id="pieLegend"></div>
+            </section>
+
+            <!-- 顶部右侧：各模型 Token 用量 -->
+            <section class="metric-card token-usage-card" aria-label="各模型 Token 用量" data-i18n-aria="usage.ariaLabel">
+              <div class="card-header token-card-header">
+                <div class="card-title token-card-title">
+                  <div class="token-title-bar">
+                    <h2 class="card-title-text" data-i18n="usage.title">模型 Token 用量</h2>
+                    <div class="token-total-meta">
+                      <span class="token-total-count" id="tokenTotalCount">0</span>
+                      <span class="token-total-cost" id="tokenTotalCost">$0.00</span>
+                    </div>
+                  </div>
+                  <div class="card-title-filters" role="group" aria-label="Token 用量筛选">
+                    <div class="filter-tab-group" data-filter-group="scope" role="tablist" aria-label="统计范围">
+                      <button class="filter-tab" type="button" role="tab" aria-selected="false" data-scope="global" data-i18n="usage.scopeGlobal">全局</button>
+                      <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-scope="current" data-i18n="usage.scopeCurrent">当前</button>
+                    </div>
+                    <div class="filter-tab-group" data-filter-group="range" role="tablist" aria-label="时间范围">
+                      <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-range="today" data-i18n="usage.rangeToday">今天</button>
+                      <button class="filter-tab" type="button" role="tab" aria-selected="false" data-range="7d" data-i18n="usage.range7d">近七天</button>
+                      <button class="filter-tab" type="button" role="tab" aria-selected="false" data-range="30d" data-i18n="usage.range30d">近一个月</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="token-models-list" id="tokenModelsList"></div>
+            </section>
+          </div>
+
+          <!-- 配置行：全局默认模型 + 系统提示词 -->
+          <div class="config-rows-stack">
+            <!-- 全局默认模型选择 -->
+            <div class="model-selector-row" aria-label="全局默认模型配置">
+              <span class="prompt-row-label" data-i18n="model.defaultLabel">发起模型偏好</span>
+
+              <div class="model-row-controls">
+                <div class="global-model-selector" id="globalModelSelector">
+                  <button
+                    class="global-model-btn"
+                    id="globalModelBtn"
+                    type="button"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                  >
+                    <span class="global-model-active-info">
+                      <svg class="model-spark-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M8 1.5 9.6 6.4 14.5 8 9.6 9.6 8 14.5 6.4 9.6 1.5 8 6.4 6.4 8 1.5Z" fill="currentColor"/>
+                      </svg>
+                      <span class="global-model-active-name" id="globalModelActiveName" data-i18n="model.loading">读取可用模型…</span>
+                      <span class="global-model-active-tier" id="globalModelActiveTier"></span>
+                    </span>
+                    <span class="global-model-active-meta">
+                      <span class="global-model-status-tag" id="globalModelActiveBadge"></span>
+                      <svg class="prompt-chevron" width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M4.2 6.2 8 10l3.8-3.8" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </span>
+                  </button>
+
+                  <div class="global-model-dropdown" id="globalModelDropdown" role="listbox" aria-label="全局默认模型列表" hidden></div>
+                </div>
+
+                <button
+                  class="action-pill-btn"
+                  id="newConvDefaultModelBtn"
+                  type="button"
+                  title="使用选定模型立即发起新对话（需发送首句）"
+                  data-i18n-title="model.newConvTitle"
+                >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+                  </svg>
+                  <span data-i18n="model.newConvBtn">发起新对话</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- 当前系统提示词选择 -->
+            <div class="prompt-selector-row" aria-label="系统提示词配置">
+              <span class="prompt-row-label" data-i18n="prompt.label">全局 Rules 预设</span>
+
+              <div class="prompt-row-controls">
+                <div class="prompt-selector" id="promptSelector">
+                  <button
+                    class="prompt-select-btn"
+                    id="promptSelectBtn"
+                    type="button"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                  >
+                    <span class="prompt-active-info">
+                      <span class="prompt-dot" aria-hidden="true"></span>
+                      <span class="prompt-active-name" id="promptActiveName">官方原版</span>
+                    </span>
+                    <span class="prompt-active-meta">
+                      <span class="prompt-token-tag" id="promptActiveTokens">+0</span>
+                      <svg class="prompt-chevron" width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M4.2 6.2 8 10l3.8-3.8" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </span>
+                  </button>
+
+                  <div class="prompt-dropdown" id="promptDropdown" role="listbox" aria-label="系统提示词列表" hidden></div>
+                </div>
+
+                <button
+                  class="prompt-import-btn"
+                  id="promptImportBtn"
+                  type="button"
+                  title="导入 .md 文件新增规则预设"
+                  data-i18n-title="prompt.importTitle"
+                >
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M9.5 2.3H4.6A1.5 1.5 0 0 0 3.1 3.8v8.4a1.5 1.5 0 0 0 1.5 1.5h6.8a1.5 1.5 0 0 0 1.5-1.5V5.7L9.5 2.3Z" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/>
+                    <path d="M9.3 2.5v3.4h3.4M8 7.5v3.8M6.1 9.4h3.8" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span data-i18n="prompt.importBtn">导入 .md</span>
+                </button>
+                <button
+                  class="prompt-help-btn"
+                  id="promptHelpBtn"
+                  type="button"
+                  title="格式说明与安全提醒"
+                  aria-label="系统提示词导入说明与安全提醒"
+                  data-i18n-title="prompt.helpTitle"
+                  data-i18n-aria="prompt.helpTitle"
+                >?</button>
+                <input type="file" id="promptMdInput" accept=".md,.markdown,text/markdown" hidden />
+              </div>
+            </div>
+
+            <div class="inline-feedback" id="promptImportStatus" role="alert" hidden></div>
+          </div>
+
+          <!-- 第三行：活动 / 未读 / 最近活动 / 常用会话 -->
+          <div class="sessions-section-wrap">
+            <div class="sessions-hub-row" id="sessionsHubRow" aria-label="会话总览与常用管理">
+              <!-- 1. 活动会话 -->
+              <section class="session-group" aria-label="活动会话">
+                <div class="session-group-header">
+                  <div class="session-group-title-wrap">
+                    <span class="session-group-title" data-i18n="sessions.activeTitle">活动会话</span>
+                    <span class="session-group-count" id="activeSessionsCount">0</span>
+                  </div>
+                  <span class="session-group-sub" data-i18n="sessions.activeSub">运行中</span>
+                </div>
+                <div class="session-list" id="activeSessionsList"></div>
+              </section>
+
+              <!-- 2. 已完成但未读 -->
+              <section class="session-group" aria-label="已完成但未读">
+                <div class="session-group-header">
+                  <div class="session-group-title-wrap">
+                    <span class="session-group-title" data-i18n="sessions.unreadTitle">已完成未读</span>
+                    <span class="session-group-count" id="unreadSessionsCount">0</span>
+                  </div>
+                  <span class="session-group-sub" data-i18n="sessions.unreadSub">待查看</span>
+                </div>
+                <div class="session-list" id="unreadSessionsList"></div>
+              </section>
+
+              <!-- 3. 最近活动（按完成时间降序） -->
+              <section class="session-group" aria-label="最近活动会话">
+                <div class="session-group-header">
+                  <div class="session-group-title-wrap">
+                    <span class="session-group-title" data-i18n="sessions.recentTitle">最近活动</span>
+                    <span class="session-group-count" id="recentSessionsCount">0</span>
+                  </div>
+                  <span class="session-group-sub" data-i18n="sessions.recentSub">完成时间降序</span>
+                </div>
+                <div class="session-list" id="recentSessionsList"></div>
+              </section>
+
+              <!-- 4. 常用会话（支持手动加入与顺序调整） -->
+              <section class="session-group session-group-favorites" aria-label="常用会话">
+                <div class="session-group-header">
+                  <div class="session-group-title-wrap">
+                    <span class="session-group-title" data-i18n="sessions.favoritesTitle">常用会话</span>
+                    <span class="session-group-count" id="favoriteSessionsCount">0</span>
+                  </div>
+                  <div class="favorite-add-wrap" id="favoriteAddWrap">
+                    <button class="favorite-add-btn" id="favoriteAddBtn" type="button" aria-haspopup="listbox" aria-expanded="false">
+                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                      </svg>
+                      <span data-i18n="sessions.addFavorite">加入</span>
+                    </button>
+                    <div class="favorite-add-dropdown" id="favoriteAddDropdown" role="listbox" aria-label="添加常用会话" hidden></div>
+                  </div>
+                </div>
+                <div class="session-list" id="favoriteSessionsList"></div>
+              </section>
+            </div>
+            <div class="sessions-feedback-bar" id="sessionsFeedback" role="status" aria-live="polite" hidden></div>
+          </div>
+
+          <!-- 第四行：速率与上游真实返回模型（双栏铺满） -->
+          <div class="runtime-telemetry-row" id="runtimeTelemetryRow" aria-label="实时运行指标">
+            <div class="telemetry-cell telemetry-speed">
+              <div class="telemetry-label-row">
+                <span class="telemetry-label" data-i18n="runtime.speedLabel">生成速率</span>
+                <span class="telemetry-dot" id="telemetrySpeedDot" aria-hidden="true"></span>
+              </div>
+              <div class="telemetry-main-value">
+                <span class="telemetry-num" id="telemetrySpeedNum">--</span>
+                <span class="telemetry-unit" id="telemetrySpeedUnit">tok/s</span>
+              </div>
+              <div class="telemetry-sub" id="telemetrySpeedSub">--</div>
+            </div>
+
+            <div class="telemetry-cell telemetry-upstream">
+              <div class="telemetry-label-row">
+                <span class="telemetry-label" data-i18n="runtime.upstreamLabel">最近一次上游真实返回模型</span>
+                <span class="telemetry-status-pill" id="telemetryUpstreamBadge" hidden></span>
+              </div>
+              <div class="telemetry-model-id" id="telemetryUpstreamModel" title="">--</div>
+              <div class="telemetry-sub" id="telemetryUpstreamSub">--</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 掌握面板：视图 1 总览（顶部进程条 + 总结模型行 + 总进度 + 主次协作网） / 视图 2 点击 Agent 进入的 Codex 式内容历程 -->
+        <div class="monitor-tab-panel monitor-mastery-panel" id="panelMastery" data-subnav-panel="mastery" hidden>
+          <!-- 视图 1：总览页 -->
+          <div class="mastery-overview-view" id="masteryOverviewView">
+            <section class="mastery-cli-section" aria-label="活动与已完成未读会话进程">
+              <div class="mastery-cli-header">
+                <div class="mastery-cli-title-wrap">
+                  <span class="mastery-cli-title">会话进程</span>
+                  <span class="mastery-cli-count" id="masteryTotalCount">0</span>
+                </div>
+                <span class="mastery-cli-summary" id="masteryStatusSummary"></span>
+              </div>
+              <div class="mv-f-cli" id="masteryCliList" role="listbox" aria-label="会话进程列表"></div>
+            </section>
+
+            <!-- 总结模型配置行：默认开启自身模型（每分钟 / 思维低）；支持关闭或切换第三方模型，改动自动持久化 -->
+            <section class="mastery-summary-model-row" id="masterySummaryModelRow" aria-label="自定义总结模型">
+              <div class="msm-main-row">
+                <div class="msm-left">
+                  <label class="msm-switch" title="开启或关闭定时总结">
+                    <input type="checkbox" id="msmEnableToggle" aria-label="启用总结模型" checked />
+                    <span class="msm-switch-slider" aria-hidden="true"></span>
+                  </label>
+                  <span class="msm-label">总结模型</span>
+                  <span class="msm-source-tag" id="msmSourceTag">自身模型</span>
+                </div>
+                <div class="msm-controls" id="msmControls" role="radiogroup" aria-label="总结模型来源">
+                  <button
+                    type="button"
+                    class="msm-btn is-active"
+                    id="msmSelfBtn"
+                    role="radio"
+                    aria-checked="true"
+                    title="由正在运行的 Agent 自身模型顺带输出开场思考与阶段总结，保留原会话缓存命中"
+                  >
+                    <span class="msm-btn-dot" aria-hidden="true"></span>
+                    <span class="msm-btn-text">自身模型</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    class="msm-btn is-thirdparty"
+                    id="msmThirdPartyBtn"
+                    role="radio"
+                    aria-checked="false"
+                    title="自定义第三方模型（OpenAI / Anthropic 协议）"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M8 2.2v1.6M8 12.2v1.6M2.2 8h1.6M12.2 8h1.6M3.9 3.9l1.1 1.1M11 11l1.1 1.1M12.1 3.9L11 5M5 11l-1.1 1.1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                      <circle cx="8" cy="8" r="2.3" stroke="currentColor" stroke-width="1.3"/>
+                    </svg>
+                    <span class="msm-btn-text" id="msmThirdPartyLabel">第三方模型</span>
+                  </button>
+                </div>
+              </div>
+
+              <!-- 启用后自动展开：总结频率 + 思维程度 -->
+              <div class="msm-extra-row" id="msmExtraRow">
+                <div class="msm-extra-group">
+                  <span class="msm-extra-label">总结频率</span>
+                  <div class="msm-seg-group" role="radiogroup" aria-label="总结频率">
+                    <button type="button" class="msm-seg-btn" data-msm-freq="30s" aria-checked="false">每半分钟</button>
+                    <button type="button" class="msm-seg-btn is-active" data-msm-freq="1m" aria-checked="true">每分钟</button>
+                    <button type="button" class="msm-seg-btn" data-msm-freq="3m" aria-checked="false">每三分钟</button>
+                    <button type="button" class="msm-seg-btn" data-msm-freq="5m" aria-checked="false">每五分钟</button>
+                  </div>
+                </div>
+                <div class="msm-extra-group" id="msmThinkGroup">
+                  <span class="msm-extra-label">思维程度</span>
+                  <div class="msm-seg-group" role="radiogroup" aria-label="模型思维程度">
+                    <button type="button" class="msm-seg-btn" data-msm-think="off" aria-checked="false">关</button>
+                    <button type="button" class="msm-seg-btn is-active" data-msm-think="low" aria-checked="true">低</button>
+                    <button type="button" class="msm-seg-btn" data-msm-think="medium" aria-checked="false">中</button>
+                    <button type="button" class="msm-seg-btn" data-msm-think="high" aria-checked="false">高</button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- 下方主体：任务总进度（跟随主 Agent） + 左主右次三态协作关系网 -->
+            <div class="mastery-workspace" id="masteryWorkspace" aria-label="选中会话协作总览">
+              <section class="mastery-overview-bar" aria-label="任务总进度">
+                <div class="mastery-overview-top">
+                  <div class="mastery-overview-left">
+                    <span class="mastery-overview-label">任务总进度</span>
+                    <span class="mastery-overview-pct" id="masteryOverviewPct">0%</span>
+                  </div>
+                  <span class="mastery-overview-summary" id="masteryOverviewSummary">等待活动会话</span>
+                </div>
+                <div class="mastery-total-track" aria-hidden="true">
+                  <div class="mastery-total-fill" id="masteryTotalFillBar"></div>
+                </div>
+                <div class="mastery-overview-goal" id="masteryOverviewGoal"></div>
+              </section>
+
+              <section class="mastery-graph-section" aria-label="主次 Agent 协作关系">
+                <div class="mastery-graph-header">
+                  <span class="mastery-graph-title">主次协作关系</span>
+                  <div class="mastery-status-legend" aria-label="Agent 状态颜色说明">
+                    <span class="mg-status-key is-running"><span class="mg-key-dot"></span>运行中</span>
+                    <span class="mg-status-key is-sleep"><span class="mg-key-moon">☾</span>休眠</span>
+                    <span class="mg-status-key is-unread"><span class="mg-key-dot"></span>任务结束未读</span>
+                    <span class="mg-status-key is-done"><span class="mg-key-dot"></span>任务结束</span>
+                  </div>
+                </div>
+                <div class="mastery-graph-stage" id="masteryGraphStage">
+                  <svg class="mastery-graph-svg" id="masteryGraphSvg" aria-hidden="true"></svg>
+                  <div class="mastery-col-master" id="masteryColMaster"></div>
+                  <div class="mastery-col-subs" id="masteryColSubs"></div>
+                </div>
+                <div class="mastery-graph-foot">
+                  <span class="mg-foot-item"><span class="mg-foot-line is-bus"></span>左侧箭头：主次往来</span>
+                  <span class="mg-foot-item"><span class="mg-foot-line is-peer"></span>右侧连线：次级配合</span>
+                  <span class="mg-foot-tip">悬停看连线 · 点击角色进历程</span>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <!-- 视图 2：点击具体 Agent 后切换的新盒子（顶部返回 + 类 Codex 内容历程） -->
+          <div class="mastery-detail-view" id="masteryDetailView" aria-label="Agent 内容历程" hidden>
+            <div class="mad-topbar">
+              <div class="mad-top-left">
+                <button type="button" class="mad-back-btn" id="madBackBtn" title="返回协作总览 (Esc)">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M10.2 3.2L5.4 8l4.8 4.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span>返回</span>
+                </button>
+                <span class="mad-role-badge" id="madRoleBadge">主 Agent</span>
+                <span class="mad-agent-name" id="madAgentName">主 Agent</span>
+              </div>
+              <div class="mad-state-slot" id="madStateSlot"></div>
+            </div>
+
+            <div class="mad-subbar">
+              <span class="mad-session-crumb" id="madSessionCrumb"></span>
+              <span class="mad-duration" id="madDuration"></span>
+            </div>
+
+            <div class="mad-timeline" id="madTimeline" role="log" aria-label="Agent 执行内容历程"></div>
+          </div>
+        </div>
+
+        <!-- 美化面板：色调、图片壁纸、语言与宿主边界说明 -->
+        <div class="monitor-tab-panel monitor-theme-panel" id="panelTheme" data-subnav-panel="theme" hidden>
+          <!-- 模块一：色调与自定义方案保存 -->
+          <section class="theme-section" aria-label="色调与撞色配置">
+            <div class="theme-section-header">
+              <div class="theme-section-title-group">
+                <span class="theme-section-title" data-i18n="theme.colorTitle">色调</span>
+                <span class="theme-section-sub" data-i18n="theme.colorSub">本面板配色定制与明暗反色适配</span>
+              </div>
+              <div class="theme-section-actions">
+                <button
+                  class="theme-pill-btn is-toggled"
+                  id="themeSyncGlobalBtn"
+                  type="button"
+                  aria-pressed="true"
+                  title="开启后仅监听宿主明暗主题事件（不读写 config.json）"
+                  data-i18n-title="theme.syncTitle"
+                >
+                  <span class="theme-toggle-dot" aria-hidden="true"></span>
+                  <span data-i18n="theme.syncHostBtn">跟随宿主明暗</span>
+                </button>
+                <button class="theme-pill-btn" id="themeResetBtn" type="button" data-i18n="theme.resetBtn">还原默认</button>
+              </div>
+            </div>
+
+            <!-- 撞色搭配方案（内置 + 已保存自定义） -->
+            <div class="theme-palettes-row" id="themePalettesRow" role="listbox" aria-label="撞色搭配方案"></div>
+
+            <!-- 自定义配色方案命名保存 -->
+            <div class="custom-palette-save-bar" id="customPaletteSaveBar">
+              <input
+                class="custom-palette-input"
+                id="customPaletteNameInput"
+                type="text"
+                maxlength="32"
+                placeholder="为当前调色方案命名并保存…"
+                data-i18n-placeholder="theme.saveNamePlaceholder"
+                aria-label="自定义配色方案名称"
+              />
+              <button class="theme-pill-btn is-primary" id="customPaletteSaveBtn" type="button" data-i18n="theme.savePaletteBtn">保存方案</button>
+              <span class="theme-save-status" id="themeSaveStatus" role="status" aria-live="polite"></span>
+            </div>
+
+            <!-- 每类元素色彩自定义 -->
+            <div class="theme-colors-grid" id="themeColorsGrid"></div>
+
+            <!-- 样式示例区 -->
+            <div class="theme-preview-wrap">
+              <div class="theme-preview-label-row">
+                <span class="theme-sub-label" data-i18n="theme.previewLabel">样式示例区</span>
+                <span class="theme-preview-caption" id="themePreviewCaption">极昼原版</span>
+              </div>
+              <div class="theme-preview-stage" id="themePreviewStage">
+                <div class="preview-wallpaper-bg" id="previewWallpaperBg" aria-hidden="true"></div>
+                <div class="preview-mini-app">
+                  <div class="preview-mini-sidebar">
+                    <div class="preview-mini-pill"></div>
+                    <div class="preview-mini-line is-active"></div>
+                    <div class="preview-mini-line"></div>
+                    <div class="preview-mini-line is-short"></div>
+                  </div>
+                  <div class="preview-mini-main">
+                    <div class="preview-mini-bubble">
+                      <span class="preview-mini-text" data-i18n="theme.previewBubbleText">已开启撞色视觉配置</span>
+                      <span class="preview-mini-badge" data-i18n="theme.previewBadgeText">运行中</span>
+                    </div>
+                    <div class="preview-mini-metrics">
+                      <div class="preview-mini-bar-wrap">
+                        <span class="preview-mini-tag" data-i18n="theme.previewMetricText">上下文 53%</span>
+                        <div class="preview-mini-track">
+                          <div class="preview-mini-fill is-accent"></div>
+                          <div class="preview-mini-fill is-contrast"></div>
+                        </div>
+                      </div>
+                      <div class="preview-mini-composer">
+                        <span class="preview-mini-ring"></span>
+                        <span class="preview-mini-send"></span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 模块二：图片壁纸与氛围参数 -->
+          <section class="theme-section" aria-label="图片壁纸设置">
+            <div class="theme-section-header">
+              <div class="theme-section-title-group">
+                <span class="theme-section-title" data-i18n="theme.wallpaperTitle">图片壁纸</span>
+                <span class="theme-section-sub" id="wallpaperCurrentName" data-i18n="theme.wallpaperNone">未启用壁纸</span>
+              </div>
+              <div class="theme-section-actions">
+                <button class="theme-pill-btn" id="wallpaperRandomBtn" type="button">
+                  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M2.5 5h2.8l5.4 6h2.8M11.6 9.3 13.5 11l-1.9 1.7M2.5 11h2.8l1.6-1.8M9.1 6.8 10.7 5h2.8M11.6 3.3 13.5 5l-1.9 1.7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span data-i18n="theme.wallpaperRandom">随机壁纸</span>
+                </button>
+                <button class="theme-pill-btn" id="wallpaperUploadBtn" type="button">
+                  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <rect x="2.2" y="2.8" width="11.6" height="10.4" rx="1.6" stroke="currentColor" stroke-width="1.3"/>
+                    <circle cx="5.6" cy="6" r="1.1" fill="currentColor"/>
+                    <path d="m3.3 11.4 3.3-3.2 2.2 2.1 1.7-1.6 2.2 2.7" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span data-i18n="theme.wallpaperUpload">自定义图片</span>
+                </button>
+                <button class="theme-pill-btn" id="wallpaperClearBtn" type="button" data-i18n="theme.wallpaperClear">清除</button>
+                <input type="file" id="wallpaperFileInput" accept="image/png,image/jpeg,image/webp,image/gif" hidden />
+              </div>
+            </div>
+
+            <!-- 5 张内置二次元壁纸缩略图快选 -->
+            <div class="wallpaper-thumbs-row" id="wallpaperThumbsRow" role="listbox" aria-label="二次元壁纸快选"></div>
+
+            <!-- 已上传的自定义壁纸列表 -->
+            <div class="custom-wallpapers-row" id="customWallpapersRow" hidden></div>
+
+            <!-- 质感参数调节（2x2 网格） -->
+            <div class="wallpaper-sliders-grid">
+              <label class="theme-slider-item">
+                <span class="theme-slider-head">
+                  <span data-i18n="theme.opacity">透明度</span>
+                  <span class="theme-slider-val" id="wallpaperOpacityVal">100%</span>
+                </span>
+                <input class="theme-range" id="wallpaperOpacityInput" type="range" min="0" max="100" value="100" />
+              </label>
+
+              <label class="theme-slider-item">
+                <span class="theme-slider-head">
+                  <span data-i18n="theme.blur">模糊度</span>
+                  <span class="theme-slider-val" id="wallpaperBlurVal">0px</span>
+                </span>
+                <input class="theme-range" id="wallpaperBlurInput" type="range" min="0" max="24" value="0" />
+              </label>
+
+              <label class="theme-slider-item">
+                <span class="theme-slider-head">
+                  <span data-i18n="theme.dim">暗度遮罩</span>
+                  <span class="theme-slider-val" id="wallpaperDimVal">0%</span>
+                </span>
+                <input class="theme-range" id="wallpaperDimInput" type="range" min="0" max="85" value="0" />
+              </label>
+
+              <label class="theme-slider-item">
+                <span class="theme-slider-head">
+                  <span data-i18n="theme.radius">圆角柔化</span>
+                  <span class="theme-slider-val" id="themeRadiusVal">10px</span>
+                </span>
+                <input class="theme-range" id="themeRadiusInput" type="range" min="4" max="18" value="10" />
+              </label>
+            </div>
+
+            <!-- 显示模式附加选项 -->
+            <div class="wallpaper-options-row">
+              <span class="theme-sub-label" data-i18n="theme.fitLabel">壁纸适配</span>
+              <div class="filter-tab-group" role="tablist" aria-label="壁纸填充方式">
+                <button class="filter-tab is-active" type="button" data-wp-fit="cover" aria-selected="true" data-i18n="theme.fitCover">铺满裁剪</button>
+                <button class="filter-tab" type="button" data-wp-fit="contain" aria-selected="false" data-i18n="theme.fitContain">完整居中</button>
+              </div>
+            </div>
+
+            <!-- 整机背景美化模式（支持方案一 ⇄ 方案二一键切换） -->
+            <div class="backdrop-companion-card" id="backdropCompanionBox">
+              <div class="backdrop-companion-head">
+                <div class="backdrop-title-wrap">
+                  <span class="backdrop-companion-title" data-i18n="backdrop.title">整机壁纸方案</span>
+                  <span class="boundary-badge is-scoped" id="backdropStatusBadge" data-i18n="backdrop.statusPreparing">待启动</span>
+                </div>
+                <button
+                  class="theme-pill-btn is-toggled"
+                  id="backdropToggleBtn"
+                  type="button"
+                  aria-pressed="true"
+                >
+                  <span class="theme-toggle-dot" aria-hidden="true"></span>
+                  <span id="backdropToggleLabel" data-i18n="backdrop.toggleBtn">启用整机壁纸</span>
+                </button>
+              </div>
+
+              <div class="wallpaper-options-row">
+                <span class="theme-sub-label" data-i18n="backdrop.modeLabel">渲染方案</span>
+                <div class="filter-tab-group" id="hostThemeModeGroup" role="tablist" aria-label="整机美化渲染方案">
+                  <button class="filter-tab is-active" type="button" data-host-mode="backdrop" aria-selected="true" data-i18n="backdrop.modeBackdrop">方案一 · 贴背微透</button>
+                  <button class="filter-tab" type="button" data-host-mode="cdp" aria-selected="false" data-i18n="backdrop.modeCdp">方案二 · CDP 高清纯CSS</button>
+                </div>
+              </div>
+
+              <label class="theme-slider-item">
+                <span class="theme-slider-head">
+                  <span id="backdropBlendLabel" data-i18n="backdrop.blendLabel">整机壁纸透显度（主窗柔和透明）</span>
+                  <span class="theme-slider-val" id="backdropBlendVal">25%</span>
+                </span>
+                <input class="theme-range" id="backdropBlendInput" type="range" min="5" max="42" value="25" />
+              </label>
+
+              <div class="backdrop-helper-row" id="backdropHelperRow">
+                <span class="backdrop-helper-desc" id="backdropStatusHint" data-i18n="backdrop.descAuto">
+                  将在 Antigravity 窗口正后方贴合当前壁纸并同步模糊与压暗参数（绝不修改 app.asar）。
+                </span>
+                <button
+                  class="theme-pill-btn"
+                  id="copyBackdropCmdBtn"
+                  type="button"
+                  hidden
+                  data-i18n="backdrop.copyCmdBtn"
+                >
+                  复制启动命令
+                </button>
+              </div>
+              <input
+                class="backdrop-cmd-input"
+                id="backdropCmdInput"
+                type="text"
+                readonly
+                hidden
+                aria-label="桌面壁纸伴侣启动命令"
+              />
+            </div>
+          </section>
+
+          <!-- 模块三：语言设置与官方沙箱能力边界说明 -->
+          <section class="theme-section theme-language-section" aria-label="语言设置与能力边界说明">
+            <div class="theme-section-header">
+              <div class="theme-section-title-group">
+                <span class="theme-section-title" data-i18n="theme.languageTitle">宿主界面语言</span>
+                <span class="theme-section-sub" data-i18n="theme.languageSub">仅切换 Antigravity 宿主界面（需 CDP 连通），本控制台固定中文</span>
+              </div>
+              <div class="filter-tab-group" id="languageSelector" role="tablist" aria-label="Antigravity 宿主界面语言">
+                <button class="filter-tab is-active" type="button" role="tab" data-lang="zh-CN" aria-selected="true">简体中文</button>
+                <button class="filter-tab" type="button" role="tab" data-lang="en" aria-selected="false">English</button>
+              </div>
+            </div>
+
+            <div class="host-boundary-card" id="hostBoundaryCard">
+              <div class="boundary-card-title" data-i18n="theme.boundaryTitle">能力范围与官方沙箱边界说明</div>
+              <div class="boundary-list">
+                <div class="boundary-item">
+                  <div class="boundary-item-head">
+                    <span class="boundary-item-name" data-i18n="theme.boundaryThemeLabel">主题配色与明暗跟随</span>
+                    <span class="boundary-badge is-synced" id="hostThemeSyncBadge" data-i18n="theme.boundarySynced">仅监听宿主明暗</span>
+                  </div>
+                  <div class="boundary-item-desc" data-i18n="theme.boundaryThemeDesc">
+                    所有颜色方案与浅色画布高对比反色均在插件面板内生效；开启「跟随宿主明暗」后仅只读响应宿主 theme-change 事件，不直接写 ~/.gemini/config/config.json。
+                  </div>
+                </div>
+                <div class="boundary-item">
+                  <div class="boundary-item-head">
+                    <span class="boundary-item-name" data-i18n="theme.boundaryWallpaperLabel">整机壁纸（贴背伴侣）</span>
+                    <span class="boundary-badge is-synced" data-i18n="theme.boundaryBackdropBadge">零侵入桌面伴侣</span>
+                  </div>
+                  <div class="boundary-item-desc" data-i18n="theme.boundaryWallpaperDesc">
+                    严格遵守不篡改 app.asar、不注入宿主 DOM 的红线：通过外置桌面贴背窗与系统窗口微透实现全窗壁纸，壁纸、模糊与压暗参数与本面板实时联动。
+                  </div>
+                </div>
+                <div class="boundary-item">
+                  <div class="boundary-item-head">
+                    <span class="boundary-item-name" data-i18n="theme.boundaryLangLabel">双语切换与宿主菜单</span>
+                    <span class="boundary-badge is-scoped" data-i18n="theme.boundaryPanelOnly">仅作用于本面板</span>
+                  </div>
+                  <div class="boundary-item-desc" data-i18n="theme.boundaryLangDesc">
+                    双语切换完整覆盖本监控插件全部界面；桌面主窗口菜单、原生设置与左侧新建模型选择器保持 Antigravity 官方原生行为与语言。
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <!-- 弹窗一：系统提示词导入说明与安全警告 -->
+    <div class="modal-overlay" id="promptHelpModal" hidden role="dialog" aria-modal="true" aria-labelledby="promptHelpTitle">
+      <div class="modal-backdrop" id="promptHelpBackdrop" data-modal-close></div>
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title" id="promptHelpTitle" data-i18n="promptModal.title">系统提示词导入说明（.md 格式与安全提醒）</h3>
+          <button class="modal-close-btn" id="promptHelpCloseBtn" type="button" data-modal-close aria-label="关闭" data-i18n-aria="common.close">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body" id="promptHelpBody">
+          <div class="modal-section">
+            <div class="modal-section-title" data-i18n="promptModal.formatTitle">基础格式要求</div>
+            <p class="modal-text" data-i18n="promptModal.formatDesc">
+              支持 UTF-8 编码的 .md / .markdown 纯文本文件（严格不超过 24,000 字节）。首行可使用「# 方案名称」作为预设显示名，未填写时自动取文件名。
+            </p>
+          </div>
+          <div class="modal-section">
+            <div class="modal-section-title" data-i18n="promptModal.scopeTitle">生效范围说明</div>
+            <p class="modal-text" data-i18n="promptModal.scopeDesc">
+              在 Antigravity 原生插件机制下，所选预设会作为附加行为规则写入受控 rules/AGENTS.md，无法删改或替换官方内置系统底座，因此饼图会诚实拆分为「官方底座」与「规则增量」。
+            </p>
+          </div>
+          <div class="modal-alert-box">
+            <strong class="modal-alert-title" data-i18n="promptModal.securityTitle">重要防风控安全提醒</strong>
+            <p class="modal-alert-text" data-i18n="promptModal.securityDesc">
+              官方正持续通过提示词与工具调用特征匹配打击未授权反代接口及 dsh、PI（pi-coding-agent）等第三方 Harness 外壳。日常请优先选用「官方原版」或近官方行为规范预设，切勿导入包含 &lt;system&gt; 伪造标签、第三方客户端工具协议或反代/Harness 特征头的内容（后端将自动拦截高危特征）。
+            </p>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-primary-btn" id="promptHelpOkBtn" type="button" data-modal-close data-i18n="common.gotIt">我知道了</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗二：第三方总结模型自定义配置 -->
+    <div class="tp-modal-backdrop" id="masteryThirdPartyModal" role="dialog" aria-modal="true" aria-labelledby="tpModalTitle" hidden>
+      <div class="tp-modal">
+        <div class="tp-modal-header">
+          <div class="tp-modal-title-wrap">
+            <span class="tp-modal-title" id="tpModalTitle">自定义第三方总结模型</span>
+            <span class="tp-modal-sub">定时总结 Agent 状态词与执行进展，不消耗主对话模型额度</span>
+          </div>
+          <button type="button" class="tp-modal-close" id="tpModalCloseBtn" aria-label="关闭">×</button>
+        </div>
+
+        <div class="tp-modal-body">
+          <div class="tp-field">
+            <div class="tp-field-head">
+              <span class="tp-label">接口协议</span>
+              <span class="tp-hint" id="tpProtoHint">兼容 OpenAI / DeepSeek / 中转站 / 本地 Ollama</span>
+            </div>
+            <div class="tp-protocol-switch" role="tablist" aria-label="第三方接口协议">
+              <button type="button" class="tp-proto-btn is-active" data-tp-proto="openai" role="tab" aria-selected="true">
+                <span class="tp-proto-name">OpenAI 协议</span>
+                <span class="tp-proto-path">/v1/chat/completions</span>
+              </button>
+              <button type="button" class="tp-proto-btn" data-tp-proto="anthropic" role="tab" aria-selected="false">
+                <span class="tp-proto-name">Anthropic 协议</span>
+                <span class="tp-proto-path">/v1/messages</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="tp-field">
+            <div class="tp-field-head">
+              <label class="tp-label" for="tpBaseUrlInput">接口地址 (Base URL)</label>
+              <span class="tp-hint">自动拼接 /models 与对话路径</span>
+            </div>
+            <input
+              type="url"
+              class="tp-input is-mono"
+              id="tpBaseUrlInput"
+              placeholder="https://api.openai.com/v1"
+              autocomplete="off"
+            />
+          </div>
+
+          <div class="tp-field">
+            <div class="tp-field-head">
+              <label class="tp-label" for="tpApiKeyInput">API Key</label>
+              <span class="tp-hint">仅保存在本机插件数据目录，绝不上传主上下文</span>
+            </div>
+            <div class="tp-input-row">
+              <input
+                type="password"
+                class="tp-input is-mono"
+                id="tpApiKeyInput"
+                placeholder="sk-..."
+                autocomplete="off"
+              />
+              <button type="button" class="tp-inline-btn" id="tpToggleKeyBtn">显示</button>
+            </div>
+          </div>
+
+          <div class="tp-field">
+            <div class="tp-field-head">
+              <label class="tp-label" for="tpModelSelect">模型列表</label>
+              <span class="tp-fetch-status" id="tpFetchStatus">点击右侧按钮拉取可用模型</span>
+            </div>
+            <div class="tp-input-row">
+              <select class="tp-select is-mono" id="tpModelSelect" aria-label="选择已获取的模型">
+                <option value="gpt-4o-mini">gpt-4o-mini</option>
+                <option value="gpt-4.1-nano">gpt-4.1-nano</option>
+                <option value="deepseek-chat">deepseek-chat</option>
+              </select>
+              <button type="button" class="tp-inline-btn is-accent" id="tpFetchModelsBtn">获取模型</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="tp-modal-footer">
+          <div class="tp-test-wrap">
+            <button type="button" class="tp-inline-btn" id="tpTestConnBtn">测试连通</button>
+            <span class="tp-test-result" id="tpTestResult"></span>
+          </div>
+          <div class="tp-footer-actions">
+            <button type="button" class="tp-cancel-btn" id="tpCancelBtn">取消</button>
+            <button type="button" class="tp-save-btn" id="tpSaveBtn">保存并启用</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 全局轻提示 -->
+    <div class="toast-banner" id="toastBanner" role="status" aria-live="polite" hidden></div>
+  </div>
+
+  <script defer src="./boot_guard.js"></script>
+  <script defer src="./bundle.js"></script>
+</body>
+</html>

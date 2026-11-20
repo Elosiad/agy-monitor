@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 24 24" fill="none">
+  <title>AGY 控制台</title>
+  <defs>
+    <linearGradient id="agyBg" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1A2236"/>
+      <stop offset="100%" stop-color="#11131D"/>
+    </linearGradient>
+    <linearGradient id="agyArc" x1="5" y1="5" x2="19" y2="19" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6B97F3"/>
+      <stop offset="55%" stop-color="#4BD6C8"/>
+      <stop offset="100%" stop-color="#E59824"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="20" height="20" rx="5.5" fill="url(#agyBg)" stroke="#33415C" stroke-width="1.2"/>
+  <circle cx="12" cy="12" r="6.2" stroke="#283249" stroke-width="2.1"/>
+  <path d="M12 5.8a6.2 6.2 0 1 1-5.37 9.3" stroke="url(#agyArc)" stroke-width="2.1" stroke-linecap="round"/>
+  <path d="M8.4 12.2h1.9l1.2-2.6 1.7 4.4 1.1-1.8h1.5" stroke="#EAF2FF" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="17.8" cy="6.2" r="1.35" fill="#4BD6C8"/>
+</svg>

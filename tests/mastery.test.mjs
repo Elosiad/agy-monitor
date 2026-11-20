@@ -1,0 +1,375 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { evaluateMasteryHook } from '../hooks/mastery_summary_hook.mjs';
+import {
+  buildMasterySnapshot,
+  classifyToolCall,
+  parseAgentJourney,
+  parseProgressTag,
+  sanitizeTimelineMarkdown,
+  stripMarkdownForPlainLine,
+} from '../sidecars/agy_monitor/backend/mastery.mjs';
+import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
+import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
+
+function makeTempEnv(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-mastery-test-'));
+  const paths = resolvePaths({
+    appDataDir: path.join(root, 'appData'),
+    geminiConfigDir: path.join(root, 'config'),
+    pluginDataDir: path.join(root, 'pluginData'),
+    sidecarDataDir: path.join(root, 'sidecarData'),
+    brainDir: path.join(root, 'brain'),
+  });
+  const storage = createStorage(paths);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return { root, paths, storage };
+}
+
+test('PreInvocation mastery_summary_hook respects default-on self mode, explicit off, opening 30-char prompt, and frequency throttling', async (t) => {
+  const { paths, storage } = makeTempEnv(t);
+
+  // 1. Default ON -> self mode, 1m frequency, low thinking
+  const cfgDefault = await storage.getMasteryConfig();
+  assert.equal(cfgDefault.enabled, true);
+  assert.equal(cfgDefault.source, 'self');
+  assert.equal(cfgDefault.frequency, '1m');
+  assert.equal(cfgDefault.thinking, 'low');
+
+  // 1b. Explicit OFF -> auto-saved & zero injection
+  await storage.updateMasteryConfig({ enabled: false });
+  assert.equal((await storage.getMasteryConfig()).enabled, false);
+  const outOff = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 1, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_000_000 },
+  );
+  assert.deepEqual(outOff, {});
+
+  // 2. Thirdparty mode -> zero injection into host prompt
+  await storage.updateMasteryConfig({ enabled: true, source: 'thirdparty', frequency: '30s' });
+  const outTp = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 1, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_000_000 },
+  );
+  assert.deepEqual(outTp, {});
+
+  // 3. Self mode -> opening ~30-char prompt on new user input
+  await storage.updateMasteryConfig({ enabled: true, source: 'self', frequency: '30s' });
+  const outIntro = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 1, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_000_000 },
+  );
+  assert.equal(outIntro.injectSteps?.length, 1);
+  assert.match(outIntro.injectSteps[0].systemMessage.systemMessage, /30字/);
+  assert.match(outIntro.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS\|10%/);
+
+  // 4. Within frequency window (15s < 30s) -> zero injection (cache untouched)
+  const outSkipped = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 2, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_015_000 },
+  );
+  assert.deepEqual(outSkipped, {});
+
+  // 5. After frequency window (35s >= 30s) -> periodic <=10-char summary + % prompt
+  const outPeriodic = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 3, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_035_000 },
+  );
+  assert.equal(outPeriodic.injectSteps?.length, 1);
+  assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /10字以内/);
+  assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS/);
+});
+
+test('parseProgressTag, classifyToolCall, and buildMasterySnapshot align total progress with Main Agent & classify Codex actions', async (t) => {
+  const { paths } = makeTempEnv(t);
+
+  // Tag parsing + 10-char cap
+  const parsed = parseProgressTag(
+    '[AGY_PROGRESS|68%|修好登录掉线准备跑全量测试验证] 我已经定位到刷新令牌没有排队锁，正加锁并跑测试。',
+  );
+  assert.equal(parsed.percent, 68);
+  assert.equal(Array.from(parsed.summary).length <= 10, true);
+  assert.equal(parsed.narrative, '我已经定位到刷新令牌没有排队锁，正加锁并跑测试。');
+
+  // Tool classifications
+  assert.equal(classifyToolCall({ name: 'run_command', args: { CommandLine: 'npm test' } }).categoryLabel, '运行了命令');
+  const editCls = classifyToolCall({
+    name: 'edit_file',
+    args: { Path: 'd:/repo/src/auth.js', Target: 'a\nb', Replacement: 'a\nb\nc\nd' },
+  });
+  assert.equal(editCls.categoryLabel, '编辑了文件');
+  assert.equal(editCls.add, '+4');
+  assert.equal(editCls.del, '-2');
+  assert.equal(
+    classifyToolCall({ name: 'read_file', args: { Path: 'd:/repo/src/auth.js', StartLine: 1, EndLine: 20 } }).categoryLabel,
+    '读取了文件',
+  );
+
+  // Synthetic master + subagent transcript & swarm board
+  const masterId = 'conv-master-001';
+  const subAId = 'conv-sub-aaa';
+  const subBId = 'conv-sub-bbb';
+
+  const masterSys = path.join(paths.brainDir, masterId, '.system_generated');
+  fs.mkdirSync(path.join(masterSys, 'logs'), { recursive: true });
+  fs.mkdirSync(path.join(masterSys, 'swarm'), { recursive: true });
+  fs.mkdirSync(path.join(masterSys, 'subagents'), { recursive: true });
+
+  const masterTranscript = [
+    {
+      step_index: 1,
+      type: 'USER_INPUT',
+      created_at: '2026-11-20T00:00:00Z',
+      content: '<USER_REQUEST>修复登录令牌并发覆盖问题</USER_REQUEST>',
+    },
+    {
+      step_index: 2,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T00:00:05Z',
+      content: '[AGY_PROGRESS|15%|看懂需求查日志] 我明白了，你想修好并发刷新导致掉线的问题，我先查日志并拆任务。',
+      tool_calls: [
+        { name: 'read_file', args: { Path: 'd:/repo/src/auth.js', StartLine: 1, EndLine: 40 } },
+        { name: 'run_command', args: { CommandLine: 'npm test' } },
+      ],
+    },
+    {
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T00:01:00Z',
+      content: '[AGY_PROGRESS|72%|加好排队锁复测] 并发锁已写完，正跑回归验证。',
+      tool_calls: [
+        { name: 'edit_file', args: { Path: 'd:/repo/src/auth.js', Target: 'old()', Replacement: 'lock();\nold();' } },
+      ],
+    },
+  ];
+  fs.writeFileSync(
+    path.join(masterSys, 'logs', 'transcript.jsonl'),
+    masterTranscript.map((l) => JSON.stringify(l)).join('\n') + '\n',
+    'utf8',
+  );
+
+  fs.writeFileSync(
+    path.join(masterSys, 'swarm', 'members.json'),
+    JSON.stringify({
+      title: '鉴权竞态修复',
+      members: {
+        coordinator: { conversation_id: masterId, role: 'coordinator', phase: 'RUNNING' },
+        patcher: { conversation_id: subAId, role: 'worker', phase: 'RUNNING' },
+        verifier: { conversation_id: subBId, role: 'worker', phase: 'WAITING' },
+      },
+    }),
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(masterSys, 'swarm', 'board.jsonl'),
+    JSON.stringify({ seq: 1, agent: 'patcher', text: '@verifier 补丁落盘，等你回归' }) + '\n',
+    'utf8',
+  );
+
+  // Subagent A transcript (progress 40% - different from Main Agent's 72%)
+  const subASys = path.join(paths.brainDir, subAId, '.system_generated', 'logs');
+  fs.mkdirSync(subASys, { recursive: true });
+  fs.writeFileSync(
+    path.join(subASys, 'transcript.jsonl'),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T00:00:50Z',
+      content: '[AGY_PROGRESS|40%|改鉴权代码中] 正在加锁。',
+      tool_calls: [{ name: 'edit_file', args: { Path: 'd:/repo/src/auth.js', Target: 'x', Replacement: 'y\nz' } }],
+    }) + '\n',
+    'utf8',
+  );
+
+  const journey = await parseAgentJourney(paths.brainDir, masterId, {
+    isMaster: true,
+    isCompleted: false,
+    nowMs: Date.parse('2026-11-20T00:01:20Z'),
+  });
+  assert.equal(journey.progress, 72);
+  assert.equal(journey.shortStatus, '加好排队锁复测');
+  assert.ok(journey.steps.some((s) => s.type === 'actions' && s.label.includes('读取了文件')));
+  assert.ok(journey.steps.some((s) => s.type === 'actions' && s.label === '编辑了文件' && s.defaultOpen === false));
+  assert.equal(
+    journey.steps.filter((s) => s.type === 'actions').every((s) => s.defaultOpen === false),
+    true,
+  );
+
+  const snap = await buildMasterySnapshot(
+    paths,
+    {
+      active: [{ id: masterId, title: '修复登录令牌并发覆盖', workspace: 'agy-plugin', modifiedMs: Date.parse('2026-11-20T00:01:10Z'), agoText: '1m' }],
+      waiting: [],
+      unread: [],
+      recent: [],
+    },
+    { selectedSessionId: masterId, nowMs: Date.parse('2026-11-20T00:01:20Z') },
+  );
+
+  // Total progress MUST follow Main Agent (72%), NOT averaged with SubAgent (40%)
+  assert.equal(snap.sessions.length, 1);
+  assert.equal(snap.sessions[0].progress, 72);
+  assert.equal(snap.sessions[0].tag, '加好排队锁复测');
+  assert.equal(snap.detailSession.progress, 72);
+  assert.equal(snap.detailSession.master.progress, 72);
+  assert.equal(snap.detailSession.subs.length, 2);
+  assert.ok(snap.detailSession.edges.some((e) => e.type === 'peer'));
+
+  // Marking a completed session/agent read flips "任务结束未读" -> "任务结束"
+  const doneSnapUnread = await buildMasterySnapshot(
+    paths,
+    {
+      active: [],
+      waiting: [],
+      unread: [{ id: masterId, title: '修复登录令牌并发覆盖', workspace: 'agy-plugin', modifiedMs: Date.parse('2026-11-20T00:01:10Z'), agoText: '1m' }],
+      recent: [],
+    },
+    { selectedSessionId: masterId, sessionsMeta: { lastSeenByConv: {}, lastSeenByAgent: {} }, nowMs: Date.parse('2026-11-20T00:01:20Z') },
+  );
+  assert.equal(doneSnapUnread.detailSession.master.stateLabel, '任务结束未读');
+  assert.equal(doneSnapUnread.sessions[0].tag, '结束未读');
+
+  const doneSnapRead = await buildMasterySnapshot(
+    paths,
+    {
+      active: [],
+      waiting: [],
+      unread: [{ id: masterId, title: '修复登录令牌并发覆盖', workspace: 'agy-plugin', modifiedMs: Date.parse('2026-11-20T00:01:10Z'), agoText: '1m' }],
+      recent: [],
+    },
+    {
+      selectedSessionId: masterId,
+      sessionsMeta: {
+        lastSeenByConv: { [masterId]: Date.parse('2026-11-20T00:02:00Z') },
+        lastSeenByAgent: { [masterId]: Date.parse('2026-11-20T00:02:00Z'), [subAId]: Date.parse('2026-11-20T00:02:00Z') },
+      },
+      nowMs: Date.parse('2026-11-20T00:02:00Z'),
+    },
+  );
+  assert.equal(doneSnapRead.detailSession.master.stateLabel, '任务结束');
+  assert.equal(doneSnapRead.detailSession.master.stateKind, 'done');
+  assert.equal(doneSnapRead.sessions[0].tag, '任务结束');
+  assert.equal(doneSnapRead.sessions[0].status, 'done');
+  assert.equal(doneSnapRead.detailSession.subs.every((sub) => sub.stateLabel === '任务结束' && sub.stateKind === 'done'), true);
+});
+
+test('mastery strips Markdown from overview cards, keeps file:/// links intact in timeline, and strips stray path quotes', async (t) => {
+  const { paths } = makeTempEnv(t);
+
+  // Stray surrounding quotes in tool path arguments should be cleaned
+  const quotedRead = classifyToolCall({
+    name: 'read_file',
+    args: { Path: '"d:\\workspace\\agy-plugin\\sidecars\\agy_monitor\\backend\\mastery.mjs"', StartLine: 10, EndLine: 20 },
+  });
+  assert.equal(quotedRead.text, '读取 backend/mastery.mjs L10-20');
+
+  // Linear-time ReDoS safety: malformed/unclosed Markdown links must finish in < 50ms
+  const t0 = Date.now();
+  const pathological = `[broken](file:///d:/${'a'.repeat(400)} unclosed_link_without_paren`;
+  assert.ok(stripMarkdownForPlainLine(pathological).length > 0);
+  assert.ok(sanitizeTimelineMarkdown(pathological, 120).length > 0);
+  assert.ok(Date.now() - t0 < 200, 'Markdown sanitizer must remain linear-time on unclosed links');
+
+  // Markdown plain-line stripping for overview cards
+  const richReply = [
+    '已修复，把 **「任务结束（已读）」** 独立拆成 `done`（沉静灰）：',
+    '- **四态视觉区分**：`运行中` / `休眠` / `任务结束未读` / `任务结束`。',
+    '- **改动范围**：',
+    '  - [mastery.mjs](file:///d:/AAA%E5%85%A8%E6%A0%88%E5%AD%A6%E4%B9%A0/AI%E7%A8%8B%E5%BA%8F/agy-plugin/sidecars/agy_monitor/backend/mastery.mjs#L913-L1035)：返回 `stateKind: "done"`。',
+    '  - [mastery_hub.js](file:///d:/AAA%E5%85%A8%E6%A0%88%E5%AD%A6%E4%B9%A0/AI%E7%A8%8B%E5%BA%8F/agy-plugin/sidecars/agy_monitor/frontend/components/mastery_hub.js#L1-L20)：同步灰态徽章。',
+  ].join('\n');
+
+  const plain = stripMarkdownForPlainLine(richReply);
+  assert.equal(plain.includes('**'), false);
+  assert.equal(plain.includes('`'), false);
+  assert.equal(plain.includes('file:///'), false);
+  assert.ok(plain.includes('mastery.mjs'));
+  assert.ok(plain.includes('mastery_hub.js'));
+
+  // Timeline Markdown sanitizer measures visible length, so long percent-encoded file:/// links stay intact
+  const sanitized = sanitizeTimelineMarkdown(richReply);
+  assert.ok(sanitized.includes('[mastery.mjs](file:///d:/AAA%E5%85%A8'));
+  assert.ok(sanitized.includes('[mastery_hub.js](file:///d:/AAA%E5%85%A8'));
+  assert.ok(sanitized.includes('同步灰态徽章。'));
+
+  // Oversized single-line text truncates cleanly without slicing inside a Markdown link
+  const singleLineHuge = `已完成 ${'说明'.repeat(120)} 并修改 [mastery.mjs](file:///d:/AAA%E5%85%A8%E6%A0%88%E5%AD%A6%E4%B9%A0/mastery.mjs#L1-L10) 结束`;
+  const truncated = sanitizeTimelineMarkdown(singleLineHuge, 80);
+  assert.equal(truncated.includes('file:///'), false);
+  assert.ok(truncated.endsWith('…'));
+
+  // Full parseAgentJourney integration: clean overview taskLine + intact timeline steps
+  const convId = 'conv-md-001';
+  const logsDir = path.join(paths.brainDir, convId, '.system_generated', 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(logsDir, 'transcript.jsonl'),
+    [
+      { step_index: 1, type: 'USER_INPUT', created_at: '2026-11-20T01:00:00Z', content: '<USER_REQUEST>修好排版</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T01:00:10Z', content: richReply },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+    'utf8',
+  );
+  const journey = await parseAgentJourney(paths.brainDir, convId, { isMaster: true, isCompleted: true });
+  assert.equal(journey.taskLine.includes('**'), false);
+  assert.equal(journey.taskLine.includes('`'), false);
+  assert.equal(journey.taskLine.includes('file:///'), false);
+  const msgSteps = journey.steps.filter((s) => s.type === 'msg');
+  assert.equal(msgSteps.length, 1);
+  assert.ok(msgSteps[0].text.includes('[mastery_hub.js](file:///d:/AAA%E5%85%A8'));
+
+  // Multi-turn & mid-run supplement preservation: sending a follow-up while running must NOT wipe prior history
+  const multiConvId = 'conv-multi-002';
+  const multiLogsDir = path.join(paths.brainDir, multiConvId, '.system_generated', 'logs');
+  fs.mkdirSync(multiLogsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(multiLogsDir, 'transcript.jsonl'),
+    [
+      { step_index: 1, type: 'USER_INPUT', created_at: '2026-11-20T01:00:00Z', content: '<USER_REQUEST>先解释一下报错原因</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-20T01:00:10Z', content: '原因是路径被直接截断。', tool_calls: [] },
+      { step_index: 3, type: 'USER_INPUT', created_at: '2026-11-20T01:01:00Z', content: '<USER_REQUEST>修掉</USER_REQUEST>' },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-20T01:01:05Z',
+        content: '[AGY_PROGRESS|45%|正在修排版渲染] 正在修改前后端文件。',
+        tool_calls: [{ name: 'edit_file', args: { Path: 'd:/repo/mastery.mjs', Target: 'a', Replacement: 'b' } }],
+      },
+      { step_index: 5, type: 'USER_INPUT', created_at: '2026-11-20T01:01:20Z', content: '<USER_REQUEST>顺便把操作列表默认收起</USER_REQUEST>' },
+      {
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-20T01:01:25Z',
+        content: '已一并收起操作列表。',
+        tool_calls: [{ name: 'read_file', args: { Path: 'd:/repo/mastery_hub.js', StartLine: 1, EndLine: 10 } }],
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+    'utf8',
+  );
+  const multiJourney = await parseAgentJourney(paths.brainDir, multiConvId, {
+    isMaster: true,
+    isCompleted: false,
+    nowMs: Date.parse('2026-11-20T01:01:30Z'),
+  });
+  const userSteps = multiJourney.steps.filter((s) => s.type === 'user');
+  assert.equal(userSteps.length, 3);
+  assert.equal(userSteps[0].text, '先解释一下报错原因');
+  assert.equal(userSteps[0].isFollowup, false);
+  assert.equal(userSteps[1].text, '修掉');
+  assert.equal(userSteps[1].isFollowup, false);
+  assert.equal(userSteps[2].text, '顺便把操作列表默认收起');
+  assert.equal(userSteps[2].isFollowup, true);
+  assert.equal(userSteps[2].label, '用户补充');
+  // Mid-run supplement keeps current run's progress & prior steps intact
+  assert.equal(multiJourney.progress, 45);
+  assert.ok(multiJourney.steps.some((s) => s.type === 'msg' && s.text.includes('原因是路径被直接截断')));
+  assert.ok(multiJourney.steps.some((s) => s.type === 'actions' && s.label === '编辑了文件' && s.defaultOpen === false));
+});

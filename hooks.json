@@ -1,0 +1,11 @@
+{
+  "agy-mastery-self-summary": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./hooks/mastery_summary_hook.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

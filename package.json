@@ -1,0 +1,25 @@
+{
+  "name": "agy-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "AGY Console (AGY 控制台): Antigravity context telemetry, token usage, multi-agent Mastery tracker, and theme/backdrop studio.",
+  "homepage": "https://github.com/aishadiaodeqishui/agy-monitor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aishadiaodeqishui/agy-monitor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aishadiaodeqishui/agy-monitor/issues"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=2 tests/*.test.mjs",
+    "install:plugin": "node scripts/install.mjs",
+    "uninstall:plugin": "node scripts/uninstall.mjs",
+    "sync": "node scripts/sync_to_plugins.mjs",
+    "pack": "node scripts/pack_release.mjs"
+  }
+}
