@@ -987,7 +987,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   let lastSnapshot = null;
   let activeDetailSession = null;
   let configState = {
-    enabled: true,
+    enabled: false,
     source: "self",
     frequency: "1m",
     thinking: "low",
@@ -1000,6 +1000,8 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
       selectedModel: "gpt-4o-mini",
     },
   };
+  let configMutationSeq = 0;
+  let configSaveInFlight = 0;
 
   let draftProto = "openai";
   let draftModels = [...PROTOCOL_PRESETS.openai.models];
@@ -1283,21 +1285,31 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     });
   };
 
-  const saveConfigPatch = async (patch, { toastText = "" } = {}) => {
+  const saveConfigPatch = async (patch, { toastText = "", toastType = "success", refreshAfter = false } = {}) => {
+    const reqSeq = ++configMutationSeq;
+    configSaveInFlight += 1;
     try {
       const res = await callJson(apiFetch, "/api/mastery/config", {
         method: "POST",
         body: JSON.stringify(patch),
       });
-      if (res?.config) {
+      if (res?.config && reqSeq === configMutationSeq) {
         configState = res.config;
         renderConfigRow();
       }
-      if (toastText) onToast?.(toastText, "success");
+      if (toastText) onToast?.(toastText, toastType);
+      if (refreshAfter) {
+        void refreshMastery();
+      }
       return res?.config || null;
     } catch (err) {
       onToast?.(err?.message || "保存总结模型配置失败", "error");
+      if (reqSeq === configMutationSeq) {
+        void refreshMastery();
+      }
       return null;
+    } finally {
+      configSaveInFlight = Math.max(0, configSaveInFlight - 1);
     }
   };
 
@@ -1923,10 +1935,12 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     return btn;
   };
 
-  const renderSnapshot = (snap) => {
+  const renderSnapshot = (snap, { reqCfgSeq = null } = {}) => {
     if (!snap) return;
     lastSnapshot = snap;
-    if (snap.config) {
+    const allowConfigHydrate =
+      configSaveInFlight === 0 && (reqCfgSeq === null || reqCfgSeq === configMutationSeq);
+    if (snap.config && allowConfigHydrate) {
       configState = snap.config;
       renderConfigRow();
     }
@@ -2095,11 +2109,12 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   const refreshMastery = async () => {
     if (destroyed || inFlight || typeof apiFetch !== "function") return;
     inFlight = true;
+    const reqCfgSeq = configMutationSeq;
     try {
       const qs = selectedSessionId ? `?sessionId=${encodeURIComponent(selectedSessionId)}` : "";
       const data = await callJson(apiFetch, `/api/mastery${qs}`);
       if (destroyed) return;
-      renderSnapshot(data);
+      renderSnapshot(data, { reqCfgSeq });
     } catch {
       // Non-fatal refresh error
     } finally {
@@ -2296,7 +2311,19 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     const nextEnabled = Boolean(msmEnableToggle.checked);
     configState.enabled = nextEnabled;
     renderConfigRow();
-    void saveConfigPatch({ enabled: nextEnabled });
+    const isTp = configState.source === "thirdparty";
+    void saveConfigPatch(
+      { enabled: nextEnabled },
+      {
+        toastText: nextEnabled
+          ? isTp
+            ? "已开启第三方总结模型"
+            : "已开启自身模型总结（下一轮对话起生效）"
+          : "已关闭总结模型（后续回复将停止输出进度汇报）",
+        toastType: nextEnabled ? "success" : "info",
+        refreshAfter: true,
+      }
+    );
   });
 
   on(msmSelfBtn, "click", () => {

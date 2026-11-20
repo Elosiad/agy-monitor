@@ -1083,9 +1083,9 @@ export function createMonitorHandlers({
     const snapshot = await buildMasterySnapshot(resolvedPaths, sessionsHub, {
       selectedSessionId: requestedSessionId,
       sessionsMeta,
-      summariesCache,
+      summariesCache: publicCfg.enabled && publicCfg.source === 'thirdparty' ? summariesCache : {},
     });
-    if (snapshot.detailSession) {
+    if (snapshot.detailSession && publicCfg.enabled && publicCfg.source === 'thirdparty') {
       void masterySummarizer.maybeSchedule(snapshot.detailSession);
     }
     return {

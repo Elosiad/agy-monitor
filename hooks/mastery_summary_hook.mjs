@@ -62,14 +62,47 @@ function writeJsonAtomicSync(filePath, obj) {
   }
 }
 
-function resolvePluginDataDir() {
-  const envDir = process.env.AGY_MONITOR_PLUGIN_DATA_DIR || process.env.PLUGIN_DATA;
-  if (envDir && envDir.trim()) {
-    return path.resolve(envDir.trim());
+function resolvePluginDataDirs(explicitDir) {
+  if (explicitDir && String(explicitDir).trim()) {
+    return [path.resolve(String(explicitDir).trim())];
   }
+  const dirs = [];
+  const addDir = (raw) => {
+    if (!raw || !String(raw).trim()) return;
+    const resolved = path.resolve(String(raw).trim());
+    if (!dirs.some((d) => d.toLowerCase() === resolved.toLowerCase())) {
+      dirs.push(resolved);
+    }
+  };
+  addDir(process.env.AGY_MONITOR_PLUGIN_DATA_DIR);
+  addDir(process.env.PLUGIN_DATA);
   const appData =
     process.env.AGY_MONITOR_APP_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity');
-  return path.join(path.resolve(appData), 'plugin_data', 'agy-monitor');
+  addDir(path.join(path.resolve(appData), 'plugin_data', 'agy-monitor'));
+  return dirs;
+}
+
+function readLatestMasteryConfig(candidateDirs) {
+  let bestCfg = null;
+  let bestMtime = -1;
+  let bestDir = candidateDirs[0];
+
+  for (const dir of candidateDirs) {
+    const cfgPath = path.join(dir, 'mastery_config.json');
+    try {
+      const st = fs.statSync(cfgPath);
+      if (!st.isFile()) continue;
+      const parsed = readJsonSafe(cfgPath);
+      if (parsed && typeof parsed === 'object' && st.mtimeMs >= bestMtime) {
+        bestCfg = parsed;
+        bestMtime = st.mtimeMs;
+        bestDir = dir;
+      }
+    } catch {
+      // Candidate does not exist or unreadable; keep probing
+    }
+  }
+  return { rawCfg: bestCfg, activeDataDir: bestDir };
 }
 
 function hashText(raw) {
@@ -79,22 +112,47 @@ function hashText(raw) {
 }
 
 export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now() } = {}) {
-  const dataDir = pluginDataDir || resolvePluginDataDir();
-  const configPath = path.join(dataDir, 'mastery_config.json');
-  const statePath = path.join(dataDir, 'mastery_hook_state.json');
-
-  const rawCfg = readJsonSafe(configPath);
-  const cfg = rawCfg && typeof rawCfg === 'object'
-    ? rawCfg
-    : { enabled: true, source: 'self', frequency: '1m', thinking: 'low' };
-  if (cfg.enabled !== true || cfg.source !== 'self') {
-    return {};
-  }
+  const candidateDirs = resolvePluginDataDirs(pluginDataDir);
+  const { rawCfg, activeDataDir } = readLatestMasteryConfig(candidateDirs);
+  const statePath = path.join(activeDataDir, 'mastery_hook_state.json');
 
   const convId =
     typeof payload?.conversationId === 'string' && payload.conversationId.trim()
       ? payload.conversationId.trim()
       : 'default';
+
+  const cfg =
+    rawCfg && typeof rawCfg === 'object'
+      ? rawCfg
+      : { enabled: false, source: 'self', frequency: '1m', thinking: 'low' };
+
+  if (cfg.enabled !== true || cfg.source !== 'self') {
+    // If this ongoing conversation previously received [AGY_PROGRESS] prompts, emit a single
+    // one-shot stop notice so the LLM immediately breaks few-shot format inertia; new conversations
+    // or subsequent turns return `{}` with zero overhead.
+    const state = readJsonSafe(statePath);
+    const prev = state?.convs && typeof state.convs === 'object' ? state.convs[convId] : null;
+    if (prev && prev.introSent === true && prev.stopNoticeSent !== true) {
+      state.convs[convId] = {
+        ...prev,
+        stopNoticeSent: true,
+        updatedAtMs: nowMs,
+      };
+      writeJsonAtomicSync(statePath, state);
+      return {
+        injectSteps: [
+          {
+            systemMessage: {
+              systemMessage:
+                '【AGY掌握·已关闭】用户已关闭自动进度总结功能。从本轮开始请停止输出 `[AGY_PROGRESS|...|...]` 标签，也无需额外开场/阶段汇报，按正常对话直接回复即可。',
+            },
+          },
+        ],
+      };
+    }
+    return {};
+  }
+
   const freqMs = FREQ_MS[cfg.frequency] || FREQ_MS['1m'];
   const invocationNum = Number(payload?.invocationNum || 0);
   const inputHash = hashText(payload?.lastUserInput || '');
@@ -107,7 +165,8 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
   const prev = state.convs[convId] || {};
   const isNewUserTask =
     (inputHash && inputHash !== prev.lastInputHash) ||
-    (!prev.introSent && invocationNum <= 1);
+    (!prev.introSent && invocationNum <= 1) ||
+    prev.stopNoticeSent === true;
 
   let instruction = '';
   if (isNewUserTask) {
@@ -118,6 +177,7 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
     state.convs[convId] = {
       lastInputHash: inputHash || prev.lastInputHash || '',
       introSent: true,
+      stopNoticeSent: false,
       lastPromptAtMs: nowMs,
       updatedAtMs: nowMs,
     };
@@ -132,6 +192,7 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
       state.convs[convId] = {
         lastInputHash: inputHash || prev.lastInputHash || '',
         introSent: true,
+        stopNoticeSent: false,
         lastPromptAtMs: nowMs,
         updatedAtMs: nowMs,
       };

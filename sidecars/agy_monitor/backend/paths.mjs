@@ -64,6 +64,7 @@ export function resolvePaths(overrides = {}) {
   const pluginDataDir = path.resolve(
     overrides.pluginDataDir ||
       process.env.AGY_MONITOR_PLUGIN_DATA_DIR ||
+      process.env.PLUGIN_DATA ||
       path.join(appDataDir, 'plugin_data', PLUGIN_NAME),
   );
 

@@ -32,19 +32,23 @@ function makeTempEnv(t) {
   return { root, paths, storage };
 }
 
-test('PreInvocation mastery_summary_hook respects default-on self mode, explicit off, opening 30-char prompt, and frequency throttling', async (t) => {
-  const { paths, storage } = makeTempEnv(t);
+test('PreInvocation mastery_summary_hook respects default-off, PLUGIN_DATA fallback, one-shot stop notice, opening 30-char prompt, and frequency throttling', async (t) => {
+  const { root, paths, storage } = makeTempEnv(t);
 
-  // 1. Default ON -> self mode, 1m frequency, low thinking
+  // 0. Missing mastery_config.json -> Default OFF & zero injection
+  const outMissing = evaluateMasteryHook(
+    { conversationId: 'conv-0', invocationNum: 1, lastUserInput: '你好' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 900_000 },
+  );
+  assert.deepEqual(outMissing, {});
+
+  // 1. Seeded default config -> Default OFF, self mode preset ready
   const cfgDefault = await storage.getMasteryConfig();
-  assert.equal(cfgDefault.enabled, true);
+  assert.equal(cfgDefault.enabled, false);
   assert.equal(cfgDefault.source, 'self');
   assert.equal(cfgDefault.frequency, '1m');
   assert.equal(cfgDefault.thinking, 'low');
 
-  // 1b. Explicit OFF -> auto-saved & zero injection
-  await storage.updateMasteryConfig({ enabled: false });
-  assert.equal((await storage.getMasteryConfig()).enabled, false);
   const outOff = evaluateMasteryHook(
     { conversationId: 'conv-1', invocationNum: 1, lastUserInput: '修一下登录超时' },
     { pluginDataDir: paths.pluginDataDir, nowMs: 1_000_000 },
@@ -86,6 +90,90 @@ test('PreInvocation mastery_summary_hook respects default-on self mode, explicit
   assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /10字以内/);
   assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS/);
   assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /空一行/);
+
+  // 6. Turning OFF mid-conversation -> emits ONE-SHOT stop notice to break format inertia, then {} forever
+  await storage.updateMasteryConfig({ enabled: false });
+  assert.equal((await storage.getMasteryConfig()).enabled, false);
+  const outStopOnce = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 4, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_080_000 },
+  );
+  assert.equal(outStopOnce.injectSteps?.length, 1);
+  assert.match(outStopOnce.injectSteps[0].systemMessage.systemMessage, /已关闭/);
+  assert.match(outStopOnce.injectSteps[0].systemMessage.systemMessage, /停止输出/);
+
+  const outAfterStop = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 5, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_160_000 },
+  );
+  assert.deepEqual(outAfterStop, {});
+
+  // New conversation while OFF -> zero stop notice, strictly {}
+  const outNewConvOff = evaluateMasteryHook(
+    { conversationId: 'conv-brand-new', invocationNum: 1, lastUserInput: '新任务' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_170_000 },
+  );
+  assert.deepEqual(outNewConvOff, {});
+
+  // 7. Re-enabling after stop -> immediately resumes opening prompt cleanly
+  await storage.updateMasteryConfig({ enabled: true, source: 'self', frequency: '30s' });
+  const outResumed = evaluateMasteryHook(
+    { conversationId: 'conv-1', invocationNum: 6, lastUserInput: '修一下登录超时' },
+    { pluginDataDir: paths.pluginDataDir, nowMs: 1_180_000 },
+  );
+  assert.equal(outResumed.injectSteps?.length, 1);
+  assert.match(outResumed.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS\|10%/);
+
+  // 8. PLUGIN_DATA vs canonical plugin_data/agy-monitor mismatch (e.g. non-default folder install):
+  //    Hook must probe both and respect the canonical config written by sidecar instead of defaulting ON.
+  const prevEnv = {
+    AGY_MONITOR_PLUGIN_DATA_DIR: process.env.AGY_MONITOR_PLUGIN_DATA_DIR,
+    AGY_MONITOR_APP_DATA_DIR: process.env.AGY_MONITOR_APP_DATA_DIR,
+    PLUGIN_DATA: process.env.PLUGIN_DATA,
+  };
+  try {
+    const fakeAppData = path.join(root, 'mismatchAppData');
+    const canonicalDir = path.join(fakeAppData, 'plugin_data', 'agy-monitor');
+    const altPluginData = path.join(fakeAppData, 'plugin_data', 'agy-monitor-main');
+    fs.mkdirSync(canonicalDir, { recursive: true });
+    fs.mkdirSync(altPluginData, { recursive: true });
+    fs.writeFileSync(
+      path.join(canonicalDir, 'mastery_config.json'),
+      JSON.stringify({ enabled: true, source: 'self', frequency: '1m' }),
+      'utf8',
+    );
+    delete process.env.AGY_MONITOR_PLUGIN_DATA_DIR;
+    process.env.AGY_MONITOR_APP_DATA_DIR = fakeAppData;
+    process.env.PLUGIN_DATA = altPluginData;
+
+    const outEnabledCanonical = evaluateMasteryHook(
+      { conversationId: 'conv-mismatch', invocationNum: 1, lastUserInput: '测试跨目录' },
+      { nowMs: 2_000_000 },
+    );
+    assert.equal(outEnabledCanonical.injectSteps?.length, 1);
+
+    // Sidecar turns OFF in canonical dir -> hook still sees OFF despite empty PLUGIN_DATA
+    fs.writeFileSync(
+      path.join(canonicalDir, 'mastery_config.json'),
+      JSON.stringify({ enabled: false, source: 'self', frequency: '1m' }),
+      'utf8',
+    );
+    const outDisabledStop = evaluateMasteryHook(
+      { conversationId: 'conv-mismatch', invocationNum: 2, lastUserInput: '测试跨目录' },
+      { nowMs: 2_070_000 },
+    );
+    assert.match(outDisabledStop.injectSteps?.[0]?.systemMessage?.systemMessage || '', /已关闭/);
+    const outDisabledNext = evaluateMasteryHook(
+      { conversationId: 'conv-mismatch', invocationNum: 3, lastUserInput: '测试跨目录' },
+      { nowMs: 2_140_000 },
+    );
+    assert.deepEqual(outDisabledNext, {});
+  } finally {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });
 
 test('parseProgressTag, classifyToolCall, and buildMasterySnapshot align total progress with Main Agent & classify Codex actions', async (t) => {

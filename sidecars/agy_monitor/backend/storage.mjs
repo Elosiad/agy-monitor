@@ -234,7 +234,7 @@ const DEFAULT_TP_MODELS = {
 function defaultMasteryConfig() {
   return {
     version: 1,
-    enabled: true,
+    enabled: false,
     source: 'self',
     frequency: '1m',
     thinking: 'low',

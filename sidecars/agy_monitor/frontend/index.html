@@ -377,24 +377,24 @@
               <div class="mv-f-cli" id="masteryCliList" role="listbox" aria-label="会话进程列表"></div>
             </section>
 
-            <!-- 总结模型配置行：默认开启自身模型（每分钟 / 思维低）；支持关闭或切换第三方模型，改动自动持久化 -->
-            <section class="mastery-summary-model-row" id="masterySummaryModelRow" aria-label="自定义总结模型">
+            <!-- 总结模型配置行：默认关闭，开启后可选自身模型或第三方模型，改动自动持久化 -->
+            <section class="mastery-summary-model-row is-off" id="masterySummaryModelRow" aria-label="自定义总结模型">
               <div class="msm-main-row">
                 <div class="msm-left">
                   <label class="msm-switch" title="开启或关闭定时总结">
-                    <input type="checkbox" id="msmEnableToggle" aria-label="启用总结模型" checked />
+                    <input type="checkbox" id="msmEnableToggle" aria-label="启用总结模型" />
                     <span class="msm-switch-slider" aria-hidden="true"></span>
                   </label>
                   <span class="msm-label">总结模型</span>
-                  <span class="msm-source-tag" id="msmSourceTag">自身模型</span>
+                  <span class="msm-source-tag is-off" id="msmSourceTag">已关闭</span>
                 </div>
                 <div class="msm-controls" id="msmControls" role="radiogroup" aria-label="总结模型来源">
                   <button
                     type="button"
-                    class="msm-btn is-active"
+                    class="msm-btn"
                     id="msmSelfBtn"
                     role="radio"
-                    aria-checked="true"
+                    aria-checked="false"
                     title="由正在运行的 Agent 自身模型顺带输出开场思考与阶段总结，保留原会话缓存命中"
                   >
                     <span class="msm-btn-dot" aria-hidden="true"></span>
@@ -419,7 +419,7 @@
               </div>
 
               <!-- 启用后自动展开：总结频率 + 思维程度 -->
-              <div class="msm-extra-row" id="msmExtraRow">
+              <div class="msm-extra-row" id="msmExtraRow" hidden>
                 <div class="msm-extra-group">
                   <span class="msm-extra-label">总结频率</span>
                   <div class="msm-seg-group" role="radiogroup" aria-label="总结频率">

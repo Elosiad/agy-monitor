@@ -133,7 +133,7 @@ test('installPlugin seeds pinned defaults on fresh install, preserves modified u
   const masteryCfg = JSON.parse(fs.readFileSync(path.join(pluginDataDir, 'mastery_config.json'), 'utf8'));
   const themesCfg = JSON.parse(fs.readFileSync(path.join(pluginDataDir, 'themes.json'), 'utf8'));
   const prefsCfg = JSON.parse(fs.readFileSync(path.join(pluginDataDir, 'user_prefs.json'), 'utf8'));
-  assert.equal(masteryCfg.enabled, true);
+  assert.equal(masteryCfg.enabled, false);
   assert.equal(masteryCfg.source, 'self');
   assert.equal(masteryCfg.frequency, '1m');
   assert.equal(masteryCfg.thinking, 'low');
@@ -150,7 +150,7 @@ test('installPlugin seeds pinned defaults on fresh install, preserves modified u
   // 2. Simulate user customizing settings, then re-running installer (upgrade) -> MUST preserve user changes
   fs.writeFileSync(
     path.join(pluginDataDir, 'mastery_config.json'),
-    JSON.stringify({ ...masteryCfg, enabled: false, frequency: '3m' }, null, 2),
+    JSON.stringify({ ...masteryCfg, enabled: true, frequency: '3m' }, null, 2),
     'utf8',
   );
   const res2 = await installPlugin({
@@ -168,7 +168,7 @@ test('installPlugin seeds pinned defaults on fresh install, preserves modified u
   });
   assert.deepEqual(res2.seededDefaults, []);
   const masteryAfterUpgrade = JSON.parse(fs.readFileSync(path.join(pluginDataDir, 'mastery_config.json'), 'utf8'));
-  assert.equal(masteryAfterUpgrade.enabled, false);
+  assert.equal(masteryAfterUpgrade.enabled, true);
   assert.equal(masteryAfterUpgrade.frequency, '3m');
 
   // 3. Uninstall default preserves plugin_data; --purge-data removes it
