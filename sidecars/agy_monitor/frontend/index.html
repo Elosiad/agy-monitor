@@ -424,7 +424,21 @@
                     <span class="mastery-overview-label">任务总进度</span>
                     <span class="mastery-overview-pct" id="masteryOverviewPct">0%</span>
                   </div>
-                  <span class="mastery-overview-summary" id="masteryOverviewSummary">等待活动会话</span>
+                  <div class="mastery-overview-right">
+                    <span class="mastery-overview-summary" id="masteryOverviewSummary">等待活动会话</span>
+                    <button
+                      type="button"
+                      class="mastery-jump-btn"
+                      id="masteryOverviewJumpBtn"
+                      title="在 Antigravity 中跳转到该会话"
+                      hidden
+                    >
+                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M6 3.5h6.5V10M12.3 3.7L4.2 11.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                      <span>跳转会话</span>
+                    </button>
+                  </div>
                 </div>
                 <div class="mastery-total-track" aria-hidden="true">
                   <div class="mastery-total-fill" id="masteryTotalFillBar"></div>
@@ -469,7 +483,21 @@
                 <span class="mad-role-badge" id="madRoleBadge">主 Agent</span>
                 <span class="mad-agent-name" id="madAgentName">主 Agent</span>
               </div>
-              <div class="mad-state-slot" id="madStateSlot"></div>
+              <div class="mad-top-right">
+                <button
+                  type="button"
+                  class="mastery-jump-btn"
+                  id="madJumpSessionBtn"
+                  title="在 Antigravity 中跳转到所属会话"
+                  hidden
+                >
+                  <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M6 3.5h6.5V10M12.3 3.7L4.2 11.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span>跳转会话</span>
+                </button>
+                <div class="mad-state-slot" id="madStateSlot"></div>
+              </div>
             </div>
 
             <div class="mad-subbar">

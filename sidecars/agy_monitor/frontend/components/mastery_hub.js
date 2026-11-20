@@ -921,10 +921,11 @@ async function callJson(apiFetch, url, options = {}) {
   return data;
 }
 
-export function createMasteryHub({ apiFetch, onToast } = {}) {
+export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {}) {
   const overviewViewEl = document.getElementById("masteryOverviewView");
   const detailViewEl = document.getElementById("masteryDetailView");
   const madBackBtn = document.getElementById("madBackBtn");
+  const madJumpSessionBtn = document.getElementById("madJumpSessionBtn");
   const madRoleBadgeEl = document.getElementById("madRoleBadge");
   const madAgentNameEl = document.getElementById("madAgentName");
   const madStateSlotEl = document.getElementById("madStateSlot");
@@ -938,6 +939,7 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
 
   const overviewPctEl = document.getElementById("masteryOverviewPct");
   const overviewSummaryEl = document.getElementById("masteryOverviewSummary");
+  const overviewJumpBtn = document.getElementById("masteryOverviewJumpBtn");
   const totalFillBarEl = document.getElementById("masteryTotalFillBar");
   const overviewGoalEl = document.getElementById("masteryOverviewGoal");
 
@@ -985,6 +987,7 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
   let detailAgentKey = ""; // "" when in overview; e.g. "coord" or "sub-xxxx" when in View 2
   let hoveredAgentId = null;
   let lastSnapshot = null;
+  let activeDetailSession = null;
   let configState = {
     enabled: true,
     source: "self",
@@ -1008,6 +1011,36 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
   const createdObjectUrls = new Set();
   let lastRenderedTimelineKey = "";
   let lastRenderedTimelineSig = "";
+
+  const jumpToSession = (session) => {
+    const targetId = String(session?.id || selectedSessionId || "").trim();
+    if (!targetId) return;
+    const title = String(session?.name || session?.title || targetId.slice(0, 8));
+    const workspace =
+      session?.project && session.project !== "全局" ? String(session.project) : "";
+
+    if (typeof apiFetch === "function") {
+      void callJson(apiFetch, "/api/sessions/focus", {
+        method: "POST",
+        body: JSON.stringify({
+          conversationId: targetId,
+          title,
+          workspace,
+        }),
+      }).catch(() => {});
+    }
+
+    try {
+      if (typeof window !== "undefined") {
+        window.sidecar?.ui?.toggleConversation?.(targetId);
+      }
+    } catch {
+      // Ignore host postMessage error in standalone preview
+    }
+
+    onSelectConversation?.({ id: targetId, title, workspace });
+    onToast?.(`已跳转到会话：${title}`, "success");
+  };
 
   const openLocalPath = async (rawTarget) => {
     if (!rawTarget || typeof apiFetch !== "function") return;
@@ -1341,6 +1374,10 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
     if (madSessionCrumbEl) {
       madSessionCrumbEl.textContent = `所属会话：[${session.project}] ${session.name}`;
       madSessionCrumbEl.title = `${session.project} / ${session.name}`;
+    }
+    if (madJumpSessionBtn) {
+      madJumpSessionBtn.hidden = !session.id;
+      madJumpSessionBtn.title = `跳转到所属会话：[${session.project}] ${session.name}`;
     }
     if (madDurationEl) {
       madDurationEl.textContent = `${journey.duration || ""} · 进度 ${agent.progress}%`;
@@ -1871,9 +1908,12 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
     }
 
     const session = snap.detailSession;
+    activeDetailSession = session || null;
     if (!session) {
       if (overviewPctEl) overviewPctEl.textContent = "0%";
       if (overviewSummaryEl) overviewSummaryEl.textContent = "等待活动会话";
+      if (overviewJumpBtn) overviewJumpBtn.hidden = true;
+      if (madJumpSessionBtn) madJumpSessionBtn.hidden = true;
       if (totalFillBarEl) totalFillBarEl.style.width = "0%";
       if (overviewGoalEl) overviewGoalEl.textContent = "";
       if (colMasterEl) colMasterEl.textContent = "";
@@ -1893,6 +1933,10 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
     }
     if (overviewSummaryEl) {
       overviewSummaryEl.textContent = session.summaryText || "";
+    }
+    if (overviewJumpBtn) {
+      overviewJumpBtn.hidden = !session.id;
+      overviewJumpBtn.title = `在 Antigravity 中跳转到会话：[${session.project}] ${session.name}`;
     }
     if (totalFillBarEl) {
       totalFillBarEl.style.width = `${masterProgress}%`;
@@ -2050,6 +2094,8 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
 
   // ========== Bind UI Events ==========
   on(madBackBtn, "click", closeAgentDetail);
+  on(overviewJumpBtn, "click", () => jumpToSession(activeDetailSession));
+  on(madJumpSessionBtn, "click", () => jumpToSession(activeDetailSession));
 
   on(
     document,

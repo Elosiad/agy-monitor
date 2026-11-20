@@ -397,20 +397,22 @@ export function mountMonitorApp() {
     onToast: showToast,
   });
 
+  const handleConversationSelected = (session) => {
+    const nextId = typeof session === "string" ? session : session?.id;
+    if (!nextId) return;
+    state.followLatest = false;
+    state.lockedConvId = String(nextId);
+    state.autoLockedForSwitch = true;
+    state.displayConvId = state.lockedConvId;
+    updateFollowModeUi();
+    updateActiveConvBadge(state.lockedConvId, session?.title);
+    refreshSnapshot({ force: true });
+  };
+
   components.sessionsHub = createSessionsHub({
     apiFetch,
     t: translator,
-    onSelectConversation: (session) => {
-      const nextId = typeof session === "string" ? session : session?.id;
-      if (!nextId) return;
-      state.followLatest = false;
-      state.lockedConvId = String(nextId);
-      state.autoLockedForSwitch = true;
-      state.displayConvId = state.lockedConvId;
-      updateFollowModeUi();
-      updateActiveConvBadge(state.lockedConvId, session?.title);
-      refreshSnapshot({ force: true });
-    },
+    onSelectConversation: handleConversationSelected,
     onFavoritesChanged: () => {
       refreshSnapshot({ force: true });
     },
@@ -426,6 +428,7 @@ export function mountMonitorApp() {
 
   components.masteryHub = createMasteryHub({
     apiFetch,
+    onSelectConversation: handleConversationSelected,
     onToast: showToast,
   });
 
