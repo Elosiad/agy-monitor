@@ -4321,12 +4321,132 @@ html[lang="en"] .prompt-selector-row {
   overflow-wrap: anywhere;
 }
 
+.mad-msg.has-progress {
+  gap: 8px;
+}
+
+.mad-msg-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* 独立进度标签特写卡片（与汇报正文清晰分隔） */
+.mad-progress-callout {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 6px 11px;
+  border-radius: 9px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--mastery-running) 20%, var(--bg-control)) 0%,
+    color-mix(in srgb, var(--accent-teal) 10%, var(--bg-control)) 100%
+  );
+  border: 1px solid color-mix(in srgb, var(--mastery-running) 38%, transparent);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--mastery-running) 14%, transparent);
+}
+
+.mad-progress-callout.is-complete {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--mastery-unread) 20%, var(--bg-control)) 0%,
+    color-mix(in srgb, var(--accent-teal) 12%, var(--bg-control)) 100%
+  );
+  border-color: color-mix(in srgb, var(--mastery-unread) 42%, transparent);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--mastery-unread) 14%, transparent);
+}
+
+.mad-progress-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--mastery-running-bright);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--mastery-running-bright) 75%, transparent);
+  flex-shrink: 0;
+}
+
+.mad-progress-callout.is-complete .mad-progress-dot {
+  background: var(--mastery-unread-bright);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--mastery-unread-bright) 75%, transparent);
+}
+
+.mad-progress-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-strong);
+}
+
+.mad-progress-pct {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mastery-running) 24%, transparent);
+  color: var(--mastery-running-bright);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  flex-shrink: 0;
+}
+
+.mad-progress-callout.is-complete .mad-progress-pct {
+  background: color-mix(in srgb, var(--mastery-unread) 24%, transparent);
+  color: var(--mastery-unread-bright);
+}
+
+.mad-progress-bar {
+  width: 44px;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 22%, transparent);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.mad-progress-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--mastery-running-bright);
+  transition: width 0.25s ease;
+}
+
+.mad-progress-callout.is-complete .mad-progress-bar-fill {
+  background: var(--mastery-unread-bright);
+}
+
+.mad-brief-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 7px;
+}
+
 .mad-md-heading {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
   color: var(--text-strong);
-  margin-top: 2px;
-  line-height: 1.5;
+  margin-top: 4px;
+  line-height: 1.48;
+}
+
+.mad-md-heading.is-h1 {
+  font-size: 15px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.mad-md-heading.is-h2 {
+  font-size: 14px;
+}
+
+.mad-md-heading.is-h3 {
+  font-size: 13px;
 }
 
 .mad-md-p {
@@ -4342,6 +4462,27 @@ html[lang="en"] .prompt-selector-row {
 
 .mad-md-li.is-nested {
   padding-left: 16px;
+}
+
+.mad-md-checkbox {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-control);
+  color: var(--mastery-unread-bright);
+  font-size: 9.5px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transform: translateY(1px);
+}
+
+.mad-md-checkbox.is-checked {
+  border-color: color-mix(in srgb, var(--mastery-unread) 52%, transparent);
+  background: color-mix(in srgb, var(--mastery-unread) 18%, transparent);
 }
 
 .mad-md-bullet {
@@ -4366,6 +4507,16 @@ html[lang="en"] .prompt-selector-row {
   color: var(--text-strong);
 }
 
+.mad-md-em {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.mad-md-del {
+  text-decoration: line-through;
+  opacity: 0.68;
+}
+
 .mad-md-code {
   display: inline;
   padding: 1px 5px;
@@ -4381,6 +4532,7 @@ html[lang="en"] .prompt-selector-row {
 .mad-md-link {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   padding: 0 6px;
   margin: 0 1px;
   border-radius: 5px;
@@ -4391,11 +4543,177 @@ html[lang="en"] .prompt-selector-row {
   line-height: 1.52;
   max-width: 100%;
   vertical-align: baseline;
+  text-decoration: none;
+  transition: background 0.14s ease, border-color 0.14s ease, transform 0.1s ease;
 }
 
 .mad-md-link.is-code {
   font-family: ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei UI", monospace;
   font-size: 11px;
+}
+
+.mad-md-link.is-path,
+.mad-md-link.is-web {
+  cursor: pointer;
+}
+
+.mad-md-link.is-path:hover,
+.mad-md-link.is-web:hover {
+  background: color-mix(in srgb, var(--accent-blue) 24%, transparent);
+  border-color: color-mix(in srgb, var(--accent-blue) 48%, transparent);
+  color: var(--text-strong);
+}
+
+.mad-md-link.is-path:active {
+  transform: translateY(0.5px);
+}
+
+.mad-path-icon {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+/* 内嵌本地图片预览卡片（点击打开所在目录） */
+.mad-md-img-wrap {
+  display: block;
+  margin: 4px 0;
+  max-width: 100%;
+}
+
+.mad-md-img-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-width: min(100%, 360px);
+  padding: 6px;
+  border-radius: 9px;
+  background: var(--bg-control);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.mad-md-img-card:hover {
+  background: var(--bg-control-hover);
+  border-color: color-mix(in srgb, var(--accent-blue) 52%, transparent);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--accent-blue) 16%, transparent);
+}
+
+.mad-md-img-el {
+  display: block;
+  max-width: 100%;
+  max-height: 220px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 6px;
+  background: var(--bg-canvas);
+}
+
+.mad-md-img-foot {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 0 2px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.mad-md-img-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei UI", monospace;
+  color: var(--text-body);
+}
+
+.mad-md-img-hint {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--mastery-running-bright);
+  opacity: 0.85;
+}
+
+/* GFM Markdown 表格 */
+.mad-md-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin: 3px 0;
+  border-radius: 7px;
+  border: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--bg-control) 75%, transparent);
+}
+
+.mad-md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.mad-md-table th,
+.mad-md-table td {
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--border-hairline);
+  text-align: left;
+  vertical-align: top;
+}
+
+.mad-md-table th {
+  font-weight: 600;
+  color: var(--text-strong);
+  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+  white-space: nowrap;
+}
+
+.mad-md-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* GitHub / Antigravity Callout 告警块 */
+.mad-md-alert {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 10px;
+  border-radius: 0 7px 7px 0;
+  border-left: 3px solid var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-control));
+  font-size: 12px;
+}
+
+.mad-md-alert.is-tip {
+  border-left-color: var(--mastery-unread-bright);
+  background: color-mix(in srgb, var(--mastery-unread) 10%, var(--bg-control));
+}
+
+.mad-md-alert.is-important {
+  border-left-color: var(--accent-purple);
+  background: color-mix(in srgb, var(--accent-purple) 10%, var(--bg-control));
+}
+
+.mad-md-alert.is-warning {
+  border-left-color: var(--accent-amber);
+  background: color-mix(in srgb, var(--accent-amber) 11%, var(--bg-control));
+}
+
+.mad-md-alert.is-caution {
+  border-left-color: var(--accent-danger);
+  background: color-mix(in srgb, var(--accent-danger) 11%, var(--bg-control));
+}
+
+.mad-md-alert-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.mad-md-alert-body {
+  color: var(--text-primary);
 }
 
 .mad-md-quote {
@@ -4416,6 +4734,17 @@ html[lang="en"] .prompt-selector-row {
   overflow-x: auto;
   font-size: 11px;
   line-height: 1.5;
+}
+
+.mad-md-pre-head {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border-hairline);
 }
 
 .mad-md-pre-code {
@@ -4500,6 +4829,21 @@ html[lang="en"] .prompt-selector-row {
   color: var(--text-secondary);
   font-family: ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei UI", monospace;
   min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.mad-action-item.is-clickable {
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.mad-action-item.is-clickable:hover {
+  background: var(--bg-control);
+  color: var(--text-strong);
 }
 
 .mad-item-glyph {

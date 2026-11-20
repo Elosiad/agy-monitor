@@ -1387,12 +1387,12 @@ namespace AgyBackdropCompanion
             int hudTop = anchor.CenterY - hudHalfH;
             int hudBottom = anchor.CenterY + hudHalfH;
 
-            // 1. Fast Z-order walk (pure Win32, ~0.02ms): hide if a real higher Win32 window/popup covers the HUD
+            // 1. Fast Z-order walk (pure Win32, ~0.05ms): hide if a real higher Win32 window/popup covers the HUD
             try
             {
                 IntPtr prev = Native.GetWindow(hostHwnd, Native.GW_HWNDPREV);
                 int steps = 0;
-                while (prev != IntPtr.Zero && steps < 32)
+                while (prev != IntPtr.Zero && steps < 256)
                 {
                     steps++;
                     if (prev != hudHwnd && prev != backdropHwnd && Native.IsWindowVisible(prev) && !Native.IsIconic(prev) && !Native.IsWindowCloaked(prev))
@@ -1852,6 +1852,8 @@ namespace AgyBackdropCompanion
         private bool _pausedByTray = false;
         private bool _hudEnabledByTray = true;
         private bool _disposed = false;
+        private bool _inSync = false;
+        private bool _syncPending = false;
         private string _hudLastAction = "";
 
         public CompanionController(string dataDir, string assetsDir, Dispatcher dispatcher)
@@ -2250,7 +2252,31 @@ namespace AgyBackdropCompanion
                                             rec.LastOccludedReason = occReason;
                                             rec.AnchorMissCount = nextMissCount;
                                             rec.Anchor = finalAnchor;
-                                            SyncHudForWindow(rec, winRect);
+                                            if (_inSync)
+                                            {
+                                                _syncPending = true;
+                                            }
+                                            else
+                                            {
+                                                bool prevInSync = _inSync;
+                                                _inSync = true;
+                                                try
+                                                {
+                                                    Native.RECT freshRect;
+                                                    if (Native.TryGetVisibleBounds(h, out freshRect))
+                                                    {
+                                                        SyncHudForWindow(rec, freshRect);
+                                                    }
+                                                    else
+                                                    {
+                                                        HideHudIfVisible(rec);
+                                                    }
+                                                }
+                                                finally
+                                                {
+                                                    _inSync = prevInSync;
+                                                }
+                                            }
                                         }
                                     }));
                                 }
@@ -2312,13 +2338,17 @@ namespace AgyBackdropCompanion
             {
                 bool probeView = eventType == Native.EVENT_SYSTEM_FOREGROUND || eventType == Native.EVENT_SYSTEM_MOVESIZEEND;
                 TriggerFastUiaBurst(500, probeView);
-                if (eventType == Native.EVENT_OBJECT_LOCATIONCHANGE && isTracked)
+                if (eventType == Native.EVENT_OBJECT_LOCATIONCHANGE && isTracked && !_inSync)
                 {
                     SyncAllWindows(false);
                 }
-                else if (_debounceTimer != null && !_debounceTimer.IsEnabled)
+                else
                 {
-                    _debounceTimer.Start();
+                    if (_inSync) _syncPending = true;
+                    if (_debounceTimer != null && !_debounceTimer.IsEnabled)
+                    {
+                        _debounceTimer.Start();
+                    }
                 }
             }
         }
@@ -2602,23 +2632,83 @@ namespace AgyBackdropCompanion
             }
         }
 
+        private static void ForceCloseOwnedWindow(Window win)
+        {
+            if (win == null) return;
+            try
+            {
+                IntPtr h = new WindowInteropHelper(win).Handle;
+                if (h != IntPtr.Zero && Native.IsWindow(h))
+                {
+                    Native.ShowWindow(h, Native.SW_HIDE);
+                    Native.SetWindowLongPtrCompat(h, Native.GWLP_HWNDPARENT, 0);
+                }
+            }
+            catch { }
+            try { win.Hide(); } catch { }
+            try { win.Close(); } catch { }
+        }
+
+        private static void HideHudIfVisible(TrackedHostWindow item)
+        {
+            if (item == null || item.Hud == null) return;
+            try
+            {
+                IntPtr h = item.Hud.Handle;
+                if (h != IntPtr.Zero && (item.HudVisible || Native.IsWindowVisible(h)))
+                {
+                    Native.ShowWindow(h, Native.SW_HIDE);
+                }
+            }
+            catch { }
+            item.HudVisible = false;
+        }
+
+        private void SweepOrphanedWindows()
+        {
+            try
+            {
+                System.Windows.Application app = System.Windows.Application.Current;
+                if (app == null) return;
+
+                var active = new HashSet<Window>();
+                foreach (TrackedHostWindow item in _tracked.Values)
+                {
+                    if (item.Hud != null) active.Add(item.Hud);
+                    if (item.Backdrop != null) active.Add(item.Backdrop);
+                }
+
+                var orphans = new List<Window>();
+                foreach (Window w in app.Windows)
+                {
+                    if ((w is HudOverlayWindow || w is BackdropSurfaceWindow) && !active.Contains(w))
+                    {
+                        orphans.Add(w);
+                    }
+                }
+
+                foreach (Window orphan in orphans)
+                {
+                    ForceCloseOwnedWindow(orphan);
+                }
+            }
+            catch { }
+        }
+
         private void SyncHudForWindow(TrackedHostWindow item, Native.RECT winRect)
         {
             if (item == null || !Native.IsWindow(item.Hwnd)) return;
 
             bool wantHud = _config.hudEnabled && _hudEnabledByTray && !_pausedByTray && !_hudTelemetry.cdpHudActive;
             bool hostVisible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
+            bool validBounds = (winRect.Right - winRect.Left) >= 300 && (winRect.Bottom - winRect.Top) >= 240;
 
             // Only show WPF HUD when anchored to a real composer toolbar AND not occluded by native popups (Model/Usage/Dialog)
-            bool showHud = wantHud && hostVisible && item.Anchor.HasAnchor && item.Anchor.ComposerVisible && !item.Anchor.Occluded;
+            bool showHud = wantHud && hostVisible && validBounds && item.Anchor.HasAnchor && item.Anchor.ComposerVisible && !item.Anchor.Occluded;
 
             if (!showHud)
             {
-                if (item.Hud != null && item.HudVisible && item.Hud.Handle != IntPtr.Zero)
-                {
-                    Native.ShowWindow(item.Hud.Handle, Native.SW_HIDE);
-                    item.HudVisible = false;
-                }
+                HideHudIfVisible(item);
                 return;
             }
 
@@ -2626,6 +2716,8 @@ namespace AgyBackdropCompanion
             {
                 IntPtr targetHwnd = item.Hwnd;
                 var hud = new HudOverlayWindow(targetHwnd);
+                // Bind reference BEFORE Show() so re-entrant WinEvents can never spawn a second orphaned HUD
+                item.Hud = hud;
                 hud.Clicked += delegate
                 {
                     ThreadPool.QueueUserWorkItem(delegate
@@ -2636,7 +2728,6 @@ namespace AgyBackdropCompanion
                 };
                 hud.UpdateData(_hudTelemetry, _config.accentColor);
                 hud.Show();
-                item.Hud = hud;
             }
 
             IntPtr hudHwnd = item.Hud.Handle;
@@ -2674,15 +2765,16 @@ namespace AgyBackdropCompanion
                 TriggerFastUiaBurst(750, false);
             }
 
+            int minRightX = winRect.Left + (int)Math.Round(48 * hostDpiScale);
+            int maxRightX = winRect.Right - (int)Math.Round(8 * hostDpiScale);
+            if (rightX < minRightX) rightX = minRightX;
+            if (rightX > maxRightX) rightX = maxRightX;
+
             // Never push HUD rightward over Turbo/Voice buttons; instead dynamically trim model width or hide if cramped
             int availPhysW = rightX - leftGuardX - (int)Math.Round(4 * hostDpiScale);
             if (availPhysW < (int)Math.Round(28 * hostDpiScale))
             {
-                if (item.HudVisible)
-                {
-                    Native.ShowWindow(hudHwnd, Native.SW_HIDE);
-                    item.HudVisible = false;
-                }
+                HideHudIfVisible(item);
                 return;
             }
             item.Hud.SetAvailableDipWidth(availPhysW / Math.Max(0.5, hostDpiScale));
@@ -2713,129 +2805,154 @@ namespace AgyBackdropCompanion
         private void SyncAllWindows(bool refreshInventory)
         {
             if (_disposed) return;
-
-            if (refreshInventory)
+            if (_inSync)
             {
-                List<IntPtr> currentTargets = FindAntigravityTopWindows();
-                var liveSet = new HashSet<IntPtr>(currentTargets);
+                _syncPending = true;
+                return;
+            }
 
-                var stale = new List<IntPtr>();
-                foreach (IntPtr existing in _tracked.Keys)
+            _inSync = true;
+            try
+            {
+                if (refreshInventory)
                 {
-                    if (!liveSet.Contains(existing) || !Native.IsWindow(existing))
-                    {
-                        stale.Add(existing);
-                    }
-                }
-                foreach (IntPtr h in stale)
-                {
-                    RestoreHostWindow(_tracked[h], true);
-                    _tracked.Remove(h);
-                }
+                    List<IntPtr> currentTargets = FindAntigravityTopWindows();
+                    var liveSet = new HashSet<IntPtr>(currentTargets);
 
-                foreach (IntPtr h in currentTargets)
-                {
-                    if (!_tracked.ContainsKey(h))
+                    var stale = new List<IntPtr>();
+                    foreach (IntPtr existing in _tracked.Keys)
                     {
-                        long origEx = Native.GetWindowLongPtrCompat(h, Native.GWL_EXSTYLE);
-                        var rec = new TrackedHostWindow
+                        if (!liveSet.Contains(existing) || !Native.IsWindow(existing))
                         {
-                            Hwnd = h,
-                            OriginalExStyle = origEx,
-                            OriginallyLayered = (origEx & Native.WS_EX_LAYERED) != 0
-                        };
-                        _tracked[h] = rec;
+                            stale.Add(existing);
+                        }
                     }
+                    foreach (IntPtr h in stale)
+                    {
+                        RestoreHostWindow(_tracked[h], true);
+                        _tracked.Remove(h);
+                    }
+
+                    foreach (IntPtr h in currentTargets)
+                    {
+                        if (!_tracked.ContainsKey(h))
+                        {
+                            long origEx = Native.GetWindowLongPtrCompat(h, Native.GWL_EXSTYLE);
+                            var rec = new TrackedHostWindow
+                            {
+                                Hwnd = h,
+                                OriginalExStyle = origEx,
+                                OriginallyLayered = (origEx & Native.WS_EX_LAYERED) != 0
+                            };
+                            _tracked[h] = rec;
+                        }
+                    }
+
+                    SweepOrphanedWindows();
+                }
+
+                bool isCdpMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase);
+                bool activeEffect = _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCdpMode;
+                byte targetAlpha = activeEffect
+                    ? (byte)Math.Max(148, Math.Min(254, Math.Round(255.0 * (100 - _config.hostBlendPct) / 100.0)))
+                    : (byte)255;
+
+                foreach (TrackedHostWindow item in _tracked.Values)
+                {
+                    if (!Native.IsWindow(item.Hwnd)) continue;
+
+                    Native.RECT r;
+                    bool hasBounds = Native.TryGetVisibleBounds(item.Hwnd, out r);
+                    if (hasBounds)
+                    {
+                        SyncHudForWindow(item, r);
+                    }
+                    else
+                    {
+                        HideHudIfVisible(item);
+                    }
+
+                    if (!activeEffect)
+                    {
+                        RestoreBackdropOnly(item, false);
+                        continue;
+                    }
+
+                    if (!item.AlphaApplied || item.LastAlpha != targetAlpha)
+                    {
+                        long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
+                        if ((curEx & Native.WS_EX_LAYERED) == 0)
+                        {
+                            Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx | Native.WS_EX_LAYERED);
+                        }
+                        Native.SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha, Native.LWA_ALPHA);
+                        item.AlphaApplied = true;
+                        item.LastAlpha = targetAlpha;
+                    }
+
+                    bool visible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
+                    if (!visible)
+                    {
+                        if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
+                        {
+                            Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
+                            item.BackdropVisible = false;
+                        }
+                        continue;
+                    }
+
+                    bool isMaximized = Native.IsZoomed(item.Hwnd);
+                    if (item.Backdrop == null)
+                    {
+                        var backdrop = new BackdropSurfaceWindow();
+                        item.Backdrop = backdrop;
+                        backdrop.Show();
+                        item.LastMaximized = isMaximized;
+                        item.AppliedConfigVersion = _configVersion;
+                        backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
+                    }
+                    else if (item.LastMaximized != isMaximized || item.AppliedConfigVersion != _configVersion)
+                    {
+                        item.LastMaximized = isMaximized;
+                        item.AppliedConfigVersion = _configVersion;
+                        item.Backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
+                    }
+
+                    IntPtr wpHwnd = item.Backdrop.Handle;
+                    if (wpHwnd == IntPtr.Zero || !hasBounds) continue;
+
+                    int w = Math.Max(1, r.Right - r.Left);
+                    int h = Math.Max(1, r.Bottom - r.Top);
+
+                    bool zMismatch = Native.GetWindow(item.Hwnd, Native.GW_HWNDNEXT) != wpHwnd;
+                    bool rectChanged = !item.BackdropVisible || r.Left != item.LastLeft || r.Top != item.LastTop || w != item.LastWidth || h != item.LastHeight;
+
+                    if (zMismatch || rectChanged)
+                    {
+                        uint flags = Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW;
+                        Native.SetWindowPos(wpHwnd, item.Hwnd, r.Left, r.Top, w, h, flags);
+                        item.BackdropVisible = true;
+                        item.LastLeft = r.Left;
+                        item.LastTop = r.Top;
+                        item.LastWidth = w;
+                        item.LastHeight = h;
+                    }
+                }
+
+                if (_statusMenuItem != null)
+                {
+                    string stateDesc = _pausedByTray ? "已暂停" : activeEffect ? "壁纸运行中" : "待机";
+                    _statusMenuItem.Text = string.Format("AGY 桌面伴侣 · {0} ({1} 窗)", stateDesc, _tracked.Count);
                 }
             }
-
-            bool isCdpMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase);
-            bool activeEffect = _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCdpMode;
-            byte targetAlpha = activeEffect
-                ? (byte)Math.Max(148, Math.Min(254, Math.Round(255.0 * (100 - _config.hostBlendPct) / 100.0)))
-                : (byte)255;
-
-            foreach (TrackedHostWindow item in _tracked.Values)
+            finally
             {
-                if (!Native.IsWindow(item.Hwnd)) continue;
-
-                Native.RECT r;
-                bool hasBounds = Native.TryGetVisibleBounds(item.Hwnd, out r);
-                if (hasBounds)
+                _inSync = false;
+                if (_syncPending && !_disposed && _debounceTimer != null && !_debounceTimer.IsEnabled)
                 {
-                    SyncHudForWindow(item, r);
+                    _syncPending = false;
+                    _debounceTimer.Start();
                 }
-
-                if (!activeEffect)
-                {
-                    RestoreBackdropOnly(item, false);
-                    continue;
-                }
-
-                if (!item.AlphaApplied || item.LastAlpha != targetAlpha)
-                {
-                    long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
-                    if ((curEx & Native.WS_EX_LAYERED) == 0)
-                    {
-                        Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx | Native.WS_EX_LAYERED);
-                    }
-                    Native.SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha, Native.LWA_ALPHA);
-                    item.AlphaApplied = true;
-                    item.LastAlpha = targetAlpha;
-                }
-
-                bool visible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
-                if (!visible)
-                {
-                    if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
-                    {
-                        Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
-                        item.BackdropVisible = false;
-                    }
-                    continue;
-                }
-
-                bool isMaximized = Native.IsZoomed(item.Hwnd);
-                if (item.Backdrop == null)
-                {
-                    item.Backdrop = new BackdropSurfaceWindow();
-                    item.Backdrop.Show();
-                    item.LastMaximized = isMaximized;
-                    item.AppliedConfigVersion = _configVersion;
-                    item.Backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
-                }
-                else if (item.LastMaximized != isMaximized || item.AppliedConfigVersion != _configVersion)
-                {
-                    item.LastMaximized = isMaximized;
-                    item.AppliedConfigVersion = _configVersion;
-                    item.Backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
-                }
-
-                IntPtr wpHwnd = item.Backdrop.Handle;
-                if (wpHwnd == IntPtr.Zero || !hasBounds) continue;
-
-                int w = Math.Max(1, r.Right - r.Left);
-                int h = Math.Max(1, r.Bottom - r.Top);
-
-                bool zMismatch = Native.GetWindow(item.Hwnd, Native.GW_HWNDNEXT) != wpHwnd;
-                bool rectChanged = !item.BackdropVisible || r.Left != item.LastLeft || r.Top != item.LastTop || w != item.LastWidth || h != item.LastHeight;
-
-                if (zMismatch || rectChanged)
-                {
-                    uint flags = Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW;
-                    Native.SetWindowPos(wpHwnd, item.Hwnd, r.Left, r.Top, w, h, flags);
-                    item.BackdropVisible = true;
-                    item.LastLeft = r.Left;
-                    item.LastTop = r.Top;
-                    item.LastWidth = w;
-                    item.LastHeight = h;
-                }
-            }
-
-            if (_statusMenuItem != null)
-            {
-                string stateDesc = _pausedByTray ? "已暂停" : activeEffect ? "壁纸运行中" : "待机";
-                _statusMenuItem.Text = string.Format("AGY 桌面伴侣 · {0} ({1} 窗)", stateDesc, _tracked.Count);
             }
         }
 
@@ -2867,9 +2984,14 @@ namespace AgyBackdropCompanion
                 }
                 if (!string.Equals(procName, "Antigravity", StringComparison.OrdinalIgnoreCase)) return true;
 
-                Native.RECT r;
-                if (!Native.GetWindowRect(hWnd, out r)) return true;
-                if ((r.Right - r.Left) < 300 || (r.Bottom - r.Top) < 240) return true;
+                // Keep minimized Antigravity windows tracked (their rect is -32000x160x28 while iconic)
+                // so minimize/restore hides & reveals overlays cleanly without thrashing WPF windows.
+                if (!Native.IsIconic(hWnd))
+                {
+                    Native.RECT r;
+                    if (!Native.GetWindowRect(hWnd, out r)) return true;
+                    if ((r.Right - r.Left) < 300 || (r.Bottom - r.Top) < 240) return true;
+                }
 
                 found.Add(hWnd);
                 return true;
@@ -2905,9 +3027,10 @@ namespace AgyBackdropCompanion
             {
                 if (closing)
                 {
-                    try { item.Backdrop.Close(); } catch { }
+                    BackdropSurfaceWindow closingBackdrop = item.Backdrop;
                     item.Backdrop = null;
                     item.BackdropVisible = false;
+                    ForceCloseOwnedWindow(closingBackdrop);
                 }
                 else if (item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
                 {
@@ -2925,14 +3048,14 @@ namespace AgyBackdropCompanion
             {
                 if (closing)
                 {
-                    try { item.Hud.Close(); } catch { }
+                    HudOverlayWindow closingHud = item.Hud;
                     item.Hud = null;
                     item.HudVisible = false;
+                    ForceCloseOwnedWindow(closingHud);
                 }
-                else if (item.HudVisible && item.Hud.Handle != IntPtr.Zero)
+                else
                 {
-                    Native.ShowWindow(item.Hud.Handle, Native.SW_HIDE);
-                    item.HudVisible = false;
+                    HideHudIfVisible(item);
                 }
             }
         }
@@ -3032,6 +3155,7 @@ namespace AgyBackdropCompanion
                 RestoreHostWindow(item, true);
             }
             _tracked.Clear();
+            SweepOrphanedWindows();
 
             WriteStatusFile(false);
 

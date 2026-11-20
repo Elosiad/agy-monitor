@@ -8,8 +8,10 @@ import { evaluateMasteryHook } from '../hooks/mastery_summary_hook.mjs';
 import {
   buildMasterySnapshot,
   classifyToolCall,
+  openLocalPathTarget,
   parseAgentJourney,
   parseProgressTag,
+  resolveLocalTargetPath,
   sanitizeTimelineMarkdown,
   stripMarkdownForPlainLine,
 } from '../sidecars/agy_monitor/backend/mastery.mjs';
@@ -66,6 +68,7 @@ test('PreInvocation mastery_summary_hook respects default-on self mode, explicit
   assert.equal(outIntro.injectSteps?.length, 1);
   assert.match(outIntro.injectSteps[0].systemMessage.systemMessage, /30字/);
   assert.match(outIntro.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS\|10%/);
+  assert.match(outIntro.injectSteps[0].systemMessage.systemMessage, /空一行/);
 
   // 4. Within frequency window (15s < 30s) -> zero injection (cache untouched)
   const outSkipped = evaluateMasteryHook(
@@ -82,6 +85,7 @@ test('PreInvocation mastery_summary_hook respects default-on self mode, explicit
   assert.equal(outPeriodic.injectSteps?.length, 1);
   assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /10字以内/);
   assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /AGY_PROGRESS/);
+  assert.match(outPeriodic.injectSteps[0].systemMessage.systemMessage, /空一行/);
 });
 
 test('parseProgressTag, classifyToolCall, and buildMasterySnapshot align total progress with Main Agent & classify Codex actions', async (t) => {
@@ -372,4 +376,86 @@ test('mastery strips Markdown from overview cards, keeps file:/// links intact i
   assert.equal(multiJourney.progress, 45);
   assert.ok(multiJourney.steps.some((s) => s.type === 'msg' && s.text.includes('原因是路径被直接截断')));
   assert.ok(multiJourney.steps.some((s) => s.type === 'actions' && s.label === '编辑了文件' && s.defaultOpen === false));
+});
+
+test('openLocalPathTarget enters directories, opens parent dir for files, extracts user images, and separates progress tag from headings', async (t) => {
+  const { root, paths } = makeTempEnv(t);
+  const subDir = path.join(root, 'demo-folder');
+  const sampleFile = path.join(subDir, 'report.md');
+  const samplePng = path.join(subDir, 'shot.png');
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(sampleFile, '# ok\n', 'utf8');
+  fs.writeFileSync(samplePng, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]));
+
+  // Security rejections
+  assert.equal(resolveLocalTargetPath('https://example.com/a.png'), '');
+  assert.equal(resolveLocalTargetPath('javascript:alert(1)'), '');
+  assert.equal(resolveLocalTargetPath('relative/path.txt'), '');
+  assert.equal(resolveLocalTargetPath('D:\\bad"quote\\file.txt'), '');
+
+  // Windows file:/// URI decoding & line anchor stripping
+  assert.equal(
+    resolveLocalTargetPath('file:///D:/codex-tools/app.js#L10-L20', { platform: 'win32' }),
+    'D:\\codex-tools\\app.js',
+  );
+
+  // Directory -> enters itself; File -> opens parent directory & selects file
+  const calls = [];
+  const fakeSpawn = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    return { unref() {} };
+  };
+
+  const dirRes = await openLocalPathTarget(subDir, { platform: 'win32', spawnImpl: fakeSpawn });
+  assert.equal(dirRes.ok, true);
+  assert.equal(dirRes.kind, 'directory');
+  assert.equal(dirRes.openedPath, path.win32.resolve(subDir));
+  assert.equal(calls[0].cmd, 'explorer.exe');
+  assert.deepEqual(calls[0].args, [path.win32.resolve(subDir)]);
+
+  const fileRes = await openLocalPathTarget(sampleFile, { platform: 'win32', spawnImpl: fakeSpawn });
+  assert.equal(fileRes.ok, true);
+  assert.equal(fileRes.kind, 'file');
+  assert.equal(fileRes.openedPath, path.win32.resolve(subDir));
+  assert.equal(calls[1].cmd, 'explorer.exe');
+  assert.equal(calls[1].args[0], `/select,"${path.win32.resolve(sampleFile)}"`);
+
+  // Deleted target -> falls back to nearest existing parent directory
+  const missingChild = path.join(subDir, 'deleted-cache', 'temp.bin');
+  const fallbackRes = await openLocalPathTarget(missingChild, { platform: 'win32', spawnImpl: fakeSpawn });
+  assert.equal(fallbackRes.ok, true);
+  assert.equal(fallbackRes.kind, 'parent_fallback');
+  assert.equal(fallbackRes.openedPath, path.win32.resolve(subDir));
+
+  // Progress tag stays separated from leading heading & user images are extracted
+  const convId = 'conv-rich-003';
+  const logsDir = path.join(paths.brainDir, convId, '.system_generated', 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(logsDir, 'transcript.jsonl'),
+    [
+      {
+        step_index: 1,
+        type: 'USER_INPUT',
+        created_at: '2026-11-20T02:00:00Z',
+        content: `<USER_REQUEST>检查截图</USER_REQUEST><ADDITIONAL_METADATA>\n- ${samplePng}\n</ADDITIONAL_METADATA>`,
+      },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-20T02:00:05Z',
+        content: `[AGY_PROGRESS|100%|已清理完毕并列出缓存]\n\n### 一、已完成清理结果\n1. **[demo](file:///${subDir.replace(/\\/g, '/')})**: 完成`,
+      },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+    'utf8',
+  );
+  const richJourney = await parseAgentJourney(paths.brainDir, convId, { isMaster: true, isCompleted: true });
+  const uStep = richJourney.steps.find((s) => s.type === 'user');
+  assert.deepEqual(uStep?.images, [samplePng]);
+  const mStep = richJourney.steps.find((s) => s.type === 'msg');
+  assert.equal(mStep?.statusTag, '已清理完毕并列出缓存');
+  assert.equal(mStep?.progressPct, 100);
+  assert.ok(mStep?.text.startsWith('### 一、已完成清理结果'), 'Heading must start cleanly without glued tag prefix');
 });

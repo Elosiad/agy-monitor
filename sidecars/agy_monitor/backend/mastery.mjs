@@ -15,6 +15,7 @@
  *   读取了文件 / 检索了资料 / 协同了子 Agent) with real `+add / -del` line diff counts.
  */
 
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -121,6 +122,7 @@ export function stripMarkdownForPlainLine(rawText) {
     .replace(/`([^`\n]+)`/g, '$1')
     .replace(/\*\*([^*\n]+?)\*\*/g, '$1')
     .replace(/__([^_\n]+?)__/g, '$1')
+    .replace(/\*([^*\n]+?)\*/g, '$1')
     .replace(/~~([^~\n]+?)~~/g, '$1')
     .replace(/^\s{0,3}#{1,6}\s+/gm, '')
     .replace(/^\s*>\s?/gm, '')
@@ -133,7 +135,7 @@ export function stripMarkdownForPlainLine(rawText) {
  * Clean timeline Markdown while truncating on visible-text budget and safe token/line boundaries
  * so long percent-encoded file:/// links are never sliced mid-URL.
  */
-export function sanitizeTimelineMarkdown(rawText, maxVisible = 760) {
+export function sanitizeTimelineMarkdown(rawText, maxVisible = 3600) {
   const cleaned = stripProgressTags(rawText).replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (!cleaned) return '';
 
@@ -199,6 +201,21 @@ export function sanitizeTimelineMarkdown(rawText, maxVisible = 760) {
   return result.endsWith('```') ? `${result}\n…` : `${result}…`;
 }
 
+function extractUserUploadedImages(raw) {
+  if (typeof raw !== 'string' || !raw.includes('ADDITIONAL_METADATA')) return [];
+  const metaMatch = /<ADDITIONAL_METADATA>([\s\S]*?)<\/ADDITIONAL_METADATA>/i.exec(raw);
+  if (!metaMatch) return [];
+  const imgs = [];
+  const lines = metaMatch[1].split(/\r?\n/);
+  for (const line of lines) {
+    const m = /^\s*[-*]\s+((?:[a-zA-Z]:[\\/]|\/)[^\r\n]+\.(?:png|jpe?g|webp|gif|bmp|avif|ico))\s*$/i.exec(line);
+    if (m && m[1]) {
+      imgs.push(m[1].trim());
+    }
+  }
+  return imgs.slice(0, 6);
+}
+
 function stripUserRequestTags(raw) {
   if (typeof raw !== 'string') return '';
   const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i.exec(raw);
@@ -246,7 +263,8 @@ export function classifyToolCall(tc) {
   }
 
   if (name === 'edit_file' || name === 'write_file' || name === 'replace_file_content' || name === 'multi_replace_file_content') {
-    const targetPath = shortBasename(args.Path || args.TargetFile || args.path || '');
+    const rawPath = String(args.Path || args.TargetFile || args.path || '').trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const targetPath = shortBasename(rawPath);
     let addCount = 0;
     let delCount = 0;
     if (name === 'write_file') {
@@ -262,6 +280,7 @@ export function classifyToolCall(tc) {
       categoryLabel: '编辑了文件',
       kind: 'edit',
       text: targetPath ? `已编辑 ${targetPath}` : `编辑文件 (${rawName})`,
+      ...(rawPath ? { filePath: rawPath } : {}),
       ...(addCount > 0 ? { add: `+${addCount}` } : {}),
       ...(delCount > 0 ? { del: `-${delCount}` } : {}),
     };
@@ -276,7 +295,8 @@ export function classifyToolCall(tc) {
     name === 'read_resource' ||
     name === 'list_resources'
   ) {
-    const targetPath = shortBasename(args.Path || args.AbsolutePath || args.DirectoryPath || args.SearchPath || args.Uri || '');
+    const rawPath = String(args.Path || args.AbsolutePath || args.DirectoryPath || args.SearchPath || args.Uri || '').trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const targetPath = shortBasename(rawPath);
     const lineRange =
       args.StartLine && args.EndLine ? ` L${args.StartLine}-${args.EndLine}` : '';
     const query = args.Query || args.Pattern || '';
@@ -287,6 +307,7 @@ export function classifyToolCall(tc) {
       categoryLabel: '读取了文件',
       kind: 'read',
       text: desc.slice(0, 120),
+      ...(rawPath ? { filePath: rawPath } : {}),
     };
   }
 
@@ -503,9 +524,10 @@ export async function parseAgentJourney(
       icon,
       label,
       defaultOpen: false,
-      items: pendingActions.map(({ kind, text, add, del }) => ({
+      items: pendingActions.map(({ kind, text, filePath, add, del }) => ({
         kind,
         text,
+        ...(filePath ? { filePath } : {}),
         ...(add ? { add } : {}),
         ...(del ? { del } : {}),
       })),
@@ -528,12 +550,14 @@ export async function parseAgentJourney(
 
     if (entry.type === 'USER_INPUT' && entry.content) {
       const userText = stripUserRequestTags(entry.content);
-      if (!userText) continue;
+      const userImages = extractUserUploadedImages(entry.content);
+      if (!userText && userImages.length === 0) continue;
       flushActions();
       const isFollowup = followupIndices.has(i);
       steps.push({
         type: 'user',
         text: userText,
+        ...(userImages.length > 0 ? { images: userImages } : {}),
         isFollowup,
         label: isMaster ? (isFollowup ? '用户补充' : '用户布置任务') : '来自「主 Agent」派单',
         stepIndex: Number(entry.step_index || i),
@@ -568,14 +592,12 @@ export async function parseAgentJourney(
         }
       }
       flushActions();
-      const displayLine = tag.narrative
-        ? `${tag.summary ? `【${tag.summary} · ${tag.percent}%】` : ''}${tag.narrative}`
-        : `${tag.summary || '推进中'}（进度约 ${tag.percent}%）`;
+      const narrativeText = tag.narrative ? sanitizeTimelineMarkdown(tag.narrative) : '';
       steps.push({
         type: 'msg',
-        text: sanitizeTimelineMarkdown(displayLine),
+        text: narrativeText,
         progressPct: tag.percent,
-        statusTag: tag.summary,
+        statusTag: tag.summary || '推进中',
       });
     } else if (rawContent) {
       flushActions();
@@ -1232,4 +1254,161 @@ export async function buildMasterySnapshot(
     unreadCount: unreadList.length,
     detailSession,
   };
+}
+
+/**
+ * Resolve a file:/// URI or absolute local path into a clean normalized OS path.
+ * Rejects non-local protocols, relative paths, quotes, and control characters.
+ */
+export function resolveLocalTargetPath(rawInput, { platform = process.platform } = {}) {
+  if (typeof rawInput !== 'string') return '';
+  let s = rawInput.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!s || /[\0\r\n"<>|]/.test(s)) return '';
+
+  // Reject non-file schemes (http, https, javascript, mailto, etc.)
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s) && !/^file:\/\//i.test(s)) {
+    return '';
+  }
+  if (/^(?:javascript|data|mailto|vbscript):/i.test(s)) {
+    return '';
+  }
+
+  if (/^file:\/\//i.test(s)) {
+    s = s.replace(/^file:\/\/localhost\//i, '/').replace(/^file:\/\/+/i, '/');
+    // Strip #L10-L20 line anchors and ?query from file URIs
+    const hashIdx = s.indexOf('#');
+    if (hashIdx >= 0) s = s.slice(0, hashIdx);
+    const queryIdx = s.indexOf('?');
+    if (queryIdx >= 0) s = s.slice(0, queryIdx);
+    try {
+      s = decodeURIComponent(s);
+    } catch {
+      s = s.replace(/(?:%[0-9a-fA-F]{2})+/g, (seq) => {
+        try {
+          return decodeURIComponent(seq);
+        } catch {
+          return seq;
+        }
+      });
+    }
+    // Windows drive letter form `/D:/foo` -> `D:/foo`
+    if (/^\/+[a-zA-Z]:[\\/]/.test(s)) {
+      s = s.replace(/^\/+/, '');
+    }
+  } else {
+    // Strip optional `:line(:col)` or `#L10-L20` suffix on plain file paths (preserving Windows drive colon!)
+    s = s.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/(?<=[^\\/:]):\d+(?::\d+)?$/, '');
+  }
+
+  s = s.trim();
+  if (!s || /[\0\r\n"<>|]/.test(s)) return '';
+
+  const isWinDrive = /^[a-zA-Z]:[\\/]/.test(s);
+  const isWinUnc = /^\\\\[^\\]+\\[^\\]+/.test(s);
+  const isPosixAbs = s.startsWith('/');
+  if (!isWinDrive && !isWinUnc && !isPosixAbs) return '';
+
+  const pathApi = platform === 'win32' || isWinDrive || isWinUnc ? path.win32 : path.posix;
+  return pathApi.resolve(s);
+}
+
+/**
+ * Open a local path in the native file manager:
+ * - Directory -> enters the directory itself
+ * - File -> opens its parent directory (selecting the file on Windows/macOS)
+ * - Missing/deleted target -> walks up to the nearest existing parent directory
+ */
+export async function openLocalPathTarget(
+  rawInput,
+  { platform = process.platform, fsImpl = fsp, spawnImpl = spawn } = {},
+) {
+  const resolved = resolveLocalTargetPath(rawInput, { platform });
+  if (!resolved) {
+    return { ok: false, status: 400, error: '无效的本地文件或目录路径' };
+  }
+
+  const pathApi = platform === 'win32' || /^[a-zA-Z]:[\\/]/.test(resolved) ? path.win32 : path.posix;
+  let kind = 'missing';
+  let stat = null;
+  try {
+    stat = await fsImpl.stat(resolved);
+    kind = stat.isDirectory() ? 'directory' : 'file';
+  } catch {
+    kind = 'missing';
+  }
+
+  let openDir = '';
+  let selectFile = '';
+  if (kind === 'directory') {
+    openDir = resolved;
+  } else if (kind === 'file') {
+    openDir = pathApi.dirname(resolved);
+    selectFile = resolved;
+  } else {
+    // Walk up parent directories (e.g. if a cleaned-up folder/file was deleted)
+    let cur = pathApi.dirname(resolved);
+    for (let depth = 0; depth < 8 && cur; depth += 1) {
+      try {
+        const pst = await fsImpl.stat(cur);
+        if (pst.isDirectory()) {
+          openDir = cur;
+          kind = 'parent_fallback';
+          break;
+        }
+      } catch {
+        // continue walking up
+      }
+      const next = pathApi.dirname(cur);
+      if (!next || next === cur) break;
+      cur = next;
+    }
+  }
+
+  if (!openDir) {
+    return { ok: false, status: 404, error: '目标文件或上级目录不存在' };
+  }
+
+  try {
+    let child = null;
+    if (platform === 'win32') {
+      if (selectFile) {
+        // Windows Explorer reliably opens the parent folder and highlights the target file
+        child = spawnImpl('explorer.exe', [`/select,"${selectFile}"`], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false,
+          windowsVerbatimArguments: true,
+        });
+      } else {
+        child = spawnImpl('explorer.exe', [openDir], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false,
+        });
+      }
+    } else if (platform === 'darwin') {
+      child = spawnImpl('open', selectFile ? ['-R', selectFile] : [openDir], {
+        detached: true,
+        stdio: 'ignore',
+      });
+    } else {
+      child = spawnImpl('xdg-open', [openDir], {
+        detached: true,
+        stdio: 'ignore',
+      });
+    }
+    child?.unref?.();
+    return {
+      ok: true,
+      kind,
+      targetPath: resolved,
+      openedPath: openDir,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 500,
+      error: err?.message || '打开系统文件管理器失败',
+    };
+  }
 }

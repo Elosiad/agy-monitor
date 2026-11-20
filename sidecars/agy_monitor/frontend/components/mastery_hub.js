@@ -139,8 +139,78 @@ function buildActionIconSvg(kind) {
   return svg;
 }
 
-const MD_INLINE_RE =
-  /(?:`([^`\n]+)`|\[([^\[\]\n]+)\]\(([^()\s\n]+(?:\([^()\s\n]*\)[^()\s\n]*)*)\)|\[([^\[\]\n]+)\]\((file:\/\/\/[^\s<>)"']*)|\*\*([^*\n]+)\*\*|(file:\/\/\/[^\s<>)"']+))/g;
+const RASTER_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|bmp)(?:[?#].*)?$/i;
+
+function looksLikeLocalAbsPath(raw) {
+  const s = String(raw || "").trim();
+  if (!s || /[\r\n<>"]/.test(s)) return false;
+  if (/^file:\/\//i.test(s)) return true;
+  if (/^[a-zA-Z]:[\\/][^\s*?"<>|]+/.test(s)) return true;
+  if (/^\\\\[^\\/\s]+\\[^\\/\s]+/.test(s)) return true;
+  if (/^\/(?:Users|home|var|tmp|opt|etc|mnt|Volumes)\/[^\s]+/.test(s)) return true;
+  return false;
+}
+
+function isLocalRasterImageTarget(raw) {
+  if (!looksLikeLocalAbsPath(raw)) return false;
+  const decoded = decodeDisplayUrl(raw);
+  return RASTER_IMAGE_EXT_RE.test(decoded);
+}
+
+function isSafeHttpUrl(raw) {
+  return /^https?:\/\/[^\s<>"]+$/i.test(String(raw || "").trim());
+}
+
+function buildPathIconSvg(isImage = false) {
+  const svg = makeSvgEl("svg", {
+    width: 11,
+    height: 11,
+    viewBox: "0 0 16 16",
+    fill: "none",
+    "aria-hidden": "true",
+    class: "mad-path-icon",
+  });
+  if (isImage) {
+    svg.appendChild(
+      makeSvgEl("rect", {
+        x: "2",
+        y: "3",
+        width: "12",
+        height: "10",
+        rx: "1.8",
+        stroke: "currentColor",
+        "stroke-width": "1.35",
+      })
+    );
+    svg.appendChild(
+      makeSvgEl("circle", {
+        cx: "5.8",
+        cy: "6.4",
+        r: "1.1",
+        fill: "currentColor",
+      })
+    );
+    svg.appendChild(
+      makeSvgEl("path", {
+        d: "M3 11.4l3.1-3 2.3 2.1 1.9-1.7 2.7 2.6",
+        stroke: "currentColor",
+        "stroke-width": "1.25",
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
+      })
+    );
+  } else {
+    svg.appendChild(
+      makeSvgEl("path", {
+        d: "M2.2 4.4A1.4 1.4 0 0 1 3.6 3h3l1.3 1.4h4.5a1.4 1.4 0 0 1 1.4 1.4v5.8a1.4 1.4 0 0 1-1.4 1.4H3.6a1.4 1.4 0 0 1-1.4-1.4V4.4z",
+        stroke: "currentColor",
+        "stroke-width": "1.3",
+        "stroke-linejoin": "round",
+      })
+    );
+  }
+  return svg;
+}
 
 function decodeDisplayUrl(rawUrl) {
   const cleaned = String(rawUrl || "").replace(/%[0-9a-fA-F]?$/, "");
@@ -156,7 +226,8 @@ function decodeDisplayUrl(rawUrl) {
       }
     });
   }
-  return decoded.replace(/^file:\/\/\/+/i, "");
+  const stripped = decoded.replace(/^file:\/\/localhost\//i, "/").replace(/^file:\/\/\/+/i, "");
+  return /^\/+[a-zA-Z]:[\\/]/.test(stripped) ? stripped.replace(/^\/+/, "") : stripped;
 }
 
 function extractFileUriLabel(rawUrl) {
@@ -176,81 +247,384 @@ function appendPlainSpan(parent, text) {
   parent.appendChild(span);
 }
 
-function appendMarkdownInline(parent, text) {
-  const src = String(text || "");
-  if (!src) return;
-  MD_INLINE_RE.lastIndex = 0;
-  let lastIdx = 0;
-  let match;
-  while ((match = MD_INLINE_RE.exec(src)) !== null) {
-    if (match.index > lastIdx) {
-      appendPlainSpan(parent, src.slice(lastIdx, match.index));
-    }
-    if (match[1] !== undefined) {
-      const code = document.createElement("code");
-      code.className = "mad-md-code";
-      code.textContent = match[1];
-      parent.appendChild(code);
-    } else if ((match[2] !== undefined && match[3] !== undefined) || (match[4] !== undefined && match[5] !== undefined)) {
-      const rawLabel = (match[2] !== undefined ? match[2] : match[4]).trim();
-      const rawTarget = match[3] !== undefined ? match[3] : match[5];
-      const unwrappedCode = /^`(.+)`$/.exec(rawLabel);
-      const cleanLabel = (unwrappedCode ? unwrappedCode[1] : rawLabel).replace(/^\*\*(.+)\*\*$/, "$1");
-      const chip = document.createElement("span");
-      const looksLikeFile = Boolean(unwrappedCode) || /\.[a-z0-9]{1,8}(?::\d+|#L\d+)?$/i.test(cleanLabel);
-      chip.className = `mad-md-link${looksLikeFile ? " is-code" : ""}`;
-      chip.textContent = cleanLabel || extractFileUriLabel(rawTarget);
-      chip.title = decodeDisplayUrl(rawTarget);
-      parent.appendChild(chip);
-    } else if (match[6] !== undefined) {
-      const strong = document.createElement("strong");
-      strong.className = "mad-md-bold";
-      strong.textContent = match[6].trim();
-      parent.appendChild(strong);
-    } else if (match[7] !== undefined) {
-      const chip = document.createElement("span");
-      chip.className = "mad-md-link is-code";
-      chip.textContent = extractFileUriLabel(match[7]);
-      chip.title = decodeDisplayUrl(match[7]);
-      parent.appendChild(chip);
-    }
-    lastIdx = match.index + match[0].length;
+function createLocalPathChip(label, rawTarget, ctx, { isCode = true, isImage = false } = {}) {
+  const displayPath = decodeDisplayUrl(rawTarget);
+  const el = document.createElement(ctx?.onOpenPath ? "button" : "span");
+  if (el.tagName === "BUTTON") {
+    el.type = "button";
   }
-  if (lastIdx < src.length) {
-    appendPlainSpan(parent, src.slice(lastIdx));
+  el.className = `mad-md-link${isCode ? " is-code" : ""}${ctx?.onOpenPath ? " is-path" : ""}`;
+  el.appendChild(buildPathIconSvg(isImage));
+  const txt = document.createElement("span");
+  txt.textContent = label || extractFileUriLabel(rawTarget);
+  el.appendChild(txt);
+  el.title = ctx?.onOpenPath ? `点击打开目录：${displayPath}` : displayPath;
+  if (ctx?.onOpenPath) {
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      ctx.onOpenPath(rawTarget);
+    });
   }
+  return el;
 }
 
+function createLocalImagePreview(label, rawTarget, ctx) {
+  const displayPath = decodeDisplayUrl(rawTarget);
+  const cleanLabel = label || extractFileUriLabel(rawTarget);
+
+  if (typeof ctx?.loadLocalImage !== "function") {
+    return createLocalPathChip(cleanLabel, rawTarget, ctx, { isCode: true, isImage: true });
+  }
+
+  const wrap = document.createElement("span");
+  wrap.className = "mad-md-img-wrap";
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "mad-md-img-card";
+  btn.title = ctx?.onOpenPath ? `点击打开所在目录：${displayPath}` : displayPath;
+
+  const img = document.createElement("img");
+  img.className = "mad-md-img-el";
+  img.alt = cleanLabel;
+  img.loading = "lazy";
+
+  const foot = document.createElement("span");
+  foot.className = "mad-md-img-foot";
+  foot.appendChild(buildPathIconSvg(true));
+  const nameSpan = document.createElement("span");
+  nameSpan.className = "mad-md-img-name";
+  nameSpan.textContent = cleanLabel;
+  const hintSpan = document.createElement("span");
+  hintSpan.className = "mad-md-img-hint";
+  hintSpan.textContent = "点击打开目录";
+  foot.appendChild(nameSpan);
+  foot.appendChild(hintSpan);
+
+  btn.appendChild(img);
+  btn.appendChild(foot);
+  if (ctx?.onOpenPath) {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      ctx.onOpenPath(rawTarget);
+    });
+  }
+
+  wrap.appendChild(btn);
+
+  const fallbackToChip = () => {
+    if (!wrap.isConnected && !wrap.parentNode) return;
+    wrap.textContent = "";
+    wrap.appendChild(createLocalPathChip(cleanLabel, rawTarget, ctx, { isCode: true, isImage: true }));
+  };
+
+  img.addEventListener("error", fallbackToChip);
+  Promise.resolve(ctx.loadLocalImage(rawTarget))
+    .then((url) => {
+      if (url) {
+        img.src = url;
+      } else {
+        fallbackToChip();
+      }
+    })
+    .catch(fallbackToChip);
+
+  return wrap;
+}
+
+function findMatchingInlineClose(src, startIdx, delim) {
+  let i = startIdx;
+  while (i < src.length) {
+    if (src[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (src[i] === "`") {
+      const endTick = src.indexOf("`", i + 1);
+      if (endTick > i) {
+        i = endTick + 1;
+        continue;
+      }
+    }
+    if (src.startsWith(delim, i)) {
+      return i;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+function parseLinkTargetAt(src, openParenIdx) {
+  let depth = 1;
+  let i = openParenIdx + 1;
+  while (i < src.length && depth > 0) {
+    const ch = src[i];
+    if (ch === "\n" || ch === "\r") return -1;
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth -= 1;
+    if (depth === 0) return i;
+    i += 1;
+  }
+  return -1;
+}
+
+function appendMarkdownInline(parent, text, ctx = {}, depth = 0) {
+  const src = String(text || "");
+  if (!src) return;
+  if (depth > 4) {
+    appendPlainSpan(parent, src);
+    return;
+  }
+
+  let i = 0;
+  let plainBuf = "";
+  const flushPlain = () => {
+    if (plainBuf) {
+      appendPlainSpan(parent, plainBuf);
+      plainBuf = "";
+    }
+  };
+
+  while (i < src.length) {
+    const ch = src[i];
+
+    // Escaped markdown punctuation
+    if (ch === "\\" && i + 1 < src.length && /[\\`*_{}\[\]()#+\-.!~|]/.test(src[i + 1])) {
+      plainBuf += src[i + 1];
+      i += 2;
+      continue;
+    }
+
+    // Inline code `...`
+    if (ch === "`") {
+      const closeIdx = src.indexOf("`", i + 1);
+      if (closeIdx > i + 1) {
+        const inner = src.slice(i + 1, closeIdx);
+        flushPlain();
+        if (isLocalRasterImageTarget(inner)) {
+          parent.appendChild(createLocalImagePreview(extractFileUriLabel(inner), inner, ctx));
+        } else if (looksLikeLocalAbsPath(inner)) {
+          parent.appendChild(createLocalPathChip(inner, inner, ctx, { isCode: true }));
+        } else {
+          const code = document.createElement("code");
+          code.className = "mad-md-code";
+          code.textContent = inner;
+          parent.appendChild(code);
+        }
+        i = closeIdx + 1;
+        continue;
+      }
+    }
+
+    // Markdown image ![alt](url) or link [label](url)
+    if ((ch === "!" && src[i + 1] === "[") || ch === "[") {
+      const isImgSyntax = ch === "!";
+      const openBracket = isImgSyntax ? i + 1 : i;
+      const closeBracket = src.indexOf("]", openBracket + 1);
+      if (closeBracket > openBracket && src[closeBracket + 1] === "(") {
+        const closeParen = parseLinkTargetAt(src, closeBracket + 1);
+        if (closeParen > closeBracket + 2) {
+          const rawLabel = src.slice(openBracket + 1, closeBracket).trim();
+          const rawTarget = src.slice(closeBracket + 2, closeParen).trim().replace(/^<|>$/g, "");
+          const unwrappedCode = /^`(.+)`$/.exec(rawLabel);
+          const cleanLabel = (unwrappedCode ? unwrappedCode[1] : rawLabel).replace(/^\*\*(.+)\*\*$/, "$1").trim();
+
+          flushPlain();
+          if (isLocalRasterImageTarget(rawTarget)) {
+            parent.appendChild(createLocalImagePreview(cleanLabel || extractFileUriLabel(rawTarget), rawTarget, ctx));
+          } else if (looksLikeLocalAbsPath(rawTarget)) {
+            const looksLikeFile =
+              Boolean(unwrappedCode) || /[\\/]/.test(cleanLabel) || /\.[a-z0-9]{1,8}(?::\d+|#L\d+)?$/i.test(cleanLabel);
+            parent.appendChild(createLocalPathChip(cleanLabel || extractFileUriLabel(rawTarget), rawTarget, ctx, { isCode: looksLikeFile }));
+          } else if (isSafeHttpUrl(rawTarget)) {
+            const a = document.createElement("a");
+            a.className = "mad-md-link is-web";
+            a.href = rawTarget;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            a.textContent = cleanLabel || rawTarget;
+            a.title = rawTarget;
+            parent.appendChild(a);
+          } else {
+            const chip = document.createElement("span");
+            chip.className = "mad-md-link";
+            chip.textContent = cleanLabel || rawTarget;
+            chip.title = rawTarget;
+            parent.appendChild(chip);
+          }
+          i = closeParen + 1;
+          continue;
+        }
+      }
+    }
+
+    // Bold **...** or __...__ (recursively parses nested links, code, italic!)
+    if ((ch === "*" && src[i + 1] === "*") || (ch === "_" && src[i + 1] === "_")) {
+      const delim = src.slice(i, i + 2);
+      const closeIdx = findMatchingInlineClose(src, i + 2, delim);
+      if (closeIdx > i + 2) {
+        const inner = src.slice(i + 2, closeIdx);
+        if (inner.trim()) {
+          flushPlain();
+          const strong = document.createElement("strong");
+          strong.className = "mad-md-bold";
+          appendMarkdownInline(strong, inner, ctx, depth + 1);
+          parent.appendChild(strong);
+          i = closeIdx + 2;
+          continue;
+        }
+      }
+    }
+
+    // Strikethrough ~~...~~
+    if (ch === "~" && src[i + 1] === "~") {
+      const closeIdx = findMatchingInlineClose(src, i + 2, "~~");
+      if (closeIdx > i + 2) {
+        const inner = src.slice(i + 2, closeIdx);
+        if (inner.trim()) {
+          flushPlain();
+          const del = document.createElement("del");
+          del.className = "mad-md-del";
+          appendMarkdownInline(del, inner, ctx, depth + 1);
+          parent.appendChild(del);
+          i = closeIdx + 2;
+          continue;
+        }
+      }
+    }
+
+    // Italic *...* (avoid matching list bullets or bare spaces)
+    if (ch === "*" && src[i + 1] !== "*" && src[i + 1] !== " ") {
+      const closeIdx = findMatchingInlineClose(src, i + 1, "*");
+      if (closeIdx > i + 1 && src[closeIdx - 1] !== " ") {
+        const inner = src.slice(i + 1, closeIdx);
+        if (inner.trim()) {
+          flushPlain();
+          const em = document.createElement("em");
+          em.className = "mad-md-em";
+          appendMarkdownInline(em, inner, ctx, depth + 1);
+          parent.appendChild(em);
+          i = closeIdx + 1;
+          continue;
+        }
+      }
+    }
+
+    // Bare file:/// URI
+    if ((ch === "f" || ch === "F") && /^file:\/\/\//i.test(src.slice(i, i + 8))) {
+      const m = /^file:\/\/\/[^\s<>)"']+/.exec(src.slice(i));
+      if (m) {
+        const uri = m[0].replace(/[.,;:!?。，；：！？]+$/, "");
+        flushPlain();
+        if (isLocalRasterImageTarget(uri)) {
+          parent.appendChild(createLocalImagePreview(extractFileUriLabel(uri), uri, ctx));
+        } else {
+          parent.appendChild(createLocalPathChip(extractFileUriLabel(uri), uri, ctx, { isCode: true }));
+        }
+        i += uri.length;
+        continue;
+      }
+    }
+
+    // Bare https:// or http:// URL
+    if ((ch === "h" || ch === "H") && /^https?:\/\//i.test(src.slice(i, i + 8))) {
+      const m = /^https?:\/\/[^\s<>)"']+/.exec(src.slice(i));
+      if (m) {
+        const url = m[0].replace(/[.,;:!?。，；：！？]+$/, "");
+        flushPlain();
+        const a = document.createElement("a");
+        a.className = "mad-md-link is-web";
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = url;
+        a.title = url;
+        parent.appendChild(a);
+        i += url.length;
+        continue;
+      }
+    }
+
+    plainBuf += ch;
+    i += 1;
+  }
+
+  flushPlain();
+}
+
+function splitTableRow(line) {
+  let trimmed = String(line || "").trim();
+  if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+  return trimmed.split("|").map((c) => c.trim());
+}
+
+function isTableSeparatorLine(line) {
+  const cells = splitTableRow(line);
+  return cells.length >= 2 && cells.every((c) => /^:?-{3,}:?$/.test(c));
+}
+
+function parseTableAlignments(line) {
+  return splitTableRow(line).map((c) => {
+    const left = c.startsWith(":");
+    const right = c.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    return "left";
+  });
+}
+
+const ALERT_LABEL_MAP = {
+  NOTE: { cls: "is-note", label: "说明" },
+  TIP: { cls: "is-tip", label: "提示" },
+  IMPORTANT: { cls: "is-important", label: "重要" },
+  WARNING: { cls: "is-warning", label: "注意" },
+  CAUTION: { cls: "is-caution", label: "警示" },
+};
+
 /**
- * Pure-DOM, zero-innerHTML lightweight Markdown renderer for Codex journey messages.
- * Supports headings, paragraphs, nested bullet/ordered lists, blockquotes, fenced code,
- * **bold**, `inline code`, and [label](url) / file:/// link chips.
+ * Pure-DOM, zero-innerHTML native Antigravity Markdown renderer for Codex journey messages.
+ * Supports headings (H1-H6), GFM tables, alert callouts, blockquotes, fenced code with language,
+ * task/bullet/ordered lists, nested bold/italic/strikethrough/inline-code, clickable local path chips,
+ * and inline local raster image previews that open their parent folder on click.
  */
-function renderSafeMarkdown(container, rawText) {
+function renderSafeMarkdown(container, rawText, ctx = {}) {
   container.textContent = "";
   const lines = String(rawText || "").replace(/\r\n?/g, "\n").split("\n");
   let inFence = false;
+  let fenceLang = "";
   let fenceLines = [];
 
   const flushFence = () => {
     const pre = document.createElement("pre");
     pre.className = "mad-md-pre";
+    if (fenceLang) {
+      const head = document.createElement("div");
+      head.className = "mad-md-pre-head";
+      head.textContent = fenceLang;
+      pre.appendChild(head);
+    }
     const code = document.createElement("code");
     code.className = "mad-md-pre-code";
     code.textContent = fenceLines.join("\n");
     pre.appendChild(code);
     container.appendChild(pre);
     fenceLines = [];
+    fenceLang = "";
   };
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (/^\s*```/.test(line)) {
+    const fenceMatch = /^\s*```([a-zA-Z0-9_+#.-]*)\s*$/.exec(line);
+    if (fenceMatch) {
       if (inFence) {
         flushFence();
         inFence = false;
       } else {
         inFence = true;
+        fenceLang = fenceMatch[1] || "";
         fenceLines = [];
       }
       continue;
@@ -268,21 +642,115 @@ function renderSafeMarkdown(container, rawText) {
       continue;
     }
 
+    // GFM Markdown table
+    if (line.includes("|") && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
+      const headers = splitTableRow(line);
+      const aligns = parseTableAlignments(lines[i + 1]);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+        rows.push(splitTableRow(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+
+      const wrap = document.createElement("div");
+      wrap.className = "mad-md-table-wrap";
+      const table = document.createElement("table");
+      table.className = "mad-md-table";
+
+      const thead = document.createElement("thead");
+      const htr = document.createElement("tr");
+      headers.forEach((hText, colIdx) => {
+        const th = document.createElement("th");
+        if (aligns[colIdx]) th.style.textAlign = aligns[colIdx];
+        appendMarkdownInline(th, hText, ctx);
+        htr.appendChild(th);
+      });
+      thead.appendChild(htr);
+      table.appendChild(thead);
+
+      if (rows.length > 0) {
+        const tbody = document.createElement("tbody");
+        rows.forEach((row) => {
+          const tr = document.createElement("tr");
+          for (let c = 0; c < headers.length; c += 1) {
+            const td = document.createElement("td");
+            if (aligns[c]) td.style.textAlign = aligns[c];
+            appendMarkdownInline(td, row[c] || "", ctx);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+      }
+      wrap.appendChild(table);
+      container.appendChild(wrap);
+      continue;
+    }
+
     const headingMatch = /^\s{0,3}(#{1,6})\s+(.+)$/.exec(line);
     if (headingMatch) {
+      const level = Math.min(6, headingMatch[1].length);
       const h = document.createElement("div");
-      h.className = "mad-md-heading";
-      appendMarkdownInline(h, headingMatch[2]);
+      h.className = `mad-md-heading is-h${level}`;
+      appendMarkdownInline(h, headingMatch[2], ctx);
       container.appendChild(h);
       continue;
     }
 
+    // Blockquote & GitHub/Antigravity callout alert (> [!TIP] / > [!WARNING] etc.)
     const quoteMatch = /^\s*>\s?(.*)$/.exec(line);
     if (quoteMatch) {
+      const alertHeader = /^\[\!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/i.exec(quoteMatch[1].trim());
+      if (alertHeader) {
+        const meta = ALERT_LABEL_MAP[alertHeader[1].toUpperCase()] || ALERT_LABEL_MAP.NOTE;
+        const alertBox = document.createElement("div");
+        alertBox.className = `mad-md-alert ${meta.cls}`;
+        const titleEl = document.createElement("div");
+        titleEl.className = "mad-md-alert-title";
+        titleEl.textContent = meta.label;
+        alertBox.appendChild(titleEl);
+        const bodyLines = [];
+        if (alertHeader[2]) bodyLines.push(alertHeader[2]);
+        while (i + 1 < lines.length && /^\s*>\s?(.*)$/.test(lines[i + 1])) {
+          i += 1;
+          bodyLines.push(/^\s*>\s?(.*)$/.exec(lines[i])[1]);
+        }
+        bodyLines.forEach((bl) => {
+          if (!bl.trim()) return;
+          const pLine = document.createElement("div");
+          pLine.className = "mad-md-alert-body";
+          appendMarkdownInline(pLine, bl, ctx);
+          alertBox.appendChild(pLine);
+        });
+        container.appendChild(alertBox);
+        continue;
+      }
+
       const q = document.createElement("div");
       q.className = "mad-md-quote";
-      appendMarkdownInline(q, quoteMatch[1]);
+      appendMarkdownInline(q, quoteMatch[1], ctx);
       container.appendChild(q);
+      continue;
+    }
+
+    // Task list item (- [x] / - [ ])
+    const taskMatch = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.+)$/.exec(line);
+    if (taskMatch) {
+      const indent = taskMatch[1].replace(/\t/g, "  ").length;
+      const checked = taskMatch[2].toLowerCase() === "x";
+      const li = document.createElement("div");
+      li.className = `mad-md-li is-task${indent >= 2 ? " is-nested" : ""}`;
+      const box = document.createElement("span");
+      box.className = `mad-md-checkbox${checked ? " is-checked" : ""}`;
+      box.textContent = checked ? "✓" : "";
+      const body = document.createElement("div");
+      body.className = "mad-md-li-body";
+      appendMarkdownInline(body, taskMatch[3], ctx);
+      li.appendChild(box);
+      li.appendChild(body);
+      container.appendChild(li);
       continue;
     }
 
@@ -296,7 +764,7 @@ function renderSafeMarkdown(container, rawText) {
       bullet.textContent = indent >= 2 ? "◦" : "•";
       const body = document.createElement("div");
       body.className = "mad-md-li-body";
-      appendMarkdownInline(body, ulMatch[2]);
+      appendMarkdownInline(body, ulMatch[2], ctx);
       li.appendChild(bullet);
       li.appendChild(body);
       container.appendChild(li);
@@ -313,7 +781,7 @@ function renderSafeMarkdown(container, rawText) {
       num.textContent = `${olMatch[2]}.`;
       const body = document.createElement("div");
       body.className = "mad-md-li-body";
-      appendMarkdownInline(body, olMatch[3]);
+      appendMarkdownInline(body, olMatch[3], ctx);
       li.appendChild(num);
       li.appendChild(body);
       container.appendChild(li);
@@ -322,7 +790,7 @@ function renderSafeMarkdown(container, rawText) {
 
     const p = document.createElement("div");
     p.className = "mad-md-p";
-    appendMarkdownInline(p, line);
+    appendMarkdownInline(p, line, ctx);
     container.appendChild(p);
   }
 
@@ -536,8 +1004,76 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
   let draftModels = [...PROTOCOL_PRESETS.openai.models];
   const nodeElMap = new Map();
   const expandedGroupState = new Map();
+  const localImageUrlCache = new Map();
+  const createdObjectUrls = new Set();
   let lastRenderedTimelineKey = "";
   let lastRenderedTimelineSig = "";
+
+  const openLocalPath = async (rawTarget) => {
+    if (!rawTarget || typeof apiFetch !== "function") return;
+    try {
+      const res = await callJson(apiFetch, "/api/mastery/open-path", {
+        method: "POST",
+        body: JSON.stringify({ targetPath: String(rawTarget) }),
+      });
+      if (res?.openedPath) {
+        const prefix =
+          res.kind === "directory"
+            ? "已进入目录："
+            : res.kind === "parent_fallback"
+              ? "原路径已移除，已打开上级目录："
+              : "已打开所在目录：";
+        onToast?.(`${prefix}${res.openedPath}`, "success");
+      }
+    } catch (err) {
+      onToast?.(err?.message || "无法打开目标目录", "error");
+    }
+  };
+
+  const loadLocalImage = (rawTarget) => {
+    const key = String(rawTarget || "").trim();
+    if (!key || typeof apiFetch !== "function" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+      return Promise.resolve("");
+    }
+    if (localImageUrlCache.has(key)) {
+      return localImageUrlCache.get(key);
+    }
+    if (localImageUrlCache.size >= 48) {
+      const oldestKey = localImageUrlCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        const oldPromise = localImageUrlCache.get(oldestKey);
+        localImageUrlCache.delete(oldestKey);
+        Promise.resolve(oldPromise).then((oldUrl) => {
+          if (oldUrl && createdObjectUrls.has(oldUrl)) {
+            createdObjectUrls.delete(oldUrl);
+            try {
+              URL.revokeObjectURL(oldUrl);
+            } catch {}
+          }
+        });
+      }
+    }
+    const req = Promise.resolve()
+      .then(async () => {
+        const res = await apiFetch(`/api/mastery/local-image?path=${encodeURIComponent(key)}`);
+        if (!res || !res.ok || typeof res.blob !== "function") return "";
+        const blob = await res.blob();
+        if (!blob || blob.size === 0 || destroyed) return "";
+        const objUrl = URL.createObjectURL(blob);
+        createdObjectUrls.add(objUrl);
+        return objUrl;
+      })
+      .catch(() => "");
+    localImageUrlCache.set(key, req);
+    return req;
+  };
+
+  const mdCtx = {
+    onOpenPath: (target) => {
+      void openLocalPath(target);
+    },
+    loadLocalImage,
+  };
 
   const on = (el, evt, fn, opts) => {
     if (!el || typeof el.addEventListener !== "function") return;
@@ -826,7 +1362,10 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
       steps.length,
       lastStep?.type || "",
       lastStep?.id || "",
+      lastStep?.statusTag || "",
+      lastStep?.progressPct ?? "",
       lastStep?.text || "",
+      Array.isArray(lastStep?.images) ? lastStep.images.length : 0,
       Array.isArray(lastStep?.items) ? lastStep.items.length : 0,
     ].join("|");
 
@@ -872,15 +1411,78 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
         briefLabel.className = "mad-brief-label";
         briefLabel.textContent =
           step.label || (step.isFollowup ? "用户补充" : isMaster ? "用户布置任务" : "来自「主 Agent」派单");
-        const briefText = document.createElement("div");
-        briefText.textContent = step.text || "";
         brief.appendChild(briefLabel);
-        brief.appendChild(briefText);
+        if (step.text) {
+          const briefText = document.createElement("div");
+          briefText.textContent = step.text;
+          brief.appendChild(briefText);
+        }
+        if (Array.isArray(step.images) && step.images.length > 0) {
+          const imgRow = document.createElement("div");
+          imgRow.className = "mad-brief-images";
+          step.images.forEach((imgPath) => {
+            imgRow.appendChild(createLocalImagePreview(extractFileUriLabel(imgPath), imgPath, mdCtx));
+          });
+          brief.appendChild(imgRow);
+        }
         madTimelineEl.appendChild(brief);
       } else if (step.type === "msg") {
+        let statusTag = typeof step.statusTag === "string" ? step.statusTag.trim() : "";
+        let progressPct =
+          typeof step.progressPct === "number" && Number.isFinite(step.progressPct)
+            ? Math.max(0, Math.min(100, Math.round(step.progressPct)))
+            : null;
+        let bodyText = String(step.text || "");
+
+        // Backward-compatibility: strip legacy glued prefix `【摘要 · 55%】` into standalone spotlight card
+        const legacyPrefix = /^【([^】\r\n]+?)\s*[·|｜]\s*(\d{1,3})%】\s*/.exec(bodyText);
+        if (legacyPrefix) {
+          if (!statusTag) statusTag = legacyPrefix[1].trim();
+          if (progressPct === null) progressPct = Math.max(0, Math.min(100, Number(legacyPrefix[2]) || 0));
+          bodyText = bodyText.slice(legacyPrefix[0].length).trimStart();
+        }
+
         const p = document.createElement("div");
-        p.className = "mad-msg";
-        renderSafeMarkdown(p, step.text);
+        p.className = `mad-msg${statusTag || progressPct !== null ? " has-progress" : ""}`;
+
+        if (statusTag || progressPct !== null) {
+          const pctVal = progressPct !== null ? progressPct : 0;
+          const isComplete = pctVal >= 100;
+          const badge = document.createElement("div");
+          badge.className = `mad-progress-callout${isComplete ? " is-complete" : ""}`;
+
+          const dot = document.createElement("span");
+          dot.className = "mad-progress-dot";
+
+          const title = document.createElement("span");
+          title.className = "mad-progress-title";
+          title.textContent = statusTag || (isComplete ? "阶段完成" : "阶段推进");
+
+          const pctPill = document.createElement("span");
+          pctPill.className = "mad-progress-pct";
+          pctPill.textContent = `${pctVal}%`;
+
+          const bar = document.createElement("span");
+          bar.className = "mad-progress-bar";
+          const fill = document.createElement("span");
+          fill.className = "mad-progress-bar-fill";
+          fill.style.width = `${pctVal}%`;
+          bar.appendChild(fill);
+
+          badge.appendChild(dot);
+          badge.appendChild(title);
+          badge.appendChild(pctPill);
+          badge.appendChild(bar);
+          p.appendChild(badge);
+        }
+
+        if (bodyText.trim()) {
+          const body = document.createElement("div");
+          body.className = "mad-msg-body";
+          renderSafeMarkdown(body, bodyText, mdCtx);
+          p.appendChild(body);
+        }
+
         madTimelineEl.appendChild(p);
       } else if (step.type === "actions") {
         const groupKey = `${session.id}:${agent.id}:${step.id || idx}:${step.label}`;
@@ -918,8 +1520,12 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
         list.className = "mad-action-list";
 
         (step.items || []).forEach((item) => {
-          const row = document.createElement("div");
-          row.className = "mad-action-item";
+          const hasOpenableFile = Boolean(item.filePath && looksLikeLocalAbsPath(item.filePath));
+          const row = document.createElement(hasOpenableFile ? "button" : "div");
+          if (row.tagName === "BUTTON") {
+            row.type = "button";
+          }
+          row.className = `mad-action-item${hasOpenableFile ? " is-clickable" : ""}`;
 
           const glyph = document.createElement("span");
           glyph.className = "mad-item-glyph";
@@ -928,10 +1534,18 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
           const text = document.createElement("span");
           text.className = "mad-item-text";
           text.textContent = item.text || "";
-          text.title = item.text || "";
+          text.title = hasOpenableFile ? `点击打开所在目录：${item.filePath}` : item.text || "";
 
           row.appendChild(glyph);
           row.appendChild(text);
+
+          if (hasOpenableFile) {
+            row.addEventListener("click", (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void openLocalPath(item.filePath);
+            });
+          }
 
           if (item.add || item.del) {
             const diff = document.createElement("span");
@@ -1658,6 +2272,15 @@ export function createMasteryHub({ apiFetch, onToast } = {}) {
       resizeObserver?.disconnect?.();
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
+      localImageUrlCache.clear();
+      if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+        createdObjectUrls.forEach((u) => {
+          try {
+            URL.revokeObjectURL(u);
+          } catch {}
+        });
+      }
+      createdObjectUrls.clear();
     },
   };
 }

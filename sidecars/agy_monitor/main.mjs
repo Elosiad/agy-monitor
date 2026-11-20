@@ -27,7 +27,11 @@ import {
 } from './backend/backdrop_manager.mjs';
 import { createCdpThemeBridge, ensureCdpLauncher } from './backend/cdp_theme_bridge.mjs';
 import { buildFrontendBundle } from './backend/bundle_builder.mjs';
-import { buildMasterySnapshot } from './backend/mastery.mjs';
+import {
+  buildMasterySnapshot,
+  openLocalPathTarget,
+  resolveLocalTargetPath,
+} from './backend/mastery.mjs';
 import {
   createMasterySummarizer,
   fetchThirdPartyModels,
@@ -1112,6 +1116,57 @@ export function createMonitorHandlers({
       };
     });
     return { ok: true, sessionId, agentConvId, markSessionRead };
+  });
+
+  register('POST', '/api/mastery/open-path', async (data = {}) => {
+    const rawTarget =
+      typeof data.targetPath === 'string'
+        ? data.targetPath
+        : typeof data.path === 'string'
+          ? data.path
+          : '';
+    const result = await openLocalPathTarget(rawTarget);
+    if (!result.ok) {
+      return errorResponse(ResponseCtor, result.status || 400, result.error || '打开目录失败');
+    }
+    return result;
+  });
+
+  register('GET', '/api/mastery/local-image', async (data = {}) => {
+    const rawTarget = typeof data.path === 'string' ? data.path : '';
+    const resolved = resolveLocalTargetPath(rawTarget);
+    if (!resolved) {
+      return errorResponse(ResponseCtor, 400, '无效的图片路径');
+    }
+    const ext = path.extname(resolved).toLowerCase();
+    const isBmp = ext === '.bmp';
+    if (!ALLOWED_RASTER_EXT_MIME.has(ext) && !isBmp) {
+      return errorResponse(ResponseCtor, 403, '仅允许预览常见位图图片格式');
+    }
+    try {
+      const st = await fsp.stat(resolved);
+      if (!st.isFile() || st.size <= 0 || st.size > 15 * 1024 * 1024) {
+        return errorResponse(ResponseCtor, 404, '图片文件不存在或超出预览大小限制');
+      }
+      const buf = await fsp.readFile(resolved);
+      let mime = detectRasterMagic(buf);
+      if (!mime && isBmp && buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) {
+        mime = 'image/bmp';
+      }
+      if (!mime) {
+        return errorResponse(ResponseCtor, 415, '文件内容不是有效的位图图片');
+      }
+      return makeResponse(ResponseCtor, buf, {
+        status: 200,
+        contentType: mime,
+        headers: {
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'private, max-age=60',
+        },
+      });
+    } catch {
+      return errorResponse(ResponseCtor, 404, '图片文件不存在或无法读取');
+    }
   });
 
   register('POST', '/api/mastery/config', async (data = {}) => {

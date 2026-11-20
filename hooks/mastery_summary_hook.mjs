@@ -112,8 +112,8 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
   let instruction = '';
   if (isNewUserTask) {
     instruction =
-      '【AGY掌握·开场汇报】在你开始调用工具执行命令前，请先在回复最开头用1行**纯简体中文**输出：' +
-      '`[AGY_PROGRESS|10%|<10字以内纯中文、五岁孩童能懂的状态>]` 后紧跟约30字纯中文大白话，' +
+      '【AGY掌握·开场汇报】在你开始调用工具执行命令前，请先在回复最开头单独输出1行**纯简体中文**：' +
+      '`[AGY_PROGRESS|10%|<10字以内纯中文、五岁孩童能懂的状态>]`，然后**必须在标签后空一行（双换行）**再写约30字纯中文大白话汇报正文，' +
       '说明你对用户任务的理解以及接下来第一步打算做什么（严禁使用英文句子）；然后**本轮立刻继续调用工具，不要停下来等用户**。';
     state.convs[convId] = {
       lastInputHash: inputHash || prev.lastInputHash || '',
@@ -125,9 +125,9 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
     const elapsed = nowMs - Number(prev.lastPromptAtMs || 0);
     if (elapsed >= freqMs) {
       instruction =
-        '【AGY掌握·阶段总结】请在本次继续调工具前顺带用**纯简体中文**输出1行：' +
-        '`[AGY_PROGRESS|<0-100整数>%|<10字以内纯中文、给五岁孩童都能看懂的当前进度总结>]` ' +
-        '（例如 `[AGY_PROGRESS|60%|修好报错准备复测]`），可附1句简短中文进展（严禁使用英文句子）；' +
+        '【AGY掌握·阶段总结】请在本次继续调工具前顺带单独输出1行**纯简体中文**：' +
+        '`[AGY_PROGRESS|<0-100整数>%|<10字以内纯中文、给五岁孩童都能看懂的当前进度总结>]`' +
+        '（例如 `[AGY_PROGRESS|60%|修好报错准备复测]`）；如需附1句简短中文进展，**必须在标签后空一行（双换行）**与汇报正文分隔开（严禁使用英文句子）；' +
         '**同一步直接继续调用工具，不要停顿等用户**。';
       state.convs[convId] = {
         lastInputHash: inputHash || prev.lastInputHash || '',
