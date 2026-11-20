@@ -112,7 +112,6 @@ npm run pack
 - **绝不修改** Antigravity 安装目录、`app.asar` 或宿主 `~/.gemini/config/config.json`。
 - 所有本地会话与数据库均以只读方式读取，所有第三方 API Key 仅保存在本机 `plugin_data` 目录，绝不上传或外传。
 
-## License
+## 社区支持
 
-[MIT](./LICENSE)
-友情链接：<a href="Linux.do">LinuxDo</a>
+https://linux.do
