@@ -1130,15 +1130,17 @@ export function createMonitorHandlers({
         : typeof data.path === 'string'
           ? data.path
           : '';
-    const result = await openLocalPathTarget(rawTarget);
+    const mode = data.mode === 'file' ? 'file' : 'folder';
+    const result = await openLocalPathTarget(rawTarget, { mode });
     if (!result.ok) {
-      return errorResponse(ResponseCtor, result.status || 400, result.error || '打开目录失败');
+      return errorResponse(ResponseCtor, result.status || 400, result.error || '打开路径失败');
     }
     return result;
   });
 
   register('GET', '/api/mastery/local-image', async (data = {}) => {
     const rawTarget = typeof data.path === 'string' ? data.path : '';
+    const format = typeof data.format === 'string' ? data.format.trim().toLowerCase() : '';
     const resolved = resolveLocalTargetPath(rawTarget);
     if (!resolved) {
       return errorResponse(ResponseCtor, 400, '无效的图片路径');
@@ -1149,17 +1151,25 @@ export function createMonitorHandlers({
       return errorResponse(ResponseCtor, 403, '仅允许预览常见位图图片格式');
     }
     try {
-      const st = await fsp.stat(resolved);
+      const st = await fs.stat(resolved);
       if (!st.isFile() || st.size <= 0 || st.size > 15 * 1024 * 1024) {
         return errorResponse(ResponseCtor, 404, '图片文件不存在或超出预览大小限制');
       }
-      const buf = await fsp.readFile(resolved);
+      const buf = await fs.readFile(resolved);
       let mime = detectRasterMagic(buf);
       if (!mime && isBmp && buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) {
         mime = 'image/bmp';
       }
       if (!mime) {
         return errorResponse(ResponseCtor, 415, '文件内容不是有效的位图图片');
+      }
+      if (format === 'json') {
+        return {
+          ok: true,
+          mime,
+          size: buf.length,
+          dataUrl: `data:${mime};base64,${buf.toString('base64')}`,
+        };
       }
       return makeResponse(ResponseCtor, buf, {
         status: 200,

@@ -1320,13 +1320,14 @@ export function resolveLocalTargetPath(rawInput, { platform = process.platform }
  */
 export async function openLocalPathTarget(
   rawInput,
-  { platform = process.platform, fsImpl = fsp, spawnImpl = spawn } = {},
+  { mode = 'folder', platform = process.platform, fsImpl = fsp, spawnImpl = spawn } = {},
 ) {
   const resolved = resolveLocalTargetPath(rawInput, { platform });
   if (!resolved) {
     return { ok: false, status: 400, error: '无效的本地文件或目录路径' };
   }
 
+  const openMode = mode === 'file' ? 'file' : 'folder';
   const pathApi = platform === 'win32' || /^[a-zA-Z]:[\\/]/.test(resolved) ? path.win32 : path.posix;
   let kind = 'missing';
   let stat = null;
@@ -1335,6 +1336,37 @@ export async function openLocalPathTarget(
     kind = stat.isDirectory() ? 'directory' : 'file';
   } catch {
     kind = 'missing';
+  }
+
+  // Direct file open mode (e.g. clicking "打开文件" in image preview lightbox)
+  if (openMode === 'file' && kind === 'file') {
+    try {
+      let child = null;
+      if (platform === 'win32') {
+        child = spawnImpl('rundll32.exe', ['url.dll,FileProtocolHandler', resolved], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+      } else if (platform === 'darwin') {
+        child = spawnImpl('open', [resolved], { detached: true, stdio: 'ignore' });
+      } else {
+        child = spawnImpl('xdg-open', [resolved], { detached: true, stdio: 'ignore' });
+      }
+      child?.unref?.();
+      return {
+        ok: true,
+        kind: 'file_open',
+        targetPath: resolved,
+        openedPath: resolved,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 500,
+        error: err?.message || '打开目标文件失败',
+      };
+    }
   }
 
   let openDir = '';

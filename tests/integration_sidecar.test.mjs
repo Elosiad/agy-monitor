@@ -565,6 +565,25 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
   const langRes = await (await jsonPost('/api/language', { language: 'en' })).json();
   assert.equal(langRes.ok, true);
 
+  // 8. Mastery local-image preview endpoint (JSON dataUrl + raster-only guard)
+  const sampleImgPath = path.join(root, 'preview_test.png');
+  fs.writeFileSync(sampleImgPath, fullPngBuf);
+  const localImgRes = await fetch(
+    base + `/api/mastery/local-image?format=json&path=${encodeURIComponent(sampleImgPath)}`,
+    { headers: { 'X-Sidecar-Token': sidecarToken } },
+  );
+  assert.equal(localImgRes.status, 200);
+  const localImgData = await localImgRes.json();
+  assert.equal(localImgData.ok, true);
+  assert.equal(localImgData.mime, 'image/png');
+  assert.equal(localImgData.dataUrl, `data:image/png;base64,${fullPngBuf.toString('base64')}`);
+
+  const blockedNonImg = await fetch(
+    base + `/api/mastery/local-image?format=json&path=${encodeURIComponent(path.join(cfgDir, 'config.json'))}`,
+    { headers: { 'X-Sidecar-Token': sidecarToken } },
+  );
+  assert.equal(blockedNonImg.status, 403);
+
   // Confirm ZERO host_injector.js, ZERO config.json modification, ZERO .pbtxt modification
   assert.equal(fs.existsSync(path.join(handle.paths.pluginDataDir, 'host_injector.js')), false);
   assert.equal(fs.readFileSync(path.join(cfgDir, 'config.json'), 'utf8'), hostCfgRaw);

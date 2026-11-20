@@ -283,7 +283,7 @@ function createLocalImagePreview(label, rawTarget, ctx) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "mad-md-img-card";
-  btn.title = ctx?.onOpenPath ? `点击打开所在目录：${displayPath}` : displayPath;
+  btn.title = `点击预览大图：${displayPath}`;
 
   const img = document.createElement("img");
   img.className = "mad-md-img-el";
@@ -298,19 +298,23 @@ function createLocalImagePreview(label, rawTarget, ctx) {
   nameSpan.textContent = cleanLabel;
   const hintSpan = document.createElement("span");
   hintSpan.className = "mad-md-img-hint";
-  hintSpan.textContent = "点击打开目录";
+  hintSpan.textContent = "点击放大预览";
   foot.appendChild(nameSpan);
   foot.appendChild(hintSpan);
 
   btn.appendChild(img);
   btn.appendChild(foot);
-  if (ctx?.onOpenPath) {
-    btn.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
+
+  let loadedUrl = "";
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof ctx?.onPreviewImage === "function" && loadedUrl) {
+      ctx.onPreviewImage({ url: loadedUrl, targetPath: rawTarget, label: cleanLabel });
+    } else if (ctx?.onOpenPath) {
       ctx.onOpenPath(rawTarget);
-    });
-  }
+    }
+  });
 
   wrap.appendChild(btn);
 
@@ -324,6 +328,7 @@ function createLocalImagePreview(label, rawTarget, ctx) {
   Promise.resolve(ctx.loadLocalImage(rawTarget))
     .then((url) => {
       if (url) {
+        loadedUrl = url;
         img.src = url;
       } else {
         fallbackToChip();
@@ -1042,30 +1047,32 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     onToast?.(`已跳转到会话：${title}`, "success");
   };
 
-  const openLocalPath = async (rawTarget) => {
+  const openLocalPath = async (rawTarget, { mode = "folder" } = {}) => {
     if (!rawTarget || typeof apiFetch !== "function") return;
     try {
       const res = await callJson(apiFetch, "/api/mastery/open-path", {
         method: "POST",
-        body: JSON.stringify({ targetPath: String(rawTarget) }),
+        body: JSON.stringify({ targetPath: String(rawTarget), mode: mode === "file" ? "file" : "folder" }),
       });
       if (res?.openedPath) {
         const prefix =
-          res.kind === "directory"
-            ? "已进入目录："
-            : res.kind === "parent_fallback"
-              ? "原路径已移除，已打开上级目录："
-              : "已打开所在目录：";
+          res.kind === "file_open"
+            ? "已打开文件："
+            : res.kind === "directory"
+              ? "已进入目录："
+              : res.kind === "parent_fallback"
+                ? "原路径已移除，已打开上级目录："
+                : "已打开所在位置：";
         onToast?.(`${prefix}${res.openedPath}`, "success");
       }
     } catch (err) {
-      onToast?.(err?.message || "无法打开目标目录", "error");
+      onToast?.(err?.message || (mode === "file" ? "无法打开目标文件" : "无法打开目标目录"), "error");
     }
   };
 
   const loadLocalImage = (rawTarget) => {
     const key = String(rawTarget || "").trim();
-    if (!key || typeof apiFetch !== "function" || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
+    if (!key || typeof apiFetch !== "function") {
       return Promise.resolve("");
     }
     if (localImageUrlCache.has(key)) {
@@ -1088,22 +1095,107 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     }
     const req = Promise.resolve()
       .then(async () => {
-        const res = await apiFetch(`/api/mastery/local-image?path=${encodeURIComponent(key)}`);
-        if (!res || !res.ok || typeof res.blob !== "function") return "";
-        const blob = await res.blob();
-        if (!blob || blob.size === 0 || destroyed) return "";
-        const objUrl = URL.createObjectURL(blob);
-        createdObjectUrls.add(objUrl);
-        return objUrl;
+        // Use JSON dataUrl mode so both Electron window.sidecar.fetch IPC and standard HTTP fetch work identically
+        const res = await apiFetch(
+          `/api/mastery/local-image?format=json&path=${encodeURIComponent(key)}`
+        );
+        if (!res || !res.ok) return "";
+        if (typeof res.json === "function") {
+          const data = await res.json().catch(() => null);
+          if (data && typeof data.dataUrl === "string" && data.dataUrl.startsWith("data:image/")) {
+            return data.dataUrl;
+          }
+        }
+        if (typeof res.blob === "function" && typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+          const blob = await res.blob();
+          if (!blob || blob.size === 0 || destroyed) return "";
+          const objUrl = URL.createObjectURL(blob);
+          createdObjectUrls.add(objUrl);
+          return objUrl;
+        }
+        return "";
       })
       .catch(() => "");
     localImageUrlCache.set(key, req);
     return req;
   };
 
+  // ========== Image Lightbox Preview Modal (Zoom + Pan + Open File / Open Folder) ==========
+  const lightboxBackdrop = document.getElementById("madImageLightbox");
+  const lightboxCloseBtn = document.getElementById("madLightboxCloseBtn");
+  const lightboxStage = document.getElementById("madLightboxStage");
+  const lightboxImg = document.getElementById("madLightboxImg");
+  const lightboxName = document.getElementById("madLightboxName");
+  const lightboxZoomOutBtn = document.getElementById("madLightboxZoomOutBtn");
+  const lightboxZoomResetBtn = document.getElementById("madLightboxZoomResetBtn");
+  const lightboxZoomInBtn = document.getElementById("madLightboxZoomInBtn");
+  const lightboxOpenFileBtn = document.getElementById("madLightboxOpenFileBtn");
+  const lightboxOpenFolderBtn = document.getElementById("madLightboxOpenFolderBtn");
+
+  let lightboxTargetPath = "";
+  let lightboxScale = 1;
+  let lightboxTx = 0;
+  let lightboxTy = 0;
+  let lightboxDragging = false;
+  let lightboxDragStartX = 0;
+  let lightboxDragStartY = 0;
+  let lightboxDragOriginTx = 0;
+  let lightboxDragOriginTy = 0;
+
+  const applyLightboxTransform = () => {
+    if (!lightboxImg) return;
+    lightboxImg.style.transform = `translate3d(${lightboxTx.toFixed(1)}px, ${lightboxTy.toFixed(1)}px, 0) scale(${lightboxScale.toFixed(3)})`;
+    lightboxImg.classList.toggle("is-zoomed", lightboxScale > 1.02);
+    if (lightboxZoomResetBtn) {
+      lightboxZoomResetBtn.textContent = `${Math.round(lightboxScale * 100)}%`;
+    }
+  };
+
+  const setLightboxZoom = (nextScale) => {
+    lightboxScale = Math.max(0.25, Math.min(5, Number(nextScale) || 1));
+    if (lightboxScale <= 1.02) {
+      lightboxTx = 0;
+      lightboxTy = 0;
+    }
+    applyLightboxTransform();
+  };
+
+  const openImageLightbox = ({ url, targetPath, label } = {}) => {
+    if (!lightboxBackdrop || !lightboxImg || !url) {
+      if (targetPath) void openLocalPath(targetPath, { mode: "folder" });
+      return;
+    }
+    lightboxTargetPath = String(targetPath || "");
+    lightboxScale = 1;
+    lightboxTx = 0;
+    lightboxTy = 0;
+    lightboxDragging = false;
+    lightboxImg.classList.remove("is-dragging");
+    lightboxImg.src = url;
+    lightboxImg.alt = label || "";
+    if (lightboxName) {
+      lightboxName.textContent = label || extractFileUriLabel(lightboxTargetPath);
+      lightboxName.title = decodeDisplayUrl(lightboxTargetPath);
+    }
+    applyLightboxTransform();
+    lightboxBackdrop.hidden = false;
+  };
+
+  const closeImageLightbox = () => {
+    if (!lightboxBackdrop || lightboxBackdrop.hidden) return;
+    lightboxBackdrop.hidden = true;
+    lightboxDragging = false;
+    lightboxImg?.classList.remove("is-dragging");
+    if (lightboxImg) lightboxImg.src = "";
+    lightboxTargetPath = "";
+  };
+
   const mdCtx = {
     onOpenPath: (target) => {
-      void openLocalPath(target);
+      void openLocalPath(target, { mode: "folder" });
+    },
+    onPreviewImage: (info) => {
+      openImageLightbox(info);
     },
     loadLocalImage,
   };
@@ -2102,7 +2194,10 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     "keydown",
     (e) => {
       if (e.key !== "Escape") return;
-      if (modalBackdrop && !modalBackdrop.hidden) {
+      if (lightboxBackdrop && !lightboxBackdrop.hidden) {
+        e.stopImmediatePropagation?.();
+        closeImageLightbox();
+      } else if (modalBackdrop && !modalBackdrop.hidden) {
         e.stopImmediatePropagation?.();
         closeThirdPartyModal();
       } else if (detailViewEl && !detailViewEl.hidden) {
@@ -2111,6 +2206,62 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     },
     true
   );
+
+  // Lightbox zoom, pan, close, open-file & open-folder controls
+  on(lightboxCloseBtn, "click", closeImageLightbox);
+  on(lightboxBackdrop, "click", (e) => {
+    if (e.target === lightboxBackdrop || e.target === lightboxStage) {
+      closeImageLightbox();
+    }
+  });
+  on(lightboxZoomOutBtn, "click", () => setLightboxZoom(lightboxScale / 1.25));
+  on(lightboxZoomInBtn, "click", () => setLightboxZoom(lightboxScale * 1.25));
+  on(lightboxZoomResetBtn, "click", () => setLightboxZoom(1));
+  on(lightboxImg, "dblclick", (e) => {
+    e.preventDefault();
+    setLightboxZoom(lightboxScale > 1.1 ? 1 : 2);
+  });
+  on(
+    lightboxStage,
+    "wheel",
+    (e) => {
+      if (!lightboxBackdrop || lightboxBackdrop.hidden) return;
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.16 : 1 / 1.16;
+      setLightboxZoom(lightboxScale * factor);
+    },
+    { passive: false }
+  );
+  on(lightboxImg, "pointerdown", (e) => {
+    if (e.button !== 0 || lightboxScale <= 1.02) return;
+    e.preventDefault();
+    lightboxDragging = true;
+    lightboxDragStartX = e.clientX;
+    lightboxDragStartY = e.clientY;
+    lightboxDragOriginTx = lightboxTx;
+    lightboxDragOriginTy = lightboxTy;
+    lightboxImg.classList.add("is-dragging");
+    lightboxImg.setPointerCapture?.(e.pointerId);
+  });
+  on(lightboxImg, "pointermove", (e) => {
+    if (!lightboxDragging) return;
+    lightboxTx = lightboxDragOriginTx + (e.clientX - lightboxDragStartX);
+    lightboxTy = lightboxDragOriginTy + (e.clientY - lightboxDragStartY);
+    applyLightboxTransform();
+  });
+  const endLightboxDrag = () => {
+    if (!lightboxDragging) return;
+    lightboxDragging = false;
+    lightboxImg?.classList.remove("is-dragging");
+  };
+  on(lightboxImg, "pointerup", endLightboxDrag);
+  on(lightboxImg, "pointercancel", endLightboxDrag);
+  on(lightboxOpenFileBtn, "click", () => {
+    if (lightboxTargetPath) void openLocalPath(lightboxTargetPath, { mode: "file" });
+  });
+  on(lightboxOpenFolderBtn, "click", () => {
+    if (lightboxTargetPath) void openLocalPath(lightboxTargetPath, { mode: "folder" });
+  });
 
   on(msmEnableToggle, "change", () => {
     const nextEnabled = Boolean(msmEnableToggle.checked);

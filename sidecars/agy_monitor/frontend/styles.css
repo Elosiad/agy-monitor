@@ -4734,12 +4734,12 @@ html[lang="en"] .prompt-selector-row {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  max-width: min(100%, 360px);
-  padding: 6px;
+  max-width: min(100%, 340px);
+  padding: 5px;
   border-radius: 9px;
   background: var(--bg-control);
   border: 1px solid var(--border-subtle);
-  cursor: pointer;
+  cursor: zoom-in;
   text-align: left;
   transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
@@ -4753,12 +4753,195 @@ html[lang="en"] .prompt-selector-row {
 .mad-md-img-el {
   display: block;
   max-width: 100%;
-  max-height: 220px;
+  max-height: 200px;
+  min-height: 44px;
   width: auto;
   height: auto;
   object-fit: contain;
   border-radius: 6px;
   background: var(--bg-canvas);
+}
+
+/* 掌握页图片放大预览弹窗（仿原生全屏暗化浮层 + 底部悬浮胶囊栏） */
+.mad-lightbox-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  background: color-mix(in srgb, var(--bg-canvas) 82%, transparent);
+  backdrop-filter: blur(12px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 18px 24px;
+  gap: 14px;
+  animation: madFadeIn 0.14s ease;
+}
+
+.mad-lightbox-backdrop[hidden] {
+  display: none;
+}
+
+.mad-lightbox-close {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 2;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-elevated) 86%, transparent);
+  color: var(--text-secondary);
+  font-size: 17px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.mad-lightbox-close:hover {
+  background: var(--bg-control-hover);
+  border-color: var(--border-focus);
+  color: var(--text-strong);
+}
+
+.mad-lightbox-stage {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  user-select: none;
+}
+
+.mad-lightbox-img {
+  max-width: 92%;
+  max-height: calc(100vh - 118px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 10px;
+  box-shadow: var(--shadow-elevated);
+  transform-origin: center center;
+  transition: transform 0.08s ease-out;
+  cursor: zoom-in;
+}
+
+.mad-lightbox-img.is-zoomed {
+  cursor: grab;
+}
+
+.mad-lightbox-img.is-dragging {
+  cursor: grabbing;
+  transition: none;
+}
+
+.mad-lightbox-bar {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  max-width: min(96%, 640px);
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-soft);
+  flex-shrink: 0;
+}
+
+.mad-lightbox-name {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Microsoft YaHei UI", monospace;
+}
+
+.mad-lightbox-zoom {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--bg-control);
+  border: 1px solid var(--border-hairline);
+}
+
+.mad-lightbox-zbtn,
+.mad-lightbox-zpct {
+  height: 22px;
+  border-radius: 6px;
+  color: var(--text-body);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.mad-lightbox-zbtn {
+  width: 22px;
+  font-weight: 600;
+}
+
+.mad-lightbox-zpct {
+  min-width: 40px;
+  padding: 0 5px;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.mad-lightbox-zbtn:hover,
+.mad-lightbox-zpct:hover {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+}
+
+.mad-lightbox-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mad-lightbox-act-btn {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-control);
+  color: var(--text-body);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.mad-lightbox-act-btn:hover {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+}
+
+.mad-lightbox-act-btn.is-primary {
+  background: color-mix(in srgb, var(--mastery-unread) 24%, var(--bg-control));
+  border-color: color-mix(in srgb, var(--mastery-unread) 52%, transparent);
+  color: var(--mastery-unread-bright);
+  font-weight: 600;
+}
+
+.mad-lightbox-act-btn.is-primary:hover {
+  background: color-mix(in srgb, var(--mastery-unread) 34%, var(--bg-control));
+  color: var(--text-strong);
 }
 
 .mad-md-img-foot {

@@ -932,6 +932,26 @@
       </div>
     </div>
 
+    <!-- 掌握页：图片放大预览弹窗（支持滚轮/按钮缩放、拖拽平移、打开文件、打开所在位置） -->
+    <div class="mad-lightbox-backdrop" id="madImageLightbox" role="dialog" aria-modal="true" aria-label="图片放大预览" hidden>
+      <button type="button" class="mad-lightbox-close" id="madLightboxCloseBtn" title="关闭预览 (Esc)" aria-label="关闭预览">×</button>
+      <div class="mad-lightbox-stage" id="madLightboxStage">
+        <img class="mad-lightbox-img" id="madLightboxImg" alt="" draggable="false" />
+      </div>
+      <div class="mad-lightbox-bar" id="madLightboxBar">
+        <span class="mad-lightbox-name" id="madLightboxName"></span>
+        <div class="mad-lightbox-zoom" aria-label="缩放控制">
+          <button type="button" class="mad-lightbox-zbtn" id="madLightboxZoomOutBtn" title="缩小" aria-label="缩小">−</button>
+          <button type="button" class="mad-lightbox-zpct" id="madLightboxZoomResetBtn" title="还原 100%">100%</button>
+          <button type="button" class="mad-lightbox-zbtn" id="madLightboxZoomInBtn" title="放大" aria-label="放大">+</button>
+        </div>
+        <div class="mad-lightbox-actions">
+          <button type="button" class="mad-lightbox-act-btn" id="madLightboxOpenFileBtn" title="使用系统默认程序打开图片文件">打开文件</button>
+          <button type="button" class="mad-lightbox-act-btn is-primary" id="madLightboxOpenFolderBtn" title="在文件管理器中定位并选中该文件">打开所在位置 ↗</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 全局轻提示 -->
     <div class="toast-banner" id="toastBanner" role="status" aria-live="polite" hidden></div>
   </div>

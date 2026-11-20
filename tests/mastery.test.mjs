@@ -420,6 +420,14 @@ test('openLocalPathTarget enters directories, opens parent dir for files, extrac
   assert.equal(calls[1].cmd, 'explorer.exe');
   assert.equal(calls[1].args[0], `/select,"${path.win32.resolve(sampleFile)}"`);
 
+  // Direct open-file mode (from lightbox "打开文件")
+  const directOpenRes = await openLocalPathTarget(samplePng, { mode: 'file', platform: 'win32', spawnImpl: fakeSpawn });
+  assert.equal(directOpenRes.ok, true);
+  assert.equal(directOpenRes.kind, 'file_open');
+  assert.equal(directOpenRes.openedPath, path.win32.resolve(samplePng));
+  assert.equal(calls[2].cmd, 'rundll32.exe');
+  assert.deepEqual(calls[2].args, ['url.dll,FileProtocolHandler', path.win32.resolve(samplePng)]);
+
   // Deleted target -> falls back to nearest existing parent directory
   const missingChild = path.join(subDir, 'deleted-cache', 'temp.bin');
   const fallbackRes = await openLocalPathTarget(missingChild, { platform: 'win32', spawnImpl: fakeSpawn });
