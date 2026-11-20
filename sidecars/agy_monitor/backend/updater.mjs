@@ -1,0 +1,509 @@
+/**
+ * Safe GitHub update checker & one-click in-place updater for AGY Console (agy-monitor).
+ *
+ * - Strictly allowlisted to the official repository (zero arbitrary URL downloads).
+ * - Zero npm dependencies (uses Node.js >= 22.5 built-in fetch + OS archive tools with shell: false).
+ * - Preserves all user settings (plugin_data/agy-monitor/*.json) and rules/AGENTS.md.
+ * - Single-flight update lock prevents concurrent overwrite races.
+ */
+
+import { execFile, spawn } from 'node:child_process';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { ensureBackdropAssets } from './backdrop_manager.mjs';
+import { atomicWriteJson } from './paths.mjs';
+
+export const REPO_OWNER = 'aishadiaodeqishui';
+export const REPO_NAME = 'agy-monitor';
+export const REPO_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}`;
+const GITHUB_COMMIT_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/commits/main`;
+const GITHUB_RELEASE_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`;
+const GITHUB_ARCHIVE_ZIP_URL = `https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/zip/refs/heads/main`;
+
+const CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
+const MIN_ARCHIVE_BYTES = 10 * 1024;
+const MAX_ARCHIVE_BYTES = 30 * 1024 * 1024;
+
+const ROOT_FILES = ['plugin.json', 'package.json', 'hooks.json', 'README.md'];
+const MIRROR_DIRS = ['assets', 'sidecars', 'hooks'];
+const REQUIRED_CORE_FILES = [
+  'plugin.json',
+  'hooks.json',
+  'hooks/mastery_summary_hook.mjs',
+  'sidecars/agy_monitor/sidecar.json',
+  'sidecars/agy_monitor/main.mjs',
+];
+
+const checkCache = new Map();
+let updateInFlight = null;
+
+function execFileAsync(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { windowsHide: true, ...options }, (err, stdout, stderr) => {
+      if (err) {
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+export function compareSemver(a, b) {
+  const parse = (v) =>
+    String(v || '0.0.0')
+      .trim()
+      .replace(/^v/i, '')
+      .split('-')[0]
+      .split('.')
+      .map((n) => parseInt(n, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < 3; i += 1) {
+    const diff = (pa[i] || 0) - (pb[i] || 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+function readJsonSyncSafe(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function readLocalInstallState(paths) {
+  const pluginRoot = paths?.pluginRoot || '';
+  const pluginDataDir = paths?.pluginDataDir || '';
+
+  const manifest = pluginRoot ? readJsonSyncSafe(path.join(pluginRoot, 'plugin.json')) : null;
+  const currentVersion =
+    typeof manifest?.version === 'string' && manifest.version.trim()
+      ? manifest.version.trim().replace(/^v/i, '')
+      : '1.0.0';
+
+  const metaPath = pluginDataDir ? path.join(pluginDataDir, 'install_meta.json') : '';
+  const meta = metaPath ? readJsonSyncSafe(metaPath) : null;
+  const localFullSha =
+    typeof meta?.commitSha === 'string' && /^[0-9a-f]{7,40}$/i.test(meta.commitSha.trim())
+      ? meta.commitSha.trim().toLowerCase()
+      : '';
+
+  let localNewestMtimeMs = Number(meta?.updatedAtMs || 0);
+  if (pluginRoot) {
+    const probes = [
+      path.join(pluginRoot, 'plugin.json'),
+      path.join(pluginRoot, 'sidecars', 'agy_monitor', 'main.mjs'),
+      path.join(pluginRoot, 'sidecars', 'agy_monitor', 'frontend', 'components', 'mastery_hub.js'),
+      path.join(pluginRoot, 'sidecars', 'agy_monitor', 'backdrop', 'AgyBackdrop.cs'),
+    ];
+    for (const p of probes) {
+      try {
+        const st = fs.statSync(p);
+        if (st.mtimeMs > localNewestMtimeMs) localNewestMtimeMs = st.mtimeMs;
+      } catch {
+        // ignore missing probe file
+      }
+    }
+  }
+
+  return {
+    currentVersion,
+    localFullSha,
+    localSha: localFullSha ? localFullSha.slice(0, 7) : '',
+    localNewestMtimeMs,
+    metaPath,
+  };
+}
+
+function mirrorDirectoryInPlace(srcDir, destDir) {
+  const srcExists = fs.existsSync(srcDir);
+  const destStat = fs.lstatSync(destDir, { throwIfNoEntry: false });
+  if (!srcExists) {
+    if (destStat) {
+      fs.rmSync(destDir, { recursive: true, force: true });
+    }
+    return;
+  }
+  if (destStat && !destStat.isDirectory()) {
+    fs.unlinkSync(destDir);
+  }
+  fs.mkdirSync(destDir, { recursive: true });
+
+  const srcEntries = fs.readdirSync(srcDir, { withFileTypes: true });
+  const srcNames = new Set(srcEntries.map((e) => e.name));
+
+  for (const destEntry of fs.readdirSync(destDir, { withFileTypes: true })) {
+    if (!srcNames.has(destEntry.name)) {
+      fs.rmSync(path.join(destDir, destEntry.name), { recursive: true, force: true });
+    }
+  }
+
+  for (const srcEntry of srcEntries) {
+    const srcChild = path.join(srcDir, srcEntry.name);
+    const destChild = path.join(destDir, srcEntry.name);
+    if (srcEntry.isDirectory()) {
+      mirrorDirectoryInPlace(srcChild, destChild);
+    } else {
+      const destChildStat = fs.lstatSync(destChild, { throwIfNoEntry: false });
+      if (destChildStat && destChildStat.isDirectory()) {
+        fs.rmSync(destChild, { recursive: true, force: true });
+      }
+      fs.copyFileSync(srcChild, destChild);
+    }
+  }
+}
+
+async function fetchJsonWithTimeout(fetchImpl, url, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'agy-monitor-updater',
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, data: null };
+    }
+    const data = await res.json();
+    return { ok: true, status: res.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Check GitHub main branch & latest release against local installed state.
+ */
+export async function checkForUpdates(
+  paths,
+  { force = false, fetchImpl = globalThis.fetch, nowMs = Date.now() } = {},
+) {
+  const cacheKey = paths?.pluginRoot || 'default';
+  const cached = checkCache.get(cacheKey);
+  if (!force && cached && nowMs - cached.checkedAtMs < CHECK_CACHE_TTL_MS) {
+    return { ...cached, cached: true };
+  }
+
+  const local = readLocalInstallState(paths);
+  if (typeof fetchImpl !== 'function') {
+    return {
+      ok: false,
+      repoUrl: REPO_URL,
+      currentVersion: local.currentVersion,
+      localSha: local.localSha,
+      hasUpdate: false,
+      error: '当前运行环境不支持网络检测',
+      checkedAtMs: nowMs,
+    };
+  }
+
+  try {
+    const [commitRes, releaseRes] = await Promise.all([
+      fetchJsonWithTimeout(fetchImpl, GITHUB_COMMIT_API, 7000),
+      fetchJsonWithTimeout(fetchImpl, GITHUB_RELEASE_API, 6000).catch(() => ({ ok: false, data: null })),
+    ]);
+
+    if (!commitRes.ok || !commitRes.data?.sha) {
+      const rateLimited = commitRes.status === 403 || commitRes.status === 429;
+      return {
+        ok: false,
+        repoUrl: REPO_URL,
+        currentVersion: local.currentVersion,
+        localSha: local.localSha,
+        hasUpdate: false,
+        error: rateLimited ? 'GitHub 接口限流，请稍后再试' : '无法获取远程版本信息',
+        checkedAtMs: nowMs,
+      };
+    }
+
+    const remoteFullSha = String(commitRes.data.sha || '').trim().toLowerCase();
+    const remoteSha = remoteFullSha.slice(0, 7);
+    const remoteDate = String(
+      commitRes.data?.commit?.committer?.date || commitRes.data?.commit?.author?.date || '',
+    );
+    const remoteDateMs = Date.parse(remoteDate) || 0;
+    const rawMsg = String(commitRes.data?.commit?.message || '').trim();
+    const remoteMessage = rawMsg.split(/\r?\n/)[0].slice(0, 120);
+
+    const releaseTag =
+      releaseRes?.ok && typeof releaseRes.data?.tag_name === 'string'
+        ? releaseRes.data.tag_name.trim().replace(/^v/i, '')
+        : '';
+    const remoteVersion = releaseTag || local.currentVersion;
+
+    const semverNewer = Boolean(releaseTag && compareSemver(releaseTag, local.currentVersion) > 0);
+    let commitNewer = false;
+    if (local.localFullSha) {
+      commitNewer =
+        remoteFullSha.length >= 7 &&
+        !remoteFullSha.startsWith(local.localFullSha) &&
+        !local.localFullSha.startsWith(remoteFullSha);
+    } else if (remoteDateMs > 0 && local.localNewestMtimeMs > 0) {
+      commitNewer = remoteDateMs > local.localNewestMtimeMs + 120_000;
+    }
+
+    const hasUpdate = Boolean(semverNewer || commitNewer);
+    const payload = {
+      ok: true,
+      repoUrl: REPO_URL,
+      currentVersion: local.currentVersion,
+      localSha: local.localSha,
+      remoteVersion,
+      remoteSha,
+      remoteFullSha,
+      remoteDate,
+      remoteMessage,
+      hasUpdate,
+      checkedAtMs: nowMs,
+    };
+    checkCache.set(cacheKey, payload);
+    return payload;
+  } catch (err) {
+    return {
+      ok: false,
+      repoUrl: REPO_URL,
+      currentVersion: local.currentVersion,
+      localSha: local.localSha,
+      hasUpdate: false,
+      error: err?.name === 'AbortError' ? '连接 GitHub 超时，点击重试' : '无法连接 GitHub，点击重试',
+      checkedAtMs: nowMs,
+    };
+  }
+}
+
+async function extractZipArchive(zipPath, extractDir, { platform = process.platform, execFileImpl = execFileAsync } = {}) {
+  await fsp.mkdir(extractDir, { recursive: true });
+  if (platform === 'win32') {
+    try {
+      await execFileImpl('tar.exe', ['-xf', zipPath, '-C', extractDir], { timeout: 25000 });
+      return;
+    } catch {
+      await execFileImpl(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`,
+        ],
+        { timeout: 30000 },
+      );
+      return;
+    }
+  }
+  await execFileImpl('unzip', ['-q', '-o', zipPath, '-d', extractDir], { timeout: 25000 });
+}
+
+function resolveExtractedPluginRoot(extractDir) {
+  if (fs.existsSync(path.join(extractDir, 'plugin.json'))) {
+    return extractDir;
+  }
+  const entries = fs.readdirSync(extractDir, { withFileTypes: true });
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const cand = path.join(extractDir, e.name);
+    if (fs.existsSync(path.join(cand, 'plugin.json'))) {
+      return cand;
+    }
+  }
+  return '';
+}
+
+/**
+ * Download official main archive from GitHub, validate integrity, mirror into installed pluginRoot
+ * while preserving user configs & rules/AGENTS.md, and recompile Windows backdrop companion.
+ */
+export async function applyPluginUpdate(
+  paths,
+  {
+    fetchImpl = globalThis.fetch,
+    execFileImpl = execFileAsync,
+    ensureBackdropFn = ensureBackdropAssets,
+    platform = process.platform,
+    nowMs = Date.now(),
+  } = {},
+) {
+  if (updateInFlight) {
+    return updateInFlight;
+  }
+
+  const run = async () => {
+    const pluginRoot = paths?.pluginRoot;
+    if (!pluginRoot || !fs.existsSync(pluginRoot)) {
+      return { ok: false, status: 400, error: '未找到本地插件安装目录' };
+    }
+    if (typeof fetchImpl !== 'function') {
+      return { ok: false, status: 500, error: '当前运行环境不支持下载更新' };
+    }
+
+    const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'agy-monitor-update-'));
+    try {
+      const latestCheck = await checkForUpdates(paths, { force: true, fetchImpl, nowMs });
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 45000);
+      let zipBuf;
+      try {
+        const dlRes = await fetchImpl(GITHUB_ARCHIVE_ZIP_URL, {
+          method: 'GET',
+          headers: { 'User-Agent': 'agy-monitor-updater' },
+          redirect: 'follow',
+          signal: controller.signal,
+        });
+        if (!dlRes.ok) {
+          return { ok: false, status: 502, error: `下载更新包失败 (HTTP ${dlRes.status})` };
+        }
+        const ab = await dlRes.arrayBuffer();
+        zipBuf = Buffer.from(ab);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (
+        !zipBuf ||
+        zipBuf.length < MIN_ARCHIVE_BYTES ||
+        zipBuf.length > MAX_ARCHIVE_BYTES ||
+        zipBuf[0] !== 0x50 ||
+        zipBuf[1] !== 0x4b
+      ) {
+        return { ok: false, status: 502, error: '下载的更新压缩包格式或大小异常，已中止升级' };
+      }
+
+      const zipPath = path.join(tempRoot, 'update.zip');
+      const extractDir = path.join(tempRoot, 'extracted');
+      await fsp.writeFile(zipPath, zipBuf);
+      await extractZipArchive(zipPath, extractDir, { platform, execFileImpl });
+
+      const extractedRoot = resolveExtractedPluginRoot(extractDir);
+      if (!extractedRoot) {
+        return { ok: false, status: 500, error: '更新包结构异常：缺少 plugin.json' };
+      }
+
+      for (const rel of REQUIRED_CORE_FILES) {
+        if (!fs.existsSync(path.join(extractedRoot, rel))) {
+          return { ok: false, status: 500, error: `更新包校验失败：缺少核心文件 ${rel}` };
+        }
+      }
+
+      // Mirror official files in place while strictly preserving rules/AGENTS.md & plugin_data/*
+      for (const rel of ROOT_FILES) {
+        const src = path.join(extractedRoot, rel);
+        if (fs.existsSync(src)) {
+          fs.copyFileSync(src, path.join(pluginRoot, rel));
+        }
+      }
+      for (const rel of MIRROR_DIRS) {
+        mirrorDirectoryInPlace(path.join(extractedRoot, rel), path.join(pluginRoot, rel));
+      }
+
+      // Initialize rules/AGENTS.md only if absent; never overwrite user rules
+      const srcAgents = path.join(extractedRoot, 'rules', 'AGENTS.md');
+      const destAgents = path.join(pluginRoot, 'rules', 'AGENTS.md');
+      if (fs.existsSync(srcAgents) && !fs.existsSync(destAgents)) {
+        fs.mkdirSync(path.dirname(destAgents), { recursive: true });
+        fs.copyFileSync(srcAgents, destAgents);
+      }
+
+      const updatedManifest = readJsonSyncSafe(path.join(pluginRoot, 'plugin.json'));
+      const nextVersion =
+        typeof updatedManifest?.version === 'string' && updatedManifest.version.trim()
+          ? updatedManifest.version.trim().replace(/^v/i, '')
+          : latestCheck.remoteVersion || '1.0.0';
+
+      let backdropCompiled = false;
+      if (platform === 'win32' && typeof ensureBackdropFn === 'function') {
+        const bd = await ensureBackdropFn(paths).catch(() => ({ compiled: false }));
+        backdropCompiled = Boolean(bd?.compiled);
+      }
+
+      if (paths?.pluginDataDir) {
+        const metaPath = path.join(paths.pluginDataDir, 'install_meta.json');
+        await atomicWriteJson(metaPath, {
+          version: nextVersion,
+          commitSha: latestCheck.remoteFullSha || '',
+          shortSha: latestCheck.remoteSha || '',
+          updatedAtMs: nowMs,
+        }).catch(() => {});
+      }
+
+      checkCache.delete(pluginRoot);
+      const nextStatus = {
+        ok: true,
+        repoUrl: REPO_URL,
+        currentVersion: nextVersion,
+        localSha: latestCheck.remoteSha || '',
+        remoteVersion: nextVersion,
+        remoteSha: latestCheck.remoteSha || '',
+        remoteFullSha: latestCheck.remoteFullSha || '',
+        remoteDate: latestCheck.remoteDate || '',
+        remoteMessage: latestCheck.remoteMessage || '',
+        hasUpdate: false,
+        checkedAtMs: nowMs,
+      };
+      checkCache.set(pluginRoot, nextStatus);
+
+      return {
+        ok: true,
+        updated: true,
+        needsReload: true,
+        version: nextVersion,
+        shortSha: latestCheck.remoteSha || '',
+        commitMessage: latestCheck.remoteMessage || '',
+        backdropCompiled,
+        status: nextStatus,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 500,
+        error: err?.name === 'AbortError' ? '下载更新包超时，请检查网络后重试' : err?.message || '自动更新失败',
+      };
+    } finally {
+      await fsp.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  };
+
+  updateInFlight = run().finally(() => {
+    updateInFlight = null;
+  });
+  return updateInFlight;
+}
+
+/**
+ * Open the hardcoded official GitHub repository page in the OS default browser.
+ */
+export function openRepoInBrowser({ platform = process.platform, spawnImpl = spawn } = {}) {
+  try {
+    let child = null;
+    if (platform === 'win32') {
+      child = spawnImpl('rundll32.exe', ['url.dll,FileProtocolHandler', REPO_URL], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    } else if (platform === 'darwin') {
+      child = spawnImpl('open', [REPO_URL], { detached: true, stdio: 'ignore' });
+    } else {
+      child = spawnImpl('xdg-open', [REPO_URL], { detached: true, stdio: 'ignore' });
+    }
+    child?.unref?.();
+    return { ok: true, url: REPO_URL };
+  } catch (err) {
+    return { ok: false, status: 500, error: err?.message || '打开项目主页失败' };
+  }
+}
+
+export function resetUpdateCheckCache() {
+  checkCache.clear();
+}

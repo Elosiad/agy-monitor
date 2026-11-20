@@ -46,6 +46,11 @@ import {
   sanitizePublicMasteryConfig,
 } from './backend/storage.mjs';
 import { queryTelemetrySnapshot } from './backend/telemetry.mjs';
+import {
+  applyPluginUpdate,
+  checkForUpdates,
+  openRepoInBrowser,
+} from './backend/updater.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1420,6 +1425,27 @@ export function createMonitorHandlers({
     const themes = await store.getThemes();
     const cdpStatus = await cdp.syncHostLanguage(language, themes).catch(() => cdp.getStatus(themes));
     return { ok: true, language, cdp: cdpStatus };
+  });
+
+  register('GET', '/api/update/status', async (data = {}) => {
+    const force = data.force === '1' || data.force === 'true' || data.force === true;
+    return checkForUpdates(resolvedPaths, { force });
+  });
+
+  register('POST', '/api/update/apply', async () => {
+    const result = await applyPluginUpdate(resolvedPaths);
+    if (!result.ok) {
+      return errorResponse(ResponseCtor, result.status || 500, result.error || '自动更新失败');
+    }
+    return result;
+  });
+
+  register('POST', '/api/update/open-repo', async () => {
+    const result = openRepoInBrowser();
+    if (!result.ok) {
+      return errorResponse(ResponseCtor, result.status || 500, result.error || '打开项目主页失败');
+    }
+    return result;
   });
 
   return routes;

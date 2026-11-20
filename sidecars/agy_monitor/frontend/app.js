@@ -117,16 +117,31 @@ export function mountMonitorApp() {
   const followModeLabel = document.getElementById("followModeLabel");
   const activeConvChip = document.getElementById("activeConvChip");
   const activeConvNameEl = document.getElementById("activeConvName");
+  const updateStatusBtn = document.getElementById("updateStatusBtn");
+  const updateStatusLabel = document.getElementById("updateStatusLabel");
+  const repoLinkBtn = document.getElementById("repoLinkBtn");
   const manualRefreshBtn = document.getElementById("manualRefreshBtn");
   const toastBanner = document.getElementById("toastBanner");
 
   let translator = createTranslator("zh-CN");
   let toastTimer = null;
+  let updateCheckTimer = null;
   let pollTimer = null;
   let snapshotInFlight = false;
   let pendingForcedRefresh = false;
   let destroyed = false;
   const cleanups = [];
+
+  const updateState = {
+    phase: "idle", // idle | checking | latest | available | updating | updated | error
+    currentVersion: "1.0.0",
+    remoteVersion: "",
+    remoteSha: "",
+    remoteMessage: "",
+    hasUpdate: false,
+    needsReload: false,
+    error: "",
+  };
 
   const state = {
     language: "zh-CN",
@@ -478,6 +493,152 @@ export function mountMonitorApp() {
     cleanups.push(() => followModeBtn.removeEventListener("click", onFollowToggle));
   }
 
+  function renderUpdateButtonUi() {
+    if (!updateStatusBtn || !updateStatusLabel) return;
+    updateStatusBtn.classList.remove("is-latest", "is-available", "is-updating", "is-updated");
+    updateStatusBtn.disabled = updateState.phase === "checking" || updateState.phase === "updating";
+
+    if (updateState.phase === "checking") {
+      updateStatusLabel.textContent = translator("nav.updateChecking");
+      updateStatusBtn.title = "正在连接 GitHub 检测最新版本…";
+    } else if (updateState.phase === "updating") {
+      updateStatusBtn.classList.add("is-updating");
+      updateStatusLabel.textContent = translator("nav.updating");
+      updateStatusBtn.title = "正在从 GitHub 下载并部署最新版本…";
+    } else if (updateState.phase === "updated") {
+      updateStatusBtn.classList.add("is-updated");
+      updateStatusLabel.textContent = translator("nav.updatedReload");
+      updateStatusBtn.title = `已更新至 v${updateState.currentVersion}${updateState.remoteSha ? ` (${updateState.remoteSha})` : ""}，点击重载面板（或重启 Antigravity 加载新版后端）`;
+    } else if (updateState.phase === "available" && updateState.hasUpdate) {
+      updateStatusBtn.classList.add("is-available");
+      updateStatusLabel.textContent = translator("nav.updateAvailable");
+      const summary = updateState.remoteMessage ? `\n最新提交：${updateState.remoteMessage}` : "";
+      const verHint = updateState.remoteSha ? ` (${updateState.remoteSha})` : "";
+      updateStatusBtn.title = `发现新版本 v${updateState.remoteVersion || updateState.currentVersion}${verHint}，点击一键更新！${summary}`;
+    } else if (updateState.phase === "latest") {
+      updateStatusBtn.classList.add("is-latest");
+      updateStatusLabel.textContent = translator("nav.updateLatest");
+      updateStatusBtn.title = `当前已是最新版本 v${updateState.currentVersion}${updateState.remoteSha ? ` (${updateState.remoteSha})` : ""}（点击重新检测）`;
+    } else {
+      updateStatusLabel.textContent = translator("nav.updateCheck");
+      updateStatusBtn.title = updateState.error || "点击检测 GitHub 是否有新版本";
+    }
+  }
+
+  async function checkPluginUpdate({ force = false, notify = false } = {}) {
+    if (destroyed || updateState.phase === "updating" || updateState.phase === "checking") return;
+    updateState.phase = "checking";
+    updateState.error = "";
+    renderUpdateButtonUi();
+
+    try {
+      const data = await fetchJson(`/api/update/status${force ? "?force=1" : ""}`);
+      if (destroyed) return;
+      if (data && data.ok) {
+        updateState.currentVersion = String(data.currentVersion || "1.0.0");
+        updateState.remoteVersion = String(data.remoteVersion || updateState.currentVersion);
+        updateState.remoteSha = String(data.remoteSha || "");
+        updateState.remoteMessage = String(data.remoteMessage || "");
+        updateState.hasUpdate = Boolean(data.hasUpdate);
+        updateState.phase = updateState.hasUpdate ? "available" : "latest";
+        updateState.error = "";
+        renderUpdateButtonUi();
+        if (notify) {
+          if (updateState.hasUpdate) {
+            showToast(
+              `发现新版本 (${updateState.remoteSha || updateState.remoteVersion})，再次点击「有更新」即可一键更新`,
+              "success"
+            );
+          } else {
+            showToast(`当前已是最新版本 v${updateState.currentVersion}`, "success");
+          }
+        }
+      } else {
+        updateState.hasUpdate = false;
+        updateState.phase = "error";
+        updateState.error = String(data?.error || "检测更新失败，点击重试");
+        renderUpdateButtonUi();
+        if (notify) showToast(updateState.error, "error");
+      }
+    } catch {
+      if (destroyed) return;
+      updateState.hasUpdate = false;
+      updateState.phase = "error";
+      updateState.error = "无法连接更新服务，点击重试";
+      renderUpdateButtonUi();
+      if (notify) showToast(updateState.error, "error");
+    }
+  }
+
+  async function applyPluginUpdateNow() {
+    if (destroyed || updateState.phase === "updating") return;
+    updateState.phase = "updating";
+    renderUpdateButtonUi();
+    showToast("正在从 GitHub 下载并部署最新版本…", "info");
+
+    try {
+      const res = await fetchJson("/api/update/apply", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (destroyed) return;
+      if (res && res.ok) {
+        updateState.currentVersion = String(res.version || updateState.remoteVersion || updateState.currentVersion);
+        updateState.remoteSha = String(res.shortSha || updateState.remoteSha || "");
+        updateState.hasUpdate = false;
+        updateState.needsReload = true;
+        updateState.phase = "updated";
+        renderUpdateButtonUi();
+        showToast(
+          `更新成功 (${updateState.remoteSha || `v${updateState.currentVersion}`})！已保留全部配置，请重载插件或重启 Antigravity 生效`,
+          "success"
+        );
+      } else {
+        updateState.phase = "available";
+        renderUpdateButtonUi();
+        showToast(res?.error || "自动更新失败，请稍后重试", "error");
+      }
+    } catch (err) {
+      if (destroyed) return;
+      updateState.phase = "available";
+      renderUpdateButtonUi();
+      showToast(err?.message || "自动更新失败，请检查网络连接", "error");
+    }
+  }
+
+  if (updateStatusBtn) {
+    const onUpdateClick = () => {
+      if (updateState.phase === "checking" || updateState.phase === "updating") return;
+      if (updateState.phase === "available" && updateState.hasUpdate) {
+        void applyPluginUpdateNow();
+      } else if (updateState.phase === "updated" && updateState.needsReload) {
+        if (typeof window !== "undefined" && typeof window.location?.reload === "function") {
+          window.location.reload();
+        }
+      } else {
+        void checkPluginUpdate({ force: true, notify: true });
+      }
+    };
+    updateStatusBtn.addEventListener("click", onUpdateClick);
+    cleanups.push(() => updateStatusBtn.removeEventListener("click", onUpdateClick));
+  }
+
+  if (repoLinkBtn) {
+    const onRepoClick = (e) => {
+      e.preventDefault();
+      void fetchJson("/api/update/open-repo", {
+        method: "POST",
+        body: JSON.stringify({}),
+      }).catch(() => {
+        if (typeof window !== "undefined" && typeof window.open === "function") {
+          window.open(repoLinkBtn.href, "_blank", "noopener,noreferrer");
+        }
+      });
+    };
+    repoLinkBtn.addEventListener("click", onRepoClick);
+    cleanups.push(() => repoLinkBtn.removeEventListener("click", onRepoClick));
+  }
+
   if (manualRefreshBtn) {
     const onManualRefresh = () => {
       refreshPreferences();
@@ -593,6 +754,13 @@ export function mountMonitorApp() {
     refreshSnapshot({ force: true, syncHud: true }),
   ]).finally(() => {
     startPolling();
+    if (!destroyed && updateStatusBtn) {
+      updateCheckTimer = setTimeout(() => {
+        if (!destroyed) {
+          void checkPluginUpdate({ force: false, notify: false });
+        }
+      }, 1200);
+    }
   });
 
   activeController = {
@@ -606,6 +774,7 @@ export function mountMonitorApp() {
       destroyed = true;
       stopPolling();
       clearTimeout(toastTimer);
+      clearTimeout(updateCheckTimer);
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
       Object.values(components).forEach((comp) => comp?.destroy?.());
