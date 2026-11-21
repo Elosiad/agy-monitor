@@ -18,7 +18,8 @@ import { createRuntimeBar } from "./components/runtime_bar.js";
 import { createMasteryHub } from "./components/mastery_hub.js";
 import { createThemeStudio } from "./components/theme_studio.js";
 
-const POLL_INTERVAL_MS = 1000;
+const POLL_ACTIVE_MS = 1200;
+const POLL_IDLE_MS = 2500;
 
 function resolveRequestUrl(url) {
   const raw = String(url || "");
@@ -328,6 +329,9 @@ export function mountMonitorApp() {
         });
         components.tokenUsage?.update(data.tokenUsage);
         components.sessionsHub?.update(data.sessionsHub, nextConvId);
+        lastKnownActiveCount = Array.isArray(data.sessionsHub?.active)
+          ? data.sessionsHub.active.length
+          : 0;
         components.runtimeBar?.update(data.runtimeTelemetry, {
           activeConvId: nextConvId,
           activeConvTitle: findSessionTitle(data.sessionsHub, nextConvId),
@@ -679,17 +683,38 @@ export function mountMonitorApp() {
     return true;
   }
 
+  let lastKnownActiveCount = 1;
+  let currentPollDelayMs = POLL_ACTIVE_MS;
+
+  function scheduleNextPoll() {
+    if (destroyed) return;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    const nextMs = lastKnownActiveCount > 0 ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+    currentPollDelayMs = nextMs;
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      if (destroyed) return;
+      if (!isPanelVisible()) {
+        scheduleNextPoll();
+        return;
+      }
+      Promise.resolve(refreshSnapshot({ force: false, syncHud: false })).finally(() => {
+        scheduleNextPoll();
+      });
+    }, nextMs);
+  }
+
   function startPolling() {
     if (pollTimer !== null || destroyed) return;
-    pollTimer = setInterval(() => {
-      if (!isPanelVisible()) return;
-      refreshSnapshot({ force: false, syncHud: false });
-    }, POLL_INTERVAL_MS);
+    scheduleNextPoll();
   }
 
   function stopPolling() {
     if (pollTimer !== null) {
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       pollTimer = null;
     }
   }
@@ -703,13 +728,97 @@ export function mountMonitorApp() {
     updateFollowModeUi();
   }
 
+  const paneViewportId = `vp_${Math.random().toString(36).slice(2, 10)}`;
+  let viewportReportTimer = null;
+  let viewportHeartbeatTimer = null;
+  let lastReportedPhysW = -1;
+  let lastReportedVisible = null;
+
+  function readConsoleViewport() {
+    if (typeof window === "undefined") {
+      return { visible: false, physW: 0, physH: 0, outerW: 0 };
+    }
+    const vis =
+      (typeof document === "undefined" || document.visibilityState !== "hidden") &&
+      (Number(window.innerWidth) || 0) > 0 &&
+      (Number(window.innerHeight) || 0) > 0;
+    if (!vis) {
+      return { visible: false, physW: 0, physH: 0, outerW: 0 };
+    }
+    const dpr = Math.max(0.5, Math.min(4, Number(window.devicePixelRatio) || 1));
+    return {
+      visible: true,
+      physW: Math.round((Number(window.innerWidth) || 0) * dpr),
+      physH: Math.round((Number(window.innerHeight) || 0) * dpr),
+      outerW: Math.round((Number(window.outerWidth) || 0) * dpr),
+    };
+  }
+
+  function syncViewportHeartbeat(vp) {
+    if (destroyed) return;
+    const needHeartbeat = Boolean(vp && vp.visible && vp.physW >= 520);
+    if (needHeartbeat && !viewportHeartbeatTimer) {
+      viewportHeartbeatTimer = setInterval(() => {
+        if (destroyed) return;
+        sendConsoleViewport({ force: true });
+      }, 3600);
+    } else if (!needHeartbeat && viewportHeartbeatTimer) {
+      clearInterval(viewportHeartbeatTimer);
+      viewportHeartbeatTimer = null;
+    }
+  }
+
+  function sendConsoleViewport({ force = false, forceHidden = false } = {}) {
+    if (destroyed || typeof apiFetch !== "function") return;
+    const vp = forceHidden
+      ? { visible: false, physW: 0, physH: 0, outerW: 0 }
+      : readConsoleViewport();
+    syncViewportHeartbeat(vp);
+    if (!vp.visible && !lastReportedVisible) {
+      return;
+    }
+    if (
+      !force &&
+      vp.visible === lastReportedVisible &&
+      Math.abs(vp.physW - lastReportedPhysW) < 4
+    ) {
+      return;
+    }
+    lastReportedVisible = vp.visible;
+    lastReportedPhysW = vp.physW;
+    Promise.resolve(
+      apiFetch("/api/hud/console-viewport", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paneId: paneViewportId,
+          visible: vp.visible,
+          physW: vp.physW,
+          physH: vp.physH,
+          outerW: vp.outerW,
+        }),
+      })
+    ).catch(() => {});
+  }
+
+  function scheduleConsoleViewportReport() {
+    if (destroyed) return;
+    if (viewportReportTimer) clearTimeout(viewportReportTimer);
+    viewportReportTimer = setTimeout(() => {
+      viewportReportTimer = null;
+      sendConsoleViewport({ force: false });
+    }, 32);
+  }
+
   const onVisibilityChange = () => {
     if (document.visibilityState === "hidden") {
       releaseAutoSwitchLock();
       stopPolling();
+      sendConsoleViewport({ force: true, forceHidden: true });
     } else {
       releaseAutoSwitchLock();
       state.etag = "";
+      sendConsoleViewport({ force: true });
       refreshSnapshot({ force: false, syncHud: true });
       startPolling();
     }
@@ -725,14 +834,33 @@ export function mountMonitorApp() {
       releaseAutoSwitchLock();
       if (isPanelVisible()) {
         state.etag = "";
+        sendConsoleViewport({ force: false });
         refreshSnapshot({ force: false, syncHud: true });
       }
     };
+    const onWindowResize = () => {
+      scheduleConsoleViewportReport();
+    };
+    const onWindowHide = () => {
+      sendConsoleViewport({ force: true, forceHidden: true });
+    };
     window.addEventListener("blur", onWindowBlur);
     window.addEventListener("focus", onWindowFocus);
+    window.addEventListener("resize", onWindowResize, { passive: true });
+    window.addEventListener("pagehide", onWindowHide);
+    window.addEventListener("beforeunload", onWindowHide);
     cleanups.push(() => window.removeEventListener("blur", onWindowBlur));
     cleanups.push(() => window.removeEventListener("focus", onWindowFocus));
+    cleanups.push(() => window.removeEventListener("resize", onWindowResize));
+    cleanups.push(() => window.removeEventListener("pagehide", onWindowHide));
+    cleanups.push(() => window.removeEventListener("beforeunload", onWindowHide));
   }
+  if (typeof ResizeObserver === "function" && typeof document !== "undefined" && document.documentElement) {
+    const vpRo = new ResizeObserver(() => scheduleConsoleViewportReport());
+    vpRo.observe(document.documentElement);
+    cleanups.push(() => vpRo.disconnect());
+  }
+  sendConsoleViewport({ force: true });
 
   const auxPaneShell = document.getElementById("auxPaneShell");
   if (auxPaneShell && typeof auxPaneShell.addEventListener === "function") {
@@ -778,6 +906,9 @@ export function mountMonitorApp() {
       stopPolling();
       clearTimeout(toastTimer);
       clearTimeout(updateCheckTimer);
+      clearTimeout(viewportReportTimer);
+      clearInterval(viewportHeartbeatTimer);
+      viewportHeartbeatTimer = null;
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
       Object.values(components).forEach((comp) => comp?.destroy?.());

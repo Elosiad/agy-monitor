@@ -126,4 +126,16 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   assert.match(src, /查看用量/);
   assert.match(src, /重置于/);
   assert.match(src, /frompoint-portal-box/);
+  assert.match(src, /anchor-covered/, 'IsHudOccluded must detect when a maximized side panel covers the composer anchor');
+  assert.match(src, /DecodePixelWidth/, 'Wallpaper and lightbox bitmaps must cap DecodePixelWidth to curb RAM');
+  assert.match(src, /SetProcessWorkingSetSize/, 'Companion must trim startup/idle working set memory');
+  assert.match(src, /ControlType\.ComboBox/, 'ProbeComposerAnchor must detect ComboBox model pickers on narrow composers');
+  assert.match(src, /CollectLeftToolbarBoundary/, 'ProbeComposerAnchor must walk toolbarRow subtree to guard against ARIA-less left controls');
+  assert.match(src, /CachedComposerBox/, 'Companion must clamp HUD within composer container left edge');
+  assert.match(src, /minModelDip/, 'HudOverlayWindow must progressively drop long model ID before clipping speed or leaving only ring');
+  assert.match(src, /anchor-covered-doc/, 'IsHudOccluded must detect cross-document sidecar iframe covering composer anchor');
+  assert.match(src, /hitIsAncestorOfAnchor/, 'IsHudOccluded must never false-trigger when FromPoint returns an ancestor of cachedAnchor');
+  assert.match(src, /if\s*\(mouseDownOnHost\)\s*\{[^}]*finalAnchor\.Occluded\s*=\s*prevAnchor\.Occluded;/s, 'mouseDownOnHost must preserve occlusion state so full-screen Console never flashes HUD on click');
+  assert.match(src, /IsTargetFile\(name,\s*"console_viewport\.json"\)/, 'Companion must watch console_viewport.json for instant full-screen Console occlusion');
+  assert.match(src, /IsConsoleCoveringAnchor\s*\(/, 'SyncHudForWindow must check exact consoleLeftPx geometry against composer anchor');
 });

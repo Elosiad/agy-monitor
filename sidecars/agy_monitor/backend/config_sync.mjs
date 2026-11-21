@@ -310,16 +310,24 @@ export async function syncHostThemeSeeds(_paths, colors, _syncGlobal = true) {
  * Read-only inspection of antigravity_state.pbtxt for last_selected_agent_model hint.
  * Ignores protobuf MODEL_PLACEHOLDER_* placeholder enum values. Strictly read-only.
  */
+const hostModelHintCache = new Map();
+
 export async function readHostModelHint(paths) {
-  if (!paths?.pbtxtPath) return null;
+  const fp = paths?.pbtxtPath;
+  if (!fp) return null;
   try {
-    const raw = await fs.readFile(paths.pbtxtPath, 'utf8');
+    const st = await fs.stat(fp);
+    const cached = hostModelHintCache.get(fp);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      return cached.value;
+    }
+    const raw = await fs.readFile(fp, 'utf8');
     const match = /^\s*last_selected_agent_model:\s*"?([A-Za-z0-9_.-]+)"?/m.exec(raw);
     const value = match ? match[1].trim() : '';
-    if (!value || PLACEHOLDER_MODEL_RE.test(value)) {
-      return null;
-    }
-    return value;
+    const resolved = !value || PLACEHOLDER_MODEL_RE.test(value) ? null : value;
+    if (hostModelHintCache.size > 16) hostModelHintCache.clear();
+    hostModelHintCache.set(fp, { mtimeMs: st.mtimeMs, size: st.size, value: resolved });
+    return resolved;
   } catch {
     return null;
   }

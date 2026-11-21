@@ -654,7 +654,46 @@ export function createMonitorHandlers({
   const cdp = cdpBridge || createCdpThemeBridge(resolvedPaths);
   const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp);
   const masterySummarizer = createMasterySummarizer(resolvedPaths, store);
+  const consoleViewports = new Map();
+  let lastViewportDiskSig = '';
+  let lastViewportDiskWriteMs = 0;
   const routes = new Map();
+
+  const flushConsoleViewportFile = async (force = false) => {
+    if (!resolvedPaths.consoleViewportFile) return;
+    const now = Date.now();
+    let bestPhysW = 0;
+    let bestPhysH = 0;
+    let bestOuterW = 0;
+    let anyVisible = false;
+    for (const [id, entry] of consoleViewports.entries()) {
+      if (!entry || now - (entry.updatedAtMs || 0) > 8000) {
+        consoleViewports.delete(id);
+        continue;
+      }
+      if (entry.visible && entry.physW > 0) {
+        anyVisible = true;
+        if (entry.physW > bestPhysW) {
+          bestPhysW = entry.physW;
+          bestPhysH = entry.physH || 0;
+          bestOuterW = entry.outerW || 0;
+        }
+      }
+    }
+    const sig = `${anyVisible ? 1 : 0}|${Math.round(bestPhysW / 4)}|${Math.round(bestOuterW / 8)}`;
+    if (!force && sig === lastViewportDiskSig && (!anyVisible || now - lastViewportDiskWriteMs < 3000)) {
+      return;
+    }
+    lastViewportDiskSig = sig;
+    lastViewportDiskWriteMs = now;
+    await atomicWriteJson(resolvedPaths.consoleViewportFile, {
+      visible: anyVisible,
+      physW: bestPhysW,
+      physH: bestPhysH,
+      outerW: bestOuterW,
+      updatedAtMs: now,
+    }).catch(() => {});
+  };
 
   const register = (method, routePath, handler) => {
     routes.set(`${method.toUpperCase()} ${routePath}`, handler);
@@ -1090,6 +1129,30 @@ export function createMonitorHandlers({
     hud.setActiveHostConv?.(conversationId);
     await hud.refreshFromDb();
     return { ok: true, conversationId };
+  });
+
+  register('POST', '/api/hud/console-viewport', async (data = {}) => {
+    const paneId =
+      typeof data.paneId === 'string' && data.paneId.trim()
+        ? data.paneId.trim().slice(0, 40)
+        : 'default';
+    const visible = Boolean(data.visible);
+    const physW = visible ? Math.max(0, Math.min(16384, Math.round(Number(data.physW) || 0))) : 0;
+    const physH = visible ? Math.max(0, Math.min(16384, Math.round(Number(data.physH) || 0))) : 0;
+    const outerW = visible ? Math.max(0, Math.min(16384, Math.round(Number(data.outerW) || 0))) : 0;
+    if (visible && physW > 0) {
+      consoleViewports.set(paneId, {
+        visible: true,
+        physW,
+        physH,
+        outerW,
+        updatedAtMs: Date.now(),
+      });
+    } else {
+      consoleViewports.delete(paneId);
+    }
+    await flushConsoleViewportFile(false);
+    return { ok: true, visible: Boolean(visible && physW > 0), physW };
   });
 
   register('POST', '/api/sessions/mark-read', async (data = {}) => {
@@ -1587,7 +1650,7 @@ export function createMonitorHandlers({
   return routes;
 }
 
-function spawnWorkerSupervisor(paths, { scanIntervalMs = 1000, onUpdated } = {}) {
+function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {}) {
   let child = null;
   let stopped = false;
   let restartTimer = null;
@@ -1716,7 +1779,7 @@ function attachCorsAndPreflight(server) {
  */
 export async function startSidecarServer({
   pathsOverrides = {},
-  scanIntervalMs = 1000,
+  scanIntervalMs = 2000,
   skipWorker = false,
 } = {}) {
   const { SidecarApp, Response } = await loadSidecarSdk();

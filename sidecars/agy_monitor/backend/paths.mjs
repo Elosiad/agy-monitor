@@ -135,6 +135,7 @@ export function resolvePaths(overrides = {}) {
     hudTelemetryFile: path.join(pluginDataDir, 'hud_telemetry.json'),
     hudActiveViewFile: path.join(pluginDataDir, 'hud_active_view.json'),
     hudDisplayFile: path.join(pluginDataDir, 'hud_display.json'),
+    consoleViewportFile: path.join(pluginDataDir, 'console_viewport.json'),
     backdropLauncherVbs: path.join(pluginDataDir, 'launch_backdrop.vbs'),
     backdropLauncherCmd: path.join(pluginDataDir, '启动整机壁纸伴侣.cmd'),
     cdpLauncherVbs: path.join(pluginDataDir, 'launch_antigravity_cdp.vbs'),

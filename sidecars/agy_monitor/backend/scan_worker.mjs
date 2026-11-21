@@ -134,7 +134,10 @@ function openCacheDb(cacheDbPath) {
   return db;
 }
 
-async function discoverTranscripts(brainDir) {
+const COLD_CONV_AGE_MS = 10 * 60 * 1000;
+const COLD_RESCAN_MODULO = 5;
+
+async function discoverTranscripts(brainDir, { coldCache = null, scanTick = 0, fullSweep = true } = {}) {
   let entries;
   try {
     entries = await fsp.readdir(brainDir, { withFileTypes: true });
@@ -143,26 +146,65 @@ async function discoverTranscripts(brainDir) {
     throw err;
   }
 
+  const nowMs = Date.now();
+  const seenIds = coldCache ? new Set() : null;
   const results = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const convId = entry.name;
     if (convId.startsWith('.')) continue;
+    if (seenIds) seenIds.add(convId);
+
+    const cached = coldCache ? coldCache.get(convId) : null;
+    if (
+      !fullSweep &&
+      cached &&
+      nowMs - cached.mtimeMs > COLD_CONV_AGE_MS &&
+      scanTick % COLD_RESCAN_MODULO !== 0
+    ) {
+      if (cached.exists) {
+        results.push({
+          convId,
+          transcriptPath: cached.transcriptPath,
+          mtimeMs: cached.mtimeMs,
+          sizeBytes: cached.sizeBytes,
+        });
+      }
+      continue;
+    }
+
     const transcriptPath = path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl');
     try {
       const st = await withRetry(() => fsp.stat(transcriptPath));
       if (st.isFile()) {
+        const mtimeMs = Math.trunc(st.mtimeMs);
+        const sizeBytes = st.size;
+        if (coldCache) {
+          coldCache.set(convId, { exists: true, transcriptPath, mtimeMs, sizeBytes });
+        }
         results.push({
           convId,
           transcriptPath,
-          mtimeMs: Math.trunc(st.mtimeMs),
-          sizeBytes: st.size,
+          mtimeMs,
+          sizeBytes,
         });
+      } else if (coldCache) {
+        coldCache.set(convId, { exists: false, transcriptPath, mtimeMs: 0, sizeBytes: 0 });
       }
     } catch (err) {
-      if (err && err.code === 'ENOENT') continue;
+      if (err && err.code === 'ENOENT') {
+        if (coldCache) {
+          coldCache.set(convId, { exists: false, transcriptPath, mtimeMs: 0, sizeBytes: 0 });
+        }
+        continue;
+      }
       if (err && RETRY_ERRORS.has(err.code)) continue;
       throw err;
+    }
+  }
+  if (coldCache && seenIds) {
+    for (const key of coldCache.keys()) {
+      if (!seenIds.has(key)) coldCache.delete(key);
     }
   }
   return results;
@@ -446,17 +488,21 @@ function computeDbEtag(db) {
   return crypto.createHash('sha1').update(raw).digest('hex').slice(0, 12);
 }
 
-function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
-  return (async () => {
-    const selectWatermark = db.prepare(
+const PREPARED_STMTS_BY_DB = new WeakMap();
+
+function getPreparedStatements(db) {
+  let stmts = PREPARED_STMTS_BY_DB.get(db);
+  if (stmts) return stmts;
+  stmts = {
+    selectWatermark: db.prepare(
       `SELECT mtime_ms, size_bytes, byte_offset FROM session_watermarks WHERE conv_id = ?`
-    );
-    const selectMaxStep = db.prepare(
+    ),
+    selectMaxStep: db.prepare(
       `SELECT COALESCE(MAX(step_index), -1) AS max_idx FROM step_ledger WHERE conv_id = ?`
-    );
-    const deleteConvSteps = db.prepare(`DELETE FROM step_ledger WHERE conv_id = ?`);
-    const deleteConvMetrics = db.prepare(`DELETE FROM conv_latest_metrics WHERE conv_id = ?`);
-    const upsertStep = db.prepare(
+    ),
+    deleteConvSteps: db.prepare(`DELETE FROM step_ledger WHERE conv_id = ?`),
+    deleteConvMetrics: db.prepare(`DELETE FROM conv_latest_metrics WHERE conv_id = ?`),
+    upsertStep: db.prepare(
       `INSERT INTO step_ledger (
          conv_id, step_index, step_type, created_at_ms, model,
          input_tokens, cache_read_tokens, output_tokens, tool_calls_count,
@@ -472,8 +518,8 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
          tool_calls_count = excluded.tool_calls_count,
          content_chars = excluded.content_chars,
          thinking_chars = excluded.thinking_chars`
-    );
-    const upsertWatermark = db.prepare(
+    ),
+    upsertWatermark: db.prepare(
       `INSERT INTO session_watermarks (
          conv_id, transcript_path, mtime_ms, size_bytes, byte_offset, last_scan_ms
        ) VALUES (?, ?, ?, ?, ?, ?)
@@ -483,11 +529,27 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
          size_bytes = excluded.size_bytes,
          byte_offset = excluded.byte_offset,
          last_scan_ms = excluded.last_scan_ms`
-    );
-    const upsertMeta = db.prepare(
+    ),
+    upsertMeta: db.prepare(
       `INSERT INTO scan_meta (key, value) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-    );
+    ),
+  };
+  PREPARED_STMTS_BY_DB.set(db, stmts);
+  return stmts;
+}
+
+function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
+  return (async () => {
+    const {
+      selectWatermark,
+      selectMaxStep,
+      deleteConvSteps,
+      deleteConvMetrics,
+      upsertStep,
+      upsertWatermark,
+      upsertMeta,
+    } = getPreparedStatements(db);
 
     const changedConvs = [];
     let updatedFiles = 0;
@@ -625,6 +687,8 @@ async function runWorkerMain() {
   const intervalMs = rawInterval === undefined ? 2500 : Number(rawInterval);
 
   const db = openCacheDb(cacheDbPath);
+  const coldCache = new Map();
+  let scanTick = 0;
   let shuttingDown = false;
   let inFlight = null;
   let timer = null;
@@ -634,7 +698,12 @@ async function runWorkerMain() {
     if (inFlight) return inFlight;
     inFlight = (async () => {
       try {
-        const transcripts = await discoverTranscripts(brainDir);
+        scanTick += 1;
+        const transcripts = await discoverTranscripts(brainDir, {
+          coldCache,
+          scanTick,
+          fullSweep: Boolean(forceNotify) || scanTick === 1,
+        });
         const res = await scanDbWithConnection(db, transcripts, { flushPartial: false });
         if ((res.etagChanged || forceNotify) && process.connected && typeof process.send === 'function') {
           try {

@@ -648,16 +648,22 @@ function buildHudSyncExpr(hudPayload, accentColor, displayConfig = null, guideIm
 
       var anyMeta = disp.showSpeed || disp.showCacheHit || disp.showModel;
       var anyAll = disp.showContext || anyMeta;
+      var showModel = disp.showModel && !(effectiveWidth > 0 && effectiveWidth < 520);
+      var showCache = disp.showCacheHit && !(effectiveWidth > 0 && effectiveWidth < 430);
+      var showSpeed = disp.showSpeed && !(effectiveWidth > 0 && effectiveWidth < 370);
+      var anyVisibleMeta = showSpeed || showCache || showModel;
       if (ringBtn) ringBtn.style.display = disp.showContext ? 'inline-flex' : 'none';
-      if (emptyBtn) emptyBtn.style.display = anyAll ? 'none' : 'inline-flex';
-      if (speedEl) speedEl.style.display = disp.showSpeed ? 'inline' : 'none';
-      if (cacheEl) cacheEl.style.display = disp.showCacheHit ? 'inline' : 'none';
-      if (modelEl) modelEl.style.display = disp.showModel ? 'inline' : 'none';
-      if (dot1) dot1.style.display = (disp.showSpeed && (disp.showCacheHit || disp.showModel)) ? 'inline' : 'none';
-      if (dot2) dot2.style.display = (disp.showCacheHit && disp.showModel) ? 'inline' : 'none';
+      if (emptyBtn) emptyBtn.style.display = (disp.showContext || anyVisibleMeta) ? 'none' : 'inline-flex';
+      if (speedEl) speedEl.style.display = showSpeed ? 'inline' : 'none';
+      if (cacheEl) cacheEl.style.display = showCache ? 'inline' : 'none';
+      if (modelEl) modelEl.style.display = showModel ? 'inline' : 'none';
+      if (dot1) dot1.style.display = (showSpeed && (showCache || showModel)) ? 'inline' : 'none';
+      if (dot2) dot2.style.display = (showCache && showModel) ? 'inline' : 'none';
       if (metaBtn) {
-        var hideNarrow = effectiveWidth > 0 && effectiveWidth < 360 && disp.showContext;
-        metaBtn.style.display = (anyMeta && !hideNarrow) ? 'inline-flex' : 'none';
+        metaBtn.style.display = anyVisibleMeta ? 'inline-flex' : 'none';
+      }
+      if (hudEl) {
+        hudEl.style.display = (effectiveWidth > 0 && effectiveWidth < 260) ? 'none' : 'inline-flex';
       }
     }
 

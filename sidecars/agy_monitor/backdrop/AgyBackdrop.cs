@@ -315,6 +315,12 @@ namespace AgyBackdropCompanion
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+
         [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
@@ -560,6 +566,35 @@ namespace AgyBackdropCompanion
                 downSteps++;
             }
             return false;
+        }
+
+        public static void TrimWorkingSet()
+        {
+            try
+            {
+                GC.Collect(2, GCCollectionMode.Optimized, false);
+                SetProcessWorkingSetSize(GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1));
+            }
+            catch { }
+        }
+
+        public static int GetMaxMonitorPhysicalWidth()
+        {
+            int maxW = 1920;
+            try
+            {
+                Screen[] screens = Screen.AllScreens;
+                if (screens != null)
+                {
+                    for (int i = 0; i < screens.Length; i++)
+                    {
+                        int w = screens[i].Bounds.Width;
+                        if (w > maxW) maxW = w;
+                    }
+                }
+            }
+            catch { }
+            return Math.Max(1280, Math.Min(2560, maxW));
         }
 
         public static string GetDesktopName()
@@ -1172,6 +1207,11 @@ namespace AgyBackdropCompanion
                     Native.SetWindowLongPtrCompat(_hwnd, Native.GWLP_HWNDPARENT, _ownerHwnd.ToInt64());
                 }
             };
+            Closed += delegate
+            {
+                try { _image.Source = null; } catch { }
+                Native.TrimWorkingSet();
+            };
         }
 
         private static Border MakePillButton(
@@ -1218,14 +1258,16 @@ namespace AgyBackdropCompanion
             if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return false;
             try
             {
-                byte[] bytes = File.ReadAllBytes(filePath);
-                if (bytes.Length == 0 || bytes.Length > 15 * 1024 * 1024) return false;
+                var fi = new FileInfo(filePath);
+                if (fi.Length == 0 || fi.Length > 15 * 1024 * 1024) return false;
                 BitmapImage bmp = new BitmapImage();
-                using (var ms = new MemoryStream(bytes))
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
                     bmp.BeginInit();
                     bmp.CacheOption = BitmapCacheOption.OnLoad;
-                    bmp.StreamSource = ms;
+                    bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                    bmp.DecodePixelWidth = 3840;
+                    bmp.StreamSource = fs;
                     bmp.EndInit();
                 }
                 bmp.Freeze();
@@ -1697,13 +1739,13 @@ namespace AgyBackdropCompanion
             };
             _emptyAnchorPill.MouseEnter += delegate
             {
-                _emptyAnchorPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(232, 32, 36, 48));
-                _emptyAnchorPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(72, 255, 255, 255));
+                _emptyAnchorPill.Background = EmptyHoverBg;
+                _emptyAnchorPill.BorderBrush = EmptyHoverBorder;
             };
             _emptyAnchorPill.MouseLeave += delegate
             {
-                _emptyAnchorPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(180, 22, 24, 32));
-                _emptyAnchorPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(44, 255, 255, 255));
+                _emptyAnchorPill.Background = EmptyIdleBg;
+                _emptyAnchorPill.BorderBrush = EmptyIdleBorder;
             };
             _emptyAnchorPill.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
             {
@@ -1750,20 +1792,79 @@ namespace AgyBackdropCompanion
             };
         }
 
+        private static SolidColorBrush FrozenBrush(byte a, byte r, byte g, byte b)
+        {
+            var br = new SolidColorBrush(System.Windows.Media.Color.FromArgb(a, r, g, b));
+            br.Freeze();
+            return br;
+        }
+
+        private static readonly SolidColorBrush RingHoverBg = FrozenBrush(228, 22, 24, 32);
+        private static readonly SolidColorBrush RingHoverBorder = FrozenBrush(58, 255, 255, 255);
+        private static readonly SolidColorBrush RingIdleBg = FrozenBrush(1, 20, 22, 29);
+        private static readonly SolidColorBrush MetaHoverBg = FrozenBrush(232, 28, 31, 41);
+        private static readonly SolidColorBrush MetaHoverBorder = FrozenBrush(68, 255, 255, 255);
+        private static readonly SolidColorBrush MetaIdleBg = FrozenBrush(192, 19, 21, 28);
+        private static readonly SolidColorBrush MetaIdleBorder = FrozenBrush(40, 255, 255, 255);
+        private static readonly SolidColorBrush EmptyHoverBg = FrozenBrush(232, 32, 36, 48);
+        private static readonly SolidColorBrush EmptyHoverBorder = FrozenBrush(72, 255, 255, 255);
+        private static readonly SolidColorBrush EmptyIdleBg = FrozenBrush(180, 22, 24, 32);
+        private static readonly SolidColorBrush EmptyIdleBorder = FrozenBrush(44, 255, 255, 255);
+        private static readonly Typeface MetaTypeface = new Typeface(
+            new System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI"),
+            FontStyles.Normal,
+            FontWeights.Normal,
+            FontStretches.Normal);
+        private System.Windows.Media.Color _lastArcColor = System.Windows.Media.Color.FromRgb(91, 140, 255);
+        private double _speedDipW = 54.0;
+        private double _cacheDipW = 46.0;
+        private double _modelDipW = 96.0;
+
+        private static double MeasureTextDipWidth(string text, double fontSize)
+        {
+            if (string.IsNullOrEmpty(text)) return 0.0;
+            try
+            {
+#pragma warning disable 618
+                var ft = new FormattedText(
+                    text,
+                    CultureInfo.CurrentUICulture,
+                    System.Windows.FlowDirection.LeftToRight,
+                    MetaTypeface,
+                    fontSize,
+                    System.Windows.Media.Brushes.White
+                );
+#pragma warning restore 618
+                return Math.Ceiling(ft.WidthIncludingTrailingWhitespace);
+            }
+            catch
+            {
+                return Math.Ceiling(text.Length * fontSize * 0.62);
+            }
+        }
+
         private void ApplyRingHoverStyle(bool hovered)
         {
             _ringHovered = hovered;
-            if (hovered)
+            bool expandPct = hovered && _availDip >= 60.0;
+            if (expandPct)
             {
-                _ringPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(228, 22, 24, 32));
-                _ringPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(58, 255, 255, 255));
+                _ringPill.Background = RingHoverBg;
+                _ringPill.BorderBrush = RingHoverBorder;
                 _ringPill.Padding = new Thickness(6, 0, 7, 0);
                 _pctText.Visibility = Visibility.Visible;
+            }
+            else if (hovered)
+            {
+                _ringPill.Background = RingHoverBg;
+                _ringPill.BorderBrush = RingHoverBorder;
+                _ringPill.Padding = new Thickness(3, 0, 3, 0);
+                _pctText.Visibility = Visibility.Collapsed;
             }
             else
             {
                 // Alpha = 1 keeps hover hit-testing responsive while appearing visually bare
-                _ringPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(1, 20, 22, 29));
+                _ringPill.Background = RingIdleBg;
                 _ringPill.BorderBrush = System.Windows.Media.Brushes.Transparent;
                 _ringPill.Padding = new Thickness(3, 0, 3, 0);
                 _pctText.Visibility = Visibility.Collapsed;
@@ -1775,13 +1876,13 @@ namespace AgyBackdropCompanion
         {
             if (hovered)
             {
-                _metaPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(232, 28, 31, 41));
-                _metaPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(68, 255, 255, 255));
+                _metaPill.Background = MetaHoverBg;
+                _metaPill.BorderBrush = MetaHoverBorder;
             }
             else
             {
-                _metaPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(192, 19, 21, 28));
-                _metaPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(40, 255, 255, 255));
+                _metaPill.Background = MetaIdleBg;
+                _metaPill.BorderBrush = MetaIdleBorder;
             }
         }
 
@@ -1801,6 +1902,7 @@ namespace AgyBackdropCompanion
                 _lastPercent = pct;
                 _lastAccentHex = accent;
                 _pctText.Text = string.Format("{0}%", pct);
+                _ringPill.ToolTip = string.Format("上下文占用 {0}% · 点击选择底部显示项", pct);
 
                 System.Windows.Media.Color arcColor;
                 if (pct >= 90)
@@ -1815,39 +1917,70 @@ namespace AgyBackdropCompanion
                 {
                     arcColor = ColorUtil.ParseHex(accent, System.Windows.Media.Color.FromRgb(91, 140, 255));
                 }
-                _ringArc.Stroke = new SolidColorBrush(arcColor);
+                if (arcColor != _lastArcColor || _ringArc.Stroke == null)
+                {
+                    _lastArcColor = arcColor;
+                    var frozenArc = new SolidColorBrush(arcColor);
+                    frozenArc.Freeze();
+                    _ringArc.Stroke = frozenArc;
+                }
                 _ringArc.Data = BuildArcGeometry(Math.Min(100, pct));
             }
 
+            string nextSpeedStr;
             if (data != null && data.tokPerSec.HasValue && data.tokPerSec.Value > 0)
             {
                 double val = data.tokPerSec.Value;
                 string num = val >= 100
                     ? Math.Round(val).ToString("0", CultureInfo.InvariantCulture)
                     : val.ToString("0.0", CultureInfo.InvariantCulture);
-                _speedStr = num + " tok/s";
+                nextSpeedStr = num + " tok/s";
             }
             else
             {
-                _speedStr = "-- tok/s";
+                nextSpeedStr = "-- tok/s";
             }
 
+            string nextCacheValStr;
             if (data != null && data.cacheHitPct.HasValue)
             {
-                _cacheValStr = string.Format("{0}%", Math.Max(0, Math.Min(100, data.cacheHitPct.Value)));
+                nextCacheValStr = string.Format("{0}%", Math.Max(0, Math.Min(100, data.cacheHitPct.Value)));
             }
             else
             {
-                _cacheValStr = "--";
+                nextCacheValStr = "--";
             }
 
-            _modelStr = (data != null && !string.IsNullOrEmpty(data.upstreamModelId))
+            string nextModelStr = (data != null && !string.IsNullOrEmpty(data.upstreamModelId))
                 ? data.upstreamModelId
                 : "--";
 
-            _speedRun.Text = _speedStr;
-            _cacheValRun.Text = _cacheValStr;
-            _modelRun.Text = _modelStr;
+            bool widthsChanged = false;
+            if (!string.Equals(nextSpeedStr, _speedStr, StringComparison.Ordinal))
+            {
+                _speedStr = nextSpeedStr;
+                _speedRun.Text = _speedStr;
+                _speedDipW = MeasureTextDipWidth(_speedStr, 11.0);
+                widthsChanged = true;
+            }
+            if (!string.Equals(nextCacheValStr, _cacheValStr, StringComparison.Ordinal))
+            {
+                _cacheValStr = nextCacheValStr;
+                _cacheValRun.Text = _cacheValStr;
+                _cacheDipW = MeasureTextDipWidth("缓存 " + _cacheValStr, 11.0);
+                widthsChanged = true;
+            }
+            if (!string.Equals(nextModelStr, _modelStr, StringComparison.Ordinal))
+            {
+                _modelStr = nextModelStr;
+                _modelRun.Text = _modelStr;
+                _modelDipW = MeasureTextDipWidth(_modelStr, 11.0);
+                widthsChanged = true;
+            }
+            if (widthsChanged)
+            {
+                ApplyAvailableDipLayout();
+            }
         }
 
         public bool ApplyDpiScale(double targetDpiScale, out int physW, out int physH)
@@ -1924,11 +2057,19 @@ namespace AgyBackdropCompanion
             bool anyEnabled = wantContext || wantSpeed || wantCache || wantModel;
 
             _ringPill.Visibility = wantContext ? Visibility.Visible : Visibility.Collapsed;
-            _emptyAnchorPill.Visibility = anyEnabled ? Visibility.Collapsed : Visibility.Visible;
-            _metaPill.Margin = wantContext ? new Thickness(6, 0, 0, 0) : new Thickness(0);
+            _metaPill.Margin = wantContext ? new Thickness(5, 0, 0, 0) : new Thickness(0);
+
+            // Keep hover pct pill from overflowing into left controls on narrow composers
+            if (_ringHovered)
+            {
+                bool expandPct = _availDip >= 60.0;
+                _pctText.Visibility = expandPct ? Visibility.Visible : Visibility.Collapsed;
+                _ringPill.Padding = expandPct ? new Thickness(6, 0, 7, 0) : new Thickness(3, 0, 3, 0);
+            }
 
             if (!wantSpeed && !wantCache && !wantModel)
             {
+                _emptyAnchorPill.Visibility = anyEnabled ? Visibility.Collapsed : Visibility.Visible;
                 if (_metaPill.Visibility != Visibility.Collapsed)
                 {
                     _metaPill.Visibility = Visibility.Collapsed;
@@ -1936,27 +2077,73 @@ namespace AgyBackdropCompanion
                 return;
             }
 
-            // Tight, accurate ring budget so the meta pill receives every free pixel of the composer toolbar gap
-            double ringBudget = wantContext ? (_ringHovered ? 52.0 : 22.0) : 0.0;
-            double metaAvail = _availDip - ringBudget - (wantContext ? 6.0 : 0.0);
+            // Progressive width-based compression:
+            // 1) Full enabled items (mildly trim long model ID only if >= 76 DIP remains for model)
+            // 2) Drop long model ID completely before chopping speed/cache
+            // 3) Drop cache hit if speed + cache cannot both fit cleanly
+            // 4) Collapse meta pill entirely -> keep only compact Context Ring (or '...' anchor if ring disabled)
+            bool expandedRing = wantContext && _ringHovered && _availDip >= 60.0;
+            double ringBudget = wantContext ? (expandedRing ? 58.0 : 21.0) : 0.0;
+            double metaAvail = _availDip - ringBudget - (wantContext ? 5.0 : 0.0);
+            const double pillChromeDip = 19.0; // 8+8 padding + 1+1 border + 1px safety
+            const double sepDip = 11.0;        // " · "
+            double textBudget = metaAvail - pillChromeDip;
 
-            if (metaAvail < 56.0 && wantContext)
+            bool showSpeed = wantSpeed;
+            bool showCache = wantCache;
+            bool showModel = wantModel;
+
+            // Step 1: Drop model ID completely if it cannot fit comfortably (>= 76 DIP or full width)
+            if (showModel)
+            {
+                double baseWithoutModel =
+                    (showSpeed ? _speedDipW : 0.0) +
+                    (showCache ? _cacheDipW : 0.0) +
+                    (showSpeed && showCache ? sepDip : 0.0);
+                double needBeforeModel = baseWithoutModel + (baseWithoutModel > 0.0 ? sepDip : 0.0);
+                double modelRem = textBudget - needBeforeModel;
+                double minModelDip = Math.Min(_modelDipW, 76.0);
+                if (modelRem < minModelDip)
+                {
+                    showModel = false;
+                }
+            }
+
+            // Step 2: Drop cache hit if speed + cache exceed budget
+            if (showSpeed && showCache && (_speedDipW + sepDip + _cacheDipW) > textBudget + 1.0)
+            {
+                showCache = false;
+            }
+
+            // Step 3: Never leave half-chopped speed ("99.6 tok/...") or cache ("缓...") — drop completely if it doesn't fit whole
+            if (showSpeed && !showCache && !showModel && _speedDipW > textBudget + 1.0)
+            {
+                showSpeed = false;
+            }
+            if (!showSpeed && showCache && !showModel && _cacheDipW > textBudget + 1.0)
+            {
+                showCache = false;
+            }
+
+            if (!showSpeed && !showCache && !showModel)
             {
                 if (_metaPill.Visibility != Visibility.Collapsed)
                 {
                     _metaPill.Visibility = Visibility.Collapsed;
                 }
+                _emptyAnchorPill.Visibility = wantContext ? Visibility.Collapsed : Visibility.Visible;
                 return;
             }
 
+            _emptyAnchorPill.Visibility = Visibility.Collapsed;
             if (_metaPill.Visibility != Visibility.Visible)
             {
                 _metaPill.Visibility = Visibility.Visible;
             }
 
-            RebuildMetaInlines(wantSpeed, wantCache, wantModel);
-            double nextMax = Math.Max(42.0, Math.Min(390.0, metaAvail - 18.0));
-            if (Math.Abs(_metaText.MaxWidth - nextMax) >= 2.0)
+            RebuildMetaInlines(showSpeed, showCache, showModel);
+            double nextMax = Math.Max(28.0, Math.Min(390.0, Math.Floor(textBudget)));
+            if (Math.Abs(_metaText.MaxWidth - nextMax) >= 1.5)
             {
                 _metaText.MaxWidth = nextMax;
             }
@@ -2947,12 +3134,147 @@ namespace AgyBackdropCompanion
             }
         }
 
+        private static void FindToolbarRowAndComposerBox(
+            AutomationElement chosen,
+            System.Windows.Rect chosenRect,
+            int winW,
+            double dpiScale,
+            out AutomationElement toolbarRow,
+            out AutomationElement composerBox
+        )
+        {
+            toolbarRow = null;
+            composerBox = null;
+            if (chosen == null) return;
+            try
+            {
+                AutomationElement cur = TreeWalker.ControlViewWalker.GetParent(chosen);
+                for (int hop = 0; hop < 8 && cur != null; hop++)
+                {
+                    System.Windows.Rect ar;
+                    if (TryGetValidRect(cur, out ar) &&
+                        ar.Width >= 140.0 * dpiScale && ar.Width <= winW * 0.92 &&
+                        ar.Left <= chosenRect.Left - 24.0 * dpiScale &&
+                        ar.Right >= chosenRect.Right - 4.0 * dpiScale)
+                    {
+                        if (toolbarRow == null && ar.Height >= 20.0 * dpiScale && ar.Height <= 72.0 * dpiScale)
+                        {
+                            toolbarRow = cur;
+                        }
+                        if (composerBox == null && ar.Height >= 52.0 * dpiScale && ar.Height <= 420.0 * dpiScale)
+                        {
+                            composerBox = cur;
+                            if (toolbarRow != null) break;
+                        }
+                    }
+                    try { cur = TreeWalker.ControlViewWalker.GetParent(cur); }
+                    catch { break; }
+                }
+            }
+            catch { }
+        }
+
+        private static void CollectLeftToolbarBoundary(
+            AutomationElement container,
+            AutomationElement chosen,
+            System.Windows.Rect chosenRect,
+            double cy,
+            int rowAlignTol,
+            int winW,
+            double dpiScale,
+            int depth,
+            ref int visited,
+            ref int bestLeftRight,
+            ref AutomationElement bestLeft
+        )
+        {
+            if (container == null || visited >= 48) return;
+            try
+            {
+                AutomationElement child = TreeWalker.ControlViewWalker.GetFirstChild(container);
+                while (child != null && visited < 48)
+                {
+                    visited++;
+                    if (!SameElement(child, chosen))
+                    {
+                        System.Windows.Rect br;
+                        if (TryGetValidRect(child, out br))
+                        {
+                            if (br.Left < chosenRect.Left - 2.0 * dpiScale)
+                            {
+                                ControlType ct = null;
+                                try { ct = child.Current.ControlType; } catch { }
+                                bool isControl =
+                                    ct == ControlType.Button ||
+                                    ct == ControlType.ComboBox ||
+                                    ct == ControlType.SplitButton ||
+                                    ct == ControlType.MenuItem ||
+                                    ct == ControlType.Hyperlink;
+                                if (isControl)
+                                {
+                                    double bcy = (br.Top + br.Bottom) / 2.0;
+                                    double bMidX = (br.Left + br.Right) / 2.0;
+                                    if (Math.Abs(bcy - cy) <= rowAlignTol &&
+                                        bMidX < chosenRect.Left &&
+                                        br.Width < winW * 0.55 &&
+                                        br.Right <= chosenRect.Right + 2.0 * dpiScale)
+                                    {
+                                        int candRight = (int)Math.Round(br.Right) + (int)Math.Round(5 * dpiScale);
+                                        if (candRight > bestLeftRight)
+                                        {
+                                            bestLeftRight = candRight;
+                                            bestLeft = child;
+                                        }
+                                    }
+                                }
+                                else if (ct == ControlType.Text || ct == ControlType.Image)
+                                {
+                                    double bcy = (br.Top + br.Bottom) / 2.0;
+                                    double bMidX = (br.Left + br.Right) / 2.0;
+                                    if (Math.Abs(bcy - cy) <= rowAlignTol &&
+                                        bMidX < chosenRect.Left &&
+                                        br.Width < winW * 0.50 &&
+                                        br.Right <= chosenRect.Left + 4.0 * dpiScale)
+                                    {
+                                        int candRight = (int)Math.Round(br.Right) + (int)Math.Round(8 * dpiScale);
+                                        if (candRight > bestLeftRight)
+                                        {
+                                            bestLeftRight = candRight;
+                                            bestLeft = child;
+                                        }
+                                    }
+                                }
+                                else if (depth > 0)
+                                {
+                                    CollectLeftToolbarBoundary(
+                                        child, chosen, chosenRect, cy, rowAlignTol, winW, dpiScale,
+                                        depth - 1, ref visited, ref bestLeftRight, ref bestLeft
+                                    );
+                                }
+                            }
+                        }
+                        else if (depth > 0)
+                        {
+                            CollectLeftToolbarBoundary(
+                                child, chosen, chosenRect, cy, rowAlignTol, winW, dpiScale,
+                                depth - 1, ref visited, ref bestLeftRight, ref bestLeft
+                            );
+                        }
+                    }
+                    try { child = TreeWalker.ControlViewWalker.GetNextSibling(child); }
+                    catch { break; }
+                }
+            }
+            catch { }
+        }
+
         public static HudAnchorInfo ProbeComposerAnchor(
             IntPtr hwnd,
             Native.RECT winRect,
             ref AutomationElement cachedAnchor,
             ref int cachedKind,
-            ref AutomationElement cachedLeftGuard
+            ref AutomationElement cachedLeftGuard,
+            ref AutomationElement cachedComposerBox
         )
         {
             var result = new HudAnchorInfo
@@ -2970,15 +3292,16 @@ namespace AgyBackdropCompanion
             };
 
             double dpiScale = Native.GetWindowDpiScale(hwnd);
+            int winW = Math.Max(1, winRect.Right - winRect.Left);
             int winH = Math.Max(1, winRect.Bottom - winRect.Top);
             // Expand upward band so tall pasted multiline prompts never drop the composer toolbar anchor
             int bandTop = winRect.Bottom - Math.Min((int)Math.Round(280 * dpiScale), Math.Max((int)Math.Round(140 * dpiScale), winH / 2));
             int bandBottom = winRect.Bottom - (int)Math.Round(4 * dpiScale);
-            int minBtnLeft = winRect.Left + (int)Math.Round(180 * dpiScale);
+            int minBtnLeft = winRect.Left + (int)Math.Round(140 * dpiScale);
             int defaultLeftGuard = winRect.Left + (int)Math.Round(220 * dpiScale);
             int rowAlignTol = (int)Math.Round(16 * dpiScale);
 
-            // Fast path: reuse cached UIA anchor element (<0.5ms)
+            // Fast path: reuse cached UIA anchor + left-guard + composer-box elements (<0.5ms)
             if (cachedAnchor != null)
             {
                 System.Windows.Rect cr;
@@ -2986,31 +3309,55 @@ namespace AgyBackdropCompanion
                     cr.Top >= bandTop && cr.Bottom <= bandBottom &&
                     cr.Left >= minBtnLeft && cr.Right <= winRect.Right - 4)
                 {
-                    int baseShift = cachedKind == 1 ? 6 : (cachedKind == 2 ? 36 : 86);
+                    int baseShift = cachedKind == 1 ? 5 : (cachedKind == 2 ? 36 : 86);
                     int extraShift = (int)Math.Round(baseShift * dpiScale);
                     int rX = (int)Math.Round(cr.Left) - extraShift;
                     int lGuard = defaultLeftGuard;
+
+                    // Hard clamp: never allow HUD to escape outside the composer box's own left edge
+                    if (cachedComposerBox != null)
+                    {
+                        System.Windows.Rect boxR;
+                        if (TryGetValidRect(cachedComposerBox, out boxR) &&
+                            boxR.Left < cr.Left && boxR.Right >= cr.Right - 6.0 * dpiScale)
+                        {
+                            int boxLeftGuard = (int)Math.Round(boxR.Left) + (int)Math.Round(10 * dpiScale);
+                            if (boxLeftGuard > lGuard) lGuard = boxLeftGuard;
+                        }
+                    }
+
+                    bool leftGuardHealthy = false;
                     if (cachedLeftGuard != null)
                     {
                         System.Windows.Rect lr;
                         if (TryGetValidRect(cachedLeftGuard, out lr) &&
                             Math.Abs(((lr.Top + lr.Bottom) / 2.0) - ((cr.Top + cr.Bottom) / 2.0)) <= rowAlignTol &&
-                            lr.Right < rX)
+                            lr.Left < cr.Left - 2.0 * dpiScale &&
+                            (lr.Left + lr.Right) / 2.0 < cr.Left)
                         {
-                            lGuard = (int)Math.Round(lr.Right) + (int)Math.Round(6 * dpiScale);
+                            // Keep exact right edge of model picker / left button even when squeezed right against anchor!
+                            int lgRight = (int)Math.Round(lr.Right) + (int)Math.Round(5 * dpiScale);
+                            if (lgRight > lGuard) lGuard = lgRight;
+                            leftGuardHealthy = true;
                         }
                     }
-                    result.HasAnchor = true;
-                    result.ComposerVisible = true;
-                    result.FromUia = true;
-                    result.RightX = rX;
-                    result.LeftGuardX = lGuard;
-                    result.CenterY = (int)Math.Round((cr.Top + cr.Bottom) / 2.0);
-                    return result;
+
+                    // Only stay on fast path when left guard is still valid; if model picker re-mounted, re-scan immediately!
+                    if (leftGuardHealthy)
+                    {
+                        result.HasAnchor = true;
+                        result.ComposerVisible = true;
+                        result.FromUia = true;
+                        result.RightX = rX;
+                        result.LeftGuardX = lGuard;
+                        result.CenterY = (int)Math.Round((cr.Top + cr.Bottom) / 2.0);
+                        return result;
+                    }
                 }
                 cachedAnchor = null;
                 cachedKind = 0;
                 cachedLeftGuard = null;
+                cachedComposerBox = null;
             }
 
             try
@@ -3018,10 +3365,14 @@ namespace AgyBackdropCompanion
                 AutomationElement root = AutomationElement.FromHandle(hwnd);
                 if (root == null) return result;
 
-                AutomationElementCollection buttons = root.FindAll(
-                    TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)
+                // Include ComboBox / SplitButton / MenuItem so Radix/Electron model picker (<button role="combobox">) is never missed!
+                System.Windows.Automation.Condition ctrlCond = new OrCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.SplitButton),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem)
                 );
+                AutomationElementCollection buttons = root.FindAll(TreeScope.Descendants, ctrlCond);
 
                 if (buttons == null || buttons.Count == 0)
                 {
@@ -3082,7 +3433,7 @@ namespace AgyBackdropCompanion
                     for (int i = 0; i < rowButtons.Count; i++)
                     {
                         AutomationElement cand = rowButtons[i].Key;
-                        if (cand == micMatch) continue;
+                        if (SameElement(cand, micMatch)) continue;
                         System.Windows.Rect br = rowButtons[i].Value;
                         double bcy = (br.Top + br.Bottom) / 2.0;
                         if (Math.Abs(bcy - mcy) <= 14.0 * dpiScale && br.Right <= micRect.Left + 2.0 * dpiScale && (micRect.Left - br.Right) <= 28.0 * dpiScale && br.Width <= 52.0 * dpiScale)
@@ -3097,8 +3448,8 @@ namespace AgyBackdropCompanion
                 AutomationElement chosen = null;
                 System.Windows.Rect chosenRect = System.Windows.Rect.Empty;
                 int chosenKind = 0;
-                int shift = (int)Math.Round(6 * dpiScale);
-                if (modeMatch != null) { chosen = modeMatch; chosenRect = modeRect; chosenKind = 1; shift = (int)Math.Round(6 * dpiScale); }
+                int shift = (int)Math.Round(5 * dpiScale);
+                if (modeMatch != null) { chosen = modeMatch; chosenRect = modeRect; chosenKind = 1; shift = (int)Math.Round(5 * dpiScale); }
                 else if (micMatch != null) { chosen = micMatch; chosenRect = micRect; chosenKind = 2; shift = (int)Math.Round(36 * dpiScale); }
                 else if (sendMatch != null) { chosen = sendMatch; chosenRect = sendRect; chosenKind = 3; shift = (int)Math.Round(86 * dpiScale); }
 
@@ -3107,18 +3458,35 @@ namespace AgyBackdropCompanion
                     int rX = (int)Math.Round(chosenRect.Left) - shift;
                     double cy = (chosenRect.Top + chosenRect.Bottom) / 2.0;
 
+                    AutomationElement toolbarRow, composerBox;
+                    FindToolbarRowAndComposerBox(chosen, chosenRect, winW, dpiScale, out toolbarRow, out composerBox);
+
+                    int bestLeftRight = defaultLeftGuard;
+                    if (composerBox != null)
+                    {
+                        System.Windows.Rect boxR;
+                        if (TryGetValidRect(composerBox, out boxR))
+                        {
+                            int boxLeft = (int)Math.Round(boxR.Left) + (int)Math.Round(10 * dpiScale);
+                            if (boxLeft > bestLeftRight) bestLeftRight = boxLeft;
+                        }
+                    }
+
                     // Verify this is a real multi-button composer toolbar row (prevents false attachment on Settings/Terminal/Diff buttons)
                     int sameRowCount = 0;
                     AutomationElement bestLeft = null;
-                    int bestLeftRight = defaultLeftGuard;
                     for (int i = 0; i < rowButtons.Count; i++)
                     {
                         System.Windows.Rect br = rowButtons[i].Value;
                         double bcy = (br.Top + br.Bottom) / 2.0;
                         if (Math.Abs(bcy - cy) > rowAlignTol) continue;
                         sameRowCount++;
-                        if (br.Right >= rX - (int)Math.Round(10 * dpiScale)) continue;
-                        int brRight = (int)Math.Round(br.Right) + (int)Math.Round(6 * dpiScale);
+                        if (SameElement(rowButtons[i].Key, chosen)) continue;
+                        double bMidX = (br.Left + br.Right) / 2.0;
+                        // Include EVERY control strictly left of chosen (even when touching/squeezed right up to chosen!)
+                        if (br.Left >= chosenRect.Left - 2.0 * dpiScale || bMidX >= chosenRect.Left) continue;
+                        if (br.Width > winW * 0.55 || br.Right > chosenRect.Right + 2.0 * dpiScale) continue;
+                        int brRight = (int)Math.Round(br.Right) + (int)Math.Round(5 * dpiScale);
                         if (brRight > bestLeftRight)
                         {
                             bestLeftRight = brRight;
@@ -3126,11 +3494,22 @@ namespace AgyBackdropCompanion
                         }
                     }
 
+                    // Also inspect toolbarRow subtree directly (<0.3ms) so ARIA-less custom/text model pickers are never missed
+                    if (toolbarRow != null)
+                    {
+                        int visited = 0;
+                        CollectLeftToolbarBoundary(
+                            toolbarRow, chosen, chosenRect, cy, rowAlignTol, winW, dpiScale,
+                            4, ref visited, ref bestLeftRight, ref bestLeft
+                        );
+                    }
+
                     if (sameRowCount >= 2)
                     {
                         cachedAnchor = chosen;
                         cachedKind = chosenKind;
                         cachedLeftGuard = bestLeft;
+                        cachedComposerBox = composerBox;
                         result.HasAnchor = true;
                         result.ComposerVisible = true;
                         result.FromUia = true;
@@ -3362,54 +3741,160 @@ namespace AgyBackdropCompanion
                 return true;
             }
 
-            // 3. O(1) React/Radix Portal sibling check (~0.5ms, zero FindAll, zero self-flicker):
-            // walks up from cachedAnchor to Document, then inspects trailing non-ancestor portal siblings on body/#root.
+            // Build cachedAnchor's ancestor chain once (up to Document and Window) for both Step 2b (anchor-covered) & Step 3 (portal check)
+            var chain = new List<AutomationElement>();
             var composerAncestors = new List<AutomationElement>();
+            AutomationElement anchorDoc = null;
+            int docIdx = -1;
             if (cachedAnchor != null)
             {
                 try
                 {
-                    var chain = new List<AutomationElement>();
                     AutomationElement cur = cachedAnchor;
-                    int docIdx = -1;
-                    for (int hop = 0; hop < 28 && cur != null; hop++)
+                    for (int hop = 0; hop < 32 && cur != null; hop++)
                     {
                         chain.Add(cur);
-                        if (hop < 8) composerAncestors.Add(cur);
-                        try
+                        if (docIdx < 0 && hop < 8) composerAncestors.Add(cur);
+                        ControlType cct = null;
+                        try { cct = cur.Current.ControlType; } catch { }
+                        if (docIdx < 0 && cct == ControlType.Document)
                         {
-                            if (cur.Current.ControlType == ControlType.Document)
-                            {
-                                docIdx = hop;
-                                break;
-                            }
+                            docIdx = hop;
+                            anchorDoc = cur;
                         }
-                        catch { }
+                        if (cct == ControlType.Window) break;
                         try { cur = TreeWalker.ControlViewWalker.GetParent(cur); }
                         catch { break; }
                     }
+                }
+                catch { }
+            }
 
-                    int checkTop = hudTop - (int)Math.Round(10 * dpiScale);
-                    if (docIdx >= 1)
+            // 2b. O(1) Anchor visibility hit-test (~0.3ms):
+            // Detects maximized Side Panel / iframe (e.g. full-screen AGY Console with left sidebar open) covering the composer,
+            // while never false-triggering on inner spans/wrappers, re-mounted buttons inside cachedAnchor's rect, or outer Document/Pane fallbacks!
+            if (cachedAnchor != null)
+            {
+                try
+                {
+                    System.Windows.Rect ar;
+                    if (TryGetValidRect(cachedAnchor, out ar) && ar.Width >= 8 && ar.Height >= 8)
                     {
-                        // Inspect portals mounted directly on <body> (including nested Radix sub-popups like View Usage / 使用限额)
-                        if (CheckPortalContainerChildren(chain[docIdx], chain[docIdx - 1], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 16, 4))
+                        double acx = ar.Left + ar.Width * 0.5;
+                        double acy = ar.Top + ar.Height * 0.5;
+                        AutomationElement aHit = AutomationElement.FromPoint(new System.Windows.Point(acx, acy));
+                        if (aHit != null && !SameElement(aHit, cachedAnchor))
                         {
-                            reason = "doc-portal";
-                            return true;
+                            int aHitPid = 0;
+                            ControlType aHitCt = null;
+                            try
+                            {
+                                aHitPid = aHit.Current.ProcessId;
+                                aHitCt = aHit.Current.ControlType;
+                            }
+                            catch { }
+                            if (aHitPid != selfPid && aHitCt != ControlType.Window)
+                            {
+                                bool hitIsAncestorOfAnchor = false;
+                                for (int ci = 0; ci < chain.Count; ci++)
+                                {
+                                    if (SameElement(aHit, chain[ci]))
+                                    {
+                                        hitIsAncestorOfAnchor = true;
+                                        break;
+                                    }
+                                }
+
+                                if (!hitIsAncestorOfAnchor)
+                                {
+                                    bool hitMatchesAnchor = false;
+                                    bool hitSharesComposer = false;
+                                    AutomationElement hitNearestDoc = null;
+                                    AutomationElement walk = aHit;
+                                    for (int hop = 0; hop < 36 && walk != null; hop++)
+                                    {
+                                        if (SameElement(walk, cachedAnchor))
+                                        {
+                                            hitMatchesAnchor = true;
+                                            break;
+                                        }
+                                        for (int ci = 0; ci < composerAncestors.Count; ci++)
+                                        {
+                                            if (SameElement(walk, composerAncestors[ci]))
+                                            {
+                                                hitSharesComposer = true;
+                                                break;
+                                            }
+                                        }
+                                        if (hitSharesComposer) break;
+                                        ControlType wct = null;
+                                        try { wct = walk.Current.ControlType; } catch { }
+                                        if (hitNearestDoc == null && wct == ControlType.Document)
+                                        {
+                                            hitNearestDoc = walk;
+                                        }
+                                        if (wct == ControlType.Window) break;
+                                        try { walk = TreeWalker.ControlViewWalker.GetParent(walk); }
+                                        catch { break; }
+                                    }
+
+                                    if (!hitMatchesAnchor && !hitSharesComposer)
+                                    {
+                                        // Case A: Hit belongs to a DIFFERENT Document (e.g. maximized AGY Console sidecar iframe)
+                                        if (hitNearestDoc != null && anchorDoc != null && !SameElement(hitNearestDoc, anchorDoc))
+                                        {
+                                            reason = "anchor-covered-doc";
+                                            return true;
+                                        }
+
+                                        // Case B: Unrelated same-document covering panel (skip outer Document/Pane fallback
+                                        // and skip inner wrappers / freshly re-mounted Turbo buttons strictly inside cachedAnchor's rect)
+                                        if (aHitCt != ControlType.Document && aHitCt != ControlType.Pane)
+                                        {
+                                            System.Windows.Rect hr;
+                                            bool strictlyInsideAnchor =
+                                                TryGetValidRect(aHit, out hr) &&
+                                                hr.Left >= ar.Left - 6 && hr.Right <= ar.Right + 6 &&
+                                                hr.Top >= ar.Top - 6 && hr.Bottom <= ar.Bottom + 6;
+                                            if (!strictlyInsideAnchor)
+                                            {
+                                                reason = "anchor-covered";
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        // Inspect portals mounted inside #root (first wrapper inside Document)
-                        if (docIdx >= 2 && CheckPortalContainerChildren(chain[docIdx - 1], chain[docIdx - 2], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 12, 3))
-                        {
-                            reason = "root-portal";
-                            return true;
-                        }
-                        // Inspect portals mounted inside top-level app shell
-                        if (docIdx >= 3 && CheckPortalContainerChildren(chain[docIdx - 2], chain[docIdx - 3], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 8, 2))
-                        {
-                            reason = "shell-portal";
-                            return true;
-                        }
+                    }
+                }
+                catch { }
+            }
+
+            // 3. O(1) React/Radix Portal sibling check (~0.5ms, zero FindAll, zero self-flicker):
+            // inspects trailing non-ancestor portal siblings on body/#root using the ancestor chain already built above.
+            if (docIdx >= 1)
+            {
+                try
+                {
+                    int checkTop = hudTop - (int)Math.Round(10 * dpiScale);
+                    // Inspect portals mounted directly on <body> (including nested Radix sub-popups like View Usage / 使用限额)
+                    if (CheckPortalContainerChildren(chain[docIdx], chain[docIdx - 1], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 16, 4))
+                    {
+                        reason = "doc-portal";
+                        return true;
+                    }
+                    // Inspect portals mounted inside #root (first wrapper inside Document)
+                    if (docIdx >= 2 && CheckPortalContainerChildren(chain[docIdx - 1], chain[docIdx - 2], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 12, 3))
+                    {
+                        reason = "root-portal";
+                        return true;
+                    }
+                    // Inspect portals mounted inside top-level app shell
+                    if (docIdx >= 3 && CheckPortalContainerChildren(chain[docIdx - 2], chain[docIdx - 3], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 8, 2))
+                    {
+                        reason = "shell-portal";
+                        return true;
                     }
                 }
                 catch { }
@@ -3665,9 +4150,11 @@ namespace AgyBackdropCompanion
         public int AnchorMissCount;
         public DateTime LastOcclusionCheckUtc = DateTime.MinValue;
         public string LastOccludedReason = "";
+        public bool ConsoleOccluded = false;
         public AutomationElement CachedUiaAnchor;
         public int CachedUiaAnchorKind;
         public AutomationElement CachedLeftGuard;
+        public AutomationElement CachedComposerBox;
         public DateTime LastFullUiaScanUtc = DateTime.MinValue;
         public string WindowWorkspace = "";
         public string WindowTitle = "";
@@ -3694,6 +4181,7 @@ namespace AgyBackdropCompanion
         private readonly string _hudTelemetryPath;
         private readonly string _hudActiveViewPath;
         private readonly string _hudDisplayPath;
+        private readonly string _consoleViewportPath;
         private readonly string _statusPath;
         private readonly string _lightboxCmdPath;
         private readonly Dispatcher _dispatcher;
@@ -3730,6 +4218,12 @@ namespace AgyBackdropCompanion
         private long _lastHudLength = -1;
         private DateTime _lastHudDisplayWriteUtc = DateTime.MinValue;
         private long _lastHudDisplayLength = -1;
+        private DateTime _lastConsoleViewportWriteUtc = DateTime.MinValue;
+        private long _lastConsoleViewportLength = -1;
+        private bool _consoleViewportVisible = false;
+        private int _consoleViewportPhysW = 0;
+        private int _consoleViewportOuterW = 0;
+        private long _consoleViewportUpdatedMs = 0;
         private DateTime _lastLightboxCmdWriteUtc = DateTime.MinValue;
         private long _lastLightboxCmdLength = -1;
         private string _lastLightboxCmdId = "";
@@ -3770,6 +4264,7 @@ namespace AgyBackdropCompanion
             _hudTelemetryPath = System.IO.Path.Combine(_dataDir, "hud_telemetry.json");
             _hudActiveViewPath = System.IO.Path.Combine(_dataDir, "hud_active_view.json");
             _hudDisplayPath = System.IO.Path.Combine(_dataDir, "hud_display.json");
+            _consoleViewportPath = System.IO.Path.Combine(_dataDir, "console_viewport.json");
             _statusPath = System.IO.Path.Combine(_dataDir, "backdrop_status.json");
             _lightboxCmdPath = System.IO.Path.Combine(_dataDir, "lightbox_cmd.json");
             _dispatcher = dispatcher;
@@ -3796,6 +4291,7 @@ namespace AgyBackdropCompanion
             ReloadThemeConfig(true);
             ReloadHudDisplayConfig();
             ReloadHudTelemetry();
+            ReloadConsoleViewport();
             InstallHooks();
             InstallWatcher();
             StartStopEventListener();
@@ -3810,14 +4306,20 @@ namespace AgyBackdropCompanion
             };
 
             int reconcileTick = 0;
+            bool startupTrimmed = false;
             _reconcileTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher);
-            _reconcileTimer.Interval = TimeSpan.FromMilliseconds(250);
+            _reconcileTimer.Interval = TimeSpan.FromMilliseconds(1000);
             _reconcileTimer.Tick += delegate
             {
                 reconcileTick++;
                 CheckDataFilesTimestamp();
-                SyncAllWindows((reconcileTick % 4) == 0);
-                if ((DateTime.UtcNow - _lastStatusWriteUtc).TotalSeconds >= 2.0)
+                SyncAllWindows((reconcileTick % 2) == 0);
+                if (!startupTrimmed && reconcileTick >= 4)
+                {
+                    startupTrimmed = true;
+                    Native.TrimWorkingSet();
+                }
+                if ((DateTime.UtcNow - _lastStatusWriteUtc).TotalSeconds >= 3.0)
                 {
                     WriteStatusFile(true);
                 }
@@ -4120,36 +4622,87 @@ namespace AgyBackdropCompanion
             _uiaWorkerThread = new Thread(delegate()
             {
                 bool prevMouseDownOnHost = false;
+                Native.POINT prevCursorPt = new Native.POINT();
+                bool hasPrevCursor = false;
+                IntPtr prevFgHwnd = IntPtr.Zero;
+                DateTime lastInputUtc = DateTime.UtcNow;
+                int uiaScanCycles = 0;
                 while (!_disposed)
                 {
                     bool mouseDownOnHost = false;
                     bool clickJustReleased = false;
                     bool typingNewlineKey = false;
+                    bool userActiveNow = false;
+                    bool isFgTracked = false;
+                    bool anyOccluded = false;
                     try
                     {
-                        List<IntPtr> hwnds = new List<IntPtr>();
+                        var snapHwnds = new List<IntPtr>();
+                        var snapCachedEl = new List<AutomationElement>();
+                        var snapCachedKind = new List<int>();
+                        var snapCachedLeft = new List<AutomationElement>();
+                        var snapCachedBox = new List<AutomationElement>();
+                        var snapLastScan = new List<DateTime>();
+                        var snapLastOcc = new List<DateTime>();
+                        var snapPrevAnchor = new List<HudAnchorInfo>();
+                        var snapPrevOccReason = new List<string>();
+                        var snapMissCount = new List<int>();
+                        var snapHudHwnd = new List<IntPtr>();
+                        var snapBackdropHwnd = new List<IntPtr>();
                         bool cdpTakesHud = false;
+
+                        // Single cross-thread UI snapshot per tick (eliminates N+1 blocking Dispatcher.Invoke calls!)
                         _dispatcher.Invoke(new Action(delegate
                         {
                             cdpTakesHud = _hudTelemetry != null && _hudTelemetry.cdpHudActive;
-                            foreach (TrackedHostWindow item in _tracked.Values)
+                            if (cdpTakesHud) return;
+                            foreach (TrackedHostWindow rec in _tracked.Values)
                             {
-                                if (Native.IsWindow(item.Hwnd) && Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd))
+                                if (Native.IsWindow(rec.Hwnd) && Native.IsWindowVisible(rec.Hwnd) && !Native.IsIconic(rec.Hwnd))
                                 {
-                                    hwnds.Add(item.Hwnd);
+                                    snapHwnds.Add(rec.Hwnd);
+                                    snapCachedEl.Add(rec.CachedUiaAnchor);
+                                    snapCachedKind.Add(rec.CachedUiaAnchorKind);
+                                    snapCachedLeft.Add(rec.CachedLeftGuard);
+                                    snapCachedBox.Add(rec.CachedComposerBox);
+                                    snapLastScan.Add(rec.LastFullUiaScanUtc);
+                                    snapLastOcc.Add(rec.LastOcclusionCheckUtc);
+                                    snapPrevAnchor.Add(rec.Anchor);
+                                    snapPrevOccReason.Add(rec.LastOccludedReason ?? "");
+                                    snapMissCount.Add(rec.AnchorMissCount);
+                                    snapHudHwnd.Add(rec.Hud != null ? rec.Hud.Handle : IntPtr.Zero);
+                                    snapBackdropHwnd.Add(rec.Backdrop != null ? rec.Backdrop.Handle : IntPtr.Zero);
                                 }
                             }
                         }));
 
-                        if (cdpTakesHud || hwnds.Count == 0)
+                        if (cdpTakesHud || snapHwnds.Count == 0)
                         {
                             prevMouseDownOnHost = false;
-                            try { _uiaWakeEvent.WaitOne(400); } catch { Thread.Sleep(400); }
+                            try { _uiaWakeEvent.WaitOne(500); } catch { Thread.Sleep(500); }
                             continue;
                         }
 
+                        DateTime loopNow = DateTime.UtcNow;
                         IntPtr fgHwnd = Native.GetForegroundWindow();
-                        bool isFgTracked = fgHwnd != IntPtr.Zero && hwnds.Contains(fgHwnd);
+                        isFgTracked = fgHwnd != IntPtr.Zero && snapHwnds.Contains(fgHwnd);
+                        if (fgHwnd != prevFgHwnd)
+                        {
+                            prevFgHwnd = fgHwnd;
+                            if (isFgTracked) lastInputUtc = loopNow;
+                        }
+
+                        Native.POINT curPt;
+                        if (Native.GetCursorPos(out curPt))
+                        {
+                            if (!hasPrevCursor || curPt.X != prevCursorPt.X || curPt.Y != prevCursorPt.Y)
+                            {
+                                prevCursorPt = curPt;
+                                hasPrevCursor = true;
+                                if (isFgTracked) lastInputUtc = loopNow;
+                            }
+                        }
+
                         bool leftButtonDown = (Native.GetAsyncKeyState(Native.VK_LBUTTON) & 0x8000) != 0;
                         mouseDownOnHost = isFgTracked && leftButtonDown;
                         clickJustReleased = prevMouseDownOnHost && !mouseDownOnHost;
@@ -4162,78 +4715,67 @@ namespace AgyBackdropCompanion
                             if (enterDown || backDown)
                             {
                                 typingNewlineKey = true;
-                                DateTime typeBoost = DateTime.UtcNow.AddMilliseconds(450);
+                                lastInputUtc = loopNow;
+                                DateTime typeBoost = loopNow.AddMilliseconds(450);
                                 if (typeBoost > _fastTrackUntilUtc) _fastTrackUntilUtc = typeBoost;
                             }
                         }
 
                         if (mouseDownOnHost)
                         {
-                            DateTime boost = DateTime.UtcNow.AddMilliseconds(450);
+                            lastInputUtc = loopNow;
+                            DateTime boost = loopNow.AddMilliseconds(450);
                             if (boost > _fastTrackUntilUtc) _fastTrackUntilUtc = boost;
                         }
                         else if (clickJustReleased)
                         {
-                            DateTime postBoost = DateTime.UtcNow.AddMilliseconds(600);
+                            lastInputUtc = loopNow;
+                            DateTime postBoost = loopNow.AddMilliseconds(600);
                             if (postBoost > _fastTrackUntilUtc) _fastTrackUntilUtc = postBoost;
                             // Defer breadcrumb probe ~220ms so Electron finishes rendering the newly selected conversation header
-                            Native.POINT pt;
                             Native.RECT fgRect;
-                            if (Native.GetCursorPos(out pt) && fgHwnd != IntPtr.Zero && Native.TryGetVisibleBounds(fgHwnd, out fgRect))
+                            if (hasPrevCursor && fgHwnd != IntPtr.Zero && Native.TryGetVisibleBounds(fgHwnd, out fgRect))
                             {
                                 double fgDpi = Native.GetWindowDpiScale(fgHwnd);
-                                if (pt.X < fgRect.Left + (int)Math.Round(360 * fgDpi) || pt.Y < fgRect.Top + (int)Math.Round(110 * fgDpi))
+                                if (prevCursorPt.X < fgRect.Left + (int)Math.Round(360 * fgDpi) || prevCursorPt.Y < fgRect.Top + (int)Math.Round(110 * fgDpi))
                                 {
-                                    _pendingViewProbeAtUtc = DateTime.UtcNow.AddMilliseconds(220);
+                                    _pendingViewProbeAtUtc = loopNow.AddMilliseconds(220);
                                 }
                             }
                         }
                         prevMouseDownOnHost = mouseDownOnHost;
+                        userActiveNow = isFgTracked && ((loopNow - lastInputUtc).TotalMilliseconds < 700.0 || loopNow < _fastTrackUntilUtc);
 
-                        bool pendingDue = DateTime.UtcNow >= _pendingViewProbeAtUtc;
+                        bool pendingDue = loopNow >= _pendingViewProbeAtUtc;
                         bool explicitViewTrigger = _forceViewProbe || pendingDue;
-                        bool wantViewProbe = !mouseDownOnHost && (explicitViewTrigger || (DateTime.UtcNow - _lastViewProbeUtc).TotalMilliseconds >= 12000);
+                        // Avoid blind 12s full-DOM FindAll scans while idle: passive safety refresh runs every 60s only when foreground
+                        bool wantViewProbe = !mouseDownOnHost && (explicitViewTrigger || (isFgTracked && (loopNow - _lastViewProbeUtc).TotalMilliseconds >= 60000));
 
-                        foreach (IntPtr h in hwnds)
+                        for (int idx = 0; idx < snapHwnds.Count; idx++)
                         {
                             if (_disposed) break;
+                            IntPtr h = snapHwnds[idx];
                             Native.RECT winRect;
                             if (!Native.TryGetVisibleBounds(h, out winRect)) continue;
 
-                            AutomationElement cachedEl = null;
-                            int cachedKind = 0;
-                            AutomationElement cachedLeft = null;
-                            DateTime lastScan = DateTime.MinValue;
-                            DateTime lastOccCheck = DateTime.MinValue;
-                            HudAnchorInfo prevAnchor = new HudAnchorInfo();
-                            string prevOccReason = "";
-                            int missCount = 0;
-                            IntPtr hudHwnd = IntPtr.Zero;
-                            IntPtr backdropHwnd = IntPtr.Zero;
-                            _dispatcher.Invoke(new Action(delegate
-                            {
-                                TrackedHostWindow rec;
-                                if (_tracked.TryGetValue(h, out rec))
-                                {
-                                    cachedEl = rec.CachedUiaAnchor;
-                                    cachedKind = rec.CachedUiaAnchorKind;
-                                    cachedLeft = rec.CachedLeftGuard;
-                                    lastScan = rec.LastFullUiaScanUtc;
-                                    lastOccCheck = rec.LastOcclusionCheckUtc;
-                                    prevAnchor = rec.Anchor;
-                                    prevOccReason = rec.LastOccludedReason ?? "";
-                                    missCount = rec.AnchorMissCount;
-                                    if (rec.Hud != null) hudHwnd = rec.Hud.Handle;
-                                    if (rec.Backdrop != null) backdropHwnd = rec.Backdrop.Handle;
-                                }
-                            }));
+                            AutomationElement cachedEl = snapCachedEl[idx];
+                            int cachedKind = snapCachedKind[idx];
+                            AutomationElement cachedLeft = snapCachedLeft[idx];
+                            AutomationElement cachedBox = snapCachedBox[idx];
+                            DateTime lastScan = snapLastScan[idx];
+                            DateTime lastOccCheck = snapLastOcc[idx];
+                            HudAnchorInfo prevAnchor = snapPrevAnchor[idx];
+                            string prevOccReason = snapPrevOccReason[idx];
+                            int missCount = snapMissCount[idx];
+                            IntPtr hudHwnd = snapHudHwnd[idx];
+                            IntPtr backdropHwnd = snapBackdropHwnd[idx];
 
-                            double rescanCooldownMs = clickJustReleased ? 220.0 : (mouseDownOnHost ? 320.0 : 900.0);
-                            bool canProbeAnchor = cachedEl != null || (DateTime.UtcNow - lastScan).TotalMilliseconds >= rescanCooldownMs;
+                            double rescanCooldownMs = clickJustReleased ? 220.0 : (mouseDownOnHost ? 320.0 : (isFgTracked ? 1200.0 : 4000.0));
+                            bool canProbeAnchor = cachedEl != null || (loopNow - lastScan).TotalMilliseconds >= rescanCooldownMs;
                             if (canProbeAnchor)
                             {
                                 bool hadCached = cachedEl != null;
-                                HudAnchorInfo anchor = UiaHelper.ProbeComposerAnchor(h, winRect, ref cachedEl, ref cachedKind, ref cachedLeft);
+                                HudAnchorInfo anchor = UiaHelper.ProbeComposerAnchor(h, winRect, ref cachedEl, ref cachedKind, ref cachedLeft, ref cachedBox);
                                 DateTime scanTime = (!hadCached || cachedEl == null) ? DateTime.UtcNow : lastScan;
 
                                 HudAnchorInfo finalAnchor = anchor;
@@ -4246,15 +4788,29 @@ namespace AgyBackdropCompanion
                                     nextMissCount = 0;
                                     if (mouseDownOnHost)
                                     {
-                                        // Never falsely hide during active splitter/window drag
-                                        finalAnchor.Occluded = false;
+                                        // Preserve current occlusion state during mouse-down/drag:
+                                        // stays visible during splitter drag, and stays hidden when already covered by full-screen Console/menus
+                                        finalAnchor.Occluded = prevAnchor.Occluded;
+                                        occReason = prevOccReason;
                                     }
                                     else
                                     {
-                                        bool runUiaChecks = clickJustReleased || typingNewlineKey || (DateTime.UtcNow - lastOccCheck).TotalMilliseconds >= 140.0;
-                                        if (runUiaChecks) nextOccCheck = DateTime.UtcNow;
+                                        // Adaptive UIA occlusion interval:
+                                        // - Background window: pure-Win32 Z-order only (0 COM UIA RPCs!) unless verifying a freshly discovered anchor
+                                        // - Active foreground interaction: 160ms
+                                        // - Currently occluded (waiting for menu/fullscreen close): 240ms
+                                        // - Idle foreground: 750ms (instant wake on any mouse move/click!)
+                                        double occIntervalMs = userActiveNow ? 160.0 : (prevAnchor.Occluded ? 240.0 : 750.0);
+                                        bool freshAnchorVerify = !hadCached && cachedEl != null;
+                                        bool runUiaChecks = freshAnchorVerify || (isFgTracked && (clickJustReleased || typingNewlineKey || (loopNow - lastOccCheck).TotalMilliseconds >= occIntervalMs));
+                                        if (runUiaChecks)
+                                        {
+                                            nextOccCheck = loopNow;
+                                            uiaScanCycles++;
+                                        }
                                         finalAnchor.Occluded = UiaHelper.IsHudOccluded(h, hudHwnd, backdropHwnd, selfPid, winRect, anchor, cachedEl, cachedLeft, runUiaChecks, prevAnchor.Occluded, prevOccReason, out occReason);
                                     }
+                                    if (finalAnchor.Occluded) anyOccluded = true;
                                 }
                                 else
                                 {
@@ -4266,21 +4822,46 @@ namespace AgyBackdropCompanion
                                     }
                                 }
 
-                                if (!_disposed)
+                                bool anchorChanged =
+                                    finalAnchor.HasAnchor != prevAnchor.HasAnchor ||
+                                    finalAnchor.ComposerVisible != prevAnchor.ComposerVisible ||
+                                    finalAnchor.Occluded != prevAnchor.Occluded ||
+                                    finalAnchor.RightX != prevAnchor.RightX ||
+                                    finalAnchor.LeftGuardX != prevAnchor.LeftGuardX ||
+                                    finalAnchor.CenterY != prevAnchor.CenterY ||
+                                    finalAnchor.FromUia != prevAnchor.FromUia ||
+                                    !string.Equals(occReason, prevOccReason, StringComparison.Ordinal) ||
+                                    nextMissCount != missCount ||
+                                    hadCached != (cachedEl != null) ||
+                                    scanTime != lastScan ||
+                                    nextOccCheck != lastOccCheck;
+
+                                bool needsHudSync =
+                                    finalAnchor.HasAnchor != prevAnchor.HasAnchor ||
+                                    finalAnchor.ComposerVisible != prevAnchor.ComposerVisible ||
+                                    finalAnchor.Occluded != prevAnchor.Occluded ||
+                                    finalAnchor.RightX != prevAnchor.RightX ||
+                                    finalAnchor.LeftGuardX != prevAnchor.LeftGuardX ||
+                                    finalAnchor.CenterY != prevAnchor.CenterY;
+
+                                if (anchorChanged && !_disposed)
                                 {
+                                    IntPtr targetH = h;
                                     _dispatcher.BeginInvoke(new Action(delegate
                                     {
                                         TrackedHostWindow rec;
-                                        if (!_disposed && _tracked.TryGetValue(h, out rec))
+                                        if (!_disposed && _tracked.TryGetValue(targetH, out rec))
                                         {
                                             rec.CachedUiaAnchor = cachedEl;
                                             rec.CachedUiaAnchorKind = cachedKind;
                                             rec.CachedLeftGuard = cachedLeft;
+                                            rec.CachedComposerBox = cachedBox;
                                             rec.LastFullUiaScanUtc = scanTime;
                                             rec.LastOcclusionCheckUtc = nextOccCheck;
                                             rec.LastOccludedReason = occReason;
                                             rec.AnchorMissCount = nextMissCount;
                                             rec.Anchor = finalAnchor;
+                                            if (!needsHudSync) return;
                                             if (_inSync)
                                             {
                                                 _syncPending = true;
@@ -4292,7 +4873,7 @@ namespace AgyBackdropCompanion
                                                 try
                                                 {
                                                     Native.RECT freshRect;
-                                                    if (Native.TryGetVisibleBounds(h, out freshRect))
+                                                    if (Native.TryGetVisibleBounds(targetH, out freshRect))
                                                     {
                                                         SyncHudForWindow(rec, freshRect, null);
                                                     }
@@ -4320,18 +4901,20 @@ namespace AgyBackdropCompanion
                             // Probe active conversation breadcrumb for each visible window (dual-window support + foreground view file)
                             if (wantViewProbe)
                             {
+                                uiaScanCycles += 4;
                                 ActiveViewInfo view = UiaHelper.ProbeActiveConversationView(h, winRect);
                                 if (view.IsNewConversation || !string.IsNullOrEmpty(view.Title))
                                 {
                                     string vwWs = view.Workspace ?? "";
                                     string vwTitle = view.Title ?? "";
                                     bool vwIsNew = view.IsNewConversation;
+                                    IntPtr targetH = h;
                                     if (!_disposed)
                                     {
                                         _dispatcher.BeginInvoke(new Action(delegate
                                         {
                                             TrackedHostWindow rec;
-                                            if (!_disposed && _tracked.TryGetValue(h, out rec))
+                                            if (!_disposed && _tracked.TryGetValue(targetH, out rec))
                                             {
                                                 bool viewChanged =
                                                     rec.WindowIsNewConv != vwIsNew ||
@@ -4347,7 +4930,7 @@ namespace AgyBackdropCompanion
                                             }
                                         }));
                                     }
-                                    if (h == fgHwnd || hwnds.Count == 1)
+                                    if (h == fgHwnd || snapHwnds.Count == 1)
                                     {
                                         WriteActiveViewFile(vwWs, vwTitle, vwIsNew, explicitViewTrigger);
                                     }
@@ -4361,12 +4944,22 @@ namespace AgyBackdropCompanion
                             _pendingViewProbeAtUtc = DateTime.MaxValue;
                             _lastViewProbeUtc = DateTime.UtcNow;
                         }
+
+                        // Periodically reclaim transient UIA COM RCW wrappers to keep handle count & RAM flat
+                        if (uiaScanCycles >= 45 && !mouseDownOnHost)
+                        {
+                            uiaScanCycles = 0;
+                            GC.Collect(1, GCCollectionMode.Optimized, false);
+                        }
                     }
                     catch { }
 
-                    int waitMs = (mouseDownOnHost || typingNewlineKey)
-                        ? 16
-                        : (DateTime.UtcNow < _fastTrackUntilUtc ? 28 : 110);
+                    int waitMs;
+                    if (mouseDownOnHost || typingNewlineKey) waitMs = 16;
+                    else if (userActiveNow) waitMs = 32;
+                    else if (!isFgTracked) waitMs = 550;
+                    else if (anyOccluded) waitMs = 200;
+                    else waitMs = 360;
                     try { _uiaWakeEvent.WaitOne(waitMs); } catch { Thread.Sleep(waitMs); }
                 }
             });
@@ -4542,6 +5135,15 @@ namespace AgyBackdropCompanion
                     PushHudDisplayToWindows();
                 }));
             }
+            else if (IsTargetFile(name, "console_viewport.json"))
+            {
+                _dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (_disposed) return;
+                    ReloadConsoleViewport();
+                    SyncAllWindows(false);
+                }));
+            }
             else if (IsTargetFile(name, "lightbox_cmd.json"))
             {
                 _dispatcher.BeginInvoke(new Action(delegate
@@ -4592,6 +5194,19 @@ namespace AgyBackdropCompanion
                     {
                         ReloadHudDisplayConfig();
                         PushHudDisplayToWindows();
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (File.Exists(_consoleViewportPath))
+                {
+                    var info = new FileInfo(_consoleViewportPath);
+                    if (info.LastWriteTimeUtc != _lastConsoleViewportWriteUtc || info.Length != _lastConsoleViewportLength)
+                    {
+                        ReloadConsoleViewport();
                     }
                 }
             }
@@ -4767,6 +5382,73 @@ namespace AgyBackdropCompanion
                 }
             }
             return null;
+        }
+
+        private void ReloadConsoleViewport()
+        {
+            try
+            {
+                if (!File.Exists(_consoleViewportPath))
+                {
+                    _consoleViewportVisible = false;
+                    _consoleViewportPhysW = 0;
+                    _consoleViewportOuterW = 0;
+                    _consoleViewportUpdatedMs = 0;
+                    return;
+                }
+                var info = new FileInfo(_consoleViewportPath);
+                string raw = ReadTextWithRetry(_consoleViewportPath);
+                if (string.IsNullOrEmpty(raw)) return;
+                _lastConsoleViewportWriteUtc = info.LastWriteTimeUtc;
+                _lastConsoleViewportLength = info.Length;
+
+                var doc = _json.DeserializeObject(raw) as Dictionary<string, object>;
+                if (doc == null) return;
+
+                _consoleViewportVisible = ReadBool(doc, "visible", false);
+                _consoleViewportPhysW = Math.Max(0, ReadInt(doc, "physW", 0));
+                _consoleViewportOuterW = Math.Max(0, ReadInt(doc, "outerW", 0));
+                _consoleViewportUpdatedMs = ReadLong(doc, "updatedAtMs", 0);
+            }
+            catch { }
+        }
+
+        private bool IsConsoleCoveringAnchor(TrackedHostWindow item, Native.RECT winRect, double hostDpiScale)
+        {
+            if (item == null || !item.Anchor.HasAnchor || !_consoleViewportVisible || _consoleViewportPhysW <= 0)
+            {
+                return false;
+            }
+            long nowMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+            if (_consoleViewportUpdatedMs <= 0 || (nowMs - _consoleViewportUpdatedMs) > 9500)
+            {
+                return false;
+            }
+            int winW = Math.Max(1, winRect.Right - winRect.Left);
+            if (_tracked.Count > 1)
+            {
+                bool outerMatches = _consoleViewportOuterW > 0 && Math.Abs(winW - _consoleViewportOuterW) <= 80;
+                bool isFg = Native.GetForegroundWindow() == item.Hwnd;
+                if (!outerMatches && !isFg) return false;
+            }
+
+            int anchorW = Math.Max(1, item.Anchor.AnchorWinRight - item.Anchor.AnchorWinLeft);
+            int projRightX;
+            if (winW == anchorW)
+            {
+                projRightX = item.Anchor.RightX + (winRect.Left - item.Anchor.AnchorWinLeft);
+            }
+            else
+            {
+                double relRightFrac = Math.Max(0.05, Math.Min(0.98, (item.Anchor.RightX - item.Anchor.AnchorWinLeft) / (double)anchorW));
+                projRightX = winRect.Left + (int)Math.Round(winW * relRightFrac);
+            }
+
+            // Side-by-side mode leaves >= 140 DIP of composer buttons (Turbo/Mic/Voice/Stop) between projRightX and consoleLeftPx;
+            // Full-screen AGY Console (with or without left sidebar) sweeps consoleLeftPx far left of projRightX!
+            int consoleLeftPx = winRect.Right - _consoleViewportPhysW;
+            int padPx = (int)Math.Round(24.0 * Math.Max(0.75, hostDpiScale));
+            return projRightX >= (consoleLeftPx - padPx);
         }
 
         private void ReloadHudDisplayConfig()
@@ -5290,22 +5972,29 @@ namespace AgyBackdropCompanion
             _cachedWpPath = filePath ?? "";
             _cachedBitmap = null;
             _cachedWpMtimeUtc = DateTime.MinValue;
-            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return;
+            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+            {
+                Native.TrimWorkingSet();
+                return;
+            }
 
             try
             {
                 _cachedWpMtimeUtc = File.GetLastWriteTimeUtc(filePath);
-                byte[] bytes = File.ReadAllBytes(filePath);
-                using (var ms = new MemoryStream(bytes))
+                int decodeW = Native.GetMaxMonitorPhysicalWidth();
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
                     var bmp = new BitmapImage();
                     bmp.BeginInit();
                     bmp.CacheOption = BitmapCacheOption.OnLoad;
-                    bmp.StreamSource = ms;
+                    bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                    bmp.DecodePixelWidth = decodeW;
+                    bmp.StreamSource = fs;
                     bmp.EndInit();
                     bmp.Freeze();
                     _cachedBitmap = bmp;
                 }
+                Native.TrimWorkingSet();
             }
             catch
             {
@@ -5426,9 +6115,12 @@ namespace AgyBackdropCompanion
             bool wantHud = _config.hudEnabled && _hudEnabledByTray && !_pausedByTray && !_hudTelemetry.cdpHudActive && !lightboxOpen;
             bool hostVisible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
             bool validBounds = (winRect.Right - winRect.Left) >= 300 && (winRect.Bottom - winRect.Top) >= 240;
+            double hostDpiScale = Native.GetWindowDpiScale(item.Hwnd);
+            bool consoleCoversAnchor = item.Anchor.HasAnchor && IsConsoleCoveringAnchor(item, winRect, hostDpiScale);
+            item.ConsoleOccluded = consoleCoversAnchor;
 
-            // Only show WPF HUD when anchored to a real composer toolbar AND not occluded by native popups (Model/Usage/Dialog)
-            bool showHud = wantHud && hostVisible && validBounds && item.Anchor.HasAnchor && item.Anchor.ComposerVisible && !item.Anchor.Occluded;
+            // Only show WPF HUD when anchored to a real composer toolbar AND not occluded by native popups or full-screen AGY Console
+            bool showHud = wantHud && hostVisible && validBounds && item.Anchor.HasAnchor && item.Anchor.ComposerVisible && !item.Anchor.Occluded && !consoleCoversAnchor;
 
             if (!showHud)
             {
@@ -5454,7 +6146,6 @@ namespace AgyBackdropCompanion
             IntPtr hudHwnd = item.Hud.Handle;
             if (hudHwnd == IntPtr.Zero) return;
 
-            double hostDpiScale = Native.GetWindowDpiScale(item.Hwnd);
             if (Math.Abs(hostDpiScale - item.LastHostDpiScale) > 0.01)
             {
                 item.LastHostDpiScale = hostDpiScale;
@@ -5481,7 +6172,7 @@ namespace AgyBackdropCompanion
             {
                 // Proportional projection avoids slamming HUD into the right side panel while 60fps UIA refines exact anchor
                 double relLeftFrac = Math.Max(0.05, Math.Min(0.95, (item.Anchor.LeftGuardX - item.Anchor.AnchorWinLeft) / (double)anchorW));
-                double relRightFrac = Math.Max(relLeftFrac + 0.05, Math.Min(0.98, (item.Anchor.RightX - item.Anchor.AnchorWinLeft) / (double)anchorW));
+                double relRightFrac = Math.Max(0.05, Math.Min(0.98, (item.Anchor.RightX - item.Anchor.AnchorWinLeft) / (double)anchorW));
                 leftGuardX = winRect.Left + (int)Math.Round(curW * relLeftFrac);
                 rightX = winRect.Left + (int)Math.Round(curW * relRightFrac);
                 TriggerFastUiaBurst(750, false);
@@ -5492,9 +6183,9 @@ namespace AgyBackdropCompanion
             if (rightX < minRightX) rightX = minRightX;
             if (rightX > maxRightX) rightX = maxRightX;
 
-            // Never push HUD rightward over Turbo/Voice buttons; instead dynamically trim model width or hide if cramped
-            int availPhysW = rightX - leftGuardX - (int)Math.Round(4 * hostDpiScale);
-            if (availPhysW < (int)Math.Round(28 * hostDpiScale))
+            // Never push HUD leftward over model picker / composer edge; progressively drop model -> cache -> speed -> ring-only -> hide
+            int availPhysW = rightX - leftGuardX;
+            if (availPhysW < (int)Math.Round(21 * hostDpiScale))
             {
                 HideHudIfVisible(item);
                 return;
@@ -6000,7 +6691,12 @@ namespace AgyBackdropCompanion
                         anyBackdropBlocked = true;
                         if (!string.IsNullOrEmpty(item.BackdropBlockReason)) blockReason = item.BackdropBlockReason;
                     }
-                    if (item.Anchor.Occluded)
+                    if (item.ConsoleOccluded)
+                    {
+                        anyHudOccluded = true;
+                        occReason = "console-fullscreen";
+                    }
+                    else if (item.Anchor.Occluded)
                     {
                         anyHudOccluded = true;
                         if (!string.IsNullOrEmpty(item.LastOccludedReason)) occReason = item.LastOccludedReason;

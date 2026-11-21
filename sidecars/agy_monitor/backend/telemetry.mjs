@@ -109,12 +109,22 @@ function openReadOnlyCacheDb(cacheDbPath) {
   }
 }
 
+const rulesTokenCache = new Map();
+
 async function readRulesAddonTokens(paths) {
   const candidates = [paths?.rulesFile, paths?.agentsMdPath].filter(Boolean);
   for (const fp of candidates) {
     try {
+      const st = await fsp.stat(fp);
+      const cached = rulesTokenCache.get(fp);
+      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        return cached.tokens;
+      }
       const content = await fsp.readFile(fp, 'utf8');
-      return estimateTokensFromText(content);
+      const tokens = estimateTokensFromText(content);
+      if (rulesTokenCache.size > 16) rulesTokenCache.clear();
+      rulesTokenCache.set(fp, { mtimeMs: st.mtimeMs, size: st.size, tokens });
+      return tokens;
     } catch {
       // Missing optional rules file
     }

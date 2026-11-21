@@ -1048,21 +1048,10 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   const openLocalPath = async (rawTarget, { mode = "folder" } = {}) => {
     if (!rawTarget || typeof apiFetch !== "function") return;
     try {
-      const res = await callJson(apiFetch, "/api/mastery/open-path", {
+      await callJson(apiFetch, "/api/mastery/open-path", {
         method: "POST",
         body: JSON.stringify({ targetPath: String(rawTarget), mode: mode === "file" ? "file" : "folder" }),
       });
-      if (res?.openedPath) {
-        const prefix =
-          res.kind === "file_open"
-            ? "已打开文件："
-            : res.kind === "directory"
-              ? "已进入目录："
-              : res.kind === "parent_fallback"
-                ? "原路径已移除，已打开上级目录："
-                : "已打开所在位置：";
-        onToast?.(`${prefix}${res.openedPath}`, "success");
-      }
     } catch (err) {
       onToast?.(err?.message || (mode === "file" ? "无法打开目标文件" : "无法打开目标目录"), "error");
     }
