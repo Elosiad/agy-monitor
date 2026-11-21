@@ -661,9 +661,29 @@ namespace AgyBackdropCompanion
             {
                 _hwnd = new WindowInteropHelper(this).Handle;
                 long ex = Native.GetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE);
-                ex |= Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TRANSPARENT;
+                ex |= Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW;
                 Native.SetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE, ex);
+                HwndSource src = HwndSource.FromHwnd(_hwnd);
+                if (src != null)
+                {
+                    src.AddHook(BackdropWndProc);
+                }
             };
+        }
+
+        private static IntPtr BackdropWndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == 0x0084) // WM_NCHITTEST -> HTTRANSPARENT (click-through without non-layered WS_EX_TRANSPARENT GDI side effects)
+            {
+                handled = true;
+                return new IntPtr(-1);
+            }
+            if (msg == 0x0021) // WM_MOUSEACTIVATE -> MA_NOACTIVATE
+            {
+                handled = true;
+                return new IntPtr(3);
+            }
+            return IntPtr.Zero;
         }
 
         private void ApplyBlurAndScaling()
@@ -1604,6 +1624,7 @@ namespace AgyBackdropCompanion
                 Child = metaInner
             };
             ApplyMetaHoverStyle(false);
+            ApplyAvailableDipLayout();
 
             _metaPill.MouseEnter += delegate
             {
@@ -1776,6 +1797,7 @@ namespace AgyBackdropCompanion
 
         private void ApplyAvailableDipLayout()
         {
+            if (_metaPill == null || _modelText == null) return;
             // Reserve expansion budget while hovering the ring pill so the expanded "%"-badge never overlaps the left model picker
             double effectiveAvail = _availDip - (_ringHovered ? 40.0 : 0.0);
             if (effectiveAvail < 110.0)
@@ -2115,7 +2137,7 @@ namespace AgyBackdropCompanion
                         }
                     }
 
-                    if (sameRowCount >= 3 || (sameRowCount >= 2 && (micMatch != null || bestLeft != null)))
+                    if (sameRowCount >= 2)
                     {
                         cachedAnchor = chosen;
                         cachedKind = chosenKind;
@@ -3390,6 +3412,7 @@ namespace AgyBackdropCompanion
                                                         HideHudIfVisible(rec);
                                                     }
                                                 }
+                                                catch { }
                                                 finally
                                                 {
                                                     _inSync = prevInSync;
@@ -3495,7 +3518,23 @@ namespace AgyBackdropCompanion
             {
                 if (_tracked.Count > 0 && !_inSync)
                 {
-                    SyncAllWindows(false);
+                    bool needsZFix = false;
+                    foreach (TrackedHostWindow item in _tracked.Values)
+                    {
+                        if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero &&
+                            Native.IsWindow(item.Hwnd) && Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd))
+                        {
+                            if (Native.GetWindow(item.Hwnd, Native.GW_HWNDNEXT) != item.Backdrop.Handle)
+                            {
+                                needsZFix = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (needsZFix)
+                    {
+                        SyncAllWindows(false);
+                    }
                 }
                 return;
             }
@@ -4357,7 +4396,9 @@ namespace AgyBackdropCompanion
                     ? (byte)Math.Max(148, Math.Min(254, Math.Round(255.0 * (100 - _config.hostBlendPct) / 100.0)))
                     : (byte)255;
 
-                var pendingMoves = new List<PendingWinMove>(Math.Max(2, _tracked.Count * 2));
+                var backdropMoves = new List<PendingWinMove>(Math.Max(1, _tracked.Count));
+                var hudMoves = new List<PendingWinMove>(Math.Max(1, _tracked.Count));
+                var alphaTargets = new List<TrackedHostWindow>(Math.Max(1, _tracked.Count));
 
                 foreach (TrackedHostWindow item in _tracked.Values)
                 {
@@ -4376,7 +4417,7 @@ namespace AgyBackdropCompanion
                     bool hasBounds = Native.TryGetVisibleBounds(item.Hwnd, out r);
                     if (hasBounds)
                     {
-                        SyncHudForWindow(item, r, pendingMoves);
+                        try { SyncHudForWindow(item, r, hudMoves); } catch { }
                     }
                     else
                     {
@@ -4387,18 +4428,6 @@ namespace AgyBackdropCompanion
                     {
                         RestoreBackdropOnly(item, false);
                         continue;
-                    }
-
-                    if (!item.AlphaApplied || item.LastAlpha != targetAlpha)
-                    {
-                        long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
-                        if ((curEx & Native.WS_EX_LAYERED) == 0)
-                        {
-                            Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx | Native.WS_EX_LAYERED);
-                        }
-                        Native.SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha, Native.LWA_ALPHA);
-                        item.AlphaApplied = true;
-                        item.LastAlpha = targetAlpha;
                     }
 
                     bool visible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
@@ -4443,7 +4472,7 @@ namespace AgyBackdropCompanion
                     if (zMismatch || rectChanged)
                     {
                         uint flags = Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW;
-                        pendingMoves.Add(new PendingWinMove
+                        backdropMoves.Add(new PendingWinMove
                         {
                             Hwnd = wpHwnd,
                             InsertAfter = item.Hwnd,
@@ -4459,9 +4488,31 @@ namespace AgyBackdropCompanion
                         item.LastWidth = w;
                         item.LastHeight = h;
                     }
+
+                    if (!item.AlphaApplied || item.LastAlpha != targetAlpha)
+                    {
+                        alphaTargets.Add(item);
+                    }
                 }
 
-                CommitPendingMoves(pendingMoves);
+                // Always place the opaque backdrop behind the host BEFORE making the host translucent
+                CommitPendingMoves(backdropMoves);
+
+                for (int i = 0; i < alphaTargets.Count; i++)
+                {
+                    TrackedHostWindow item = alphaTargets[i];
+                    if (!Native.IsWindow(item.Hwnd)) continue;
+                    long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
+                    if ((curEx & Native.WS_EX_LAYERED) == 0)
+                    {
+                        Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx | Native.WS_EX_LAYERED);
+                    }
+                    Native.SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha, Native.LWA_ALPHA);
+                    item.AlphaApplied = true;
+                    item.LastAlpha = targetAlpha;
+                }
+
+                CommitPendingMoves(hudMoves);
 
                 if (_lightbox != null)
                 {
@@ -4816,6 +4867,52 @@ namespace AgyBackdropCompanion
             return Math.Max(min, Math.Min(max, v));
         }
 
+        public void LogFatalException(string source, Exception ex)
+        {
+            try
+            {
+                string logPath = System.IO.Path.Combine(_dataDir, "backdrop_error.log");
+                string msg = string.Format(
+                    "[{0}] {1}: {2}\r\n",
+                    DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                    source ?? "unknown",
+                    ex != null ? ex.ToString() : "(null)"
+                );
+                File.AppendAllText(logPath, msg, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        public void RestoreAllHostOpacityEmergency()
+        {
+            try
+            {
+                var snapshot = new List<TrackedHostWindow>(_tracked.Values);
+                for (int i = 0; i < snapshot.Count; i++)
+                {
+                    TrackedHostWindow item = snapshot[i];
+                    if (item == null || !item.AlphaApplied || !Native.IsWindow(item.Hwnd)) continue;
+                    try
+                    {
+                        if (item.OriginallyLayered)
+                        {
+                            Native.SetLayeredWindowAttributes(item.Hwnd, 0, 255, Native.LWA_ALPHA);
+                        }
+                        else
+                        {
+                            long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
+                            Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx & ~Native.WS_EX_LAYERED);
+                            Native.RedrawWindow(item.Hwnd, IntPtr.Zero, IntPtr.Zero, Native.RDW_INVALIDATE | Native.RDW_FRAME | Native.RDW_UPDATENOW);
+                        }
+                    }
+                    catch { }
+                    item.AlphaApplied = false;
+                    item.LastAlpha = 255;
+                }
+            }
+            catch { }
+        }
+
         public static void SignalExistingStop()
         {
             try
@@ -4868,6 +4965,31 @@ namespace AgyBackdropCompanion
                 };
 
                 var controller = new CompanionController(dataDir, assetsDir, app.Dispatcher);
+                app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)
+                {
+                    try { controller.LogFatalException("DispatcherUnhandledException", e.Exception); } catch { }
+                    try { controller.Dispose(); } catch { try { controller.RestoreAllHostOpacityEmergency(); } catch { } }
+                    e.Handled = false;
+                };
+                AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+                {
+                    try { controller.LogFatalException("UnhandledException", e.ExceptionObject as Exception); } catch { }
+                    try
+                    {
+                        if (app.Dispatcher != null && !app.Dispatcher.CheckAccess() && !app.Dispatcher.HasShutdownStarted)
+                        {
+                            app.Dispatcher.Invoke(DispatcherPriority.Send, TimeSpan.FromSeconds(2), new Action(controller.Dispose));
+                        }
+                        else
+                        {
+                            controller.Dispose();
+                        }
+                    }
+                    catch
+                    {
+                        try { controller.RestoreAllHostOpacityEmergency(); } catch { }
+                    }
+                };
                 AppDomain.CurrentDomain.ProcessExit += delegate
                 {
                     try
@@ -4883,7 +5005,7 @@ namespace AgyBackdropCompanion
                     }
                     catch
                     {
-                        try { controller.Dispose(); } catch { }
+                        try { controller.RestoreAllHostOpacityEmergency(); } catch { }
                     }
                 };
                 app.Exit += delegate { controller.Dispose(); };

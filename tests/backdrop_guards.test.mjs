@@ -66,9 +66,27 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   const bdSrc = src.slice(bdStart, lbClassStart);
   assert.match(bdSrc, /AllowsTransparency\s*=\s*false;/, 'BackdropSurfaceWindow must use hardware-accelerated AllowsTransparency=false');
   assert.match(bdSrc, /DwmSetWindowAttribute/, 'BackdropSurfaceWindow must apply native DWM rounded corners');
-  assert.match(src, /BeginDeferWindowPos/, 'SyncAllWindows must batch Backdrop + HUD updates via DeferWindowPos');
+  assert.doesNotMatch(bdSrc, /Native\.WS_EX_TRANSPARENT/, 'Non-layered BackdropSurfaceWindow must NOT set GDI WS_EX_TRANSPARENT');
+  assert.match(bdSrc, /0x0084/, 'BackdropSurfaceWindow must handle WM_NCHITTEST for click-through');
+  assert.match(bdSrc, /0x0021/, 'BackdropSurfaceWindow must handle WM_MOUSEACTIVATE to never steal focus');
+  assert.match(src, /BeginDeferWindowPos/, 'SyncAllWindows must batch window updates via DeferWindowPos');
+  assert.match(src, /CommitPendingMoves\s*\(\s*backdropMoves\s*\)/, 'SyncAllWindows must commit backdropMoves separately');
+  assert.match(src, /CommitPendingMoves\s*\(\s*hudMoves\s*\)/, 'SyncAllWindows must commit hudMoves separately');
+  const syncAllIdx = src.indexOf('private void SyncAllWindows(');
+  const commitBdIdx = src.indexOf('CommitPendingMoves(backdropMoves);', syncAllIdx);
+  const applyAlphaIdx = src.indexOf('SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha', syncAllIdx);
+  assert.ok(commitBdIdx > syncAllIdx && applyAlphaIdx > commitBdIdx, 'Backdrop must be positioned BEFORE making host window translucent');
   assert.match(src, /CompositionTarget\.Rendering\s*\+=\s*OnCompositionRendering/, 'Companion must VSync-track window moves/resizes');
   assert.match(src, /EVENT_OBJECT_REORDER/, 'Companion must hook EVENT_OBJECT_REORDER for instant Z-order sync');
   assert.match(src, /\[AGY_PROGRESS/, 'IsHeaderChromeText must reject [AGY_PROGRESS...] chat lines as titles');
   assert.match(src, /IsNewConversationTitle/, 'ProbeActiveConversationView must detect blank New Conversation headers');
+
+  // 9. Constructor null-safety & global unhandled-exception host-opacity safety net
+  const applyDipIdx = src.indexOf('private void ApplyAvailableDipLayout()');
+  assert.ok(applyDipIdx > 0, 'ApplyAvailableDipLayout missing');
+  const applyDipSnippet = src.slice(applyDipIdx, applyDipIdx + 240);
+  assert.match(applyDipSnippet, /if\s*\(_metaPill\s*==\s*null\s*\|\|\s*_modelText\s*==\s*null\)\s*return;/, 'ApplyAvailableDipLayout must guard against pre-init null controls');
+  assert.match(src, /DispatcherUnhandledException/, 'Program.Main must hook DispatcherUnhandledException');
+  assert.match(src, /AppDomain\.CurrentDomain\.UnhandledException/, 'Program.Main must hook AppDomain.CurrentDomain.UnhandledException');
+  assert.match(src, /RestoreAllHostOpacityEmergency/, 'CompanionController must provide pure-Win32 emergency host opacity restore');
 });
