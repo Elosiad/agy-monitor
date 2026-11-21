@@ -84,9 +84,46 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   // 9. Constructor null-safety & global unhandled-exception host-opacity safety net
   const applyDipIdx = src.indexOf('private void ApplyAvailableDipLayout()');
   assert.ok(applyDipIdx > 0, 'ApplyAvailableDipLayout missing');
-  const applyDipSnippet = src.slice(applyDipIdx, applyDipIdx + 240);
-  assert.match(applyDipSnippet, /if\s*\(_metaPill\s*==\s*null\s*\|\|\s*_modelText\s*==\s*null\)\s*return;/, 'ApplyAvailableDipLayout must guard against pre-init null controls');
+  const applyDipSnippet = src.slice(applyDipIdx, applyDipIdx + 260);
+  assert.match(applyDipSnippet, /if\s*\(_metaPill\s*==\s*null\s*\|\|\s*_metaText\s*==\s*null[^)]*\)\s*return;/, 'ApplyAvailableDipLayout must guard against pre-init null controls');
   assert.match(src, /DispatcherUnhandledException/, 'Program.Main must hook DispatcherUnhandledException');
   assert.match(src, /AppDomain\.CurrentDomain\.UnhandledException/, 'Program.Main must hook AppDomain.CurrentDomain.UnhandledException');
   assert.match(src, /RestoreAllHostOpacityEmergency/, 'CompanionController must provide pure-Win32 emergency host opacity restore');
+
+  // 10. Context ring click-to-configure popover (showSpeed, showCacheHit, showModel, showContext)
+  assert.match(src, /internal\s+sealed\s+class\s+HudConfigPopupWindow\s*:\s*Window/, 'HudConfigPopupWindow class missing');
+  assert.match(src, /w\s+is\s+HudConfigPopupWindow/, 'SweepOrphanedWindows must sweep orphaned HudConfigPopupWindow instances');
+  assert.match(src, /IsTargetFile\(name,\s*"hud_display\.json"\)/, 'FileSystemWatcher must watch hud_display.json');
+  const popMethodIdx = src.indexOf('private void ToggleHudConfigPopup(');
+  assert.ok(popMethodIdx > 0, 'ToggleHudConfigPopup missing');
+  const popBlock = src.slice(popMethodIdx, popMethodIdx + 2400);
+  const popAssign = popBlock.indexOf('_hudPopup = popup;');
+  const popShow = popBlock.indexOf('popup.Show();');
+  assert.ok(popAssign > 0 && popShow > 0 && popAssign < popShow, '_hudPopup must be bound before popup.Show()');
+  assert.doesNotMatch(popBlock, /ForceActivateWindow/, 'ToggleHudConfigPopup must NOT steal foreground focus from host window');
+  const popClassIdx = src.indexOf('internal sealed class HudConfigPopupWindow');
+  const uiaClassIdx = src.indexOf('internal static class UiaHelper', popClassIdx);
+  assert.ok(popClassIdx > 0 && uiaClassIdx > popClassIdx);
+  const popClassSrc = src.slice(popClassIdx, uiaClassIdx);
+  assert.match(popClassSrc, /WS_EX_NOACTIVATE/, 'HudConfigPopupWindow must set WS_EX_NOACTIVATE to avoid z-order focus jump');
+  assert.match(popClassSrc, /0x0021/, 'HudConfigPopupWindow must return MA_NOACTIVATE on WM_MOUSEACTIVATE');
+  assert.match(popClassSrc, /SWP_NOACTIVATE/, 'HudConfigPopupWindow positioning must pass SWP_NOACTIVATE');
+  assert.match(popClassSrc, /生成速率/);
+  assert.match(popClassSrc, /缓存命中/);
+  assert.match(popClassSrc, /上游模型/);
+  assert.match(popClassSrc, /上下文占用/);
+
+  // 11. v1.0.7 zero mouse-injection, hover console guide card, dual-monitor/Wallpaper-Engine Z-order kill-switch, and Chinese usage popup occlusion
+  assert.doesNotMatch(src, /SendInput\s*\(/, 'AgyBackdrop.cs must not inject synthetic mouse clicks via SendInput');
+  assert.doesNotMatch(src, /SetCursorPos\s*\(/, 'AgyBackdrop.cs must not hijack cursor via SetCursorPos');
+  assert.match(src, /internal\s+sealed\s+class\s+HudGuidePreviewWindow\s*:\s*Window/, 'HudGuidePreviewWindow class missing');
+  assert.match(src, /w\s+is\s+HudGuidePreviewWindow/, 'SweepOrphanedWindows must sweep orphaned HudGuidePreviewWindow instances');
+  assert.match(src, /open_console_guide\.jpg/, 'HudConfigPopupWindow must reference bundled open_console_guide.jpg');
+  assert.ok(fs.existsSync(path.resolve(__dirname, '..', 'assets', 'open_console_guide.jpg')), 'assets/open_console_guide.jpg must exist');
+  assert.match(src, /IsWindowStrictlyBehind\s*\(/, 'Backdrop sync must verify strict behind-host Z-order before showing');
+  assert.match(src, /BackdropGuardBlocked/, 'Backdrop sync must circuit-break when Z-order or layered alpha conflicts');
+  assert.match(src, /使用限额/);
+  assert.match(src, /查看用量/);
+  assert.match(src, /重置于/);
+  assert.match(src, /frompoint-portal-box/);
 });

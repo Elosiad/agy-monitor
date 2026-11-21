@@ -10,8 +10,21 @@ const execFileAsync = promisify(execFile);
 
 const STYLE_ELEMENT_ID = 'agy-monitor-cdp-theme';
 const HUD_ELEMENT_ID = 'agy-monitor-cdp-hud';
+const HUD_POPOVER_ID = 'agy-monitor-cdp-hud-popover';
+const HUD_GUIDE_ID = 'agy-monitor-cdp-hud-guide';
 const HUD_STYLE_ID = 'agy-monitor-cdp-hud-style';
 const DEFAULT_CDP_PORT = 9229;
+
+function normalizeHudDisplayConfig(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  return {
+    showSpeed: src.showSpeed !== false,
+    showCacheHit: src.showCacheHit !== false,
+    showModel: src.showModel !== false,
+    showContext: src.showContext !== false,
+    updatedAtMs: Number.isFinite(Number(src.updatedAtMs)) ? Number(src.updatedAtMs) : 0,
+  };
+}
 
 const EXT_TO_MIME = new Map([
   ['.webp', 'image/webp'],
@@ -491,70 +504,273 @@ function buildRemoveThemeExpr() {
   })()`;
 }
 
-function buildHudSyncExpr(hudPayload, accentColor) {
+function buildHudSyncExpr(hudPayload, accentColor, displayConfig = null, guideImageDataUri = '') {
+  const disp = normalizeHudDisplayConfig(displayConfig);
   const safePayload = JSON.stringify({
     percent: clampInt(hudPayload?.percent, 0, 999, 0),
+    totalUsed: Math.max(0, Math.round(Number(hudPayload?.totalUsed) || 0)),
+    windowCap: Math.max(1, Math.round(Number(hudPayload?.windowCap) || 512000)),
     tokPerSec:
       typeof hudPayload?.tokPerSec === 'number' && Number.isFinite(hudPayload.tokPerSec) && hudPayload.tokPerSec > 0
         ? hudPayload.tokPerSec
+        : null,
+    cacheHitPct:
+      typeof hudPayload?.cacheHitPct === 'number' && Number.isFinite(hudPayload.cacheHitPct)
+        ? clampInt(hudPayload.cacheHitPct, 0, 100, 0)
         : null,
     upstreamModelId: typeof hudPayload?.upstreamModelId === 'string' ? hudPayload.upstreamModelId : '',
     accent:
       typeof accentColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(accentColor)
         ? accentColor
         : '#5b8cff',
+    display: disp,
+    guideImageDataUri: typeof guideImageDataUri === 'string' ? guideImageDataUri : '',
   });
 
   return `(function(data){
     var HUD_ID = ${JSON.stringify(HUD_ELEMENT_ID)};
+    var POP_ID = ${JSON.stringify(HUD_POPOVER_ID)};
+    var GUIDE_ID = ${JSON.stringify(HUD_GUIDE_ID)};
     var STYLE_ID = ${JSON.stringify(HUD_STYLE_ID)};
 
     if (!document.getElementById(STYLE_ID)) {
       var st = document.createElement('style');
       st.id = STYLE_ID;
       st.textContent = [
-        '#' + HUD_ID + ' { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; min-width: 0; max-width: 310px; margin-left: auto; margin-right: 4px; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; user-select: none; }',
+        '#' + HUD_ID + ' { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; min-width: 0; max-width: 390px; margin-left: auto; margin-right: 4px; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; user-select: none; }',
         '#' + HUD_ID + ' .agy-hud-ring-pill { display: inline-flex; align-items: center; height: 22px; padding: 0 3px; border-radius: 999px; border: 1px solid transparent; background: transparent; cursor: pointer; flex-shrink: 0; transition: background 0.14s ease, border-color 0.14s ease, padding 0.14s ease; }',
         '#' + HUD_ID + ' .agy-hud-ring-pill:hover { background: rgba(22, 24, 32, 0.90); border-color: rgba(255, 255, 255, 0.22); padding: 0 7px 0 5px; }',
         '#' + HUD_ID + ' .agy-hud-pct { max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; font-size: 11px; font-weight: 600; color: #eae9ef; font-variant-numeric: tabular-nums; margin-left: 0; transition: max-width 0.14s ease, opacity 0.12s ease, margin-left 0.14s ease; }',
         '#' + HUD_ID + ' .agy-hud-ring-pill:hover .agy-hud-pct { max-width: 52px; opacity: 1; margin-left: 5px; }',
-        '#' + HUD_ID + ' .agy-hud-meta-pill { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(19, 21, 28, 0.78); cursor: pointer; min-width: 0; max-width: 245px; overflow: hidden; transition: background 0.14s ease, border-color 0.14s ease; }',
+        '#' + HUD_ID + ' .agy-hud-meta-pill { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(19, 21, 28, 0.78); cursor: pointer; min-width: 0; max-width: 320px; overflow: hidden; transition: background 0.14s ease, border-color 0.14s ease; }',
         '#' + HUD_ID + ' .agy-hud-meta-pill:hover { background: rgba(28, 31, 41, 0.94); border-color: rgba(255, 255, 255, 0.28); }',
-        '#' + HUD_ID + ' .agy-hud-speed { font-size: 11px; font-weight: 500; color: #e2e1e8; white-space: nowrap; flex-shrink: 0; font-variant-numeric: tabular-nums; }',
+        '#' + HUD_ID + ' .agy-hud-speed, #' + HUD_ID + ' .agy-hud-cache { font-size: 11px; font-weight: 400; line-height: 1; color: #e2e1e8; white-space: nowrap; flex-shrink: 0; font-variant-numeric: tabular-nums; }',
+        '#' + HUD_ID + ' .agy-hud-cache { font-size: 10.5px; color: #b8dfcf; }',
         '#' + HUD_ID + ' .agy-hud-dot { font-size: 11px; color: rgba(255, 255, 255, 0.42); flex-shrink: 0; }',
-        '#' + HUD_ID + ' .agy-hud-model { font-size: 11px; color: #b6b5c0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }'
+        '#' + HUD_ID + ' .agy-hud-model { font-size: 11px; color: #b6b5c0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }',
+        '#' + HUD_ID + ' .agy-hud-empty-pill { display: none; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.16); background: rgba(22,24,32,0.82); color: #c7c7d4; font-size: 12px; cursor: pointer; flex-shrink: 0; }',
+        '#' + HUD_ID + ' .agy-hud-empty-pill:hover { background: rgba(34,38,50,0.94); border-color: rgba(255,255,255,0.30); color: #ffffff; }',
+        '#' + POP_ID + ' { position: fixed; z-index: 2147483640; width: 238px; padding: 8px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14); background: rgba(22,24,33,0.97); box-shadow: 0 12px 32px rgba(0,0,0,0.52); color: #eae9f0; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; user-select: none; backdrop-filter: blur(14px); }',
+        '#' + POP_ID + ' .agy-pop-head { display: flex; align-items: center; justify-content: space-between; padding: 3px 6px 7px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 4px; }',
+        '#' + POP_ID + ' .agy-pop-title { font-size: 11.5px; font-weight: 600; color: #dcdce6; }',
+        '#' + POP_ID + ' .agy-pop-badge { font-size: 11px; font-weight: 600; color: #9ec0ff; font-variant-numeric: tabular-nums; }',
+        '#' + POP_ID + ' .agy-pop-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 6px 6px; border: 0; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; text-align: left; }',
+        '#' + POP_ID + ' .agy-pop-row:hover { background: rgba(255,255,255,0.07); }',
+        '#' + POP_ID + ' .agy-pop-left { display: inline-flex; align-items: center; gap: 8px; min-width: 0; flex-shrink: 0; }',
+        '#' + POP_ID + ' .agy-pop-box { width: 15px; height: 15px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.04); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 10px; font-weight: 700; color: #fff; }',
+        '#' + POP_ID + ' .agy-pop-row[data-checked="1"] .agy-pop-box { border-color: transparent; background: var(--agy-pop-accent, #5b8cff); }',
+        '#' + POP_ID + ' .agy-pop-lbl { font-size: 12px; color: #e8e8f0; }',
+        '#' + POP_ID + ' .agy-pop-val { font-size: 11px; color: #9a9cae; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 112px; font-variant-numeric: tabular-nums; }',
+        '#' + POP_ID + ' .agy-pop-foot { margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(255,255,255,0.08); }',
+        '#' + POP_ID + ' .agy-pop-guide-row { display: flex; align-items: center; justify-content: space-between; width: 100%; height: 26px; padding: 0 7px 0 6px; border: 0; border-radius: 7px; background: rgba(255,255,255,0.045); color: #bac2d6; font-size: 11.5px; cursor: pointer; }',
+        '#' + POP_ID + ' .agy-pop-guide-row:hover, #' + POP_ID + ' .agy-pop-guide-row[data-pinned="1"] { background: rgba(255,255,255,0.11); color: #f0f4ff; }',
+        '#' + POP_ID + ' .agy-pop-q { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: rgba(255,255,255,0.12); font-size: 10px; font-weight: 700; color: #bac6e4; }',
+        '#' + GUIDE_ID + ' { position: fixed; z-index: 2147483641; width: 306px; padding: 8px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.16); background: rgba(20,22,31,0.98); box-shadow: 0 14px 36px rgba(0,0,0,0.62); pointer-events: none; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; }',
+        '#' + GUIDE_ID + ' .agy-guide-cap { font-size: 11px; font-weight: 600; color: #dae0f2; margin: 0 2px 7px; }',
+        '#' + GUIDE_ID + ' .agy-guide-img { display: block; width: 100%; aspect-ratio: 784 / 439; object-fit: cover; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); }'
       ].join('\\n');
       (document.head || document.documentElement).appendChild(st);
     }
 
-    function openAgyConsole() {
-      var targets = document.querySelectorAll('[role="tab"], button, [role="menuitem"]');
-      for (var i = 0; i < targets.length; i++) {
-        var txt = ((targets[i].textContent || '') + ' ' + (targets[i].getAttribute('aria-label') || '') + ' ' + (targets[i].getAttribute('title') || '')).toLowerCase();
-        if (txt.indexOf('agy 控制台') >= 0 || txt.indexOf('antigravity monitor') >= 0) {
-          targets[i].click();
-          return;
-        }
+    function fmtTokK(n) {
+      var v = Math.max(0, Number(n) || 0);
+      if (v >= 1000000) return (v / 1000000).toFixed(1).replace(/\\.0$/, '') + 'M';
+      if (v >= 1000) return Math.round(v / 1000) + 'k';
+      return String(v);
+    }
+
+    function getDisplayState() {
+      var cur = window.__agyMonHudDisplay;
+      var incoming = data.display || { showSpeed: true, showCacheHit: true, showModel: true, showContext: true, updatedAtMs: 0 };
+      if (!cur || ((incoming.updatedAtMs || 0) > (cur.updatedAtMs || 0) && !window.__agyMonHudDisplayDirty)) {
+        cur = {
+          showSpeed: incoming.showSpeed !== false,
+          showCacheHit: incoming.showCacheHit !== false,
+          showModel: incoming.showModel !== false,
+          showContext: incoming.showContext !== false,
+          updatedAtMs: incoming.updatedAtMs || 0
+        };
+        window.__agyMonHudDisplay = cur;
       }
+      return cur;
+    }
+
+    function hideGuideCard() {
+      var g = document.getElementById(GUIDE_ID);
+      if (g && g.parentNode) g.parentNode.removeChild(g);
+    }
+
+    function showGuideCard(popEl) {
+      var d = window.__agyMonHudLatestData || data;
+      if (!popEl || !d || !d.guideImageDataUri) return;
+      hideGuideCard();
+      var g = document.createElement('div');
+      g.id = GUIDE_ID;
+      g.innerHTML =
+        '<div class="agy-guide-cap">打开方式：右上角 Plugins → AGY 控制台</div>' +
+        '<img class="agy-guide-img" alt="AGY 控制台打开指引" />';
+      var imgEl = g.querySelector('.agy-guide-img');
+      if (imgEl) imgEl.src = d.guideImageDataUri;
+      document.body.appendChild(g);
+      var pr = popEl.getBoundingClientRect();
       var vw = window.innerWidth || 1200;
-      for (var j = 0; j < targets.length; j++) {
-        var r = targets[j].getBoundingClientRect();
-        if (!r || r.top > 76 || r.left < vw - 260) continue;
-        var lbl = ((targets[j].getAttribute('aria-label') || '') + ' ' + (targets[j].getAttribute('title') || '')).toLowerCase();
-        if (lbl.indexOf('side') >= 0 || lbl.indexOf('panel') >= 0 || lbl.indexOf('aux') >= 0 || lbl.indexOf('侧边') >= 0) {
-          targets[j].click();
-          setTimeout(function() {
-            var tabs = document.querySelectorAll('[role="tab"], button');
-            for (var k = 0; k < tabs.length; k++) {
-              var t = ((tabs[k].textContent || '') + ' ' + (tabs[k].getAttribute('aria-label') || '')).toLowerCase();
-              if (t.indexOf('agy 控制台') >= 0 || t.indexOf('antigravity monitor') >= 0) {
-                tabs[k].click();
-                return;
-              }
-            }
-          }, 220);
-          return;
+      var vh = window.innerHeight || 800;
+      var gw = g.offsetWidth || 306;
+      var gh = g.offsetHeight || 202;
+      var left = Math.round(pr.right + 6);
+      if (left + gw > vw - 8) {
+        left = Math.max(8, Math.round(pr.left - gw - 6));
+      }
+      var top = Math.round(pr.bottom - gh);
+      if (top < 8) top = 8;
+      if (top + gh > vh - 8) top = Math.max(8, vh - gh - 8);
+      g.style.left = left + 'px';
+      g.style.top = top + 'px';
+    }
+
+    function closePopover() {
+      hideGuideCard();
+      var pop = document.getElementById(POP_ID);
+      if (pop && pop.parentNode) pop.parentNode.removeChild(pop);
+    }
+
+    function applyHudDisplayToDom(hudEl, effectiveWidth) {
+      if (!hudEl) return;
+      var disp = getDisplayState();
+      var ringBtn = hudEl.querySelector('.agy-hud-ring-pill');
+      var metaBtn = hudEl.querySelector('.agy-hud-meta-pill');
+      var emptyBtn = hudEl.querySelector('.agy-hud-empty-pill');
+      var speedEl = hudEl.querySelector('.agy-hud-speed');
+      var dot1 = hudEl.querySelector('.agy-hud-dot-1');
+      var cacheEl = hudEl.querySelector('.agy-hud-cache');
+      var dot2 = hudEl.querySelector('.agy-hud-dot-2');
+      var modelEl = hudEl.querySelector('.agy-hud-model');
+
+      var anyMeta = disp.showSpeed || disp.showCacheHit || disp.showModel;
+      var anyAll = disp.showContext || anyMeta;
+      if (ringBtn) ringBtn.style.display = disp.showContext ? 'inline-flex' : 'none';
+      if (emptyBtn) emptyBtn.style.display = anyAll ? 'none' : 'inline-flex';
+      if (speedEl) speedEl.style.display = disp.showSpeed ? 'inline' : 'none';
+      if (cacheEl) cacheEl.style.display = disp.showCacheHit ? 'inline' : 'none';
+      if (modelEl) modelEl.style.display = disp.showModel ? 'inline' : 'none';
+      if (dot1) dot1.style.display = (disp.showSpeed && (disp.showCacheHit || disp.showModel)) ? 'inline' : 'none';
+      if (dot2) dot2.style.display = (disp.showCacheHit && disp.showModel) ? 'inline' : 'none';
+      if (metaBtn) {
+        var hideNarrow = effectiveWidth > 0 && effectiveWidth < 360 && disp.showContext;
+        metaBtn.style.display = (anyMeta && !hideNarrow) ? 'inline-flex' : 'none';
+      }
+    }
+
+    function refreshPopoverContents() {
+      var pop = document.getElementById(POP_ID);
+      if (!pop) return;
+      var disp = getDisplayState();
+      var d = window.__agyMonHudLatestData || data;
+      pop.style.setProperty('--agy-pop-accent', d.accent || '#5b8cff');
+      var badge = pop.querySelector('.agy-pop-badge');
+      if (badge) badge.textContent = Math.max(0, Math.min(999, Math.round(Number(d.percent) || 0))) + '%';
+      var valMap = {
+        showSpeed: (typeof d.tokPerSec === 'number' && d.tokPerSec > 0)
+          ? ((d.tokPerSec >= 100 ? Math.round(d.tokPerSec) : d.tokPerSec.toFixed(1)) + ' tok/s')
+          : '--',
+        showCacheHit: (typeof d.cacheHitPct === 'number') ? (d.cacheHitPct + '%') : '--',
+        showModel: d.upstreamModelId || '--',
+        showContext: d.totalUsed > 0 ? (fmtTokK(d.totalUsed) + ' / ' + fmtTokK(d.windowCap)) : '0%'
+      };
+      var rows = pop.querySelectorAll('.agy-pop-row');
+      for (var i = 0; i < rows.length; i++) {
+        var key = rows[i].getAttribute('data-key');
+        var checked = Boolean(disp[key]);
+        rows[i].setAttribute('data-checked', checked ? '1' : '0');
+        var box = rows[i].querySelector('.agy-pop-box');
+        if (box) box.textContent = checked ? '✓' : '';
+        var val = rows[i].querySelector('.agy-pop-val');
+        if (val && Object.prototype.hasOwnProperty.call(valMap, key)) val.textContent = valMap[key];
+      }
+    }
+
+    function togglePopover(anchorEl) {
+      var existing = document.getElementById(POP_ID);
+      if (existing) {
+        closePopover();
+        return;
+      }
+      var pop = document.createElement('div');
+      pop.id = POP_ID;
+      pop.innerHTML =
+        '<div class="agy-pop-head"><span class="agy-pop-title">底部状态栏显示</span><span class="agy-pop-badge">0%</span></div>' +
+        '<button type="button" class="agy-pop-row" data-key="showSpeed"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">生成速率</span></span><span class="agy-pop-val">--</span></button>' +
+        '<button type="button" class="agy-pop-row" data-key="showCacheHit"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">缓存命中</span></span><span class="agy-pop-val">--</span></button>' +
+        '<button type="button" class="agy-pop-row" data-key="showModel"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">上游模型</span></span><span class="agy-pop-val">--</span></button>' +
+        '<button type="button" class="agy-pop-row" data-key="showContext"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">上下文占用</span></span><span class="agy-pop-val">0%</span></button>' +
+        '<div class="agy-pop-foot"><button type="button" class="agy-pop-guide-row" data-pinned="0"><span class="agy-pop-left"><span class="agy-pop-q">?</span><span>如何打开 AGY 控制台</span></span><span>▸</span></button></div>';
+
+      var guideBtn = pop.querySelector('.agy-pop-guide-row');
+      if (guideBtn) {
+        guideBtn.addEventListener('mouseenter', function() { showGuideCard(pop); });
+        guideBtn.addEventListener('mouseleave', function() {
+          if (guideBtn.getAttribute('data-pinned') !== '1') hideGuideCard();
+        });
+        guideBtn.addEventListener('click', function(ev) {
+          ev.stopPropagation();
+          var nextPin = guideBtn.getAttribute('data-pinned') !== '1';
+          guideBtn.setAttribute('data-pinned', nextPin ? '1' : '0');
+          if (nextPin) showGuideCard(pop);
+          else hideGuideCard();
+        });
+      }
+
+      pop.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        var row = ev.target && ev.target.closest ? ev.target.closest('.agy-pop-row') : null;
+        if (row) {
+          var key = row.getAttribute('data-key');
+          var disp = getDisplayState();
+          disp[key] = !disp[key];
+          disp.updatedAtMs = Date.now();
+          window.__agyMonHudDisplay = disp;
+          window.__agyMonHudDisplayDirty = {
+            showSpeed: disp.showSpeed,
+            showCacheHit: disp.showCacheHit,
+            showModel: disp.showModel,
+            showContext: disp.showContext,
+            updatedAtMs: disp.updatedAtMs
+          };
+          refreshPopoverContents();
+          applyHudDisplayToDom(document.getElementById(HUD_ID), window.__agyMonHudLastCardWidth || 0);
         }
+      });
+
+      document.body.appendChild(pop);
+      refreshPopoverContents();
+
+      var rect = anchorEl ? anchorEl.getBoundingClientRect() : null;
+      var vw = window.innerWidth || 1200;
+      var vh = window.innerHeight || 800;
+      var pw = pop.offsetWidth || 238;
+      var ph = pop.offsetHeight || 204;
+      var left = rect ? Math.round(rect.left + rect.width / 2 - pw / 2) : Math.round(vw - pw - 16);
+      var top = rect ? Math.round(rect.top - ph - 8) : Math.round(vh - ph - 48);
+      if (left < 10) left = 10;
+      if (left + pw > vw - 10) left = Math.max(10, vw - pw - 10);
+      if (top < 10) top = rect ? Math.min(vh - ph - 10, Math.round(rect.bottom + 8)) : 10;
+      pop.style.left = left + 'px';
+      pop.style.top = top + 'px';
+
+      if (!window.__agyMonHudPopDismissInstalled) {
+        window.__agyMonHudPopDismissInstalled = true;
+        window.__agyMonHudPopDocClick = function(ev) {
+          var p = document.getElementById(POP_ID);
+          if (!p) return;
+          var h = document.getElementById(HUD_ID);
+          if (p.contains(ev.target) || (h && h.contains(ev.target))) return;
+          closePopover();
+        };
+        window.__agyMonHudPopKeyDown = function(ev) {
+          if (ev.key === 'Escape') closePopover();
+        };
+        document.addEventListener('mousedown', window.__agyMonHudPopDocClick, true);
+        document.addEventListener('keydown', window.__agyMonHudPopKeyDown, true);
       }
     }
 
@@ -678,12 +894,17 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       return null;
     }
 
+    window.__agyMonHudLatestData = data;
     var anchor = findComposerAnchor();
     var hud = document.getElementById(HUD_ID);
     var focused = typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
+    var dirtyPatch = window.__agyMonHudDisplayDirty || null;
+    if (dirtyPatch) window.__agyMonHudDisplayDirty = null;
+
     if (!anchor) {
       if (hud && hud.parentNode) hud.parentNode.removeChild(hud);
-      return { hudInjected: false, activeView: readActiveView(), focused: focused };
+      closePopover();
+      return { hudInjected: false, activeView: readActiveView(), focused: focused, displayPatch: dirtyPatch };
     }
 
     if (!hud) {
@@ -693,7 +914,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       var ringPill = document.createElement('button');
       ringPill.type = 'button';
       ringPill.className = 'agy-hud-ring-pill';
-      ringPill.title = '打开 AGY 控制台';
+      ringPill.title = '点击选择底部显示项';
       ringPill.innerHTML =
         '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">' +
           '<circle cx="8" cy="8" r="6" fill="none" stroke="rgba(255,255,255,0.24)" stroke-width="2"></circle>' +
@@ -703,25 +924,39 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       ringPill.addEventListener('click', function(e) {
         e.preventDefault();
         e.stopPropagation();
-        openAgyConsole();
+        togglePopover(hud);
       });
 
       var metaPill = document.createElement('button');
       metaPill.type = 'button';
       metaPill.className = 'agy-hud-meta-pill';
-      metaPill.title = '打开 AGY 控制台';
+      metaPill.title = '点击选择底部显示项';
       metaPill.innerHTML =
         '<span class="agy-hud-speed">-- tok/s</span>' +
-        '<span class="agy-hud-dot">·</span>' +
+        '<span class="agy-hud-dot agy-hud-dot-1">·</span>' +
+        '<span class="agy-hud-cache">缓存 --</span>' +
+        '<span class="agy-hud-dot agy-hud-dot-2">·</span>' +
         '<span class="agy-hud-model">--</span>';
       metaPill.addEventListener('click', function(e) {
         e.preventDefault();
         e.stopPropagation();
-        openAgyConsole();
+        togglePopover(hud);
+      });
+
+      var emptyPill = document.createElement('button');
+      emptyPill.type = 'button';
+      emptyPill.className = 'agy-hud-empty-pill';
+      emptyPill.title = '点击选择底部显示项';
+      emptyPill.textContent = '···';
+      emptyPill.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        togglePopover(hud);
       });
 
       hud.appendChild(ringPill);
       hud.appendChild(metaPill);
+      hud.appendChild(emptyPill);
     }
 
     if (hud.parentElement !== anchor.parent || hud.nextSibling !== anchor.before) {
@@ -750,6 +985,10 @@ function buildHudSyncExpr(hudPayload, accentColor) {
         speedEl.textContent = '-- tok/s';
       }
     }
+    var cacheEl = hud.querySelector('.agy-hud-cache');
+    if (cacheEl) {
+      cacheEl.textContent = typeof data.cacheHitPct === 'number' ? ('缓存 ' + data.cacheHitPct + '%') : '缓存 --';
+    }
     var modelEl = hud.querySelector('.agy-hud-model');
     if (modelEl) {
       modelEl.textContent = data.upstreamModelId || '--';
@@ -757,10 +996,9 @@ function buildHudSyncExpr(hudPayload, accentColor) {
 
     // Measure full composer card width rather than the narrow button-group flex wrapper
     var effectiveWidth = anchor.cardWidth || (anchor.parent.getBoundingClientRect ? anchor.parent.getBoundingClientRect().width : 0);
-    var metaBtn = hud.querySelector('.agy-hud-meta-pill');
-    if (metaBtn && effectiveWidth > 0) {
-      metaBtn.style.display = effectiveWidth < 360 ? 'none' : 'inline-flex';
-    }
+    window.__agyMonHudLastCardWidth = effectiveWidth;
+    applyHudDisplayToDom(hud, effectiveWidth);
+    refreshPopoverContents();
 
     if (!window.__agyMonHudObserver && typeof MutationObserver === 'function' && document.body) {
       var hudObsTimer = null;
@@ -779,7 +1017,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       window.__agyMonHudObserver = hudObs;
     }
 
-    return { hudInjected: true, activeView: readActiveView(), focused: focused };
+    return { hudInjected: true, activeView: readActiveView(), focused: focused, displayPatch: dirtyPatch };
   })(${safePayload})`;
 }
 
@@ -789,6 +1027,19 @@ function buildRemoveHudExpr() {
       try { window.__agyMonHudObserver.disconnect(); } catch (e) {}
       delete window.__agyMonHudObserver;
     }
+    if (window.__agyMonHudPopDocClick) {
+      document.removeEventListener('mousedown', window.__agyMonHudPopDocClick, true);
+      delete window.__agyMonHudPopDocClick;
+    }
+    if (window.__agyMonHudPopKeyDown) {
+      document.removeEventListener('keydown', window.__agyMonHudPopKeyDown, true);
+      delete window.__agyMonHudPopKeyDown;
+    }
+    delete window.__agyMonHudPopDismissInstalled;
+    var g = document.getElementById(${JSON.stringify(HUD_GUIDE_ID)});
+    if (g && g.parentNode) g.parentNode.removeChild(g);
+    var pop = document.getElementById(${JSON.stringify(HUD_POPOVER_ID)});
+    if (pop && pop.parentNode) pop.parentNode.removeChild(pop);
     var el = document.getElementById(${JSON.stringify(HUD_ELEMENT_ID)});
     if (el && el.parentNode) el.parentNode.removeChild(el);
     var st = document.getElementById(${JSON.stringify(HUD_STYLE_ID)});
@@ -1243,6 +1494,25 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }
   };
 
+  let cachedGuideMtime = -1;
+  let cachedGuideDataUri = '';
+  const resolveGuideImageDataUri = async () => {
+    const filePath = paths?.assetsDir ? path.join(paths.assetsDir, 'open_console_guide.jpg') : '';
+    if (!filePath) return '';
+    try {
+      const st = await fsp.stat(filePath);
+      if (st.mtimeMs === cachedGuideMtime && cachedGuideDataUri) {
+        return cachedGuideDataUri;
+      }
+      const buf = await fsp.readFile(filePath);
+      cachedGuideMtime = st.mtimeMs;
+      cachedGuideDataUri = `data:image/jpeg;base64,${buf.toString('base64')}`;
+      return cachedGuideDataUri;
+    } catch {
+      return '';
+    }
+  };
+
   const sendEvaluateOn = (entry, expression) =>
     new Promise((resolve, reject) => {
       const sock = entry?.ws;
@@ -1530,6 +1800,16 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }).catch(() => {});
   };
 
+  const readHudDisplayConfig = async () => {
+    if (!paths?.hudDisplayFile) return normalizeHudDisplayConfig(null);
+    try {
+      const raw = await fsp.readFile(paths.hudDisplayFile, 'utf8');
+      return normalizeHudDisplayConfig(JSON.parse(raw));
+    } catch {
+      return normalizeHudDisplayConfig(null);
+    }
+  };
+
   const syncHudAll = async () => {
     if (disposed || !hasOpenSessions()) {
       notifyHudStateIfChanged();
@@ -1551,8 +1831,11 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }
 
     const accent = latestThemes?.colors?.accent || '#5b8cff';
-    const expr = buildHudSyncExpr(latestHudData || {}, accent);
+    const displayCfg = await readHudDisplayConfig();
+    const guideDataUri = await resolveGuideImageDataUri();
+    const expr = buildHudSyncExpr(latestHudData || {}, accent, displayCfg, guideDataUri);
     let anyInjected = false;
+    let latestPatch = null;
     await Promise.allSettled(
       [...sessions.values()].map(async (entry) => {
         if (entry.ws.readyState !== 1) return;
@@ -1563,8 +1846,17 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         if (val?.activeView) {
           await maybeWriteActiveView(val.activeView, { focused: val?.focused !== false });
         }
+        if (val?.displayPatch && typeof val.displayPatch === 'object') {
+          const normPatch = normalizeHudDisplayConfig(val.displayPatch);
+          if (!latestPatch || normPatch.updatedAtMs >= latestPatch.updatedAtMs) {
+            latestPatch = normPatch;
+          }
+        }
       }),
     );
+    if (latestPatch && paths?.hudDisplayFile) {
+      await atomicWriteJson(paths.hudDisplayFile, latestPatch).catch(() => {});
+    }
     notifyHudStateIfChanged();
     return anyInjected;
   };

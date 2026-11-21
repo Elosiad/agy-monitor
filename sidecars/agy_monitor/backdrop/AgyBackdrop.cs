@@ -11,6 +11,7 @@ using System.Web.Script.Serialization;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Forms;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -39,6 +40,25 @@ namespace AgyBackdropCompanion
         public string wallpaperPath = "";
     }
 
+    internal sealed class HudDisplayConfig
+    {
+        public bool showSpeed = true;
+        public bool showCacheHit = true;
+        public bool showModel = true;
+        public bool showContext = true;
+
+        public HudDisplayConfig Clone()
+        {
+            return new HudDisplayConfig
+            {
+                showSpeed = showSpeed,
+                showCacheHit = showCacheHit,
+                showModel = showModel,
+                showContext = showContext
+            };
+        }
+    }
+
     internal sealed class HudSessionEntry
     {
         public string id = "";
@@ -48,6 +68,7 @@ namespace AgyBackdropCompanion
         public long totalUsed = 0;
         public long windowCap = 512000;
         public double? tokPerSec = null;
+        public int? cacheHitPct = null;
         public string upstreamModelId = "";
     }
 
@@ -57,6 +78,7 @@ namespace AgyBackdropCompanion
         public long totalUsed = 0;
         public long windowCap = 512000;
         public double? tokPerSec = null;
+        public int? cacheHitPct = null;
         public string upstreamModelId = "";
         public string upstreamModelStatus = "no_baseline";
         public bool cdpHudActive = false;
@@ -146,8 +168,10 @@ namespace AgyBackdropCompanion
         public const int SM_CXVIRTUALSCREEN = 78;
         public const int SM_CYVIRTUALSCREEN = 79;
         public const int VK_LBUTTON = 0x01;
+        public const int VK_RBUTTON = 0x02;
         public const int VK_BACK = 0x08;
         public const int VK_RETURN = 0x0D;
+        public const int VK_ESCAPE = 0x1B;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
@@ -301,13 +325,7 @@ namespace AgyBackdropCompanion
         public static extern short GetAsyncKeyState(int vKey);
 
         [DllImport("user32.dll")]
-        public static extern bool SetCursorPos(int X, int Y);
-
-        [DllImport("user32.dll")]
         public static extern int GetSystemMetrics(int nIndex);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
         [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
         private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
@@ -517,45 +535,31 @@ namespace AgyBackdropCompanion
             }
         }
 
-        public static void SendLeftClickAt(int screenX, int screenY)
+        public static bool IsWindowStrictlyBehind(IntPtr wpHwnd, IntPtr hostHwnd)
         {
-            try
+            if (wpHwnd == IntPtr.Zero || hostHwnd == IntPtr.Zero) return false;
+            if (!IsWindow(wpHwnd) || !IsWindow(hostHwnd)) return false;
+
+            // Walk UP from hostHwnd: if wpHwnd EVER appears above hostHwnd, it is covering the host!
+            IntPtr cur = GetWindow(hostHwnd, GW_HWNDPREV);
+            int upSteps = 0;
+            while (cur != IntPtr.Zero && upSteps < 512)
             {
-                POINT prev;
-                bool hadPrev = GetCursorPos(out prev);
-
-                int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                int vw = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
-                int vh = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
-
-                int nx = (int)Math.Round(((screenX - vx) * 65535.0) / Math.Max(1, vw - 1));
-                int ny = (int)Math.Round(((screenY - vy) * 65535.0) / Math.Max(1, vh - 1));
-
-                INPUT[] inputs = new INPUT[3];
-                inputs[0].type = INPUT_MOUSE;
-                inputs[0].U.mi.dx = nx;
-                inputs[0].U.mi.dy = ny;
-                inputs[0].U.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-
-                inputs[1].type = INPUT_MOUSE;
-                inputs[1].U.mi.dx = nx;
-                inputs[1].U.mi.dy = ny;
-                inputs[1].U.mi.dwFlags = MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-
-                inputs[2].type = INPUT_MOUSE;
-                inputs[2].U.mi.dx = nx;
-                inputs[2].U.mi.dy = ny;
-                inputs[2].U.mi.dwFlags = MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-
-                SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
-                if (hadPrev)
-                {
-                    Thread.Sleep(25);
-                    SetCursorPos(prev.X, prev.Y);
-                }
+                if (cur == wpHwnd) return false;
+                cur = GetWindow(cur, GW_HWNDPREV);
+                upSteps++;
             }
-            catch { }
+
+            // Walk DOWN from hostHwnd: confirm wpHwnd actually sits below hostHwnd in Z-order
+            cur = GetWindow(hostHwnd, GW_HWNDNEXT);
+            int downSteps = 0;
+            while (cur != IntPtr.Zero && downSteps < 64)
+            {
+                if (cur == wpHwnd) return true;
+                cur = GetWindow(cur, GW_HWNDNEXT);
+                downSteps++;
+            }
+            return false;
         }
 
         public static string GetDesktopName()
@@ -1454,7 +1458,7 @@ namespace AgyBackdropCompanion
 
     internal sealed class HudOverlayWindow : Window
     {
-        public const double DipWidth = 360.0;
+        public const double DipWidth = 430.0;
         public const double DipHeight = 26.0;
 
         private readonly IntPtr _ownerHwnd;
@@ -1464,16 +1468,27 @@ namespace AgyBackdropCompanion
         private readonly System.Windows.Shapes.Path _ringArc;
         private readonly TextBlock _pctText;
         private readonly Border _metaPill;
-        private readonly TextBlock _speedText;
-        private readonly TextBlock _modelText;
+        private readonly TextBlock _metaText;
+        private readonly Run _speedRun;
+        private readonly Run _sep1Run;
+        private readonly Run _cacheLblRun;
+        private readonly Run _cacheValRun;
+        private readonly Run _sep2Run;
+        private readonly Run _modelRun;
+        private readonly Border _emptyAnchorPill;
 
         private IntPtr _hwnd = IntPtr.Zero;
         private int _lastPercent = -1;
         private string _lastAccentHex = "";
         private double _lastRelScaleX = 1.0;
         private double _lastRelScaleY = 1.0;
-        private double _availDip = 320.0;
+        private double _availDip = 360.0;
         private bool _ringHovered = false;
+        private HudDisplayConfig _display = new HudDisplayConfig();
+        private string _speedStr = "-- tok/s";
+        private string _cacheValStr = "--";
+        private string _modelStr = "--";
+        private int _lastMetaMask = -1;
 
         public event Action Clicked;
         public IntPtr Handle { get { return _hwnd; } }
@@ -1553,6 +1568,7 @@ namespace AgyBackdropCompanion
                 BorderThickness = new Thickness(1),
                 VerticalAlignment = VerticalAlignment.Center,
                 Cursor = System.Windows.Input.Cursors.Hand,
+                ToolTip = "点击选择底部显示项",
                 Child = ringInner
             };
             ApplyRingHoverStyle(false);
@@ -1572,45 +1588,58 @@ namespace AgyBackdropCompanion
                 if (handler != null) handler();
             };
 
-            // Right pill: minimal tok/s + upstream model ID
-            _speedText = new TextBlock
+            // Right pill: single unified TextBlock with Run inlines so Latin & CJK share one exact typographic baseline
+            // and CharacterEllipsis utilizes 100% of available width without clipping model IDs early.
+            _speedRun = new Run("-- tok/s")
             {
-                Text = "-- tok/s",
                 FontFamily = uiFont,
-                FontSize = 11,
-                FontWeight = FontWeights.Medium,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 225, 232)),
-                VerticalAlignment = VerticalAlignment.Center
+                FontSize = 11.0,
+                FontWeight = FontWeights.Normal,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 225, 232))
+            };
+            _sep1Run = new Run(" · ")
+            {
+                FontFamily = uiFont,
+                FontSize = 11.0,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromArgb(110, 255, 255, 255))
+            };
+            _cacheLblRun = new Run("缓存 ")
+            {
+                FontFamily = uiFont,
+                FontSize = 10.0,
+                FontWeight = FontWeights.Normal,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(156, 216, 190))
+            };
+            _cacheValRun = new Run("--")
+            {
+                FontFamily = uiFont,
+                FontSize = 11.0,
+                FontWeight = FontWeights.Normal,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(184, 223, 207))
+            };
+            _sep2Run = new Run(" · ")
+            {
+                FontFamily = uiFont,
+                FontSize = 11.0,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromArgb(110, 255, 255, 255))
+            };
+            _modelRun = new Run("--")
+            {
+                FontFamily = uiFont,
+                FontSize = 11.0,
+                FontWeight = FontWeights.Normal,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(182, 181, 192))
             };
 
-            var dotText = new TextBlock
+            _metaText = new TextBlock
             {
-                Text = " · ",
                 FontFamily = uiFont,
-                FontSize = 11,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromArgb(110, 255, 255, 255)),
-                VerticalAlignment = VerticalAlignment.Center
-            };
-
-            _modelText = new TextBlock
-            {
-                Text = "--",
-                FontFamily = uiFont,
-                FontSize = 11,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(182, 181, 192)),
+                FontSize = 11.0,
+                FontWeight = FontWeights.Normal,
                 VerticalAlignment = VerticalAlignment.Center,
-                MaxWidth = 152,
+                TextWrapping = TextWrapping.NoWrap,
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
-
-            var metaInner = new StackPanel
-            {
-                Orientation = System.Windows.Controls.Orientation.Horizontal,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            metaInner.Children.Add(_speedText);
-            metaInner.Children.Add(dotText);
-            metaInner.Children.Add(_modelText);
 
             _metaPill = new Border
             {
@@ -1621,10 +1650,10 @@ namespace AgyBackdropCompanion
                 BorderThickness = new Thickness(1),
                 VerticalAlignment = VerticalAlignment.Center,
                 Cursor = System.Windows.Input.Cursors.Hand,
-                Child = metaInner
+                ToolTip = "点击选择底部显示项",
+                Child = _metaText
             };
             ApplyMetaHoverStyle(false);
-            ApplyAvailableDipLayout();
 
             _metaPill.MouseEnter += delegate
             {
@@ -1641,6 +1670,50 @@ namespace AgyBackdropCompanion
                 if (handler != null) handler();
             };
 
+            // Minimal fallback button when user unchecks all 4 items so the popup remains reachable
+            var emptyGlyph = new TextBlock
+            {
+                Text = "···",
+                FontFamily = uiFont,
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(200, 200, 212)),
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            _emptyAnchorPill = new Border
+            {
+                Width = 22,
+                Height = 22,
+                CornerRadius = new CornerRadius(11),
+                BorderThickness = new Thickness(1),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(180, 22, 24, 32)),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(44, 255, 255, 255)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                ToolTip = "点击选择底部显示项",
+                Visibility = Visibility.Collapsed,
+                Child = emptyGlyph
+            };
+            _emptyAnchorPill.MouseEnter += delegate
+            {
+                _emptyAnchorPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(232, 32, 36, 48));
+                _emptyAnchorPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(72, 255, 255, 255));
+            };
+            _emptyAnchorPill.MouseLeave += delegate
+            {
+                _emptyAnchorPill.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(180, 22, 24, 32));
+                _emptyAnchorPill.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(44, 255, 255, 255));
+            };
+            _emptyAnchorPill.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                Action handler = Clicked;
+                if (handler != null) handler();
+            };
+
+            ApplyAvailableDipLayout();
+
             var row = new StackPanel
             {
                 Orientation = System.Windows.Controls.Orientation.Horizontal,
@@ -1649,6 +1722,7 @@ namespace AgyBackdropCompanion
             };
             row.Children.Add(_ringPill);
             row.Children.Add(_metaPill);
+            row.Children.Add(_emptyAnchorPill);
 
             // Outer Grid keeps Background = null so transparent left area is 100% click-through
             var root = new Grid
@@ -1711,6 +1785,12 @@ namespace AgyBackdropCompanion
             }
         }
 
+        public void UpdateDisplay(HudDisplayConfig display)
+        {
+            _display = display != null ? display.Clone() : new HudDisplayConfig();
+            ApplyAvailableDipLayout();
+        }
+
         public void UpdateData(HudTelemetry data, string accentHex)
         {
             int pct = data != null ? Math.Max(0, Math.Min(999, data.percent)) : 0;
@@ -1745,17 +1825,29 @@ namespace AgyBackdropCompanion
                 string num = val >= 100
                     ? Math.Round(val).ToString("0", CultureInfo.InvariantCulture)
                     : val.ToString("0.0", CultureInfo.InvariantCulture);
-                _speedText.Text = num + " tok/s";
+                _speedStr = num + " tok/s";
             }
             else
             {
-                _speedText.Text = "-- tok/s";
+                _speedStr = "-- tok/s";
             }
 
-            string modelId = (data != null && !string.IsNullOrEmpty(data.upstreamModelId))
+            if (data != null && data.cacheHitPct.HasValue)
+            {
+                _cacheValStr = string.Format("{0}%", Math.Max(0, Math.Min(100, data.cacheHitPct.Value)));
+            }
+            else
+            {
+                _cacheValStr = "--";
+            }
+
+            _modelStr = (data != null && !string.IsNullOrEmpty(data.upstreamModelId))
                 ? data.upstreamModelId
                 : "--";
-            _modelText.Text = modelId;
+
+            _speedRun.Text = _speedStr;
+            _cacheValRun.Text = _cacheValStr;
+            _modelRun.Text = _modelStr;
         }
 
         public bool ApplyDpiScale(double targetDpiScale, out int physW, out int physH)
@@ -1795,29 +1887,78 @@ namespace AgyBackdropCompanion
             return changed;
         }
 
+        private void RebuildMetaInlines(bool showSpeed, bool showCache, bool showModel)
+        {
+            int mask = (showSpeed ? 1 : 0) | (showCache ? 2 : 0) | (showModel ? 4 : 0);
+            if (mask == _lastMetaMask) return;
+            _lastMetaMask = mask;
+            _metaText.Inlines.Clear();
+            bool hasPrev = false;
+            if (showSpeed)
+            {
+                _metaText.Inlines.Add(_speedRun);
+                hasPrev = true;
+            }
+            if (showCache)
+            {
+                if (hasPrev) _metaText.Inlines.Add(_sep1Run);
+                _metaText.Inlines.Add(_cacheLblRun);
+                _metaText.Inlines.Add(_cacheValRun);
+                hasPrev = true;
+            }
+            if (showModel)
+            {
+                if (hasPrev) _metaText.Inlines.Add(_sep2Run);
+                _metaText.Inlines.Add(_modelRun);
+            }
+        }
+
         private void ApplyAvailableDipLayout()
         {
-            if (_metaPill == null || _modelText == null) return;
-            // Reserve expansion budget while hovering the ring pill so the expanded "%"-badge never overlaps the left model picker
-            double effectiveAvail = _availDip - (_ringHovered ? 40.0 : 0.0);
-            if (effectiveAvail < 110.0)
+            if (_metaPill == null || _metaText == null || _ringPill == null || _emptyAnchorPill == null) return;
+
+            bool wantContext = _display.showContext;
+            bool wantSpeed = _display.showSpeed;
+            bool wantCache = _display.showCacheHit;
+            bool wantModel = _display.showModel;
+            bool anyEnabled = wantContext || wantSpeed || wantCache || wantModel;
+
+            _ringPill.Visibility = wantContext ? Visibility.Visible : Visibility.Collapsed;
+            _emptyAnchorPill.Visibility = anyEnabled ? Visibility.Collapsed : Visibility.Visible;
+            _metaPill.Margin = wantContext ? new Thickness(6, 0, 0, 0) : new Thickness(0);
+
+            if (!wantSpeed && !wantCache && !wantModel)
             {
                 if (_metaPill.Visibility != Visibility.Collapsed)
                 {
                     _metaPill.Visibility = Visibility.Collapsed;
                 }
+                return;
             }
-            else
+
+            // Tight, accurate ring budget so the meta pill receives every free pixel of the composer toolbar gap
+            double ringBudget = wantContext ? (_ringHovered ? 52.0 : 22.0) : 0.0;
+            double metaAvail = _availDip - ringBudget - (wantContext ? 6.0 : 0.0);
+
+            if (metaAvail < 56.0 && wantContext)
             {
-                if (_metaPill.Visibility != Visibility.Visible)
+                if (_metaPill.Visibility != Visibility.Collapsed)
                 {
-                    _metaPill.Visibility = Visibility.Visible;
+                    _metaPill.Visibility = Visibility.Collapsed;
                 }
-                double nextMax = Math.Max(36.0, Math.Min(152.0, effectiveAvail - 118.0));
-                if (Math.Abs(_modelText.MaxWidth - nextMax) >= 2.0)
-                {
-                    _modelText.MaxWidth = nextMax;
-                }
+                return;
+            }
+
+            if (_metaPill.Visibility != Visibility.Visible)
+            {
+                _metaPill.Visibility = Visibility.Visible;
+            }
+
+            RebuildMetaInlines(wantSpeed, wantCache, wantModel);
+            double nextMax = Math.Max(42.0, Math.Min(390.0, metaAvail - 18.0));
+            if (Math.Abs(_metaText.MaxWidth - nextMax) >= 2.0)
+            {
+                _metaText.MaxWidth = nextMax;
             }
         }
 
@@ -1868,6 +2009,865 @@ namespace AgyBackdropCompanion
         }
     }
 
+    internal sealed class HudGuidePreviewWindow : Window
+    {
+        public const double CardDipWidth = 308.0;
+        public const double CardDipHeight = 204.0;
+        private const double ShadowPadDip = 10.0;
+        private const double TotalDipWidth = CardDipWidth + ShadowPadDip * 2.0;
+        private const double TotalDipHeight = CardDipHeight + ShadowPadDip * 2.0;
+
+        private readonly IntPtr _ownerHwnd;
+        private readonly ScaleTransform _rootScale = new ScaleTransform(1.0, 1.0);
+        private IntPtr _hwnd = IntPtr.Zero;
+        private bool _closingStarted = false;
+
+        public IntPtr Handle { get { return _hwnd; } }
+
+        public HudGuidePreviewWindow(IntPtr ownerHwnd, BitmapSource guideBitmap)
+        {
+            _ownerHwnd = ownerHwnd;
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = System.Windows.Media.Brushes.Transparent;
+            ShowInTaskbar = false;
+            ShowActivated = false;
+            Focusable = false;
+            IsHitTestVisible = false;
+            ResizeMode = ResizeMode.NoResize;
+            UseLayoutRounding = true;
+            TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
+            TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
+            Width = TotalDipWidth;
+            Height = TotalDipHeight;
+
+            var uiFont = new System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI");
+            var caption = new TextBlock
+            {
+                Text = "打开方式：右上角 Plugins → AGY 控制台",
+                FontFamily = uiFont,
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(218, 224, 242)),
+                Margin = new Thickness(2, 0, 2, 7)
+            };
+
+            var imgFill = new ImageBrush(guideBitmap)
+            {
+                Stretch = Stretch.UniformToFill,
+                AlignmentX = AlignmentX.Center,
+                AlignmentY = AlignmentY.Center
+            };
+            RenderOptions.SetBitmapScalingMode(imgFill, BitmapScalingMode.HighQuality);
+
+            var imgFrame = new Border
+            {
+                Width = 290,
+                Height = 162,
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(40, 255, 255, 255)),
+                Background = imgFill
+            };
+
+            var stack = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Vertical
+            };
+            stack.Children.Add(caption);
+            stack.Children.Add(imgFrame);
+
+            var card = new Border
+            {
+                Width = CardDipWidth,
+                CornerRadius = new CornerRadius(12),
+                Padding = new Thickness(8, 8, 8, 8),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(250, 20, 22, 31)),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(48, 255, 255, 255)),
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(ShadowPadDip),
+                Effect = new DropShadowEffect
+                {
+                    BlurRadius = 18,
+                    ShadowDepth = 4,
+                    Opacity = 0.66,
+                    Color = Colors.Black
+                },
+                Child = stack
+            };
+
+            var root = new Grid
+            {
+                Width = TotalDipWidth,
+                Height = TotalDipHeight,
+                Background = System.Windows.Media.Brushes.Transparent,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                LayoutTransform = _rootScale
+            };
+            root.Children.Add(card);
+            Content = root;
+
+            SourceInitialized += delegate
+            {
+                _hwnd = new WindowInteropHelper(this).Handle;
+                long ex = Native.GetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE);
+                ex |= Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TRANSPARENT;
+                Native.SetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE, ex);
+                if (_ownerHwnd != IntPtr.Zero && Native.IsWindow(_ownerHwnd))
+                {
+                    Native.SetWindowLongPtrCompat(_hwnd, Native.GWLP_HWNDPARENT, _ownerHwnd.ToInt64());
+                }
+            };
+        }
+
+        public void PositionBesidePopup(
+            Native.RECT hostWinRect,
+            int popCardLeftPx,
+            int popCardRightPx,
+            int popCardBottomPx,
+            double dpiScale)
+        {
+            double safeScale = Math.Max(0.75, Math.Min(3.5, dpiScale));
+            double wpfDpiX = 1.0;
+            double wpfDpiY = 1.0;
+            try
+            {
+                PresentationSource src = PresentationSource.FromVisual(this);
+                if (src != null && src.CompositionTarget != null)
+                {
+                    Matrix m = src.CompositionTarget.TransformToDevice;
+                    if (m.M11 > 0.1) wpfDpiX = m.M11;
+                    if (m.M22 > 0.1) wpfDpiY = m.M22;
+                }
+            }
+            catch { }
+
+            _rootScale.ScaleX = safeScale / wpfDpiX;
+            _rootScale.ScaleY = safeScale / wpfDpiY;
+
+            int physW = (int)Math.Ceiling(TotalDipWidth * safeScale);
+            int physH = (int)Math.Ceiling(TotalDipHeight * safeScale);
+            int padPx = (int)Math.Round(ShadowPadDip * safeScale);
+            int cardW = physW - padPx * 2;
+            int gapPx = (int)Math.Round(6.0 * safeScale);
+
+            int boundLeft = hostWinRect.Left + (int)Math.Round(6.0 * safeScale);
+            int boundRight = hostWinRect.Right - (int)Math.Round(6.0 * safeScale);
+            int boundTop = hostWinRect.Top + (int)Math.Round(32.0 * safeScale);
+            int boundBottom = hostWinRect.Bottom - (int)Math.Round(6.0 * safeScale);
+            try
+            {
+                System.Drawing.Rectangle wa = Screen.FromPoint(new System.Drawing.Point(popCardRightPx, popCardBottomPx)).WorkingArea;
+                if (wa.Width > 0 && wa.Height > 0)
+                {
+                    boundLeft = Math.Max(boundLeft, wa.Left + 4);
+                    boundRight = Math.Min(boundRight, wa.Right - 4);
+                    boundTop = Math.Max(boundTop, wa.Top + 4);
+                    boundBottom = Math.Min(boundBottom, wa.Bottom - 4);
+                }
+            }
+            catch { }
+
+            // Prefer popping to the right of the main popover; auto-flip left if right side is tight
+            int cardLeft = popCardRightPx + gapPx;
+            if (cardLeft + cardW > boundRight)
+            {
+                int leftCandidate = popCardLeftPx - gapPx - cardW;
+                if (leftCandidate >= boundLeft)
+                {
+                    cardLeft = leftCandidate;
+                }
+                else
+                {
+                    cardLeft = Math.Max(boundLeft, boundRight - cardW);
+                }
+            }
+
+            int x = cardLeft - padPx;
+            int y = popCardBottomPx - (physH - padPx);
+            int minY = boundTop - padPx;
+            int maxY = boundBottom - (physH - padPx);
+            if (maxY >= minY)
+            {
+                if (y < minY) y = minY;
+                if (y > maxY) y = maxY;
+            }
+
+            Left = x / wpfDpiX;
+            Top = y / wpfDpiY;
+            Width = physW / wpfDpiX;
+            Height = physH / wpfDpiY;
+
+            if (_hwnd != IntPtr.Zero && Native.IsWindow(_hwnd))
+            {
+                Native.SetWindowPos(_hwnd, IntPtr.Zero, x, y, physW, physH, Native.SWP_NOACTIVATE | Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            }
+        }
+
+        public void SafeClose()
+        {
+            if (_closingStarted) return;
+            _closingStarted = true;
+            try { Close(); } catch { }
+        }
+    }
+
+    internal sealed class HudConfigPopupWindow : Window
+    {
+        public const double CardDipWidth = 248.0;
+        public const double CardDipHeight = 204.0;
+        private const double ShadowPadDip = 10.0;
+        private const double TotalDipWidth = CardDipWidth + ShadowPadDip * 2.0;
+        private const double TotalDipHeight = CardDipHeight + ShadowPadDip * 2.0;
+
+        private sealed class ToggleRowControls
+        {
+            public Border CheckBox;
+            public System.Windows.Shapes.Path CheckMark;
+            public TextBlock ValueText;
+        }
+
+        private readonly IntPtr _ownerHwnd;
+        private readonly string _guideImagePath;
+        private readonly ScaleTransform _rootScale = new ScaleTransform(1.0, 1.0);
+        private readonly TextBlock _headerPctBadge;
+        private readonly ToggleRowControls _speedRow;
+        private readonly ToggleRowControls _cacheRow;
+        private readonly ToggleRowControls _modelRow;
+        private readonly ToggleRowControls _contextRow;
+
+        private IntPtr _hwnd = IntPtr.Zero;
+        private HudDisplayConfig _display = new HudDisplayConfig();
+        private System.Windows.Media.Color _accentColor = System.Windows.Media.Color.FromRgb(91, 140, 255);
+        private bool _closingStarted = false;
+        private HudGuidePreviewWindow _guidePreview = null;
+        private BitmapSource _guideBitmap = null;
+        private bool _guidePinned = false;
+        private Native.RECT _lastHostWinRect;
+        private int _lastCardLeftPx = 0;
+        private int _lastCardRightPx = 0;
+        private int _lastCardBottomPx = 0;
+        private double _lastDpiScale = 1.0;
+
+        public event Action<HudDisplayConfig> DisplayChanged;
+        public IntPtr Handle { get { return _hwnd; } }
+        public Window GuideWindow { get { return _guidePreview; } }
+
+        public HudConfigPopupWindow(IntPtr ownerHwnd, string guideImagePath)
+        {
+            _ownerHwnd = ownerHwnd;
+            _guideImagePath = guideImagePath ?? "";
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = System.Windows.Media.Brushes.Transparent;
+            ShowInTaskbar = false;
+            // Non-activating owned popup: NEVER steals foreground focus from Antigravity or pulls background apps (like OBS) forward on close!
+            ShowActivated = false;
+            Focusable = false;
+            ResizeMode = ResizeMode.NoResize;
+            UseLayoutRounding = true;
+            TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
+            TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
+            Width = TotalDipWidth;
+            Height = TotalDipHeight;
+
+            var uiFont = new System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI");
+            var monoFont = new System.Windows.Media.FontFamily("Consolas, Segoe UI, Microsoft YaHei UI");
+
+            var titleText = new TextBlock
+            {
+                Text = "底部状态栏显示",
+                FontFamily = uiFont,
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(224, 224, 234)),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            _headerPctBadge = new TextBlock
+            {
+                Text = "0%",
+                FontFamily = monoFont,
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(158, 192, 255)),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right
+            };
+
+            var headerGrid = new Grid
+            {
+                Margin = new Thickness(6, 2, 6, 6)
+            };
+            headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            Grid.SetColumn(titleText, 0);
+            Grid.SetColumn(_headerPctBadge, 1);
+            headerGrid.Children.Add(titleText);
+            headerGrid.Children.Add(_headerPctBadge);
+
+            var topDivider = new Border
+            {
+                Height = 1,
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(22, 255, 255, 255)),
+                Margin = new Thickness(4, 0, 4, 4)
+            };
+
+            Border speedBorder = CreateToggleRow("生成速率", uiFont, monoFont, out _speedRow, delegate
+            {
+                _display.showSpeed = !_display.showSpeed;
+                EmitDisplayChanged();
+            });
+            Border cacheBorder = CreateToggleRow("缓存命中", uiFont, monoFont, out _cacheRow, delegate
+            {
+                _display.showCacheHit = !_display.showCacheHit;
+                EmitDisplayChanged();
+            });
+            Border modelBorder = CreateToggleRow("上游模型", uiFont, monoFont, out _modelRow, delegate
+            {
+                _display.showModel = !_display.showModel;
+                EmitDisplayChanged();
+            });
+            Border contextBorder = CreateToggleRow("上下文占用", uiFont, monoFont, out _contextRow, delegate
+            {
+                _display.showContext = !_display.showContext;
+                EmitDisplayChanged();
+            });
+
+            var guideDivider = new Border
+            {
+                Height = 1,
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(22, 255, 255, 255)),
+                Margin = new Thickness(4, 4, 4, 5)
+            };
+
+            var guideQBadge = new Border
+            {
+                Width = 15,
+                Height = 15,
+                CornerRadius = new CornerRadius(8),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(28, 255, 255, 255)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock
+                {
+                    Text = "?",
+                    FontFamily = uiFont,
+                    FontSize = 10,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(186, 198, 228)),
+                    HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                }
+            };
+            var guideLabel = new TextBlock
+            {
+                Text = "如何打开 AGY 控制台",
+                FontFamily = uiFont,
+                FontSize = 11.5,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(186, 194, 214)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(8, 0, 0, 0)
+            };
+            var guideLeft = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            guideLeft.Children.Add(guideQBadge);
+            guideLeft.Children.Add(guideLabel);
+
+            var guideArrow = new TextBlock
+            {
+                Text = "▸",
+                FontFamily = uiFont,
+                FontSize = 11,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(144, 152, 178)),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right
+            };
+            var guideGrid = new Grid();
+            guideGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            guideGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(guideLeft, 0);
+            Grid.SetColumn(guideArrow, 1);
+            guideGrid.Children.Add(guideLeft);
+            guideGrid.Children.Add(guideArrow);
+
+            var guideNormalBg = new SolidColorBrush(System.Windows.Media.Color.FromArgb(12, 255, 255, 255));
+            var guideHoverBg = new SolidColorBrush(System.Windows.Media.Color.FromArgb(28, 255, 255, 255));
+            var guideNormalFg = new SolidColorBrush(System.Windows.Media.Color.FromRgb(186, 194, 214));
+            var guideHoverFg = new SolidColorBrush(System.Windows.Media.Color.FromRgb(240, 244, 255));
+            var guideRow = new Border
+            {
+                Height = 26,
+                Padding = new Thickness(6, 0, 7, 0),
+                CornerRadius = new CornerRadius(7),
+                Background = guideNormalBg,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                Child = guideGrid
+            };
+            guideRow.MouseEnter += delegate
+            {
+                guideRow.Background = guideHoverBg;
+                guideLabel.Foreground = guideHoverFg;
+                guideArrow.Foreground = guideHoverFg;
+                ShowGuidePreview();
+            };
+            guideRow.MouseLeave += delegate
+            {
+                if (!_guidePinned)
+                {
+                    guideRow.Background = guideNormalBg;
+                    guideLabel.Foreground = guideNormalFg;
+                    guideArrow.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(144, 152, 178));
+                    HideGuidePreview();
+                }
+            };
+            guideRow.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                _guidePinned = !_guidePinned;
+                if (_guidePinned)
+                {
+                    guideRow.Background = guideHoverBg;
+                    guideLabel.Foreground = guideHoverFg;
+                    ShowGuidePreview();
+                }
+                else
+                {
+                    guideRow.Background = guideNormalBg;
+                    guideLabel.Foreground = guideNormalFg;
+                    HideGuidePreview();
+                }
+            };
+
+            var contentStack = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Vertical
+            };
+            contentStack.Children.Add(headerGrid);
+            contentStack.Children.Add(topDivider);
+            contentStack.Children.Add(speedBorder);
+            contentStack.Children.Add(cacheBorder);
+            contentStack.Children.Add(modelBorder);
+            contentStack.Children.Add(contextBorder);
+            contentStack.Children.Add(guideDivider);
+            contentStack.Children.Add(guideRow);
+
+            var card = new Border
+            {
+                Width = CardDipWidth,
+                CornerRadius = new CornerRadius(12),
+                Padding = new Thickness(8, 8, 8, 8),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(247, 22, 24, 33)),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(42, 255, 255, 255)),
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(ShadowPadDip),
+                Effect = new DropShadowEffect
+                {
+                    BlurRadius = 18,
+                    ShadowDepth = 4,
+                    Opacity = 0.62,
+                    Color = Colors.Black
+                },
+                Child = contentStack
+            };
+
+            var root = new Grid
+            {
+                Width = TotalDipWidth,
+                Height = TotalDipHeight,
+                Background = System.Windows.Media.Brushes.Transparent,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                LayoutTransform = _rootScale
+            };
+            root.Children.Add(card);
+            Content = root;
+
+            SourceInitialized += delegate
+            {
+                _hwnd = new WindowInteropHelper(this).Handle;
+                long ex = Native.GetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE);
+                ex |= Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW;
+                Native.SetWindowLongPtrCompat(_hwnd, Native.GWL_EXSTYLE, ex);
+                if (_ownerHwnd != IntPtr.Zero && Native.IsWindow(_ownerHwnd))
+                {
+                    Native.SetWindowLongPtrCompat(_hwnd, Native.GWLP_HWNDPARENT, _ownerHwnd.ToInt64());
+                }
+                HwndSource src = HwndSource.FromHwnd(_hwnd);
+                if (src != null)
+                {
+                    src.AddHook(PopupWndProc);
+                }
+            };
+            Closed += delegate
+            {
+                HideGuidePreview();
+            };
+        }
+
+        private BitmapSource EnsureGuideBitmap()
+        {
+            if (_guideBitmap != null) return _guideBitmap;
+            if (string.IsNullOrEmpty(_guideImagePath) || !File.Exists(_guideImagePath)) return null;
+            try
+            {
+                var bi = new BitmapImage();
+                bi.BeginInit();
+                bi.CacheOption = BitmapCacheOption.OnLoad;
+                bi.UriSource = new Uri(_guideImagePath, UriKind.Absolute);
+                bi.EndInit();
+                bi.Freeze();
+                _guideBitmap = bi;
+            }
+            catch { }
+            return _guideBitmap;
+        }
+
+        private void ShowGuidePreview()
+        {
+            if (_closingStarted) return;
+            BitmapSource bmp = EnsureGuideBitmap();
+            if (bmp == null) return;
+            try
+            {
+                if (_guidePreview == null)
+                {
+                    _guidePreview = new HudGuidePreviewWindow(_ownerHwnd, bmp);
+                    _guidePreview.PositionBesidePopup(_lastHostWinRect, _lastCardLeftPx, _lastCardRightPx, _lastCardBottomPx, _lastDpiScale);
+                    _guidePreview.Show();
+                    _guidePreview.PositionBesidePopup(_lastHostWinRect, _lastCardLeftPx, _lastCardRightPx, _lastCardBottomPx, _lastDpiScale);
+                }
+                else
+                {
+                    _guidePreview.PositionBesidePopup(_lastHostWinRect, _lastCardLeftPx, _lastCardRightPx, _lastCardBottomPx, _lastDpiScale);
+                }
+            }
+            catch
+            {
+                HideGuidePreview();
+            }
+        }
+
+        public void HideGuidePreview()
+        {
+            HudGuidePreviewWindow g = _guidePreview;
+            _guidePreview = null;
+            if (g != null)
+            {
+                g.SafeClose();
+            }
+        }
+
+        private static IntPtr PopupWndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == 0x0021) // WM_MOUSEACTIVATE -> MA_NOACTIVATE (interactive clicks without stealing host focus)
+            {
+                handled = true;
+                return new IntPtr(3);
+            }
+            return IntPtr.Zero;
+        }
+
+        private static Border CreateToggleRow(
+            string label,
+            System.Windows.Media.FontFamily uiFont,
+            System.Windows.Media.FontFamily monoFont,
+            out ToggleRowControls controls,
+            Action onToggle)
+        {
+            var checkMark = new System.Windows.Shapes.Path
+            {
+                Data = Geometry.Parse("M 2.5,6.8 L 5.4,9.7 L 10.6,3.6"),
+                Stroke = System.Windows.Media.Brushes.White,
+                StrokeThickness = 1.8,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                Visibility = Visibility.Visible
+            };
+
+            var checkBox = new Border
+            {
+                Width = 15,
+                Height = 15,
+                CornerRadius = new CornerRadius(4),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(74, 255, 255, 255)),
+                Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(91, 140, 255)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = checkMark
+            };
+
+            var labelText = new TextBlock
+            {
+                Text = label,
+                FontFamily = uiFont,
+                FontSize = 12,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(234, 234, 242)),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(8, 0, 0, 0)
+            };
+
+            var leftStack = new StackPanel
+            {
+                Orientation = System.Windows.Controls.Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            leftStack.Children.Add(checkBox);
+            leftStack.Children.Add(labelText);
+
+            var valText = new TextBlock
+            {
+                Text = "--",
+                FontFamily = monoFont,
+                FontSize = 11,
+                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(154, 156, 174)),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+                MaxWidth = 116,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+
+            var rowGrid = new Grid();
+            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(leftStack, 0);
+            Grid.SetColumn(valText, 1);
+            rowGrid.Children.Add(leftStack);
+            rowGrid.Children.Add(valText);
+
+            var hoverBg = new SolidColorBrush(System.Windows.Media.Color.FromArgb(20, 255, 255, 255));
+            var rowBorder = new Border
+            {
+                Height = 29,
+                Padding = new Thickness(6, 0, 6, 0),
+                CornerRadius = new CornerRadius(7),
+                Background = System.Windows.Media.Brushes.Transparent,
+                Cursor = System.Windows.Input.Cursors.Hand,
+                Child = rowGrid
+            };
+            rowBorder.MouseEnter += delegate { rowBorder.Background = hoverBg; };
+            rowBorder.MouseLeave += delegate { rowBorder.Background = System.Windows.Media.Brushes.Transparent; };
+            rowBorder.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                if (onToggle != null) onToggle();
+            };
+
+            controls = new ToggleRowControls
+            {
+                CheckBox = checkBox,
+                CheckMark = checkMark,
+                ValueText = valText
+            };
+            return rowBorder;
+        }
+
+        private void EmitDisplayChanged()
+        {
+            ApplyCheckStyles();
+            Action<HudDisplayConfig> handler = DisplayChanged;
+            if (handler != null)
+            {
+                handler(_display.Clone());
+            }
+        }
+
+        private void ApplyCheckStyles()
+        {
+            ApplySingleCheck(_speedRow, _display.showSpeed);
+            ApplySingleCheck(_cacheRow, _display.showCacheHit);
+            ApplySingleCheck(_modelRow, _display.showModel);
+            ApplySingleCheck(_contextRow, _display.showContext);
+        }
+
+        private void ApplySingleCheck(ToggleRowControls row, bool isChecked)
+        {
+            if (row == null) return;
+            if (isChecked)
+            {
+                row.CheckBox.Background = new SolidColorBrush(_accentColor);
+                row.CheckBox.BorderBrush = System.Windows.Media.Brushes.Transparent;
+                row.CheckMark.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                row.CheckBox.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(14, 255, 255, 255));
+                row.CheckBox.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(74, 255, 255, 255));
+                row.CheckMark.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private static string FormatTokenK(long tokens)
+        {
+            long v = Math.Max(0L, tokens);
+            if (v >= 1000000L)
+            {
+                double m = v / 1000000.0;
+                return (Math.Abs(m - Math.Round(m)) < 0.05
+                    ? Math.Round(m).ToString("0", CultureInfo.InvariantCulture)
+                    : m.ToString("0.0", CultureInfo.InvariantCulture)) + "M";
+            }
+            if (v >= 1000L)
+            {
+                return Math.Round(v / 1000.0).ToString("0", CultureInfo.InvariantCulture) + "k";
+            }
+            return v.ToString(CultureInfo.InvariantCulture);
+        }
+
+        public void UpdateState(HudDisplayConfig display, HudTelemetry data, string accentHex)
+        {
+            _display = display != null ? display.Clone() : new HudDisplayConfig();
+            _accentColor = ColorUtil.ParseHex(accentHex, System.Windows.Media.Color.FromRgb(91, 140, 255));
+
+            int pct = data != null ? Math.Max(0, Math.Min(999, data.percent)) : 0;
+            _headerPctBadge.Text = string.Format("{0}%", pct);
+            if (pct >= 90)
+            {
+                _headerPctBadge.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(239, 83, 80));
+            }
+            else if (pct >= 75)
+            {
+                _headerPctBadge.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(233, 147, 21));
+            }
+            else
+            {
+                _headerPctBadge.Foreground = new SolidColorBrush(_accentColor);
+            }
+
+            if (data != null && data.tokPerSec.HasValue && data.tokPerSec.Value > 0)
+            {
+                double val = data.tokPerSec.Value;
+                string num = val >= 100
+                    ? Math.Round(val).ToString("0", CultureInfo.InvariantCulture)
+                    : val.ToString("0.0", CultureInfo.InvariantCulture);
+                _speedRow.ValueText.Text = num + " tok/s";
+            }
+            else
+            {
+                _speedRow.ValueText.Text = "--";
+            }
+
+            _cacheRow.ValueText.Text = (data != null && data.cacheHitPct.HasValue)
+                ? string.Format("{0}%", Math.Max(0, Math.Min(100, data.cacheHitPct.Value)))
+                : "--";
+
+            _modelRow.ValueText.Text = (data != null && !string.IsNullOrEmpty(data.upstreamModelId))
+                ? data.upstreamModelId
+                : "--";
+
+            if (data != null && data.totalUsed > 0)
+            {
+                _contextRow.ValueText.Text = string.Format("{0} / {1}", FormatTokenK(data.totalUsed), FormatTokenK(data.windowCap));
+            }
+            else
+            {
+                _contextRow.ValueText.Text = string.Format("{0}%", pct);
+            }
+
+            ApplyCheckStyles();
+        }
+
+        public void PositionAboveHud(Native.RECT hostWinRect, int anchorCenterX, int anchorCenterY, double dpiScale)
+        {
+            double safeScale = Math.Max(0.75, Math.Min(3.5, dpiScale));
+            double wpfDpiX = 1.0;
+            double wpfDpiY = 1.0;
+            try
+            {
+                PresentationSource src = PresentationSource.FromVisual(this);
+                if (src != null && src.CompositionTarget != null)
+                {
+                    Matrix m = src.CompositionTarget.TransformToDevice;
+                    if (m.M11 > 0.1) wpfDpiX = m.M11;
+                    if (m.M22 > 0.1) wpfDpiY = m.M22;
+                }
+            }
+            catch { }
+
+            double relX = safeScale / wpfDpiX;
+            double relY = safeScale / wpfDpiY;
+            _rootScale.ScaleX = relX;
+            _rootScale.ScaleY = relY;
+
+            int physW = (int)Math.Ceiling(TotalDipWidth * safeScale);
+            int physH = (int)Math.Ceiling(TotalDipHeight * safeScale);
+            int padPx = (int)Math.Round(ShadowPadDip * safeScale);
+            int hudHalfH = (int)Math.Round(13.0 * safeScale);
+            // Anchor snugly right above the Context Ring / HUD toolbar strip
+            int gapPx = (int)Math.Round(8.0 * safeScale);
+
+            int x = anchorCenterX - physW / 2;
+            int y = (anchorCenterY - hudHalfH - gapPx) - (physH - padPx);
+
+            int clampLeft = hostWinRect.Left + (int)Math.Round(8.0 * safeScale) - padPx;
+            int clampRight = hostWinRect.Right - (int)Math.Round(8.0 * safeScale) - (physW - padPx);
+            int clampTop = hostWinRect.Top + (int)Math.Round(36.0 * safeScale) - padPx;
+            int clampBottom = hostWinRect.Bottom - (int)Math.Round(8.0 * safeScale) - (physH - padPx);
+
+            try
+            {
+                System.Drawing.Rectangle wa = Screen.FromPoint(new System.Drawing.Point(anchorCenterX, anchorCenterY)).WorkingArea;
+                if (wa.Width > 0 && wa.Height > 0)
+                {
+                    clampLeft = Math.Max(clampLeft, wa.Left - padPx + 4);
+                    clampRight = Math.Min(clampRight, wa.Right - (physW - padPx) - 4);
+                    clampTop = Math.Max(clampTop, wa.Top - padPx + 4);
+                    clampBottom = Math.Min(clampBottom, wa.Bottom - (physH - padPx) - 4);
+                }
+            }
+            catch { }
+
+            if (clampRight >= clampLeft)
+            {
+                if (x < clampLeft) x = clampLeft;
+                if (x > clampRight) x = clampRight;
+            }
+            if (y < clampTop)
+            {
+                y = anchorCenterY + hudHalfH + (int)Math.Round(8.0 * safeScale) - padPx;
+            }
+            if (clampBottom >= clampTop)
+            {
+                if (y > clampBottom) y = clampBottom;
+                if (y < clampTop) y = clampTop;
+            }
+
+            _lastHostWinRect = hostWinRect;
+            _lastCardLeftPx = x + padPx;
+            _lastCardRightPx = x + physW - padPx;
+            _lastCardBottomPx = y + physH - padPx;
+            _lastDpiScale = safeScale;
+
+            Left = x / wpfDpiX;
+            Top = y / wpfDpiY;
+            Width = physW / wpfDpiX;
+            Height = physH / wpfDpiY;
+
+            if (_hwnd != IntPtr.Zero && Native.IsWindow(_hwnd))
+            {
+                Native.SetWindowPos(_hwnd, IntPtr.Zero, x, y, physW, physH, Native.SWP_NOACTIVATE | Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            }
+            if (_guidePreview != null)
+            {
+                _guidePreview.PositionBesidePopup(_lastHostWinRect, _lastCardLeftPx, _lastCardRightPx, _lastCardBottomPx, _lastDpiScale);
+            }
+        }
+
+        private void SafeClose()
+        {
+            if (_closingStarted) return;
+            _closingStarted = true;
+            HideGuidePreview();
+            try { Close(); } catch { }
+        }
+    }
+
     internal static class UiaHelper
     {
         private static readonly string[] ModeKeywords = new string[]
@@ -1884,17 +2884,6 @@ namespace AgyBackdropCompanion
         private static readonly string[] SendStopKeywords = new string[]
         {
             "send", "stop", "submit", "cancel", "发送", "停止"
-        };
-
-        private static readonly string[] SidePaneToggleKeywords = new string[]
-        {
-            "side pane", "auxiliary", "right pane", "secondary side", "toggle side", "toggle panel",
-            "side bar", "sidebar", "open panel", "侧边栏", "辅助面板", "右侧面板"
-        };
-
-        private static readonly string[] WindowChromeExclude = new string[]
-        {
-            "close", "minimize", "maximize", "restore", "关闭", "最小化", "最大化", "还原"
         };
 
         private static bool ContainsAny(string haystack, string[] needles)
@@ -2171,8 +3160,9 @@ namespace AgyBackdropCompanion
 
         private static readonly string[] PopupTextMarkers = new string[]
         {
-            "weekly limit", "5h limit", "resets in", "% left", "view usage", "claude and gpt", "gemini models",
-            "每周限额", "5小时限额", "后重置", "剩余", "查看额度", "切换模型", "gemini 模型", "claude 与 gpt",
+            "weekly limit", "5h limit", "resets in", "% left", "view usage", "claude and gpt", "gemini models", "usage limits", "quota",
+            "使用限额", "查看用量", "重置于", "每周限额", "5小时限额", "后重置", "剩余", "查看额度", "切换模型",
+            "gemini 模型", "claude 与 gpt", "模型配额", "用量", "限额",
             "subagents", "subagent", "running", "mention", "workflows", "skills", "rules", "mcp"
         };
 
@@ -2300,7 +3290,7 @@ namespace AgyBackdropCompanion
             int winW = Math.Max(1, winRect.Right - winRect.Left);
             int winH = Math.Max(1, winRect.Bottom - winRect.Top);
             int hudRight = anchor.RightX;
-            int hudLeft = Math.Max(anchor.LeftGuardX, hudRight - (int)Math.Round(260 * dpiScale));
+            int hudLeft = Math.Max(anchor.LeftGuardX, hudRight - (int)Math.Round(360 * dpiScale));
             int hudHalfH = (int)Math.Round(13 * dpiScale);
             int hudTop = anchor.CenterY - hudHalfH;
             int hudBottom = anchor.CenterY + hudHalfH;
@@ -2372,8 +3362,9 @@ namespace AgyBackdropCompanion
                 return true;
             }
 
-            // 3. O(1) React/Radix Portal sibling check (~0.3ms, <=20 nodes, zero FindAll, zero self-flicker):
+            // 3. O(1) React/Radix Portal sibling check (~0.5ms, zero FindAll, zero self-flicker):
             // walks up from cachedAnchor to Document, then inspects trailing non-ancestor portal siblings on body/#root.
+            var composerAncestors = new List<AutomationElement>();
             if (cachedAnchor != null)
             {
                 try
@@ -2384,6 +3375,7 @@ namespace AgyBackdropCompanion
                     for (int hop = 0; hop < 28 && cur != null; hop++)
                     {
                         chain.Add(cur);
+                        if (hop < 8) composerAncestors.Add(cur);
                         try
                         {
                             if (cur.Current.ControlType == ControlType.Document)
@@ -2397,22 +3389,23 @@ namespace AgyBackdropCompanion
                         catch { break; }
                     }
 
+                    int checkTop = hudTop - (int)Math.Round(10 * dpiScale);
                     if (docIdx >= 1)
                     {
-                        // Inspect portals mounted directly on <body> (Document's trailing children)
-                        if (CheckPortalContainerChildren(chain[docIdx], chain[docIdx - 1], winW, winH, hudLeft, hudTop, hudRight, hudBottom, 10, 2))
+                        // Inspect portals mounted directly on <body> (including nested Radix sub-popups like View Usage / 使用限额)
+                        if (CheckPortalContainerChildren(chain[docIdx], chain[docIdx - 1], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 16, 4))
                         {
                             reason = "doc-portal";
                             return true;
                         }
                         // Inspect portals mounted inside #root (first wrapper inside Document)
-                        if (docIdx >= 2 && CheckPortalContainerChildren(chain[docIdx - 1], chain[docIdx - 2], winW, winH, hudLeft, hudTop, hudRight, hudBottom, 8, 1))
+                        if (docIdx >= 2 && CheckPortalContainerChildren(chain[docIdx - 1], chain[docIdx - 2], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 12, 3))
                         {
                             reason = "root-portal";
                             return true;
                         }
                         // Inspect portals mounted inside top-level app shell
-                        if (docIdx >= 3 && CheckPortalContainerChildren(chain[docIdx - 2], chain[docIdx - 3], winW, winH, hudLeft, hudTop, hudRight, hudBottom, 6, 1))
+                        if (docIdx >= 3 && CheckPortalContainerChildren(chain[docIdx - 2], chain[docIdx - 3], winW, winH, hudLeft, checkTop, hudRight, hudBottom, 8, 2))
                         {
                             reason = "shell-portal";
                             return true;
@@ -2422,26 +3415,90 @@ namespace AgyBackdropCompanion
                 catch { }
             }
 
-            // 4. Lightweight FromPoint fallback strictly above HUD for any non-standard overlay
+            // 4. Multi-point FromPoint + ancestor-walk detector above HUD:
+            // catches nested Chinese/English popups (e.g. 查看用量 -> 使用限额) even when mounted deep inside portals
             try
             {
-                double probeX = (hudLeft + hudRight) / 2.0;
-                double probeY = hudTop - 10.0;
-                if (probeX > winRect.Left + 160 && probeX < winRect.Right - 10 && probeY > winRect.Top + 60)
+                double midX = (hudLeft + hudRight) / 2.0;
+                double[] probeXs = new double[]
                 {
-                    AutomationElement hit = AutomationElement.FromPoint(new System.Windows.Point(probeX, probeY));
-                    if (hit != null && hit.Current.ProcessId != selfPid)
+                    Math.Min(hudRight - 14.0, hudLeft + 18.0),
+                    midX,
+                    Math.Max(hudLeft + 14.0, hudRight - 18.0)
+                };
+                double probeY = hudTop - Math.Max(8.0, 8.0 * dpiScale);
+                if (probeY > winRect.Top + 60)
+                {
+                    for (int pi = 0; pi < probeXs.Length; pi++)
                     {
-                        ControlType ct = hit.Current.ControlType;
-                        if (ct == ControlType.MenuItem || ct == ControlType.Menu)
+                        double px = probeXs[pi];
+                        if (px <= winRect.Left + 120 || px >= winRect.Right - 8) continue;
+                        AutomationElement hit = null;
+                        try { hit = AutomationElement.FromPoint(new System.Windows.Point(px, probeY)); } catch { continue; }
+                        if (hit == null) continue;
+                        int hitPid = 0;
+                        ControlType hitCt = null;
+                        try
                         {
-                            reason = "frompoint-menu";
-                            return true;
+                            hitPid = hit.Current.ProcessId;
+                            hitCt = hit.Current.ControlType;
                         }
-                        string hn = hit.Current.Name ?? "";
-                        if (ContainsAny(hn, PopupTextMarkers))
+                        catch { continue; }
+                        if (hitPid == selfPid) continue;
+
+                        bool hitIsComposerInput = (hitCt == ControlType.Edit || hitCt == ControlType.Document);
+                        AutomationElement anc = hit;
+                        bool sharedComposerAncestor = false;
+                        bool sawFloatingPopupBox = false;
+                        for (int hop = 0; hop < 8 && anc != null; hop++)
                         {
-                            reason = "frompoint-marker";
+                            ControlType ct = null;
+                            string an = "";
+                            System.Windows.Rect ar = System.Windows.Rect.Empty;
+                            try
+                            {
+                                ct = anc.Current.ControlType;
+                                an = anc.Current.Name ?? "";
+                                TryGetValidRect(anc, out ar);
+                            }
+                            catch { break; }
+
+                            if (ct == ControlType.MenuItem || ct == ControlType.Menu || ct == ControlType.List || ct == ControlType.ListItem || ct == ControlType.ToolTip)
+                            {
+                                reason = "frompoint-menu-ancestor";
+                                return true;
+                            }
+                            if (ContainsAny(an, PopupTextMarkers))
+                            {
+                                reason = "frompoint-marker-ancestor";
+                                return true;
+                            }
+                            for (int ci = 0; ci < composerAncestors.Count; ci++)
+                            {
+                                if (SameElement(anc, composerAncestors[ci]))
+                                {
+                                    sharedComposerAncestor = true;
+                                    break;
+                                }
+                            }
+                            if (sharedComposerAncestor) break;
+
+                            if (!hitIsComposerInput && !ar.IsEmpty &&
+                                ar.Width >= 90.0 * dpiScale && ar.Width < winW * 0.68 &&
+                                ar.Height >= 60.0 * dpiScale && ar.Height < winH * 0.78 &&
+                                RectsOverlap(ar.Left, ar.Top, ar.Right, ar.Bottom, hudLeft - 6, hudTop - 12, hudRight + 6, hudBottom + 6))
+                            {
+                                sawFloatingPopupBox = true;
+                            }
+
+                            if (ct == ControlType.Document || ct == ControlType.Window) break;
+                            try { anc = TreeWalker.ControlViewWalker.GetParent(anc); }
+                            catch { break; }
+                        }
+
+                        if (sawFloatingPopupBox && !sharedComposerAncestor && composerAncestors.Count > 0)
+                        {
+                            reason = "frompoint-portal-box";
                             return true;
                         }
                     }
@@ -2576,189 +3633,6 @@ namespace AgyBackdropCompanion
 
             return info;
         }
-
-        private static bool ActivateElement(AutomationElement el)
-        {
-            if (el == null) return false;
-            try
-            {
-                object patObj;
-                if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out patObj))
-                {
-                    ((SelectionItemPattern)patObj).Select();
-                    return true;
-                }
-            }
-            catch { }
-            try
-            {
-                object patObj;
-                if (el.TryGetCurrentPattern(InvokePattern.Pattern, out patObj))
-                {
-                    ((InvokePattern)patObj).Invoke();
-                    return true;
-                }
-            }
-            catch { }
-            System.Windows.Rect r;
-            if (TryGetValidRect(el, out r))
-            {
-                Native.SendLeftClickAt((int)Math.Round(r.Left + r.Width / 2.0), (int)Math.Round(r.Top + r.Height / 2.0));
-                return true;
-            }
-            return false;
-        }
-
-        private static bool MatchesNamedKeywords(string name, string[] keywords)
-        {
-            if (string.IsNullOrEmpty(name) || keywords == null) return false;
-            string trimmed = name.Trim();
-            string low = trimmed.ToLowerInvariant();
-            for (int i = 0; i < keywords.Length; i++)
-            {
-                string kw = keywords[i];
-                if (string.IsNullOrEmpty(kw)) continue;
-                // Single-symbol tokens like "+" must match strictly to avoid clicking "+96 -8" diff badges
-                if (kw.Length == 1)
-                {
-                    if (string.Equals(trimmed, kw, StringComparison.Ordinal)) return true;
-                }
-                else if (low.Contains(kw))
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static AutomationElement FindNamedElement(AutomationElement root, string[] keywords, int minY, int maxY, int minX, int maxX)
-        {
-            try
-            {
-                System.Windows.Automation.Condition cond = new OrCondition(
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TabItem),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text)
-                );
-                AutomationElementCollection items = root.FindAll(TreeScope.Descendants, cond);
-                if (items == null) return null;
-
-                for (int i = 0; i < items.Count; i++)
-                {
-                    AutomationElement el = items[i];
-                    string name = "";
-                    try { name = el.Current.Name ?? ""; } catch { continue; }
-                    if (!MatchesNamedKeywords(name, keywords)) continue;
-                    if (ContainsAny(name, WindowChromeExclude)) continue;
-
-                    System.Windows.Rect r;
-                    if (!TryGetValidRect(el, out r)) continue;
-                    if (r.Top < minY || r.Top > maxY) continue;
-                    if (r.Left < minX || r.Left > maxX) continue;
-                    return el;
-                }
-            }
-            catch { }
-            return null;
-        }
-
-        public static string OpenAgyConsolePane(IntPtr hwnd)
-        {
-            if (hwnd == IntPtr.Zero || !Native.IsWindow(hwnd)) return "no-window";
-            try
-            {
-                Native.SetForegroundWindow(hwnd);
-                Native.RECT winRect;
-                if (!Native.TryGetVisibleBounds(hwnd, out winRect)) return "no-bounds";
-
-                AutomationElement root = AutomationElement.FromHandle(hwnd);
-                if (root == null) return "no-uia";
-
-                double dpiScale = Native.GetWindowDpiScale(hwnd);
-                int tabBandMaxY = winRect.Top + (int)Math.Round(110 * dpiScale);
-                int toggleBandMaxY = winRect.Top + (int)Math.Round(72 * dpiScale);
-                int toggleMinX = winRect.Right - (int)Math.Round(260 * dpiScale);
-                int addTabMinY = winRect.Top + (int)Math.Round(20 * dpiScale);
-                int addTabMaxY = winRect.Top + (int)Math.Round(100 * dpiScale);
-                int addTabMaxX = winRect.Right - (int)Math.Round(40 * dpiScale);
-
-                string[] consoleNames = new string[] { "agy 控制台", "antigravity monitor" };
-
-                // 1. If AGY 控制台 tab is already open in the top tab strip, activate it directly
-                AutomationElement tab = FindNamedElement(
-                    root,
-                    consoleNames,
-                    winRect.Top,
-                    tabBandMaxY,
-                    winRect.Left,
-                    winRect.Right
-                );
-                if (tab != null && ActivateElement(tab))
-                {
-                    return "selected-open-tab";
-                }
-
-                // 2. Try opening the right auxiliary side pane via top-right toggle button
-                AutomationElement toggleBtn = FindNamedElement(
-                    root,
-                    SidePaneToggleKeywords,
-                    winRect.Top,
-                    toggleBandMaxY,
-                    toggleMinX,
-                    winRect.Right
-                );
-                if (toggleBtn != null && ActivateElement(toggleBtn))
-                {
-                    Thread.Sleep(260);
-                    AutomationElement tabAfter = FindNamedElement(
-                        root,
-                        consoleNames,
-                        winRect.Top,
-                        tabBandMaxY,
-                        winRect.Left,
-                        winRect.Right
-                    );
-                    if (tabAfter != null && ActivateElement(tabAfter))
-                    {
-                        return "opened-pane-and-selected";
-                    }
-                }
-
-                // 3. Fallback: click the "+" (new tab) button in the right half of the tab bar and pick AGY 控制台
-                AutomationElement addTabBtn = FindNamedElement(
-                    root,
-                    new string[] { "new tab", "add tab", "open tab", "open view", "新建标签", "+" },
-                    addTabMinY,
-                    addTabMaxY,
-                    winRect.Left + (winRect.Right - winRect.Left) / 2,
-                    addTabMaxX
-                );
-                if (addTabBtn != null && ActivateElement(addTabBtn))
-                {
-                    Thread.Sleep(240);
-                    AutomationElement menuItem = FindNamedElement(
-                        root,
-                        consoleNames,
-                        winRect.Top,
-                        winRect.Bottom,
-                        winRect.Left,
-                        winRect.Right
-                    );
-                    if (menuItem != null && ActivateElement(menuItem))
-                    {
-                        return "opened-via-new-tab";
-                    }
-                }
-
-                return "tab-not-found";
-            }
-            catch
-            {
-                return "error";
-            }
-        }
     }
 
     internal sealed class TrackedHostWindow
@@ -2770,6 +3644,9 @@ namespace AgyBackdropCompanion
         public byte LastAlpha = 255;
         public BackdropSurfaceWindow Backdrop;
         public bool BackdropVisible;
+        public int BackdropZFailCount;
+        public bool BackdropGuardBlocked;
+        public string BackdropBlockReason = "";
         public int LastLeft;
         public int LastTop;
         public int LastWidth;
@@ -2816,6 +3693,7 @@ namespace AgyBackdropCompanion
         private readonly string _themesPath;
         private readonly string _hudTelemetryPath;
         private readonly string _hudActiveViewPath;
+        private readonly string _hudDisplayPath;
         private readonly string _statusPath;
         private readonly string _lightboxCmdPath;
         private readonly Dispatcher _dispatcher;
@@ -2842,6 +3720,7 @@ namespace AgyBackdropCompanion
 
         private ThemeConfig _config = new ThemeConfig();
         private HudTelemetry _hudTelemetry = new HudTelemetry();
+        private HudDisplayConfig _hudDisplay = new HudDisplayConfig();
         private string _cachedWpPath = "";
         private DateTime _cachedWpMtimeUtc = DateTime.MinValue;
         private BitmapSource _cachedBitmap = null;
@@ -2849,11 +3728,19 @@ namespace AgyBackdropCompanion
         private long _lastThemesLength = -1;
         private DateTime _lastHudWriteUtc = DateTime.MinValue;
         private long _lastHudLength = -1;
+        private DateTime _lastHudDisplayWriteUtc = DateTime.MinValue;
+        private long _lastHudDisplayLength = -1;
         private DateTime _lastLightboxCmdWriteUtc = DateTime.MinValue;
         private long _lastLightboxCmdLength = -1;
         private string _lastLightboxCmdId = "";
         private ImageLightboxWindow _lightbox = null;
         private IntPtr _lightboxOwnerHwnd = IntPtr.Zero;
+        private HudConfigPopupWindow _hudPopup = null;
+        private IntPtr _hudPopupOwnerHwnd = IntPtr.Zero;
+        private IntPtr _popupInitialFgHwnd = IntPtr.Zero;
+        private DateTime _lastHudPopupClosedUtc = DateTime.MinValue;
+        private DispatcherTimer _popupWatchTimer;
+        private bool _popupPrevMouseDown = false;
         private int _configVersion = 0;
         private DateTime _lastStatusWriteUtc = DateTime.MinValue;
         private DateTime _fastTrackUntilUtc = DateTime.MinValue;
@@ -2882,6 +3769,7 @@ namespace AgyBackdropCompanion
             _themesPath = System.IO.Path.Combine(_dataDir, "themes.json");
             _hudTelemetryPath = System.IO.Path.Combine(_dataDir, "hud_telemetry.json");
             _hudActiveViewPath = System.IO.Path.Combine(_dataDir, "hud_active_view.json");
+            _hudDisplayPath = System.IO.Path.Combine(_dataDir, "hud_display.json");
             _statusPath = System.IO.Path.Combine(_dataDir, "backdrop_status.json");
             _lightboxCmdPath = System.IO.Path.Combine(_dataDir, "lightbox_cmd.json");
             _dispatcher = dispatcher;
@@ -2906,6 +3794,7 @@ namespace AgyBackdropCompanion
             catch { }
             InitTray();
             ReloadThemeConfig(true);
+            ReloadHudDisplayConfig();
             ReloadHudTelemetry();
             InstallHooks();
             InstallWatcher();
@@ -3541,6 +4430,11 @@ namespace AgyBackdropCompanion
 
             if (eventType == Native.EVENT_SYSTEM_FOREGROUND || isTracked)
             {
+                if (eventType == Native.EVENT_SYSTEM_FOREGROUND && _hudPopup != null && hwnd != _hudPopupOwnerHwnd)
+                {
+                    CloseHudPopup();
+                }
+
                 // Immediate zero-debounce hide on minimize/hide/destroy prevents lingering backdrop/HUD ghosts
                 if (isTracked && (eventType == Native.EVENT_SYSTEM_MINIMIZESTART || eventType == Native.EVENT_OBJECT_HIDE || eventType == Native.EVENT_OBJECT_DESTROY))
                 {
@@ -3639,6 +4533,15 @@ namespace AgyBackdropCompanion
                     PushHudTelemetryToWindows();
                 }));
             }
+            else if (IsTargetFile(name, "hud_display.json"))
+            {
+                _dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (_disposed) return;
+                    ReloadHudDisplayConfig();
+                    PushHudDisplayToWindows();
+                }));
+            }
             else if (IsTargetFile(name, "lightbox_cmd.json"))
             {
                 _dispatcher.BeginInvoke(new Action(delegate
@@ -3675,6 +4578,20 @@ namespace AgyBackdropCompanion
                     {
                         ReloadHudTelemetry();
                         PushHudTelemetryToWindows();
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (File.Exists(_hudDisplayPath))
+                {
+                    var info = new FileInfo(_hudDisplayPath);
+                    if (info.LastWriteTimeUtc != _lastHudDisplayWriteUtc || info.Length != _lastHudDisplayLength)
+                    {
+                        ReloadHudDisplayConfig();
+                        PushHudDisplayToWindows();
                     }
                 }
             }
@@ -3760,6 +4677,7 @@ namespace AgyBackdropCompanion
 
         private void OpenNativeLightbox(string imgPath, string label)
         {
+            CloseHudPopup();
             IntPtr ownerHwnd = PickTargetHostForLightbox();
             if (ownerHwnd == IntPtr.Zero) return;
 
@@ -3851,6 +4769,266 @@ namespace AgyBackdropCompanion
             return null;
         }
 
+        private void ReloadHudDisplayConfig()
+        {
+            try
+            {
+                if (!File.Exists(_hudDisplayPath)) return;
+                var info = new FileInfo(_hudDisplayPath);
+                string raw = ReadTextWithRetry(_hudDisplayPath);
+                if (string.IsNullOrEmpty(raw)) return;
+                _lastHudDisplayWriteUtc = info.LastWriteTimeUtc;
+                _lastHudDisplayLength = info.Length;
+
+                var doc = _json.DeserializeObject(raw) as Dictionary<string, object>;
+                if (doc == null) return;
+
+                _hudDisplay = new HudDisplayConfig
+                {
+                    showSpeed = ReadBool(doc, "showSpeed", true),
+                    showCacheHit = ReadBool(doc, "showCacheHit", true),
+                    showModel = ReadBool(doc, "showModel", true),
+                    showContext = ReadBool(doc, "showContext", true)
+                };
+            }
+            catch { }
+        }
+
+        private void SaveHudDisplayConfig(HudDisplayConfig next)
+        {
+            if (next == null) return;
+            _hudDisplay = next.Clone();
+            PushHudDisplayToWindows();
+            try
+            {
+                long epochMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                var payload = new Dictionary<string, object>
+                {
+                    { "showSpeed", _hudDisplay.showSpeed },
+                    { "showCacheHit", _hudDisplay.showCacheHit },
+                    { "showModel", _hudDisplay.showModel },
+                    { "showContext", _hudDisplay.showContext },
+                    { "updatedAtMs", epochMs }
+                };
+                string tmp = _hudDisplayPath + ".tmp";
+                File.WriteAllText(tmp, _json.Serialize(payload), Encoding.UTF8);
+                try
+                {
+                    if (File.Exists(_hudDisplayPath))
+                    {
+                        File.Replace(tmp, _hudDisplayPath, null);
+                    }
+                    else
+                    {
+                        File.Move(tmp, _hudDisplayPath);
+                    }
+                }
+                catch
+                {
+                    File.Copy(tmp, _hudDisplayPath, true);
+                    try { File.Delete(tmp); } catch { }
+                }
+                if (File.Exists(_hudDisplayPath))
+                {
+                    var info = new FileInfo(_hudDisplayPath);
+                    _lastHudDisplayWriteUtc = info.LastWriteTimeUtc;
+                    _lastHudDisplayLength = info.Length;
+                }
+            }
+            catch { }
+        }
+
+        private void PushHudDisplayToWindows()
+        {
+            foreach (TrackedHostWindow item in _tracked.Values)
+            {
+                if (item.Hud != null)
+                {
+                    item.Hud.UpdateDisplay(_hudDisplay);
+                }
+            }
+            if (_hudPopup != null)
+            {
+                TrackedHostWindow ownerItem = null;
+                if (_hudPopupOwnerHwnd != IntPtr.Zero)
+                {
+                    _tracked.TryGetValue(_hudPopupOwnerHwnd, out ownerItem);
+                }
+                _hudPopup.UpdateState(_hudDisplay, ResolveTelemetryForWindow(ownerItem), _config.accentColor);
+            }
+        }
+
+        private void StartPopupWatchTimer()
+        {
+            if (_popupWatchTimer == null)
+            {
+                _popupWatchTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher);
+                _popupWatchTimer.Interval = TimeSpan.FromMilliseconds(30);
+                _popupWatchTimer.Tick += OnPopupWatchTick;
+            }
+            _popupInitialFgHwnd = Native.GetForegroundWindow();
+            _popupPrevMouseDown = ((Native.GetAsyncKeyState(Native.VK_LBUTTON) | Native.GetAsyncKeyState(Native.VK_RBUTTON)) & 0x8000) != 0;
+            if (!_popupWatchTimer.IsEnabled)
+            {
+                _popupWatchTimer.Start();
+            }
+        }
+
+        private void StopPopupWatchTimer()
+        {
+            try
+            {
+                if (_popupWatchTimer != null && _popupWatchTimer.IsEnabled)
+                {
+                    _popupWatchTimer.Stop();
+                }
+            }
+            catch { }
+        }
+
+        private void OnPopupWatchTick(object sender, EventArgs e)
+        {
+            if (_disposed || _hudPopup == null)
+            {
+                StopPopupWatchTimer();
+                return;
+            }
+
+            if ((Native.GetAsyncKeyState(Native.VK_ESCAPE) & 0x8000) != 0)
+            {
+                CloseHudPopup();
+                return;
+            }
+
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg != IntPtr.Zero && _hudPopupOwnerHwnd != IntPtr.Zero && fg != _hudPopupOwnerHwnd && fg != _popupInitialFgHwnd)
+            {
+                CloseHudPopup();
+                return;
+            }
+
+            bool btnDown = ((Native.GetAsyncKeyState(Native.VK_LBUTTON) & 0x8000) != 0) ||
+                           ((Native.GetAsyncKeyState(Native.VK_RBUTTON) & 0x8000) != 0);
+            if (btnDown && !_popupPrevMouseDown)
+            {
+                Native.POINT pt;
+                if (Native.GetCursorPos(out pt))
+                {
+                    bool insidePopup = false;
+                    IntPtr popH = _hudPopup.Handle;
+                    if (popH != IntPtr.Zero)
+                    {
+                        Native.RECT pr;
+                        if (Native.GetWindowRect(popH, out pr))
+                        {
+                            insidePopup = pt.X >= pr.Left && pt.X <= pr.Right && pt.Y >= pr.Top && pt.Y <= pr.Bottom;
+                        }
+                    }
+
+                    bool insideHud = false;
+                    TrackedHostWindow ownerRec;
+                    if (!insidePopup && _hudPopupOwnerHwnd != IntPtr.Zero && _tracked.TryGetValue(_hudPopupOwnerHwnd, out ownerRec) && ownerRec.HudVisible)
+                    {
+                        insideHud = pt.X >= ownerRec.LastHudX && pt.X <= (ownerRec.LastHudX + ownerRec.LastHudW) &&
+                                    pt.Y >= ownerRec.LastHudY && pt.Y <= (ownerRec.LastHudY + ownerRec.LastHudH);
+                    }
+
+                    if (!insidePopup && !insideHud)
+                    {
+                        CloseHudPopup();
+                        return;
+                    }
+                }
+            }
+            _popupPrevMouseDown = btnDown;
+        }
+
+        private string ResolveGuideImagePath()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_assetsDir))
+                {
+                    string parentDir = System.IO.Path.GetDirectoryName(_assetsDir);
+                    if (!string.IsNullOrEmpty(parentDir))
+                    {
+                        string parentCandidate = System.IO.Path.Combine(parentDir, "open_console_guide.jpg");
+                        if (File.Exists(parentCandidate)) return parentCandidate;
+                    }
+                    string directCandidate = System.IO.Path.Combine(_assetsDir, "open_console_guide.jpg");
+                    if (File.Exists(directCandidate)) return directCandidate;
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private void CloseHudPopup()
+        {
+            StopPopupWatchTimer();
+            if (_hudPopup == null) return;
+            HudConfigPopupWindow closing = _hudPopup;
+            _hudPopup = null;
+            _hudPopupOwnerHwnd = IntPtr.Zero;
+            _lastHudPopupClosedUtc = DateTime.UtcNow;
+            closing.HideGuidePreview();
+            ForceCloseOwnedWindow(closing);
+        }
+
+        private void ToggleHudConfigPopup(IntPtr hostHwnd)
+        {
+            if (_disposed) return;
+            if (_hudPopup != null)
+            {
+                CloseHudPopup();
+                return;
+            }
+            if ((DateTime.UtcNow - _lastHudPopupClosedUtc).TotalMilliseconds < 240.0)
+            {
+                return;
+            }
+
+            TrackedHostWindow item;
+            if (hostHwnd == IntPtr.Zero || !_tracked.TryGetValue(hostHwnd, out item) || !Native.IsWindow(hostHwnd))
+            {
+                return;
+            }
+            Native.RECT winRect;
+            if (!Native.TryGetVisibleBounds(hostHwnd, out winRect))
+            {
+                return;
+            }
+
+            double dpiScale = Native.GetWindowDpiScale(hostHwnd);
+            int anchorCenterX = item.HudVisible ? (item.LastHudX + item.LastHudW / 2) : (item.Anchor.RightX - (int)Math.Round(60.0 * dpiScale));
+            int anchorCenterY = item.HudVisible ? (item.LastHudY + item.LastHudH / 2) : item.Anchor.CenterY;
+
+            var popup = new HudConfigPopupWindow(hostHwnd, ResolveGuideImagePath());
+            // Bind reference BEFORE Show() so re-entrant WinEvents or SweepOrphanedWindows always track it
+            _hudPopup = popup;
+            _hudPopupOwnerHwnd = hostHwnd;
+            popup.DisplayChanged += delegate(HudDisplayConfig nextCfg)
+            {
+                SaveHudDisplayConfig(nextCfg);
+            };
+            popup.Closed += delegate
+            {
+                if (_hudPopup == popup)
+                {
+                    StopPopupWatchTimer();
+                    _hudPopup = null;
+                    _hudPopupOwnerHwnd = IntPtr.Zero;
+                    _lastHudPopupClosedUtc = DateTime.UtcNow;
+                }
+            };
+
+            popup.UpdateState(_hudDisplay, ResolveTelemetryForWindow(item), _config.accentColor);
+            popup.PositionAboveHud(winRect, anchorCenterX, anchorCenterY, dpiScale);
+            popup.Show();
+            popup.PositionAboveHud(winRect, anchorCenterX, anchorCenterY, dpiScale);
+            StartPopupWatchTimer();
+        }
+
         private void ReloadHudTelemetry()
         {
             try
@@ -3871,6 +5049,7 @@ namespace AgyBackdropCompanion
                     totalUsed = ReadLong(doc, "totalUsed", 0),
                     windowCap = ReadLong(doc, "windowCap", 512000),
                     tokPerSec = ReadNullableDouble(doc, "tokPerSec"),
+                    cacheHitPct = ReadNullableInt(doc, "cacheHitPct"),
                     upstreamModelId = ReadString(doc, "upstreamModelId", ""),
                     upstreamModelStatus = ReadString(doc, "upstreamModelStatus", "no_baseline"),
                     cdpHudActive = ReadBool(doc, "cdpHudActive", false)
@@ -3891,6 +5070,7 @@ namespace AgyBackdropCompanion
                             totalUsed = ReadLong(sdoc, "totalUsed", 0),
                             windowCap = ReadLong(sdoc, "windowCap", next.windowCap),
                             tokPerSec = ReadNullableDouble(sdoc, "tokPerSec"),
+                            cacheHitPct = ReadNullableInt(sdoc, "cacheHitPct"),
                             upstreamModelId = ReadString(sdoc, "upstreamModelId", "")
                         });
                     }
@@ -3916,6 +5096,7 @@ namespace AgyBackdropCompanion
                     totalUsed = 0,
                     windowCap = _hudTelemetry != null ? _hudTelemetry.windowCap : 512000,
                     tokPerSec = null,
+                    cacheHitPct = null,
                     upstreamModelId = "",
                     upstreamModelStatus = "unreported",
                     cdpHudActive = _hudTelemetry != null && _hudTelemetry.cdpHudActive
@@ -3968,6 +5149,7 @@ namespace AgyBackdropCompanion
                         totalUsed = best.totalUsed,
                         windowCap = best.windowCap,
                         tokPerSec = best.tokPerSec,
+                        cacheHitPct = best.cacheHitPct,
                         upstreamModelId = best.upstreamModelId ?? "",
                         upstreamModelStatus = _hudTelemetry.upstreamModelStatus,
                         cdpHudActive = _hudTelemetry.cdpHudActive
@@ -3985,6 +5167,15 @@ namespace AgyBackdropCompanion
                 {
                     item.Hud.UpdateData(ResolveTelemetryForWindow(item), _config.accentColor);
                 }
+            }
+            if (_hudPopup != null)
+            {
+                TrackedHostWindow ownerItem = null;
+                if (_hudPopupOwnerHwnd != IntPtr.Zero)
+                {
+                    _tracked.TryGetValue(_hudPopupOwnerHwnd, out ownerItem);
+                }
+                _hudPopup.UpdateState(_hudDisplay, ResolveTelemetryForWindow(ownerItem), _config.accentColor);
             }
         }
 
@@ -4027,6 +5218,12 @@ namespace AgyBackdropCompanion
                 next.wallpaperPath = ResolveWallpaperPath(next.activeWallpaperId, doc);
                 _config = next;
                 _configVersion++;
+                foreach (TrackedHostWindow tItem in _tracked.Values)
+                {
+                    tItem.BackdropGuardBlocked = false;
+                    tItem.BackdropZFailCount = 0;
+                    tItem.BackdropBlockReason = "";
+                }
 
                 if (forceImageReload || !string.Equals(_cachedWpPath, _config.wallpaperPath ?? "", StringComparison.OrdinalIgnoreCase))
                 {
@@ -4162,11 +5359,16 @@ namespace AgyBackdropCompanion
                     if (item.Backdrop != null) active.Add(item.Backdrop);
                 }
                 if (_lightbox != null) active.Add(_lightbox);
+                if (_hudPopup != null)
+                {
+                    active.Add(_hudPopup);
+                    if (_hudPopup.GuideWindow != null) active.Add(_hudPopup.GuideWindow);
+                }
 
                 var orphans = new List<Window>();
                 foreach (Window w in app.Windows)
                 {
-                    if ((w is HudOverlayWindow || w is BackdropSurfaceWindow || w is ImageLightboxWindow) && !active.Contains(w))
+                    if ((w is HudOverlayWindow || w is BackdropSurfaceWindow || w is ImageLightboxWindow || w is HudConfigPopupWindow || w is HudGuidePreviewWindow) && !active.Contains(w))
                     {
                         orphans.Add(w);
                     }
@@ -4242,12 +5444,9 @@ namespace AgyBackdropCompanion
                 item.Hud = hud;
                 hud.Clicked += delegate
                 {
-                    ThreadPool.QueueUserWorkItem(delegate
-                    {
-                        _hudLastAction = UiaHelper.OpenAgyConsolePane(targetHwnd);
-                        _dispatcher.BeginInvoke(new Action(delegate { WriteStatusFile(true); }));
-                    });
+                    ToggleHudConfigPopup(targetHwnd);
                 };
+                hud.UpdateDisplay(_hudDisplay);
                 hud.UpdateData(ResolveTelemetryForWindow(item), _config.accentColor);
                 hud.Show();
             }
@@ -4424,7 +5623,7 @@ namespace AgyBackdropCompanion
                         HideHudIfVisible(item);
                     }
 
-                    if (!activeEffect)
+                    if (!activeEffect || item.BackdropGuardBlocked)
                     {
                         RestoreBackdropOnly(item, false);
                         continue;
@@ -4447,6 +5646,12 @@ namespace AgyBackdropCompanion
                         var backdrop = new BackdropSurfaceWindow();
                         item.Backdrop = backdrop;
                         backdrop.Show();
+                        // Immediately hide off-screen HWND until strictly verified behind item.Hwnd (never flash above host!)
+                        if (backdrop.Handle != IntPtr.Zero)
+                        {
+                            Native.ShowWindow(backdrop.Handle, Native.SW_HIDE);
+                        }
+                        item.BackdropVisible = false;
                         item.LastMaximized = isMaximized;
                         item.AppliedConfigVersion = _configVersion;
                         backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
@@ -4461,6 +5666,13 @@ namespace AgyBackdropCompanion
                     IntPtr wpHwnd = item.Backdrop.Handle;
                     if (wpHwnd == IntPtr.Zero || !hasBounds) continue;
 
+                    // Emergency guard: if Wallpaper Engine / multi-monitor DWM ever popped wpHwnd ABOVE item.Hwnd, hide IMMEDIATELY!
+                    if (item.BackdropVisible && !Native.IsWindowStrictlyBehind(wpHwnd, item.Hwnd))
+                    {
+                        Native.ShowWindow(wpHwnd, Native.SW_HIDE);
+                        item.BackdropVisible = false;
+                    }
+
                     int w = Math.Max(1, r.Right - r.Left);
                     int h = Math.Max(1, r.Bottom - r.Top);
                     double hostDpi = Native.GetWindowDpiScale(item.Hwnd);
@@ -4471,7 +5683,8 @@ namespace AgyBackdropCompanion
 
                     if (zMismatch || rectChanged)
                     {
-                        uint flags = Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW;
+                        // Phase 1: position behind host WITHOUT SWP_SHOWWINDOW first when newly showing or Z-mismatched
+                        uint flags = Native.SWP_NOACTIVATE | (item.BackdropVisible && !zMismatch ? Native.SWP_SHOWWINDOW : 0u);
                         backdropMoves.Add(new PendingWinMove
                         {
                             Hwnd = wpHwnd,
@@ -4482,7 +5695,6 @@ namespace AgyBackdropCompanion
                             H = h,
                             Flags = flags
                         });
-                        item.BackdropVisible = true;
                         item.LastLeft = r.Left;
                         item.LastTop = r.Top;
                         item.LastWidth = w;
@@ -4495,19 +5707,80 @@ namespace AgyBackdropCompanion
                     }
                 }
 
-                // Always place the opaque backdrop behind the host BEFORE making the host translucent
+                // Phase 1: Place backdrops behind their hosts BEFORE revealing or applying host translucency
                 CommitPendingMoves(backdropMoves);
+
+                // Phase 2: IRONCLAD Z-ORDER INVARIANT — verify every backdrop is STRICTLY behind its host before showing!
+                foreach (TrackedHostWindow item in _tracked.Values)
+                {
+                    if (!activeEffect || item.BackdropGuardBlocked || item.Backdrop == null) continue;
+                    IntPtr wpHwnd = item.Backdrop.Handle;
+                    if (wpHwnd == IntPtr.Zero || !Native.IsWindow(item.Hwnd)) continue;
+                    bool visible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
+                    if (!visible) continue;
+
+                    bool behind = Native.IsWindowStrictlyBehind(wpHwnd, item.Hwnd);
+                    if (!behind)
+                    {
+                        // One direct retry without DeferWindowPos (handles cross-monitor / Wallpaper Engine Z-band races)
+                        Native.SetWindowPos(wpHwnd, item.Hwnd, item.LastLeft, item.LastTop, item.LastWidth, item.LastHeight, Native.SWP_NOACTIVATE);
+                        behind = Native.IsWindowStrictlyBehind(wpHwnd, item.Hwnd);
+                    }
+
+                    if (!behind)
+                    {
+                        // NEVER allow an opaque backdrop window to sit above Antigravity!
+                        Native.ShowWindow(wpHwnd, Native.SW_HIDE);
+                        item.BackdropVisible = false;
+                        RestoreHostAlphaOnly(item);
+                        item.BackdropZFailCount++;
+                        if (item.BackdropZFailCount >= 3)
+                        {
+                            item.BackdropGuardBlocked = true;
+                            item.BackdropBlockReason = "zorder-guard";
+                        }
+                        continue;
+                    }
+
+                    item.BackdropZFailCount = 0;
+                    if (!item.BackdropVisible || !Native.IsWindowVisible(wpHwnd))
+                    {
+                        Native.SetWindowPos(wpHwnd, IntPtr.Zero, item.LastLeft, item.LastTop, item.LastWidth, item.LastHeight,
+                            Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
+                        item.BackdropVisible = true;
+                    }
+                }
 
                 for (int i = 0; i < alphaTargets.Count; i++)
                 {
                     TrackedHostWindow item = alphaTargets[i];
                     if (!Native.IsWindow(item.Hwnd)) continue;
+                    if (item.BackdropGuardBlocked || !item.BackdropVisible) continue;
+                    if (item.Backdrop == null || !Native.IsWindowStrictlyBehind(item.Backdrop.Handle, item.Hwnd)) continue;
+
                     long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
-                    if ((curEx & Native.WS_EX_LAYERED) == 0)
+                    bool addedLayered = (curEx & Native.WS_EX_LAYERED) == 0;
+                    if (addedLayered)
                     {
                         Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx | Native.WS_EX_LAYERED);
                     }
-                    Native.SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha, Native.LWA_ALPHA);
+                    bool okAlpha = Native.SetLayeredWindowAttributes(item.Hwnd, 0, targetAlpha, Native.LWA_ALPHA);
+                    uint ck, lflags;
+                    byte actualAlpha = 0;
+                    bool readOk = Native.GetLayeredWindowAttributes(item.Hwnd, out ck, out actualAlpha, out lflags);
+                    if (!okAlpha || (readOk && (lflags & Native.LWA_ALPHA) != 0 && actualAlpha < 140))
+                    {
+                        // Fail-safe: never leave Antigravity invisible (alpha=0) or stuck behind wallpaper
+                        RestoreHostAlphaOnly(item);
+                        if (item.Backdrop != null && item.Backdrop.Handle != IntPtr.Zero)
+                        {
+                            Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
+                            item.BackdropVisible = false;
+                        }
+                        item.BackdropGuardBlocked = true;
+                        item.BackdropBlockReason = "alpha-guard";
+                        continue;
+                    }
                     item.AlphaApplied = true;
                     item.LastAlpha = targetAlpha;
                 }
@@ -4542,6 +5815,20 @@ namespace AgyBackdropCompanion
                                 true
                             );
                         }
+                    }
+                }
+
+                if (_hudPopup != null)
+                {
+                    bool popOwnerAlive =
+                        _hudPopupOwnerHwnd != IntPtr.Zero &&
+                        Native.IsWindow(_hudPopupOwnerHwnd) &&
+                        Native.IsWindowVisible(_hudPopupOwnerHwnd) &&
+                        !Native.IsIconic(_hudPopupOwnerHwnd) &&
+                        !Native.IsWindowCloaked(_hudPopupOwnerHwnd);
+                    if (!popOwnerAlive)
+                    {
+                        CloseHudPopup();
                     }
                 }
 
@@ -4612,20 +5899,20 @@ namespace AgyBackdropCompanion
             return found;
         }
 
-        private void RestoreBackdropOnly(TrackedHostWindow item, bool closing)
+        private void RestoreHostAlphaOnly(TrackedHostWindow item)
         {
             if (item == null) return;
-            if (item.AlphaApplied && Native.IsWindow(item.Hwnd))
+            if (Native.IsWindow(item.Hwnd))
             {
                 try
                 {
+                    long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
                     if (item.OriginallyLayered)
                     {
                         Native.SetLayeredWindowAttributes(item.Hwnd, 0, 255, Native.LWA_ALPHA);
                     }
-                    else
+                    else if ((curEx & Native.WS_EX_LAYERED) != 0)
                     {
-                        long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
                         Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx & ~Native.WS_EX_LAYERED);
                         Native.RedrawWindow(item.Hwnd, IntPtr.Zero, IntPtr.Zero, Native.RDW_INVALIDATE | Native.RDW_FRAME | Native.RDW_UPDATENOW);
                     }
@@ -4634,6 +5921,20 @@ namespace AgyBackdropCompanion
             }
             item.AlphaApplied = false;
             item.LastAlpha = 255;
+        }
+
+        private void RestoreBackdropOnly(TrackedHostWindow item, bool closing)
+        {
+            if (item == null) return;
+            if (item.AlphaApplied)
+            {
+                RestoreHostAlphaOnly(item);
+            }
+            else
+            {
+                item.AlphaApplied = false;
+                item.LastAlpha = 255;
+            }
 
             if (item.Backdrop != null)
             {
@@ -4687,11 +5988,18 @@ namespace AgyBackdropCompanion
                 bool anyHudVisible = false;
                 bool anyHudAnchor = false;
                 bool anyHudOccluded = false;
+                bool anyBackdropBlocked = false;
                 string occReason = "";
+                string blockReason = "";
                 foreach (TrackedHostWindow item in _tracked.Values)
                 {
                     if (item.HudVisible) anyHudVisible = true;
                     if (item.Anchor.HasAnchor && item.Anchor.FromUia) anyHudAnchor = true;
+                    if (item.BackdropGuardBlocked)
+                    {
+                        anyBackdropBlocked = true;
+                        if (!string.IsNullOrEmpty(item.BackdropBlockReason)) blockReason = item.BackdropBlockReason;
+                    }
                     if (item.Anchor.Occluded)
                     {
                         anyHudOccluded = true;
@@ -4703,7 +6011,9 @@ namespace AgyBackdropCompanion
                 {
                     { "pid", _selfPid },
                     { "running", running },
-                    { "activeEffect", activeEffect },
+                    { "activeEffect", activeEffect && !anyBackdropBlocked },
+                    { "backdropGuardBlocked", running && anyBackdropBlocked },
+                    { "backdropBlockReason", running ? blockReason : "" },
                     { "supportsLightbox", true },
                     { "paused", _pausedByTray },
                     { "trackedCount", _tracked.Count },
@@ -4776,6 +6086,7 @@ namespace AgyBackdropCompanion
                 _lightboxOwnerHwnd = IntPtr.Zero;
                 ForceCloseOwnedWindow(closingLightbox);
             }
+            CloseHudPopup();
             SweepOrphanedWindows();
 
             WriteStatusFile(false);
@@ -4846,6 +6157,13 @@ namespace AgyBackdropCompanion
             object v;
             if (d == null || !d.TryGetValue(key, out v) || v == null) return fallback;
             try { return Convert.ToInt64(v); } catch { return fallback; }
+        }
+
+        private static int? ReadNullableInt(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d == null || !d.TryGetValue(key, out v) || v == null) return null;
+            try { return Convert.ToInt32(v, CultureInfo.InvariantCulture); } catch { return null; }
         }
 
         private static double? ReadNullableDouble(Dictionary<string, object> d, string key)

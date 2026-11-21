@@ -516,6 +516,13 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         rt.latestTokPerSec > 0
           ? Math.round(rt.latestTokPerSec * 10) / 10
           : null;
+      const cacheHitPct =
+        !forceEmpty &&
+        used > 0 &&
+        typeof rt.cacheHitPct === 'number' &&
+        Number.isFinite(rt.cacheHitPct)
+          ? Math.max(0, Math.min(100, Math.round(rt.cacheHitPct)))
+          : null;
       const upstreamModelId = !forceEmpty && typeof rt.upstreamModelId === 'string' ? rt.upstreamModelId.trim() : '';
       const upstreamModelStatus = !forceEmpty && typeof rt.upstreamModelStatus === 'string' ? rt.upstreamModelStatus : 'unreported';
       const activeConvId = forceEmpty ? '' : (typeof telemetry?.activeConvId === 'string' ? telemetry.activeConvId : '');
@@ -530,6 +537,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         totalUsed: used,
         windowCap: cap,
         tokPerSec,
+        cacheHitPct,
         upstreamModelId,
         upstreamModelStatus,
         cdpHudActive: false,
@@ -543,9 +551,9 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
       }
 
       const sessionsSig = lastSessionsSnapshot
-        .map((s) => `${s.id}:${s.percent}:${s.tokPerSec ?? ''}:${s.upstreamModelId}`)
+        .map((s) => `${s.id}:${s.percent}:${s.tokPerSec ?? ''}:${s.cacheHitPct ?? ''}:${s.upstreamModelId}`)
         .join(',');
-      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
       try {

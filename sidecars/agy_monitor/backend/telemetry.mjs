@@ -443,7 +443,8 @@ export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap =
       const placeholders = ids.map(() => '?').join(', ');
       const rows = db
         .prepare(
-          `SELECT conv_id, latest_model, latest_context_tokens, latest_speed_tok_s
+          `SELECT conv_id, latest_model, latest_context_tokens, latest_speed_tok_s,
+                  latest_uncached_input, latest_cache_read
            FROM conv_latest_metrics
            WHERE conv_id IN (${placeholders})`,
         )
@@ -468,6 +469,10 @@ export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap =
     const percent = cap > 0 ? Math.max(0, Math.round((used / cap) * 100)) : 0;
     const rawSpeed = Number(row?.latest_speed_tok_s);
     const tokPerSec = Number.isFinite(rawSpeed) && rawSpeed > 0 ? Math.round(rawSpeed * 10) / 10 : null;
+    const uncachedIn = Number(row?.latest_uncached_input || 0);
+    const cacheRead = Number(row?.latest_cache_read || 0);
+    const totalIn = uncachedIn + cacheRead;
+    const cacheHitPct = totalIn > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / totalIn) * 100))) : null;
     return {
       id: String(s.id),
       title: String(s.title || '').trim(),
@@ -476,6 +481,7 @@ export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap =
       totalUsed: used,
       windowCap: cap,
       tokPerSec,
+      cacheHitPct,
       upstreamModelId: typeof row?.latest_model === 'string' ? row.latest_model.trim() : '',
     };
   });
