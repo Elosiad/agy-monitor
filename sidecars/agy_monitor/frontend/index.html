@@ -146,7 +146,21 @@
               <div class="card-header token-card-header">
                 <div class="card-title token-card-title">
                   <div class="token-title-bar">
-                    <h2 class="card-title-text" data-i18n="usage.title">模型 Token 用量</h2>
+                    <div class="token-title-left">
+                      <h2 class="card-title-text" data-i18n="usage.title">模型 Token 用量</h2>
+                      <button
+                        class="token-requests-btn"
+                        id="tokenRequestsBtn"
+                        type="button"
+                        title="查看每一次模型请求的详细指标与状态"
+                        data-i18n-title="usage.requestsTitle"
+                      >
+                        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                          <path d="M2.5 4h11M2.5 8h11M2.5 12h7.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                        </svg>
+                        <span data-i18n="usage.requestsBtn">请求记录</span>
+                      </button>
+                    </div>
                     <div class="token-total-meta">
                       <span class="token-total-count" id="tokenTotalCount">0</span>
                       <span class="token-total-cost" id="tokenTotalCost">$0.00</span>
@@ -839,6 +853,91 @@
         </div>
         <div class="modal-footer">
           <button class="modal-primary-btn" id="promptHelpOkBtn" type="button" data-modal-close data-i18n="common.gotIt">我知道了</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 弹窗一点五：单次模型请求明细记录 -->
+    <div class="modal-overlay req-modal-overlay" id="tokenRequestsModal" hidden role="dialog" aria-modal="true" aria-labelledby="tokenRequestsTitle">
+      <div class="modal-backdrop" id="reqModalBackdrop" data-req-modal-close></div>
+      <div class="modal-dialog req-modal-dialog">
+        <div class="modal-header req-modal-header">
+          <div class="req-modal-title-group">
+            <h3 class="modal-title" id="tokenRequestsTitle" data-i18n="usage.reqModalTitle">模型请求记录明细</h3>
+            <span class="req-scope-badge" id="reqModalScopeBadge"></span>
+          </div>
+          <div class="req-modal-head-actions">
+            <button
+              class="req-icon-btn"
+              id="reqModalRefreshBtn"
+              type="button"
+              title="刷新请求记录"
+              aria-label="刷新请求记录"
+              data-i18n-title="usage.reqRefresh"
+              data-i18n-aria="usage.reqRefresh"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M13.3 8a5.3 5.3 0 1 1-1.45-3.65M13.3 2.8v2.7h-2.7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button class="modal-close-btn" id="reqModalCloseBtn" type="button" data-req-modal-close aria-label="关闭" data-i18n-aria="common.close">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="req-toolbar">
+          <div class="req-filter-bar">
+            <div class="filter-tab-group" role="tablist" aria-label="请求范围">
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-req-scope="global" data-i18n="usage.scopeGlobal">全局</button>
+              <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-req-scope="current" data-i18n="usage.scopeCurrent">当前</button>
+            </div>
+            <div class="filter-tab-group" role="tablist" aria-label="请求时间范围">
+              <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-req-range="today" data-i18n="usage.rangeToday">今天</button>
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-req-range="7d" data-i18n="usage.range7d">近七天</button>
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-req-range="30d" data-i18n="usage.range30d">近一个月</button>
+            </div>
+            <div class="filter-tab-group" role="tablist" aria-label="请求状态筛选">
+              <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-req-status="all" data-i18n="usage.reqStatusAll">全部</button>
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-req-status="ok" data-i18n="usage.reqStatusOk">成功</button>
+              <button class="filter-tab" type="button" role="tab" aria-selected="false" data-req-status="error" data-i18n="usage.reqStatusError">异常</button>
+            </div>
+            <select class="req-model-select" id="reqModelFilter" aria-label="按模型筛选">
+              <option value="" data-i18n="usage.reqAllModels">全部模型</option>
+            </select>
+          </div>
+          <div class="req-summary-bar" id="reqSummaryBar"></div>
+        </div>
+
+        <div class="req-table-wrap" id="reqTableWrap">
+          <table class="req-table" aria-label="模型请求明细表">
+            <thead>
+              <tr>
+                <th class="col-time" data-i18n="usage.reqColTime">时间</th>
+                <th class="col-model" data-i18n="usage.reqColModel">model_id</th>
+                <th class="col-num" data-i18n="usage.reqColInput">输入</th>
+                <th class="col-num" data-i18n="usage.reqColOutput">输出</th>
+                <th class="col-center" data-i18n="usage.reqColCacheHit">缓存命中率</th>
+                <th class="col-num" data-i18n="usage.reqColCost">费用</th>
+                <th class="col-num" data-i18n="usage.reqColTtft">首字</th>
+                <th class="col-num" data-i18n="usage.reqColDuration">耗时</th>
+                <th class="col-num" data-i18n="usage.reqColSpeed">tok速度</th>
+                <th class="col-status" data-i18n="usage.reqColStatus">状态</th>
+              </tr>
+            </thead>
+            <tbody id="reqTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="modal-footer req-modal-footer">
+          <span class="req-modal-note" id="reqModalNote" data-i18n="usage.reqNote">注：首字 (TTFT) 因宿主日志暂未提供显示「—」；耗时与速度按工具步时间戳差值参考，费用为公开 API 估算参考。</span>
+          <div class="req-pagination">
+            <button class="req-page-btn" id="reqPrevPageBtn" type="button" disabled data-i18n="usage.reqPrevPage">上一页</button>
+            <span class="req-page-info" id="reqPageInfo">0 / 0</span>
+            <button class="req-page-btn" id="reqNextPageBtn" type="button" disabled data-i18n="usage.reqNextPage">下一页</button>
+          </div>
         </div>
       </div>
     </div>

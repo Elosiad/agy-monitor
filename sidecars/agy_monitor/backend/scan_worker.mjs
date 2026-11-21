@@ -95,6 +95,9 @@ export function ensureCacheSchema(db) {
       content_chars INTEGER NOT NULL DEFAULT 0,
       thinking_chars INTEGER NOT NULL DEFAULT 0,
       duration_ms INTEGER,
+      status TEXT,
+      error_text TEXT,
+      ttft_ms INTEGER,
       PRIMARY KEY (conv_id, step_index)
     );
 
@@ -125,6 +128,20 @@ export function ensureCacheSchema(db) {
       value TEXT NOT NULL
     );
   `);
+
+  // Idempotent migration for pre-existing telemetry_cache.db files
+  const existingCols = new Set(
+    db.prepare(`PRAGMA table_info(step_ledger)`).all().map((c) => String(c.name || '').toLowerCase())
+  );
+  if (!existingCols.has('status')) {
+    db.exec(`ALTER TABLE step_ledger ADD COLUMN status TEXT`);
+  }
+  if (!existingCols.has('error_text')) {
+    db.exec(`ALTER TABLE step_ledger ADD COLUMN error_text TEXT`);
+  }
+  if (!existingCols.has('ttft_ms')) {
+    db.exec(`ALTER TABLE step_ledger ADD COLUMN ttft_ms INTEGER`);
+  }
 }
 
 function openCacheDb(cacheDbPath) {
@@ -226,13 +243,33 @@ function parseLineToRow(convId, lineText, fallbackStepIndex) {
     : fallbackStepIndex;
   const stepType = typeof obj.type === 'string' && obj.type ? obj.type : 'GENERIC';
   const createdAtMs = parseTimestampMs(obj.created_at);
-  const model = typeof obj.model === 'string' && obj.model.trim() ? obj.model.trim() : null;
+  const rawStatus = typeof obj.status === 'string' && obj.status.trim() ? obj.status.trim().toUpperCase() : null;
+  const status = stepType === 'ERROR_MESSAGE' ? 'ERROR' : rawStatus;
+  const errorText =
+    typeof obj.error === 'string' && obj.error.trim()
+      ? obj.error.trim().slice(0, 240)
+      : stepType === 'ERROR_MESSAGE' && typeof obj.content === 'string' && obj.content.trim()
+        ? obj.content.trim().slice(0, 240)
+        : null;
+  let model = typeof obj.model === 'string' && obj.model.trim() ? obj.model.trim() : null;
+  if (!model && stepType === 'ERROR_MESSAGE' && errorText) {
+    const modelMatch = errorText.match(/\bfor model\s+([a-zA-Z0-9._-]+)/i);
+    if (modelMatch && modelMatch[1]) {
+      model = modelMatch[1];
+    }
+  }
   const inputTokens = toNonNegInt(obj.input_tokens);
   const cacheReadTokens = toNonNegInt(obj.cache_read_tokens);
   const outputTokens = toNonNegInt(obj.output_tokens);
   const toolCallsCount = Array.isArray(obj.tool_calls) ? obj.tool_calls.length : 0;
   const contentChars = typeof obj.content === 'string' ? obj.content.length : 0;
   const thinkingChars = typeof obj.thinking === 'string' ? obj.thinking.length : 0;
+  const rawTtft =
+    obj.ttft_ms ?? obj.first_token_ms ?? obj.first_token_latency_ms ?? obj.time_to_first_token_ms;
+  const ttftMs =
+    typeof rawTtft === 'number' && Number.isFinite(rawTtft) && rawTtft > 0
+      ? Math.trunc(rawTtft)
+      : null;
 
   return {
     conv_id: convId,
@@ -246,6 +283,9 @@ function parseLineToRow(convId, lineText, fallbackStepIndex) {
     tool_calls_count: toolCallsCount,
     content_chars: contentChars,
     thinking_chars: thinkingChars,
+    status,
+    error_text: errorText,
+    ttft_ms: ttftMs,
   };
 }
 
@@ -409,23 +449,31 @@ function recomputeConvMetrics(db, convId) {
       }
 
       const next = rows[i + 1];
-      if (
-        row.output_tokens > 0 &&
-        row.tool_calls_count > 0 &&
+      const nextIsPostToolStep =
         next &&
         (next.step_type === 'GENERIC' ||
           next.step_type === 'ERROR_MESSAGE' ||
-          next.step_type === 'CHECKPOINT')
-      ) {
+          next.step_type === 'CHECKPOINT' ||
+          next.step_type === 'CODE_ACTION' ||
+          next.step_type === 'RUN_COMMAND' ||
+          next.step_type === 'VIEW_FILE' ||
+          next.step_type === 'LIST_DIRECTORY' ||
+          next.step_type === 'SEARCH_WEB' ||
+          next.step_type === 'GREP_SEARCH' ||
+          next.step_type === 'READ_URL_CONTENT' ||
+          next.step_type === 'GENERATE_IMAGE');
+      if (row.output_tokens > 0 && row.tool_calls_count > 0 && nextIsPostToolStep) {
         const dt = next.created_at_ms - row.created_at_ms;
-        if (dt >= 1000 && dt <= 180_000) {
-          const tokPerSec = row.output_tokens / (dt / 1000);
-          latestSpeedTokS = Number(tokPerSec.toFixed(1));
-          speedSource = 'tool_step_e2e_est';
-          speedAtMs = next.created_at_ms;
-          speedOutSum += row.output_tokens;
-          speedSecSum += dt / 1000;
+        if (dt >= 1000 && dt <= 300_000) {
           updateDurationStmt.run(dt, convId, row.step_index);
+          if (dt <= 180_000) {
+            const tokPerSec = row.output_tokens / (dt / 1000);
+            latestSpeedTokS = Number(tokPerSec.toFixed(1));
+            speedSource = 'tool_step_e2e_est';
+            speedAtMs = next.created_at_ms;
+            speedOutSum += row.output_tokens;
+            speedSecSum += dt / 1000;
+          }
         }
       }
     }
@@ -506,8 +554,8 @@ function getPreparedStatements(db) {
       `INSERT INTO step_ledger (
          conv_id, step_index, step_type, created_at_ms, model,
          input_tokens, cache_read_tokens, output_tokens, tool_calls_count,
-         content_chars, thinking_chars
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         content_chars, thinking_chars, status, error_text, ttft_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(conv_id, step_index) DO UPDATE SET
          step_type = excluded.step_type,
          created_at_ms = excluded.created_at_ms,
@@ -517,7 +565,10 @@ function getPreparedStatements(db) {
          output_tokens = excluded.output_tokens,
          tool_calls_count = excluded.tool_calls_count,
          content_chars = excluded.content_chars,
-         thinking_chars = excluded.thinking_chars`
+         thinking_chars = excluded.thinking_chars,
+         status = COALESCE(excluded.status, step_ledger.status),
+         error_text = COALESCE(excluded.error_text, step_ledger.error_text),
+         ttft_ms = COALESCE(excluded.ttft_ms, step_ledger.ttft_ms)`
     ),
     upsertWatermark: db.prepare(
       `INSERT INTO session_watermarks (
@@ -606,7 +657,10 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
             r.output_tokens,
             r.tool_calls_count,
             r.content_chars,
-            r.thinking_chars
+            r.thinking_chars,
+            r.status ?? null,
+            r.error_text ?? null,
+            r.ttft_ms ?? null
           );
         }
         upsertWatermark.run(

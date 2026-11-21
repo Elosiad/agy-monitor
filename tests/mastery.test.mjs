@@ -555,3 +555,83 @@ test('openLocalPathTarget enters directories, opens parent dir for files, extrac
   assert.equal(mStep?.progressPct, 100);
   assert.ok(mStep?.text.startsWith('### 一、已完成清理结果'), 'Heading must start cleanly without glued tag prefix');
 });
+
+test('buildMasterySnapshot always pins favorite sessions at top in saved order and exposes favorite flags', async (t) => {
+  const { paths } = makeTempEnv(t);
+  const baseMs = Date.parse('2026-11-21T10:00:00Z');
+
+  const sessionsHub = {
+    active: [
+      { id: 'sess-active-1', title: '普通运行会话', workspace: 'proj-a', modifiedMs: baseMs + 5000, agoText: '1m' },
+      { id: 'sess-fav-active', title: '常用运行会话', workspace: 'proj-b', modifiedMs: baseMs + 2000, agoText: '2m' },
+    ],
+    waiting: [],
+    unread: [
+      { id: 'sess-unread-1', title: '未读会话', workspace: 'proj-c', modifiedMs: baseMs + 4000, agoText: '3m' },
+    ],
+    recent: [
+      { id: 'sess-active-1', title: '普通运行会话', workspace: 'proj-a', modifiedMs: baseMs + 5000, agoText: '1m' },
+      { id: 'sess-fav-idle', title: '常用静默会话', workspace: 'proj-fav', modifiedMs: baseMs - 60_000, agoText: '1h' },
+    ],
+    favorites: [
+      { id: 'sess-fav-idle', title: '常用静默会话', workspace: 'proj-fav', status: 'done', modifiedMs: baseMs - 60_000 },
+      { id: 'sess-fav-active', title: '常用运行会话', workspace: 'proj-b', status: 'running', modifiedMs: baseMs + 2000 },
+    ],
+    allSelectable: [],
+    subStatusById: {},
+  };
+
+  const snap = await buildMasterySnapshot(paths, sessionsHub, {
+    sessionsMeta: {
+      favoriteIds: ['sess-fav-idle', 'sess-fav-active'],
+    },
+    nowMs: baseMs + 10_000,
+  });
+
+  // Pinned favorites MUST appear first in exact saved favoriteIds order, followed by non-favorite active then unread
+  assert.deepEqual(
+    snap.sessions.map((s) => s.id),
+    ['sess-fav-idle', 'sess-fav-active', 'sess-active-1', 'sess-unread-1'],
+  );
+  assert.deepEqual(snap.favoriteIds, ['sess-fav-idle', 'sess-fav-active']);
+  assert.equal(snap.favoriteCount, 2);
+  assert.equal(snap.sessions[0].isFavorite, true);
+  assert.equal(snap.sessions[0].status, 'done');
+  assert.equal(snap.sessions[1].isFavorite, true);
+  assert.equal(snap.sessions[1].status, 'active');
+  assert.equal(snap.sessions[2].isFavorite, false);
+  assert.equal(snap.sessions[3].isFavorite, false);
+  assert.equal(snap.activeCount, 2);
+  assert.equal(snap.unreadCount, 1);
+
+  // When no active/unread sessions exist, pinned favorites stay on top and non-favorite recent sessions follow below
+  const idleSnap = await buildMasterySnapshot(
+    paths,
+    {
+      active: [],
+      waiting: [],
+      unread: [],
+      recent: [
+        { id: 'sess-recent-a', title: '最近A', workspace: 'w1', modifiedMs: baseMs + 3000, agoText: '2m' },
+        { id: 'sess-fav-idle', title: '常用静默会话', workspace: 'proj-fav', modifiedMs: baseMs - 60_000, agoText: '1h' },
+        { id: 'sess-recent-b', title: '最近B', workspace: 'w2', modifiedMs: baseMs + 1000, agoText: '5m' },
+      ],
+      favorites: [
+        { id: 'sess-fav-idle', title: '常用静默会话', workspace: 'proj-fav', status: 'done', modifiedMs: baseMs - 60_000 },
+      ],
+      allSelectable: [],
+      subStatusById: {},
+    },
+    {
+      sessionsMeta: { favoriteIds: ['sess-fav-idle'] },
+      nowMs: baseMs + 10_000,
+    },
+  );
+  assert.deepEqual(
+    idleSnap.sessions.map((s) => s.id),
+    ['sess-fav-idle', 'sess-recent-a', 'sess-recent-b'],
+  );
+  assert.equal(idleSnap.sessions[0].isFavorite, true);
+  assert.equal(idleSnap.sessions[1].isFavorite, false);
+  assert.equal(idleSnap.favoriteCount, 1);
+});

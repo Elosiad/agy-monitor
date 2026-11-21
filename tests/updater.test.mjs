@@ -109,6 +109,35 @@ test('compareSemver & checkForUpdates detect commit and semver updates accuratel
   const sameRes = await checkForUpdates(paths, { force: true, fetchImpl: fakeFetchSame, nowMs: 6000 });
   assert.equal(sameRes.ok, true);
   assert.equal(sameRes.hasUpdate, false);
+
+  // Same release semver (1.0.8 === 1.0.8) with a newer docs commit on main & stale 1.0.7 install_meta -> NOT an update
+  fs.writeFileSync(path.join(paths.pluginRoot, 'plugin.json'), JSON.stringify({ name: 'agy-monitor', version: '1.0.8' }));
+  fs.writeFileSync(
+    path.join(pluginDataDir, 'install_meta.json'),
+    JSON.stringify({ version: '1.0.7', commitSha: '078b23da94f272b459f289fefa799cda1b57006d', updatedAtMs: 1000 }),
+  );
+  const fakeFetchSameReleaseDiffSha = async (url) => {
+    if (url.includes('/commits/main')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          sha: '1752032999999999999999999999999999999999',
+          commit: { message: 'docs: update README', committer: { date: '2026-11-21T20:30:00Z' } },
+        }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ tag_name: 'v1.0.8' }) };
+  };
+  const sameVerRes = await checkForUpdates(paths, { force: true, fetchImpl: fakeFetchSameReleaseDiffSha, nowMs: 7000 });
+  assert.equal(sameVerRes.ok, true);
+  assert.equal(sameVerRes.hasUpdate, false);
+
+  // Local version ahead of remote release (1.0.9 > 1.0.8) -> NEVER prompt downgrade
+  fs.writeFileSync(path.join(paths.pluginRoot, 'plugin.json'), JSON.stringify({ name: 'agy-monitor', version: '1.0.9' }));
+  const aheadRes = await checkForUpdates(paths, { force: true, fetchImpl: fakeFetchSameReleaseDiffSha, nowMs: 8000 });
+  assert.equal(aheadRes.ok, true);
+  assert.equal(aheadRes.hasUpdate, false);
 });
 
 test('applyPluginUpdate mirrors validated zip while preserving rules/AGENTS.md and user settings, and openRepoInBrowser uses official URL', async (t) => {

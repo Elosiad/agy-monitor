@@ -1038,11 +1038,21 @@ export async function buildMasterySnapshot(
   const lastSeenByConv =
     sessionsMeta?.lastSeenByConv && typeof sessionsMeta.lastSeenByConv === 'object'
       ? sessionsMeta.lastSeenByConv
-      : {};
+      : sessionsMeta?.lastSeenModifiedMs && typeof sessionsMeta.lastSeenModifiedMs === 'object'
+        ? sessionsMeta.lastSeenModifiedMs
+        : {};
   const lastSeenByAgent =
     sessionsMeta?.lastSeenByAgent && typeof sessionsMeta.lastSeenByAgent === 'object'
       ? sessionsMeta.lastSeenByAgent
       : {};
+
+  const rawFavoriteIds = Array.isArray(sessionsMeta?.favoriteIds)
+    ? sessionsMeta.favoriteIds
+    : Array.isArray(sessionsHub?.favorites)
+      ? sessionsHub.favorites.map((f) => f?.id)
+      : [];
+  const favoriteIds = [...new Set(rawFavoriteIds.map((x) => String(x || '').trim()).filter(Boolean))];
+  const favoriteIdSet = new Set(favoriteIds);
 
   const activeRaw = [
     ...(Array.isArray(sessionsHub?.active) ? sessionsHub.active : []),
@@ -1050,42 +1060,135 @@ export async function buildMasterySnapshot(
   ];
   const unreadRaw = Array.isArray(sessionsHub?.unread) ? sessionsHub.unread : [];
   const recentRaw = Array.isArray(sessionsHub?.recent) ? sessionsHub.recent : [];
+  const favoritesRaw = Array.isArray(sessionsHub?.favorites) ? sessionsHub.favorites : [];
+  const selectableRaw = Array.isArray(sessionsHub?.allSelectable) ? sessionsHub.allSelectable : [];
+
+  const knownById = new Map();
+  const mergeKnown = (arr) => {
+    for (const item of arr) {
+      if (!item?.id) continue;
+      const prev = knownById.get(item.id);
+      if (!prev) {
+        knownById.set(item.id, { ...item });
+      } else {
+        const shortFallback = item.id.slice(0, 8);
+        knownById.set(item.id, {
+          ...prev,
+          ...item,
+          title: item.title && item.title !== shortFallback ? item.title : prev.title || item.title,
+          workspace: item.workspace || prev.workspace,
+          agoText: item.agoText || prev.agoText,
+          modifiedMs: Math.max(Number(prev.modifiedMs || 0), Number(item.modifiedMs || 0)),
+        });
+      }
+    }
+  };
+  mergeKnown(selectableRaw);
+  mergeKnown(recentRaw);
+  mergeKnown(favoritesRaw);
+  mergeKnown(unreadRaw);
+  mergeKnown(activeRaw);
 
   const seenIds = new Set();
   const activeList = [];
+  const activeById = new Map();
   for (const s of activeRaw) {
     if (!s?.id || seenIds.has(s.id)) continue;
     seenIds.add(s.id);
-    activeList.push({ ...s, masteryStatus: 'active', sessionIsRead: false });
+    const entry = {
+      ...knownById.get(s.id),
+      ...s,
+      masteryStatus: 'active',
+      sessionIsRead: false,
+      isFavorite: favoriteIdSet.has(s.id),
+    };
+    activeList.push(entry);
+    activeById.set(s.id, entry);
   }
   activeList.sort((a, b) => (b.modifiedMs || 0) - (a.modifiedMs || 0));
 
   const unreadList = [];
+  const unreadById = new Map();
   for (const s of unreadRaw) {
     if (!s?.id || seenIds.has(s.id)) continue;
     seenIds.add(s.id);
-    unreadList.push({ ...s, masteryStatus: 'unread', sessionIsRead: false });
+    const entry = {
+      ...knownById.get(s.id),
+      ...s,
+      masteryStatus: 'unread',
+      sessionIsRead: false,
+      isFavorite: favoriteIdSet.has(s.id),
+    };
+    unreadList.push(entry);
+    unreadById.set(s.id, entry);
   }
   unreadList.sort((a, b) => (b.modifiedMs || 0) - (a.modifiedMs || 0));
 
-  let candidateList = [...activeList, ...unreadList];
-  let isFallbackRecent = false;
-  if (candidateList.length === 0) {
-    for (const s of recentRaw.slice(0, 6)) {
-      if (!s?.id || seenIds.has(s.id)) continue;
-      seenIds.add(s.id);
-      candidateList.push({ ...s, masteryStatus: 'unread', isRecentFallback: true, sessionIsRead: true });
+  // Always pin favorited sessions at the very top in saved favoriteIds order
+  const pinnedList = [];
+  const pinnedIdSet = new Set();
+  for (const favId of favoriteIds) {
+    if (pinnedIdSet.has(favId)) continue;
+    if (activeById.has(favId)) {
+      pinnedIdSet.add(favId);
+      pinnedList.push({ ...activeById.get(favId), isFavorite: true });
+    } else if (unreadById.has(favId)) {
+      pinnedIdSet.add(favId);
+      pinnedList.push({ ...unreadById.get(favId), isFavorite: true });
+    } else if (knownById.has(favId)) {
+      pinnedIdSet.add(favId);
+      pinnedList.push({
+        ...knownById.get(favId),
+        masteryStatus: 'unread',
+        isRecentFallback: false,
+        sessionIsRead: true,
+        isFavorite: true,
+      });
     }
-    isFallbackRecent = candidateList.length > 0;
+  }
+
+  const nonPinnedActive = activeList.filter((s) => !pinnedIdSet.has(s.id));
+  const nonPinnedUnread = unreadList.filter((s) => !pinnedIdSet.has(s.id));
+  let nonPinnedList = [...nonPinnedActive, ...nonPinnedUnread];
+  let isFallbackRecent = false;
+
+  if (activeList.length === 0 && unreadList.length === 0) {
+    const recentCap = pinnedList.length > 0 ? Math.max(3, 6 - pinnedList.length) : 6;
+    const recentSeen = new Set(pinnedIdSet);
+    for (const s of recentRaw) {
+      if (nonPinnedList.length >= recentCap) break;
+      if (!s?.id || recentSeen.has(s.id)) continue;
+      recentSeen.add(s.id);
+      nonPinnedList.push({
+        ...s,
+        masteryStatus: 'unread',
+        isRecentFallback: true,
+        sessionIsRead: true,
+        isFavorite: false,
+      });
+    }
+    isFallbackRecent = pinnedList.length === 0 && nonPinnedList.length > 0;
   } else {
-    candidateList = candidateList.slice(0, 12);
-    // Keep currently viewed session visible right after the user marks it read so it flips smoothly to "任务结束"
-    if (selectedSessionId && !candidateList.some((c) => c.id === selectedSessionId)) {
-      const justRead = recentRaw.find((r) => r && r.id === selectedSessionId);
-      if (justRead) {
-        if (candidateList.length >= 12) candidateList.pop();
-        candidateList.push({ ...justRead, masteryStatus: 'unread', isRecentFallback: false, sessionIsRead: true });
+    const nonPinnedCap = Math.max(8, 12 - pinnedList.length);
+    nonPinnedList = nonPinnedList.slice(0, nonPinnedCap);
+  }
+
+  let candidateList = [...pinnedList, ...nonPinnedList];
+  // Keep currently viewed session visible right after the user marks it read or unstars it
+  if (selectedSessionId && !candidateList.some((c) => c.id === selectedSessionId)) {
+    const justRead = knownById.get(selectedSessionId) || recentRaw.find((r) => r && r.id === selectedSessionId);
+    if (justRead) {
+      const nonPinnedCap = Math.max(8, 12 - pinnedList.length);
+      if (nonPinnedList.length >= nonPinnedCap && candidateList.length > pinnedList.length) {
+        candidateList.pop();
       }
+      candidateList.push({
+        ...justRead,
+        masteryStatus: 'unread',
+        isRecentFallback: false,
+        sessionIsRead: true,
+        isFavorite: favoriteIdSet.has(selectedSessionId),
+      });
     }
   }
 
@@ -1253,6 +1356,7 @@ export async function buildMasterySnapshot(
         name: s.title || s.id.slice(0, 8),
         status: rowStatus,
         isRead: masterIsRead,
+        isFavorite: Boolean(s.isFavorite),
         isRecentFallback: Boolean(s.isRecentFallback),
         modifiedMs: Number(s.modifiedMs || 0),
         tag: isActive ? masterJourney.shortStatus : masterIsRead ? '任务结束' : '结束未读',
@@ -1312,6 +1416,7 @@ export async function buildMasterySnapshot(
         name: s.title || s.id.slice(0, 8),
         status: isActive ? 'active' : sessionMarkedRead ? 'done' : 'unread',
         isRead: sessionMarkedRead,
+        isFavorite: Boolean(s.isFavorite),
         isRecentFallback: Boolean(s.isRecentFallback),
         modifiedMs: Number(s.modifiedMs || 0),
         tag: isActive ? quickJourney.shortStatus : sessionMarkedRead ? '任务结束' : '结束未读',
@@ -1324,6 +1429,8 @@ export async function buildMasterySnapshot(
 
   return {
     sessions,
+    favoriteIds,
+    favoriteCount: pinnedList.length,
     selectedSessionId: effectiveSelectedId,
     isFallbackRecent,
     activeCount: activeList.length,

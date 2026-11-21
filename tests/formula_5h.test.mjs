@@ -10,6 +10,7 @@ import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 import { scanOnce } from '../sidecars/agy_monitor/backend/scan_worker.mjs';
 import {
   classifyUpstreamModelStatus,
+  queryRequestLogs,
   queryTelemetrySnapshot,
 } from '../sidecars/agy_monitor/backend/telemetry.mjs';
 
@@ -228,4 +229,142 @@ test('runtimeTelemetry detects upstream model mismatch, recovers legacy model=nu
   const row = db.prepare('SELECT COUNT(*) AS cnt FROM step_ledger').get();
   db.close();
   assert.equal(row.cnt, 4);
+});
+
+test('queryRequestLogs returns per-request metrics, extracts error status/model, respects filters & pagination', async (t) => {
+  const now = Date.now();
+  const iso = (deltaSec) => new Date(now + deltaSec * 1000).toISOString();
+
+  const { paths } = await setupTelemetryFixture(t, {
+    'conv-req-a': [
+      {
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: iso(-120),
+        model: 'gemini-4-neon-xhigh',
+        input_tokens: 2000,
+        cache_read_tokens: 18000,
+        output_tokens: 400,
+        tool_calls: [{ name: 'read_file' }],
+      },
+      {
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'DONE',
+        created_at: iso(-112),
+        content: 'tool result',
+      },
+      {
+        step_index: 3,
+        source: 'SYSTEM',
+        type: 'ERROR_MESSAGE',
+        status: 'DONE',
+        created_at: iso(-60),
+        error: 'API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server',
+      },
+      {
+        step_index: 4,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: iso(-30),
+        model: 'gemini-4-neon-xhigh',
+        input_tokens: 1000,
+        cache_read_tokens: 19000,
+        output_tokens: 250,
+        ttft_ms: 420,
+      },
+    ],
+    'conv-req-b': [
+      {
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: iso(-15),
+        model: 'claude-sonnet-4-5',
+        input_tokens: 5000,
+        cache_read_tokens: 5000,
+        output_tokens: 300,
+      },
+    ],
+  });
+
+  const convTitleMap = new Map([
+    ['conv-req-a', { title: '主会话A', workspace: 'agy-plugin' }],
+    ['conv-req-b', { title: '副会话B', workspace: 'other' }],
+  ]);
+
+  // 1. Current scope on conv-req-a returns newest first (step 4 -> step 3 error -> step 1 with 8s duration & 50 tok/s)
+  const curRes = queryRequestLogs(paths.telemetryCacheDb, {
+    scope: 'current',
+    range: 'today',
+    convId: 'conv-req-a',
+    nowMs: now,
+    convTitleMap,
+  });
+  assert.equal(curRes.totalCount, 3);
+  assert.equal(curRes.summary.okCount, 2);
+  assert.equal(curRes.summary.errorCount, 1);
+  assert.equal(curRes.summary.totalInput, 40000);
+  assert.equal(curRes.summary.totalOutput, 650);
+  assert.equal(curRes.summary.avgCacheHitPct, 93);
+  assert.equal(curRes.summary.avgTokPerSec, 50);
+
+  const [rLatest, rErr, rFirst] = curRes.items;
+  assert.equal(rLatest.stepIndex, 4);
+  assert.equal(rLatest.model, 'gemini-4-neon-xhigh');
+  assert.equal(rLatest.totalInput, 20000);
+  assert.equal(rLatest.cacheHitPct, 95);
+  assert.equal(rLatest.ttftMs, 420);
+  assert.equal(rLatest.durationMs, null);
+  assert.equal(rLatest.status, 'ok');
+  assert.equal(rLatest.convTitle, '主会话A');
+
+  assert.equal(rErr.stepIndex, 3);
+  assert.equal(rErr.status, 'error');
+  assert.equal(rErr.statusLabel, '重试失败');
+  assert.equal(rErr.model, 'gemini-3.8-flash-high');
+  assert.match(rErr.errorText, /503/);
+
+  assert.equal(rFirst.stepIndex, 1);
+  assert.equal(rFirst.durationMs, 8000);
+  assert.equal(rFirst.tokPerSec, 50);
+  assert.equal(rFirst.ttftMs, null);
+  assert.equal(rFirst.cacheHitPct, 90);
+  assert.ok(rFirst.estimatedCostUsd > 0);
+
+  // 2. Global scope + status=error filter + model filter + pagination
+  const errOnly = queryRequestLogs(paths.telemetryCacheDb, {
+    scope: 'global',
+    range: '30d',
+    status: 'error',
+    nowMs: now,
+  });
+  assert.equal(errOnly.totalCount, 1);
+  assert.equal(errOnly.items[0].status, 'error');
+
+  const paged = queryRequestLogs(paths.telemetryCacheDb, {
+    scope: 'global',
+    range: '30d',
+    limit: 2,
+    offset: 0,
+    nowMs: now,
+  });
+  assert.equal(paged.totalCount, 4);
+  assert.equal(paged.items.length, 2);
+  assert.equal(paged.hasMore, true);
+  assert.equal(paged.items[0].model, 'claude-sonnet-4-5');
+
+  const modelFiltered = queryRequestLogs(paths.telemetryCacheDb, {
+    scope: 'global',
+    range: '30d',
+    model: 'claude-sonnet-4-5',
+    nowMs: now,
+  });
+  assert.equal(modelFiltered.totalCount, 1);
+  assert.equal(modelFiltered.items[0].convId, 'conv-req-b');
 });

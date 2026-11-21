@@ -45,12 +45,17 @@ import {
   createStorage,
   sanitizePublicMasteryConfig,
 } from './backend/storage.mjs';
-import { queryBatchConvHudMetrics, queryTelemetrySnapshot } from './backend/telemetry.mjs';
+import {
+  queryBatchConvHudMetrics,
+  queryRequestLogs,
+  queryTelemetrySnapshot,
+} from './backend/telemetry.mjs';
 import {
   applyPluginUpdate,
   checkForUpdates,
   openRepoInBrowser,
 } from './backend/updater.mjs';
+import { detectWindowsHostEnv, toWindowsPath } from './backend/wsl_bridge.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -917,6 +922,70 @@ export function createMonitorHandlers({
     };
   });
 
+  register('GET', '/api/telemetry/requests', async (data = {}) => {
+    const scope = VALID_SCOPES.has(data.scope) ? data.scope : 'current';
+    const range = VALID_RANGES.has(data.range) ? data.range : 'today';
+    const model = typeof data.model === 'string' ? data.model.trim().slice(0, 128) : '';
+    const status = ['all', 'ok', 'error'].includes(data.status) ? data.status : 'all';
+    const limit = Number(data.limit) || 80;
+    const offset = Number(data.offset) || 0;
+
+    const explicitConvId =
+      typeof data.convId === 'string' && data.convId.trim() ? data.convId.trim() : '';
+    const rawHostConvId =
+      typeof data.hostConvId === 'string' && data.hostConvId.trim() ? data.hostConvId.trim() : '';
+
+    const sessionsHub = await querySessionsHub(resolvedPaths.summariesDbPath, store, {});
+    const convTitleMap = new Map();
+    const indexSessions = (arr) => {
+      if (!Array.isArray(arr)) return;
+      for (const s of arr) {
+        if (!s?.id) continue;
+        const prev = convTitleMap.get(s.id);
+        convTitleMap.set(s.id, {
+          title: s.title || prev?.title || '',
+          workspace: s.workspace || prev?.workspace || '',
+        });
+      }
+    };
+    indexSessions(sessionsHub?.allSelectable);
+    indexSessions(sessionsHub?.recent);
+    indexSessions(sessionsHub?.favorites);
+    indexSessions(sessionsHub?.unread);
+    indexSessions(sessionsHub?.active);
+
+    let resolvedConvId = explicitConvId;
+    if (scope === 'current' && !resolvedConvId) {
+      const topLevelConvIds = (sessionsHub?.allSelectable || []).map((s) => s.id).filter(Boolean);
+      const topLevelIdSet = new Set(topLevelConvIds);
+      let viewedConvId = '';
+      if (rawHostConvId && topLevelIdSet.has(rawHostConvId)) {
+        viewedConvId = rawHostConvId;
+      } else {
+        const viewedInfo = await resolveViewedConvInfo(resolvedPaths, sessionsHub);
+        viewedConvId =
+          typeof hud.resolveActiveConv === 'function'
+            ? hud.resolveActiveConv(topLevelIdSet, viewedInfo)
+            : viewedInfo.convId || '';
+      }
+      resolvedConvId =
+        viewedConvId === '__new_conversation__'
+          ? '__new_conversation__'
+          : pickFollowLatestTopLevelConvId(sessionsHub, viewedConvId) || '';
+    }
+
+    return queryRequestLogs(resolvedPaths.cacheDbPath, {
+      scope,
+      range,
+      convId: resolvedConvId,
+      model,
+      status,
+      limit,
+      offset,
+      convTitleMap,
+    });
+  });
+
   register('POST', '/api/rescan', async () => {
     triggerRescan?.();
     return { ok: true };
@@ -1331,15 +1400,17 @@ export function createMonitorHandlers({
       return errorResponse(ResponseCtor, 404, '图片文件不存在或无法读取');
     }
 
-    if (process.platform === 'win32' && resolvedPaths.lightboxCmdFile) {
+    const hostEnv = detectWindowsHostEnv();
+    if (hostEnv.hasWindowsHost && resolvedPaths.lightboxCmdFile) {
       try {
         const themes = await store.getThemes();
         const status = await getBackdropStatus(resolvedPaths, themes);
         if (status.running && status.supportsLightbox && status.trackedCount > 0) {
+          const winImagePath = hostEnv.isWsl ? await toWindowsPath(resolved, hostEnv) : resolved;
           const cmd = {
             id: `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
             ts: Date.now(),
-            path: resolved,
+            path: winImagePath || resolved,
             label: rawLabel || path.basename(resolved),
           };
           await atomicWriteJson(resolvedPaths.lightboxCmdFile, cmd);
@@ -1859,7 +1930,8 @@ export async function startSidecarServer({
     }
   }
 
-  if (!skipWorker && process.platform === 'win32') {
+  const startupHostEnv = detectWindowsHostEnv();
+  if (!skipWorker && startupHostEnv.hasWindowsHost) {
     void (async () => {
       try {
         await ensureBackdropAssets(paths);
@@ -1886,7 +1958,7 @@ export async function startSidecarServer({
       // Ignore watcher close error
     }
     await cdpBridge.dispose().catch(() => {});
-    if (!skipWorker && process.platform === 'win32') {
+    if (!skipWorker && startupHostEnv.hasWindowsHost) {
       try {
         const themes = await storage.getThemes();
         const status = await getBackdropStatus(paths, themes);

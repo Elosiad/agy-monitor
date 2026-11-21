@@ -4,9 +4,12 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { atomicWriteBuffer, atomicWriteText } from './paths.mjs';
+import {
+  detectWindowsHostEnv,
+  resolveWindowsHostDirs,
+  toWindowsPath,
+} from './wsl_bridge.mjs';
 
-const CSC_PATH = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
-const WPF_DIR = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\WPF';
 const COMPANION_ACTIVE_TTL_MS = 10_000;
 
 function writeUtf16LeBom(filePath, content) {
@@ -43,14 +46,37 @@ function isPidAlive(pid) {
 
 /**
  * Inspect only the current Node process's own Win32 thread desktop name.
- * Never touches or probes external processes or host internals.
+ * In WSL2 with Windows Interop, Windows executables launched via Interop run
+ * directly on the user's interactive Windows desktop.
  */
 export async function detectOwnDesktopInfo({ force = false } = {}) {
-  if (process.platform !== 'win32') {
-    return { isWindows: false, desktopName: 'non-win32', canAutoLaunch: false, desktopIsolated: true };
+  const hostInfo = detectWindowsHostEnv();
+  if (!hostInfo.hasWindowsHost) {
+    return {
+      isWindows: false,
+      isWsl: false,
+      desktopName: 'non-win32',
+      canAutoLaunch: false,
+      desktopIsolated: true,
+    };
+  }
+  if (hostInfo.isWsl) {
+    return {
+      isWindows: true,
+      isWsl: true,
+      desktopName: 'wsl-interop',
+      canAutoLaunch: true,
+      desktopIsolated: false,
+    };
   }
   if (process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE === '1') {
-    return { isWindows: true, desktopName: 'skipped', canAutoLaunch: false, desktopIsolated: true };
+    return {
+      isWindows: true,
+      isWsl: false,
+      desktopName: 'skipped',
+      canAutoLaunch: false,
+      desktopIsolated: true,
+    };
   }
   if (cachedDesktopInfo && !force) {
     return cachedDesktopInfo;
@@ -121,71 +147,141 @@ function buildLauncherCmdContent(vbsPath) {
   ].join('\r\n');
 }
 
+async function resolveBackdropRuntimePaths(paths, hostInfo = detectWindowsHostEnv()) {
+  if (hostInfo.isNativeWindows) {
+    return {
+      binDirPosix: paths?.backdropBinDir || '',
+      exePosix: paths?.backdropExeFile || '',
+      exeWin: paths?.backdropExeFile || '',
+      hashPosix: paths?.backdropHashFile || '',
+      stagedSrcPosix: '',
+      srcWin: paths?.backdropSourceFile || '',
+      launcherVbsPosix: paths?.backdropLauncherVbs || '',
+      launcherVbsWin: paths?.backdropLauncherVbs || '',
+      launcherCmdPosix: paths?.backdropLauncherCmd || '',
+      launcherCmdWin: paths?.backdropLauncherCmd || '',
+      dataDirWin: paths?.pluginDataDir || '',
+      assetsDirWin: paths?.wallpapersDir || '',
+    };
+  }
+
+  const dirs = await resolveWindowsHostDirs(hostInfo);
+  const dataDirWin = await toWindowsPath(paths?.pluginDataDir || '', hostInfo);
+  const assetsDirWin = await toWindowsPath(paths?.wallpapersDir || '', hostInfo);
+
+  if (dirs.stagingDirPosix && dirs.stagingDirWin) {
+    const binDirPosix = `${dirs.stagingDirPosix}/bin`;
+    const binDirWin = `${dirs.stagingDirWin}\\bin`;
+    return {
+      binDirPosix,
+      exePosix: `${binDirPosix}/agy_backdrop.exe`,
+      exeWin: `${binDirWin}\\agy_backdrop.exe`,
+      hashPosix: `${binDirPosix}/agy_backdrop.sha1`,
+      stagedSrcPosix: `${binDirPosix}/AgyBackdrop.cs`,
+      srcWin: `${binDirWin}\\AgyBackdrop.cs`,
+      launcherVbsPosix: `${dirs.stagingDirPosix}/launch_backdrop.vbs`,
+      launcherVbsWin: `${dirs.stagingDirWin}\\launch_backdrop.vbs`,
+      launcherCmdPosix: `${dirs.stagingDirPosix}/启动整机壁纸伴侣.cmd`,
+      launcherCmdWin: `${dirs.stagingDirWin}\\启动整机壁纸伴侣.cmd`,
+      dataDirWin,
+      assetsDirWin,
+    };
+  }
+
+  return {
+    binDirPosix: paths?.backdropBinDir || '',
+    exePosix: paths?.backdropExeFile || '',
+    exeWin: await toWindowsPath(paths?.backdropExeFile || '', hostInfo),
+    hashPosix: paths?.backdropHashFile || '',
+    stagedSrcPosix: '',
+    srcWin: await toWindowsPath(paths?.backdropSourceFile || '', hostInfo),
+    launcherVbsPosix: paths?.backdropLauncherVbs || '',
+    launcherVbsWin: await toWindowsPath(paths?.backdropLauncherVbs || '', hostInfo),
+    launcherCmdPosix: paths?.backdropLauncherCmd || '',
+    launcherCmdWin: await toWindowsPath(paths?.backdropLauncherCmd || '', hostInfo),
+    dataDirWin,
+    assetsDirWin,
+  };
+}
+
 /**
  * Compile AgyBackdrop.cs -> agy_backdrop.exe when source changes and emit desktop launchers.
+ * Supports both native Windows and Win + WSL2 via Windows Interop.
  */
 export async function ensureBackdropAssets(paths) {
-  if (process.platform !== 'win32') {
-    return { supported: false, compiled: false, reason: 'Windows only' };
+  const hostInfo = detectWindowsHostEnv();
+  if (!hostInfo.hasWindowsHost) {
+    return { supported: false, isWsl: false, compiled: false, reason: 'Windows only' };
   }
   if (!paths?.backdropSourceFile || !fs.existsSync(paths.backdropSourceFile)) {
-    return { supported: true, compiled: false, reason: 'Backdrop source missing' };
+    return { supported: true, isWsl: hostInfo.isWsl, compiled: false, reason: 'Backdrop source missing' };
   }
-  if (!fs.existsSync(CSC_PATH)) {
-    return { supported: true, compiled: false, reason: '.NET Framework csc.exe missing' };
+  if (!hostInfo.cscPath || !fs.existsSync(hostInfo.cscPath)) {
+    return {
+      supported: true,
+      isWsl: hostInfo.isWsl,
+      compiled: false,
+      reason: '.NET Framework csc.exe missing',
+    };
   }
 
   const doWork = async () => {
+    const rt = await resolveBackdropRuntimePaths(paths, hostInfo);
     const sourceBuf = await fsp.readFile(paths.backdropSourceFile);
     const sourceHash = crypto.createHash('sha1').update(sourceBuf).digest('hex');
 
     let prevHash = '';
     try {
-      prevHash = (await fsp.readFile(paths.backdropHashFile, 'utf8')).trim();
+      prevHash = (await fsp.readFile(rt.hashPosix, 'utf8')).trim();
     } catch {
       prevHash = '';
     }
 
-    const exeExists = fs.existsSync(paths.backdropExeFile);
+    const exeExists = Boolean(rt.exePosix && fs.existsSync(rt.exePosix));
     let compiledNow = false;
     if (!exeExists || prevHash !== sourceHash) {
-      await fsp.mkdir(paths.backdropBinDir, { recursive: true });
-      const tmpExe = `${paths.backdropExeFile}.tmp.${process.pid}.exe`;
+      await fsp.mkdir(rt.binDirPosix, { recursive: true });
+      if (rt.stagedSrcPosix) {
+        await fsp.writeFile(rt.stagedSrcPosix, sourceBuf);
+      }
+      const tmpExePosix = `${rt.exePosix}.tmp.${process.pid}.exe`;
+      const tmpExeWin = `${rt.exeWin}.tmp.${process.pid}.exe`;
+      const wpfWin = hostInfo.wpfDirWin;
       try {
-        await execFileAsync(CSC_PATH, [
+        await execFileAsync(hostInfo.cscPath, [
           '/nologo',
           '/target:winexe',
           '/optimize+',
-          `/out:${tmpExe}`,
-          `/r:${path.join(WPF_DIR, 'PresentationCore.dll')}`,
-          `/r:${path.join(WPF_DIR, 'PresentationFramework.dll')}`,
-          `/r:${path.join(WPF_DIR, 'WindowsBase.dll')}`,
-          `/r:${path.join(WPF_DIR, 'UIAutomationClient.dll')}`,
-          `/r:${path.join(WPF_DIR, 'UIAutomationTypes.dll')}`,
+          `/out:${tmpExeWin}`,
+          `/r:${wpfWin}\\PresentationCore.dll`,
+          `/r:${wpfWin}\\PresentationFramework.dll`,
+          `/r:${wpfWin}\\WindowsBase.dll`,
+          `/r:${wpfWin}\\UIAutomationClient.dll`,
+          `/r:${wpfWin}\\UIAutomationTypes.dll`,
           '/r:System.Xaml.dll',
           '/r:System.Windows.Forms.dll',
           '/r:System.Drawing.dll',
           '/r:System.Web.Extensions.dll',
-          paths.backdropSourceFile,
-        ], { timeout: 20000 });
+          rt.srcWin,
+        ], { timeout: 25000 });
         let replaced = false;
         try {
-          await fsp.rename(tmpExe, paths.backdropExeFile);
+          await fsp.rename(tmpExePosix, rt.exePosix);
           replaced = true;
         } catch {
           // If an older companion binary is currently running and locking the .exe, stop it cleanly before replacing
-          if (fs.existsSync(paths.backdropExeFile)) {
-            await execFileAsync(paths.backdropExeFile, ['--stop'], { timeout: 3000 }).catch(() => {});
+          if (fs.existsSync(rt.exePosix)) {
+            await execFileAsync(rt.exePosix, ['--stop'], { timeout: 3000 }).catch(() => {});
           }
           for (let attempt = 0; attempt < 8 && !replaced; attempt += 1) {
             await new Promise((r) => setTimeout(r, 200));
             try {
-              await fsp.rename(tmpExe, paths.backdropExeFile);
+              await fsp.rename(tmpExePosix, rt.exePosix);
               replaced = true;
             } catch {
               try {
-                await fsp.copyFile(tmpExe, paths.backdropExeFile);
-                await fsp.rm(tmpExe, { force: true }).catch(() => {});
+                await fsp.copyFile(tmpExePosix, rt.exePosix);
+                await fsp.rm(tmpExePosix, { force: true }).catch(() => {});
                 replaced = true;
               } catch {
                 // Retry while old process finishes releasing file handle
@@ -196,12 +292,13 @@ export async function ensureBackdropAssets(paths) {
             throw new Error('Failed to replace running agy_backdrop.exe');
           }
         }
-        await atomicWriteText(paths.backdropHashFile, `${sourceHash}\n`);
+        await atomicWriteText(rt.hashPosix, `${sourceHash}\n`);
         compiledNow = true;
       } catch (err) {
-        await fsp.rm(tmpExe, { force: true }).catch(() => {});
+        await fsp.rm(tmpExePosix, { force: true }).catch(() => {});
         return {
           supported: true,
+          isWsl: hostInfo.isWsl,
           compiled: false,
           error: err?.stderr || err?.stdout || err?.message || 'csc compile failed',
         };
@@ -209,21 +306,23 @@ export async function ensureBackdropAssets(paths) {
     }
 
     await writeUtf16LeBom(
-      paths.backdropLauncherVbs,
-      buildLauncherVbsContent(paths.backdropExeFile, paths.pluginDataDir, paths.wallpapersDir),
+      rt.launcherVbsPosix,
+      buildLauncherVbsContent(rt.exeWin, rt.dataDirWin, rt.assetsDirWin),
     );
     await atomicWriteText(
-      paths.backdropLauncherCmd,
-      buildLauncherCmdContent(paths.backdropLauncherVbs),
+      rt.launcherCmdPosix,
+      buildLauncherCmdContent(rt.launcherVbsWin),
     );
 
     return {
       supported: true,
+      isWsl: hostInfo.isWsl,
       compiled: true,
       compiledNow,
-      exePath: paths.backdropExeFile,
-      launcherVbsPath: paths.backdropLauncherVbs,
-      launcherCmdPath: paths.backdropLauncherCmd,
+      exePath: rt.exeWin,
+      exePosixPath: rt.exePosix,
+      launcherVbsPath: rt.launcherVbsWin,
+      launcherCmdPath: rt.launcherCmdWin,
     };
   };
 
@@ -239,8 +338,10 @@ export async function ensureBackdropAssets(paths) {
  * Return live companion status combined with current desktop isolation state.
  */
 export async function getBackdropStatus(paths, themes = {}) {
+  const hostInfo = detectWindowsHostEnv();
   const desk = await detectOwnDesktopInfo();
-  const exeExists = Boolean(paths?.backdropExeFile && fs.existsSync(paths.backdropExeFile));
+  const rt = hostInfo.hasWindowsHost ? await resolveBackdropRuntimePaths(paths, hostInfo) : null;
+  const exeExists = Boolean(rt?.exePosix && fs.existsSync(rt.exePosix));
 
   let raw = null;
   if (paths?.backdropStatusFile) {
@@ -256,19 +357,21 @@ export async function getBackdropStatus(paths, themes = {}) {
   const pid = Number(raw?.pid || 0);
   const updatedAtMs = Number(raw?.updatedAtMs || 0);
   const ageMs = updatedAtMs > 0 ? Math.max(0, nowMs - updatedAtMs) : Infinity;
-  const pidAlive = pid > 0 ? isPidAlive(pid) : true;
+  // On WSL2, raw.pid is a Windows PID that does not exist in Linux kernel; rely on heartbeat TTL.
+  const pidAlive = hostInfo.isWsl ? true : (pid > 0 ? isPidAlive(pid) : true);
   const running = Boolean(
     raw?.running === true && ageMs <= COMPANION_ACTIVE_TTL_MS && pidAlive,
   );
 
-  const launcherCmdPath = paths?.backdropLauncherCmd || '';
-  const launcherVbsPath = paths?.backdropLauncherVbs || '';
+  const launcherCmdPath = rt?.launcherCmdWin || paths?.backdropLauncherCmd || '';
+  const launcherVbsPath = rt?.launcherVbsWin || paths?.backdropLauncherVbs || '';
   const quickLaunchCommand = launcherVbsPath
     ? `wscript.exe //Nologo "${launcherVbsPath}"`
     : '';
 
   return {
-    supported: process.platform === 'win32',
+    supported: hostInfo.hasWindowsHost,
+    isWsl: hostInfo.isWsl,
     compiled: exeExists,
     desktopName: desk.desktopName,
     desktopIsolated: desk.desktopIsolated,
@@ -297,10 +400,11 @@ export async function getBackdropStatus(paths, themes = {}) {
  * Prepare binaries/launchers and start or stop the backdrop companion when running on interactive desktop.
  */
 export async function controlBackdropCompanion(paths, themes = {}, action = 'sync') {
-  if (process.platform !== 'win32') {
+  const hostInfo = detectWindowsHostEnv();
+  if (!hostInfo.hasWindowsHost) {
     return {
       ok: false,
-      error: '贴背壁纸伴侣仅支持 Windows 桌面系统',
+      error: '贴背壁纸伴侣仅支持 Windows 或 Win + WSL2 桌面环境',
       status: await getBackdropStatus(paths, themes),
     };
   }
@@ -314,6 +418,7 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
     };
   }
 
+  const rt = await resolveBackdropRuntimePaths(paths, hostInfo);
   const desk = await detectOwnDesktopInfo();
   const current = await getBackdropStatus(paths, themes);
 
@@ -331,17 +436,22 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
 
   if (desk.canAutoLaunch) {
     if (wantRunning && !current.running) {
-      const child = spawn(
-        paths.backdropExeFile,
-        ['--data-dir', paths.pluginDataDir, '--assets-dir', paths.wallpapersDir],
-        { detached: true, stdio: 'ignore', windowsHide: true },
-      );
+      const child = hostInfo.isWsl && hostInfo.wscriptPath
+        ? spawn(hostInfo.wscriptPath, ['//Nologo', rt.launcherVbsWin], {
+            detached: true,
+            stdio: 'ignore',
+          })
+        : spawn(
+            rt.exePosix,
+            ['--data-dir', rt.dataDirWin, '--assets-dir', rt.assetsDirWin],
+            { detached: true, stdio: 'ignore', windowsHide: true },
+          );
       child.on('error', () => {});
       child.unref();
       launched = true;
-      await new Promise((r) => setTimeout(r, 350));
+      await new Promise((r) => setTimeout(r, hostInfo.isWsl ? 650 : 350));
     } else if (!wantRunning && current.running) {
-      await execFileAsync(paths.backdropExeFile, ['--stop'], { timeout: 5000 }).catch(() => {});
+      await execFileAsync(rt.exePosix, ['--stop'], { timeout: 5000 }).catch(() => {});
       stopped = true;
       await new Promise((r) => setTimeout(r, 250));
     }

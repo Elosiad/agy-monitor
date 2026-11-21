@@ -505,7 +505,8 @@ export function createThemeStudio({
   const renderBackdropCompanion = () => {
     const bd = state.backdropStatus || {};
     const cdp = bd.cdp || {};
-    const supported = bd.supported !== false;
+    const supported = bd.supported !== false || cdp.supported === true;
+    const isWsl = Boolean(bd.isWsl || cdp.isWsl);
     const enabled = Boolean(state.backdropEnabled);
     const isCdp = state.hostThemeMode === "cdp";
     const hasWp = Boolean(state.activeWallpaperId);
@@ -516,6 +517,7 @@ export function createThemeStudio({
     const alphaPct = Math.round(((Number(bd.appliedAlpha || 255) / 255) * 100));
     const cdpPort = Number(cdp.port || state.cdpPort || 9229);
     const cdpConnected = Boolean(cdp.connected);
+    const cdpTransport = String(cdp.transport || "direct");
     const quickCmd = isCdp
       ? (typeof cdp.launchCommand === "string" ? cdp.launchCommand : "")
       : (typeof bd.quickLaunchCommand === "string" ? bd.quickLaunchCommand : "");
@@ -568,9 +570,16 @@ export function createThemeStudio({
       } else if (isCdp) {
         if (cdpConnected) {
           badgeCls = "boundary-badge is-synced";
-          badgeText = tr("backdrop.statusCdpConnected", "CDP 已直连 (:{port})", "CDP Linked (:{port})", {
-            port: cdpPort,
-          });
+          badgeText = isWsl
+            ? tr(
+                "backdrop.statusCdpConnectedWsl",
+                "CDP 已桥接 (WSL :{port})",
+                "CDP Bridged (WSL :{port})",
+                { port: cdpPort }
+              )
+            : tr("backdrop.statusCdpConnected", "CDP 已直连 (:{port})", "CDP Linked (:{port})", {
+                port: cdpPort,
+              });
         } else {
           badgeCls = "boundary-badge is-scoped";
           badgeText = tr("backdrop.statusCdpWait", "待 CDP 启动 (:{port})", "Wait CDP (:{port})", {
@@ -582,9 +591,13 @@ export function createThemeStudio({
         badgeText = tr("backdrop.statusPaused", "伴侣已暂停", "Paused in Tray");
       } else if (running) {
         badgeCls = "boundary-badge is-synced";
-        badgeText = tr("backdrop.statusRunning", "伴侣运行中（{count} 窗）", "Active ({count} win)", {
-          count: trackedCount,
-        });
+        badgeText = isWsl
+          ? tr("backdrop.statusRunningWsl", "伴侣运行中（WSL · {count} 窗）", "Active (WSL · {count} win)", {
+              count: trackedCount,
+            })
+          : tr("backdrop.statusRunning", "伴侣运行中（{count} 窗）", "Active ({count} win)", {
+              count: trackedCount,
+            });
       } else if (isolated) {
         badgeCls = "boundary-badge is-scoped";
         badgeText = tr("backdrop.statusIsolated", "待桌面启动", "Run on Desktop");
@@ -608,19 +621,36 @@ export function createThemeStudio({
         );
       } else if (isCdp) {
         if (cdpConnected) {
-          backdropStatusHint.textContent = tr(
-            "backdrop.descCdpConnected",
-            "方案二已连通本地 CDP (:{port})：纯 CSS 注入底层壁纸，文字/代码/图标 100% 实心锐利，滑块实时生效。",
-            "Mode 2 linked via localhost CDP (:{port}): pure-CSS wallpaper keeps text & code 100% sharp and syncs live.",
-            { port: cdpPort }
-          );
+          backdropStatusHint.textContent = isWsl
+            ? tr(
+                "backdrop.descCdpConnectedWsl",
+                "方案二已通过 WSL2 跨端通道连通 Windows CDP (:{port} · {mode})：纯 CSS 注入底层壁纸，文字/代码 100% 锐利。",
+                "Mode 2 linked across WSL2 to Windows CDP (:{port} · {mode}): pure-CSS wallpaper keeps text 100% sharp.",
+                {
+                  port: cdpPort,
+                  mode: cdpTransport === "wsl_tunnel" ? "NAT 隧道" : cdpTransport === "wsl_gateway" ? "网关" : "直连",
+                }
+              )
+            : tr(
+                "backdrop.descCdpConnected",
+                "方案二已连通本地 CDP (:{port})：纯 CSS 注入底层壁纸，文字/代码/图标 100% 实心锐利，滑块实时生效。",
+                "Mode 2 linked via localhost CDP (:{port}): pure-CSS wallpaper keeps text & code 100% sharp and syncs live.",
+                { port: cdpPort }
+              );
         } else {
-          backdropStatusHint.textContent = tr(
-            "backdrop.descCdpWait",
-            "方案二需带调试参数启动：完全退出 AGY 后双击无黑窗快捷方式「{path}」（可固定到任务栏，或给原有 AGY 快捷方式目标追加 --remote-debugging-port={port}）。",
-            "Mode 2 requires remote-debugging launch: fully quit AGY, then double-click the console-free shortcut \"{path}\" (or append --remote-debugging-port={port} to your existing AGY shortcut).",
-            { path: launcherCmdPath || quickCmd, port: cdpPort }
-          );
+          backdropStatusHint.textContent = isWsl
+            ? tr(
+                "backdrop.descCdpWaitWsl",
+                "WSL2 NAT 模式已内置免转发隧道：在 Windows 端完全退出 AGY 后运行「{path}」（或为 AGY 快捷方式追加 --remote-debugging-port={port}），即可自动连通。",
+                "WSL2 NAT tunnel ready: fully quit AGY on Windows and run \"{path}\" (or append --remote-debugging-port={port} to your AGY shortcut) to connect automatically.",
+                { path: launcherCmdPath || quickCmd, port: cdpPort }
+              )
+            : tr(
+                "backdrop.descCdpWait",
+                "方案二需带调试参数启动：完全退出 AGY 后双击无黑窗快捷方式「{path}」（可固定到任务栏，或给原有 AGY 快捷方式目标追加 --remote-debugging-port={port}）。",
+                "Mode 2 requires remote-debugging launch: fully quit AGY, then double-click the console-free shortcut \"{path}\" (or append --remote-debugging-port={port} to your existing AGY shortcut).",
+                { path: launcherCmdPath || quickCmd, port: cdpPort }
+              );
         }
       } else if (running) {
         backdropStatusHint.textContent = tr(

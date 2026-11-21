@@ -5,6 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { atomicWriteBuffer, atomicWriteJson, atomicWriteText } from './paths.mjs';
+import {
+  createWslCdpLocalProxy,
+  detectWindowsHostEnv,
+  resolveWindowsHostDirs,
+  resolveWslGatewayIp,
+  toWindowsPath,
+} from './wsl_bridge.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -57,11 +64,18 @@ function escapeVbsString(str) {
   return String(str || '').replace(/"/g, '""');
 }
 
+let cachedResolvedExeWin = '';
+let cachedLauncherSnapshot = null;
+
 /**
- * Locate Antigravity's desktop executable on Windows (strictly read-only).
+ * Locate Antigravity's desktop executable on Windows (or via WSL2 mount).
  */
 export function findAntigravityExePath() {
-  if (process.platform !== 'win32') return '';
+  const hostInfo = detectWindowsHostEnv();
+  if (!hostInfo.hasWindowsHost) return '';
+  if (hostInfo.isWsl) {
+    return cachedResolvedExeWin || '';
+  }
   const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
   const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
   const candidates = [
@@ -79,12 +93,62 @@ export function findAntigravityExePath() {
   return candidates[0];
 }
 
-async function createWindowsShortcutLnk({ lnkPath, targetPath, args, workingDir, description }) {
-  if (process.platform !== 'win32' || !lnkPath || !targetPath) return false;
-  const helperVbs = `${lnkPath}.mk.vbs`;
+async function resolveAntigravityExePathAsync(hostInfo = detectWindowsHostEnv()) {
+  if (!hostInfo.hasWindowsHost) return { exeWin: '', exeFound: false };
+  if (hostInfo.isNativeWindows) {
+    const exeWin = findAntigravityExePath();
+    return { exeWin, exeFound: Boolean(exeWin && fs.existsSync(exeWin)) };
+  }
+  const dirs = await resolveWindowsHostDirs(hostInfo);
+  const candidates = [];
+  if (dirs.localAppDataWin && dirs.localAppDataPosix) {
+    candidates.push(
+      {
+        win: `${dirs.localAppDataWin}\\Programs\\antigravity\\Antigravity.exe`,
+        posix: `${dirs.localAppDataPosix}/Programs/antigravity/Antigravity.exe`,
+      },
+      {
+        win: `${dirs.localAppDataWin}\\Programs\\Antigravity\\Antigravity.exe`,
+        posix: `${dirs.localAppDataPosix}/Programs/Antigravity/Antigravity.exe`,
+      },
+    );
+  }
+  if (dirs.programFilesWin && dirs.programFilesPosix) {
+    candidates.push({
+      win: `${dirs.programFilesWin}\\Antigravity\\Antigravity.exe`,
+      posix: `${dirs.programFilesPosix}/Antigravity/Antigravity.exe`,
+    });
+  }
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand.posix)) {
+        cachedResolvedExeWin = cand.win;
+        return { exeWin: cand.win, exeFound: true };
+      }
+    } catch {
+      // ignore
+    }
+  }
+  const fallback = candidates[0]?.win || '';
+  cachedResolvedExeWin = fallback;
+  return { exeWin: fallback, exeFound: false };
+}
+
+async function createWindowsShortcutLnk({
+  lnkPosix,
+  lnkWin,
+  targetPath,
+  args,
+  workingDir,
+  description,
+  hostInfo = detectWindowsHostEnv(),
+}) {
+  if (!hostInfo.hasWindowsHost || !lnkPosix || !lnkWin || !targetPath) return false;
+  const helperVbsPosix = `${lnkPosix}.mk.vbs`;
+  const helperVbsWin = `${lnkWin}.mk.vbs`;
   const script = [
     'Set sh = CreateObject("WScript.Shell")',
-    `Set sc = sh.CreateShortcut("${escapeVbsString(lnkPath)}")`,
+    `Set sc = sh.CreateShortcut("${escapeVbsString(lnkWin)}")`,
     `sc.TargetPath = "${escapeVbsString(targetPath)}"`,
     `sc.Arguments = "${escapeVbsString(args)}"`,
     `sc.WorkingDirectory = "${escapeVbsString(workingDir)}"`,
@@ -96,19 +160,19 @@ async function createWindowsShortcutLnk({ lnkPath, targetPath, args, workingDir,
   ].join('\r\n');
 
   try {
-    await fsp.mkdir(path.dirname(lnkPath), { recursive: true });
+    await fsp.mkdir(path.dirname(lnkPosix), { recursive: true });
     // WScript reads UTF-16LE BOM cleanly even with Chinese characters in path/description
     const bomBuf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(script, 'utf16le')]);
-    await fsp.writeFile(helperVbs, bomBuf);
-    await execFileAsync('wscript.exe', ['//Nologo', helperVbs], {
+    await fsp.writeFile(helperVbsPosix, bomBuf);
+    await execFileAsync(hostInfo.wscriptPath || 'wscript.exe', ['//Nologo', helperVbsWin], {
       windowsHide: true,
-      timeout: 5000,
+      timeout: 6000,
     });
-    return fs.existsSync(lnkPath);
+    return fs.existsSync(lnkPosix);
   } catch {
     return false;
   } finally {
-    await fsp.rm(helperVbs, { force: true }).catch(() => {});
+    await fsp.rm(helperVbsPosix, { force: true }).catch(() => {});
   }
 }
 
@@ -116,80 +180,115 @@ async function createWindowsShortcutLnk({ lnkPath, targetPath, args, workingDir,
  * Emit zero-console desktop launchers (.lnk native shortcut + silent .vbs + self-closing .cmd)
  * that start Antigravity with --remote-debugging-port without leaving any cmd window open
  * and without touching app.asar or any installation files.
+ * Supports both native Windows and Win + WSL2 via Windows NTFS staging dir.
  */
 export async function ensureCdpLauncher(paths, cdpPort = DEFAULT_CDP_PORT) {
+  const hostInfo = detectWindowsHostEnv();
   const port = clampInt(cdpPort, 1024, 65535, DEFAULT_CDP_PORT);
-  const exePath = findAntigravityExePath();
-  const exeFound = Boolean(exePath && fs.existsSync(exePath));
+  const { exeWin, exeFound } = await resolveAntigravityExePathAsync(hostInfo);
   const cdpArg = `--remote-debugging-port=${port}`;
-  const launcherVbsPath = paths?.cdpLauncherVbs || '';
-  const launcherCmdPath = paths?.cdpLauncherCmd || '';
-  const shortcutLnkPath = paths?.cdpShortcutLnk || '';
-  const launchCommand = launcherVbsPath
-    ? `wscript.exe //Nologo "${launcherVbsPath}"`
-    : `"${exePath}" ${cdpArg}`;
 
-  const cacheKey = `${exePath}|${port}|${launcherVbsPath}|${launcherCmdPath}|${shortcutLnkPath}`;
+  let launcherVbsPosix = paths?.cdpLauncherVbs || '';
+  let launcherVbsWin = launcherVbsPosix;
+  let launcherCmdPosix = paths?.cdpLauncherCmd || '';
+  let launcherCmdWin = launcherCmdPosix;
+  let shortcutLnkPosix = paths?.cdpShortcutLnk || '';
+  let shortcutLnkWin = shortcutLnkPosix;
+
+  if (hostInfo.isWsl && hostInfo.hasWindowsHost) {
+    const dirs = await resolveWindowsHostDirs(hostInfo);
+    if (dirs.stagingDirPosix && dirs.stagingDirWin) {
+      launcherVbsPosix = `${dirs.stagingDirPosix}/launch_antigravity_cdp.vbs`;
+      launcherVbsWin = `${dirs.stagingDirWin}\\launch_antigravity_cdp.vbs`;
+      launcherCmdPosix = `${dirs.stagingDirPosix}/启动_Antigravity_高清壁纸模式_CDP.cmd`;
+      launcherCmdWin = `${dirs.stagingDirWin}\\启动_Antigravity_高清壁纸模式_CDP.cmd`;
+      shortcutLnkPosix = `${dirs.stagingDirPosix}/Antigravity (高清壁纸).lnk`;
+      shortcutLnkWin = `${dirs.stagingDirWin}\\Antigravity (高清壁纸).lnk`;
+    } else {
+      launcherVbsWin = await toWindowsPath(launcherVbsPosix, hostInfo);
+      launcherCmdWin = await toWindowsPath(launcherCmdPosix, hostInfo);
+      shortcutLnkWin = await toWindowsPath(shortcutLnkPosix, hostInfo);
+    }
+  }
+
+  const launchCommand = launcherVbsWin
+    ? `wscript.exe //Nologo "${launcherVbsWin}"`
+    : exeWin
+      ? `"${exeWin}" ${cdpArg}`
+      : '';
+
+  const cacheKey = `${exeWin}|${port}|${launcherVbsWin}|${launcherCmdWin}|${shortcutLnkWin}`;
   const allExist =
-    process.platform !== 'win32' ||
-    ((!launcherVbsPath || fs.existsSync(launcherVbsPath)) &&
-      (!launcherCmdPath || fs.existsSync(launcherCmdPath)) &&
-      (!shortcutLnkPath || fs.existsSync(shortcutLnkPath)));
+    !hostInfo.hasWindowsHost ||
+    ((!launcherVbsPosix || fs.existsSync(launcherVbsPosix)) &&
+      (!launcherCmdPosix || fs.existsSync(launcherCmdPosix)) &&
+      (!shortcutLnkPosix || fs.existsSync(shortcutLnkPosix)));
 
-  if (process.platform === 'win32' && (!allExist || launcherSignatureCache.get(launcherCmdPath || shortcutLnkPath) !== cacheKey)) {
-    if (launcherVbsPath) {
+  if (
+    hostInfo.hasWindowsHost &&
+    exeWin &&
+    (!allExist || launcherSignatureCache.get(launcherCmdWin || shortcutLnkWin) !== cacheKey)
+  ) {
+    if (launcherVbsPosix) {
+      await fsp.mkdir(path.dirname(launcherVbsPosix), { recursive: true }).catch(() => {});
       const vbsContent = [
         'Set sh = CreateObject("WScript.Shell")',
-        `sh.Run """${escapeVbsString(exePath)}"" ${cdpArg}", 1, False`,
+        `sh.Run """${escapeVbsString(exeWin)}"" ${cdpArg}", 1, False`,
         '',
       ].join('\r\n');
       const vbsBuf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(vbsContent, 'utf16le')]);
-      await atomicWriteBuffer(launcherVbsPath, vbsBuf).catch(() => {});
+      await atomicWriteBuffer(launcherVbsPosix, vbsBuf).catch(() => {});
     }
 
-    if (launcherCmdPath) {
-      const cmdContent = launcherVbsPath
+    if (launcherCmdPosix) {
+      await fsp.mkdir(path.dirname(launcherCmdPosix), { recursive: true }).catch(() => {});
+      const cmdContent = launcherVbsWin
         ? [
             '@echo off',
             'chcp 65001 >nul',
             'rem 静默无黑窗启动 Antigravity 高清壁纸模式 (纯 CSS CDP 通道，不修改 app.asar)',
-            `start "" wscript.exe //Nologo "${launcherVbsPath}"`,
+            `start "" wscript.exe //Nologo "${launcherVbsWin}"`,
             'exit /b 0',
             '',
           ].join('\r\n')
         : [
             '@echo off',
             'chcp 65001 >nul',
-            `start "" /b "${exePath}" ${cdpArg}`,
+            `start "" /b "${exeWin}" ${cdpArg}`,
             'exit /b 0',
             '',
           ].join('\r\n');
-      await atomicWriteText(launcherCmdPath, cmdContent).catch(() => {});
+      await atomicWriteText(launcherCmdPosix, cmdContent).catch(() => {});
     }
 
-    if (shortcutLnkPath) {
+    if (shortcutLnkPosix && shortcutLnkWin) {
+      const workDirWin = exeWin.replace(/[\\/][^\\/]+$/, '');
       await createWindowsShortcutLnk({
-        lnkPath: shortcutLnkPath,
-        targetPath: exePath,
+        lnkPosix: shortcutLnkPosix,
+        lnkWin: shortcutLnkWin,
+        targetPath: exeWin,
         args: cdpArg,
-        workingDir: exePath ? path.dirname(exePath) : '',
+        workingDir: workDirWin,
         description: `Antigravity (高清壁纸 CDP :${port})`,
+        hostInfo,
       });
     }
 
-    launcherSignatureCache.set(launcherCmdPath || shortcutLnkPath, cacheKey);
+    launcherSignatureCache.set(launcherCmdWin || shortcutLnkWin, cacheKey);
   }
 
-  return {
+  const info = {
     port,
-    exePath,
+    exePath: exeWin,
     exeFound,
-    launcherVbsPath,
-    launcherCmdPath,
-    shortcutLnkPath: shortcutLnkPath && fs.existsSync(shortcutLnkPath) ? shortcutLnkPath : '',
+    launcherVbsPath: launcherVbsWin,
+    launcherCmdPath: launcherCmdWin,
+    shortcutLnkPath: shortcutLnkPosix && fs.existsSync(shortcutLnkPosix) ? shortcutLnkWin : '',
     launchCommand,
     directArgs: cdpArg,
   };
+  cachedLauncherSnapshot = info;
+  return info;
 }
 
 /**
@@ -219,6 +318,7 @@ export function buildCdpThemeCss(themes = {}, wallpaperDataUri = '') {
   // Exact optical match to Scheme 1 & AGY Console: single unified veil on html::after
   const totalVeilAlpha = Math.max(0.28, Math.min(0.96, 1 - (1 - dimFrac) * blendFrac)).toFixed(3);
   const sidebarTintAlpha = Math.max(0.14, Math.min(0.36, 0.30 - blendFrac * 0.28)).toFixed(3);
+  const softSurfaceAlpha = Math.max(0.18, Math.min(0.48, 0.40 - blendFrac * 0.34)).toFixed(3);
   const composerAlpha = Math.max(0.68, Math.min(0.90, 0.86 - blendFrac * 0.32)).toFixed(3);
   const safeUrl = wallpaperDataUri ? `url("${wallpaperDataUri}")` : 'none';
 
@@ -267,6 +367,40 @@ body > div:first-of-type {
   background-color: transparent !important;
 }
 
+/* Workbench & WSL Remote shell surfaces (clears stubborn opaque light/dark chrome panels) */
+.monaco-workbench,
+.monaco-workbench .part,
+.monaco-workbench .part > .content,
+.monaco-workbench .part.titlebar,
+.monaco-workbench .part.statusbar,
+.monaco-workbench .part.activitybar,
+.monaco-workbench .part.panel,
+.monaco-workbench .part.editor > .content .editor-group-container,
+.monaco-workbench .part.editor > .content .editor-group-container > .title,
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-and-actions-container,
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container,
+.monaco-workbench .part.editor > .content .editor-group-container > .title .editor-actions,
+.monaco-workbench .part.editor > .content .editor-group-container > .editor-container,
+.monaco-editor,
+.monaco-editor-background,
+.monaco-editor .margin,
+.monaco-editor .inputarea.ime-input,
+.monaco-pane-view .pane > .pane-header,
+.monaco-list .monaco-list-rows,
+.breadcrumbs-control {
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+.monaco-workbench .part.sidebar,
+.monaco-workbench .part.auxiliarybar {
+  background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
+}
+
+.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab.active {
+  background-color: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
+}
+
 /* Auto-discovered opaque structural shell containers (zero stacked double veils) */
 [data-agy-mon-layer="transparent"] {
   background-color: transparent !important;
@@ -275,6 +409,12 @@ body > div:first-of-type {
 
 [data-agy-mon-layer="sidebar"] {
   background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
+  background-image: none !important;
+}
+
+[data-agy-mon-layer="surface-soft"] {
+  background-color: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
+  background-image: none !important;
 }
 
 [data-agy-mon-layer="composer"] {
@@ -282,26 +422,32 @@ body > div:first-of-type {
   backdrop-filter: blur(10px) !important;
 }
 
-/* Protect popups, dropdowns, dialogs, menus, and tooltips with crisp opaque surfaces */
+/* Protect popups, dropdowns, dialogs, menus, hover widgets, and tooltips with crisp opaque surfaces */
 [role="dialog"],
 [role="alertdialog"],
 [role="menu"],
 [role="listbox"],
 [role="tooltip"],
 [data-radix-popper-content-wrapper] > *,
-[data-sonner-toast] {
+[data-sonner-toast],
+.monaco-hover,
+.suggest-widget,
+.quick-input-widget,
+.context-view .monaco-menu {
   background-color: rgba(${chr}, ${chg}, ${chb}, 0.96) !important;
   backdrop-filter: blur(14px) !important;
 }
 `.trim();
 }
 
-function isAntigravityAppTarget(target) {
+export function isAntigravityAppTarget(target) {
   if (!target || !target.webSocketDebuggerUrl) return false;
   const tType = String(target.type || '').toLowerCase();
   if (tType !== 'page' && tType !== 'webview' && tType !== 'iframe') return false;
   const url = String(target.url || '').trim();
   const low = url.toLowerCase();
+  const title = String(target.title || '').trim();
+  const lowTitle = title.toLowerCase();
   if (!low) return false;
   if (
     low.startsWith('devtools://') ||
@@ -313,14 +459,55 @@ function isAntigravityAppTarget(target) {
   ) {
     return false;
   }
-  // Skip loopback sidecar webviews and external web pages
-  if (low.startsWith('http://127.0.0.1:') || low.startsWith('http://localhost:')) {
+  // Never inject host wallpaper into AGY Monitor's own sidecar console
+  if (
+    lowTitle === 'antigravity monitor' ||
+    lowTitle === 'agy 控制台' ||
+    low.includes('/agy_monitor')
+  ) {
     return false;
+  }
+  // Local loopback HTTP/HTTPS targets: allow Antigravity WSL Remote / Web workbench host pages
+  // (e.g. https://127.0.0.1:<port>/... with title "... - Antigravity" or "Antigravity"),
+  // while still rejecting sidecar webviews and unrelated local dev servers.
+  const isLoopbackHttp =
+    low.startsWith('https://127.0.0.1:') ||
+    low.startsWith('https://localhost:') ||
+    low.startsWith('http://127.0.0.1:') ||
+    low.startsWith('http://localhost:');
+  if (isLoopbackHttp) {
+    if (tType !== 'page') return false;
+    return (
+      lowTitle === 'antigravity' ||
+      lowTitle.endsWith(' - antigravity') ||
+      lowTitle.includes('antigravity')
+    );
   }
   if (low.startsWith('https://') || low.startsWith('http://')) {
     return false;
   }
   return true;
+}
+
+export function rewriteTargetWsUrl(wsUrl, activePort, proxyHost, proxyPort) {
+  if (typeof wsUrl !== 'string' || !wsUrl) return '';
+  if (!proxyHost || !proxyPort) return wsUrl;
+  try {
+    const parsed = new URL(wsUrl);
+    const isLocalHost = parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost';
+    const portNum = Number(parsed.port || activePort);
+    if (isLocalHost && portNum === Number(activePort)) {
+      parsed.hostname = proxyHost;
+      parsed.port = String(proxyPort);
+      return parsed.toString();
+    }
+  } catch {
+    // Fallback string replace below
+  }
+  return wsUrl.replace(
+    new RegExp(`^(wss?:\\/\\/)(?:127\\.0\\.0\\.1|localhost):${Number(activePort)}\\b`, 'i'),
+    `$1${proxyHost}:${Number(proxyPort)}`,
+  );
 }
 
 function buildApplyThemeAndScanExpr(cssText) {
@@ -333,6 +520,10 @@ function buildApplyThemeAndScanExpr(cssText) {
       (document.head || document.documentElement).appendChild(el);
     }
     el.textContent = ${JSON.stringify(cssText)};
+
+    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 2) {
+      try { window.__agyMonLayerEngine.stop(); } catch (e) {}
+    }
 
     if (!window.__agyMonLayerEngine) {
       var probeCtx = null;
@@ -383,7 +574,62 @@ function buildApplyThemeAndScanExpr(cssText) {
         IFRAME: 1, WEBVIEW: 1, PRE: 1, CODE: 1, TABLE: 1,
         BUTTON: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, A: 1
       };
-      var PROTECT_SEL = '[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"],[role="tooltip"],[data-radix-popper-content-wrapper],[data-sonner-toast],pre,code,#' + ${JSON.stringify(HUD_ELEMENT_ID)};
+      var PROTECT_SEL = '[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"],[role="tooltip"],[data-radix-popper-content-wrapper],[data-sonner-toast],.monaco-hover,.suggest-widget,.quick-input-widget,.context-view,pre,code,#' + ${JSON.stringify(HUD_ELEMENT_ID)};
+      var LANDMARK_SEL = 'header,nav,aside,main,footer,[role="main"],[role="navigation"],[role="complementary"],[role="banner"],[role="contentinfo"],.part,.pane-body,.editor-group-container,.tabs-and-actions-container,.breadcrumbs-control';
+
+      function evaluateNode(node, vw, vh) {
+        if (!node || node.nodeType !== 1) return 0;
+        if (SKIP_TAGS[node.tagName]) return 0;
+        if (node.getAttribute('data-agy-mon-layer')) return 0;
+        if (node.closest && node.closest(PROTECT_SEL)) return 0;
+
+        var rect = node.getBoundingClientRect();
+        if (!rect || rect.width < 44 || rect.height < 20) return 0;
+
+        var st = window.getComputedStyle(node);
+        var bg = parseBgRgba(st.backgroundColor);
+        var hasGradientBg = Boolean(st.backgroundImage && st.backgroundImage.indexOf('gradient(') >= 0);
+        if ((!bg || bg.a < 0.35) && !hasGradientBg) return 0;
+
+        // Skip vivid accent banners/pills; lift neutral dark & light chrome/surfaces (incl. light blue-gray tints)
+        if (bg && bg.a >= 0.35) {
+          var chroma = Math.max(bg.r, bg.g, bg.b) - Math.min(bg.r, bg.g, bg.b);
+          if (chroma > 52) return 0;
+        }
+
+        var isLeftSidebar =
+          rect.left <= 56 &&
+          rect.width >= 44 &&
+          rect.width <= Math.min(440, vw * 0.40) &&
+          rect.height >= vh * 0.34;
+        var isRightSidebar =
+          rect.right >= vw - 56 &&
+          rect.width >= 44 &&
+          rect.width <= Math.min(460, vw * 0.42) &&
+          rect.height >= vh * 0.34;
+        var isTopBar =
+          rect.top <= 130 &&
+          rect.height <= 116 &&
+          rect.width >= Math.min(180, vw * 0.22);
+        var isBottomBar =
+          rect.bottom >= vh - 48 &&
+          rect.height <= Math.max(120, vh * 0.42) &&
+          rect.width >= Math.min(180, vw * 0.22);
+        var isMainPane =
+          rect.width >= Math.min(180, vw * 0.16) &&
+          rect.height >= Math.min(120, vh * 0.16);
+
+        if (isLeftSidebar || isRightSidebar) {
+          var hasSidebarAnc = node.parentElement && node.parentElement.closest('[data-agy-mon-layer="sidebar"]');
+          node.setAttribute('data-agy-mon-layer', hasSidebarAnc ? 'transparent' : 'sidebar');
+          return 1;
+        }
+        if (isTopBar || isBottomBar || isMainPane) {
+          node.setAttribute('data-agy-mon-layer', 'transparent');
+          return 1;
+        }
+        return 0;
+      }
 
       function scanLayers() {
         var vw = window.innerWidth || 0;
@@ -391,20 +637,26 @@ function buildApplyThemeAndScanExpr(cssText) {
         if (vw < 300 || vh < 200) return 0;
 
         var xs = [
+          12,
           Math.min(44, Math.floor(vw * 0.04)),
-          Math.min(130, Math.floor(vw * 0.11)),
-          Math.floor(vw * 0.28),
-          Math.floor(vw * 0.45),
-          Math.floor(vw * 0.62),
-          Math.floor(vw * 0.80)
+          Math.floor(vw * 0.12),
+          Math.floor(vw * 0.26),
+          Math.floor(vw * 0.42),
+          Math.floor(vw * 0.58),
+          Math.floor(vw * 0.74),
+          Math.floor(vw * 0.88),
+          Math.max(0, vw - 16)
         ];
         var ys = [
-          16,
-          52,
-          Math.floor(vh * 0.22),
-          Math.floor(vh * 0.46),
+          12,
+          44,
+          84,
+          Math.floor(vh * 0.18),
+          Math.floor(vh * 0.34),
+          Math.floor(vh * 0.52),
           Math.floor(vh * 0.70),
-          Math.floor(vh * 0.88)
+          Math.floor(vh * 0.85),
+          Math.max(0, vh - 14)
         ];
 
         var seen = new Set();
@@ -415,44 +667,23 @@ function buildApplyThemeAndScanExpr(cssText) {
             var stack = document.elementsFromPoint(xs[xi], ys[yi]);
             for (var si = 0; si < stack.length; si++) {
               var node = stack[si];
-              if (!node || node.nodeType !== 1 || seen.has(node)) continue;
+              if (!node || seen.has(node)) continue;
               seen.add(node);
-              if (SKIP_TAGS[node.tagName]) continue;
-              if (node.getAttribute('data-agy-mon-layer')) continue;
-              if (node.closest && node.closest(PROTECT_SEL)) continue;
-
-              var rect = node.getBoundingClientRect();
-              if (!rect || rect.width < 150 || rect.height < 24) continue;
-
-              var st = window.getComputedStyle(node);
-              var bg = parseBgRgba(st.backgroundColor);
-              if (!bg || bg.a < 0.35) continue;
-
-              // Skip colorful accent banners/pills; only lift neutral canvas/surface chrome
-              var chroma = Math.max(bg.r, bg.g, bg.b) - Math.min(bg.r, bg.g, bg.b);
-              if (chroma > 46) continue;
-
-              var isHeader = rect.top <= 56 && rect.height <= 96 && rect.width >= 260;
-              var isSidebar =
-                rect.left <= 48 &&
-                rect.width >= 150 &&
-                rect.width <= Math.min(400, vw * 0.34) &&
-                rect.height >= vh * 0.5;
-              var isMainPane =
-                rect.width >= Math.min(280, vw * 0.26) &&
-                rect.height >= vh * 0.36;
-
-              if (isSidebar) {
-                var hasSidebarAnc = node.parentElement && node.parentElement.closest('[data-agy-mon-layer="sidebar"]');
-                node.setAttribute('data-agy-mon-layer', hasSidebarAnc ? 'transparent' : 'sidebar');
-                tagged++;
-              } else if (isHeader || isMainPane) {
-                node.setAttribute('data-agy-mon-layer', 'transparent');
-                tagged++;
-              }
+              tagged += evaluateNode(node, vw, vh);
             }
           }
         }
+
+        try {
+          var landmarks = document.querySelectorAll(LANDMARK_SEL);
+          for (var li = 0; li < landmarks.length; li++) {
+            var lm = landmarks[li];
+            if (!lm || seen.has(lm)) continue;
+            seen.add(lm);
+            tagged += evaluateNode(lm, vw, vh);
+          }
+        } catch (e) {}
+
         return tagged;
       }
 
@@ -473,6 +704,7 @@ function buildApplyThemeAndScanExpr(cssText) {
       }
 
       window.__agyMonLayerEngine = {
+        version: 2,
         scan: scanLayers,
         stop: function() {
           clearInterval(timer);
@@ -1402,6 +1634,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   const connectingUrls = new Set();
   let lastError = '';
   let activePort = DEFAULT_CDP_PORT;
+  let activeTransport = 'direct';
+  let wslProxy = null;
   let cmdSeq = 1;
   let retryTimer = null;
   let retryTickCount = 0;
@@ -1684,35 +1918,118 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       }
     });
 
+  const fetchTargetsFrom = async (host, port, timeoutMs = 450) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`http://${host}:${port}/json/list`, {
+        signal: controller.signal,
+        headers: { Connection: 'close' },
+      });
+      if (!res.ok) {
+        return { ok: false, status: res.status, targets: [] };
+      }
+      const json = await res.json();
+      return { ok: true, status: 200, targets: Array.isArray(json) ? json : [] };
+    } catch {
+      return { ok: false, status: 0, targets: [] };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const closeWslProxy = () => {
+    if (wslProxy) {
+      try {
+        wslProxy.close();
+      } catch {
+        // ignore
+      }
+      wslProxy = null;
+    }
+  };
+
   const ensureConnected = async (port) => {
     if (disposed || typeof globalThis.WebSocket !== 'function') {
       lastError = '当前 Node 环境缺少 WebSocket 客户端';
       return false;
     }
 
-    activePort = clampInt(port, 1024, 65535, DEFAULT_CDP_PORT);
+    const nextPort = clampInt(port, 1024, 65535, DEFAULT_CDP_PORT);
+    if (wslProxy && wslProxy.targetPort !== nextPort) {
+      closeWslProxy();
+    }
+    activePort = nextPort;
+    const hostInfo = detectWindowsHostEnv();
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 450);
     let targets = [];
-    try {
-      const res = await fetch(`http://127.0.0.1:${activePort}/json/list`, {
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        lastError = `CDP 端口 ${activePort} 返回 HTTP ${res.status}`;
+    let wsRewriteHost = '';
+    let wsRewritePort = 0;
+
+    // Tier 1: Direct loopback (native Windows, WSL2 mirrored mode, or manual port forwarding)
+    const directRes = await fetchTargetsFrom('127.0.0.1', activePort, hostInfo.isWsl ? 300 : 450);
+    if (directRes.ok) {
+      targets = directRes.targets;
+      activeTransport = 'direct';
+    } else if (hostInfo.isWsl && hostInfo.hasWindowsHost) {
+      // Tier 2: WSL2 NAT zero-config Interop tunnel (reaches Windows 127.0.0.1:<port> with zero firewall/admin config)
+      if (!wslProxy) {
+        wslProxy = await createWslCdpLocalProxy(activePort, { hostInfo }).catch(() => null);
+      }
+      let tunnelOk = false;
+      if (wslProxy && wslProxy.localPort > 0) {
+        const tunRes = await fetchTargetsFrom('127.0.0.1', wslProxy.localPort, 1800);
+        if (tunRes.ok) {
+          targets = tunRes.targets;
+          wsRewriteHost = '127.0.0.1';
+          wsRewritePort = wslProxy.localPort;
+          activeTransport = 'wsl_tunnel';
+          tunnelOk = true;
+        }
+      }
+
+      // Tier 3: Fallback to WSL2 NAT Windows gateway IP (if user bound --remote-debugging-address=0.0.0.0)
+      if (!tunnelOk) {
+        const gwIp = resolveWslGatewayIp();
+        if (gwIp) {
+          const gwRes = await fetchTargetsFrom(gwIp, activePort, 450);
+          if (gwRes.ok) {
+            targets = gwRes.targets;
+            wsRewriteHost = gwIp;
+            wsRewritePort = activePort;
+            activeTransport = 'wsl_gateway';
+            tunnelOk = true;
+          }
+        }
+      }
+
+      if (!tunnelOk) {
+        lastError = `未检测到 Windows 侧 CDP 端口 ${activePort}（WSL2 NAT 已自动启用桥接，请用调试参数启动 Windows 版 Antigravity）`;
         return false;
       }
-      const json = await res.json();
-      targets = Array.isArray(json) ? json : [];
-    } catch {
-      lastError = `未检测到本地 CDP 端口 ${activePort}`;
+    } else {
+      lastError =
+        directRes.status > 0
+          ? `CDP 端口 ${activePort} 返回 HTTP ${directRes.status}`
+          : `未检测到本地 CDP 端口 ${activePort}`;
       return false;
-    } finally {
-      clearTimeout(timer);
     }
 
-    const matched = targets.filter(isAntigravityAppTarget);
+    const matched = targets
+      .filter(isAntigravityAppTarget)
+      .map((t) =>
+        wsRewriteHost && wsRewritePort
+          ? {
+              ...t,
+              webSocketDebuggerUrl: rewriteTargetWsUrl(
+                t.webSocketDebuggerUrl,
+                activePort,
+                wsRewriteHost,
+                wsRewritePort,
+              ),
+            }
+          : t,
+      );
     if (matched.length === 0) {
       lastError = `端口 ${activePort} 上未找到 Antigravity 主窗口目标`;
       return false;
@@ -2070,8 +2387,9 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   };
 
   const getStatus = (themes = latestThemes || {}) => {
+    const hostInfo = detectWindowsHostEnv();
     const port = clampInt(themes?.cdpPort, 1024, 65535, activePort || DEFAULT_CDP_PORT);
-    const exePath = findAntigravityExePath();
+    const exePath = cachedLauncherSnapshot?.exePath || findAntigravityExePath();
     const connected = hasOpenSessions();
     let title = '';
     for (const entry of sessions.values()) {
@@ -2080,10 +2398,13 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         break;
       }
     }
-    const lnkPath = paths?.cdpShortcutLnk || '';
-    const vbsPath = paths?.cdpLauncherVbs || '';
+    const lnkPath = cachedLauncherSnapshot?.shortcutLnkPath || paths?.cdpShortcutLnk || '';
+    const vbsPath = cachedLauncherSnapshot?.launcherVbsPath || paths?.cdpLauncherVbs || '';
+    const cmdPath = cachedLauncherSnapshot?.launcherCmdPath || paths?.cdpLauncherCmd || '';
     return {
-      supported: process.platform === 'win32',
+      supported: hostInfo.hasWindowsHost,
+      isWsl: hostInfo.isWsl,
+      transport: activeTransport,
       port,
       connected,
       targetCount: sessions.size,
@@ -2094,12 +2415,14 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       targetTitle: connected ? title : '',
       shortcutLnkPath: lnkPath,
       launcherVbsPath: vbsPath,
-      launcherCmdPath: paths?.cdpLauncherCmd || '',
-      launchCommand: vbsPath
-        ? `wscript.exe //Nologo "${vbsPath}"`
-        : exePath
-          ? `"${exePath}" --remote-debugging-port=${port}`
-          : '',
+      launcherCmdPath: cmdPath,
+      launchCommand:
+        cachedLauncherSnapshot?.launchCommand ||
+        (vbsPath
+          ? `wscript.exe //Nologo "${vbsPath}"`
+          : exePath
+            ? `"${exePath}" --remote-debugging-port=${port}`
+            : ''),
       lastError: connected ? '' : lastError,
     };
   };
@@ -2111,6 +2434,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     await removeCssAll().catch(() => {});
     await removeHudAll().catch(() => {});
     closeAllSessions();
+    closeWslProxy();
   };
 
   return {

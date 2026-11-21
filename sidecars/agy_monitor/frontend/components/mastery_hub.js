@@ -44,6 +44,25 @@ function makeSvgEl(tag, attrs = {}) {
   return el;
 }
 
+function buildStarIconSvg(filled) {
+  const svg = makeSvgEl("svg", {
+    width: 11,
+    height: 11,
+    viewBox: "0 0 16 16",
+    fill: filled ? "currentColor" : "none",
+    "aria-hidden": "true",
+  });
+  svg.appendChild(
+    makeSvgEl("path", {
+      d: "m8 2.2 1.8 3.65 4.03.59-2.91 2.84.69 4.01L8 11.4l-3.61 1.89.69-4.01-2.91-2.84 4.03-.59L8 2.2Z",
+      stroke: "currentColor",
+      "stroke-width": "1.25",
+      "stroke-linejoin": "round",
+    })
+  );
+  return svg;
+}
+
 function buildActionIconSvg(kind) {
   const svg = makeSvgEl("svg", {
     width: 13,
@@ -268,8 +287,47 @@ function createLocalPathChip(label, rawTarget, ctx, { isCode = true, isImage = f
   return el;
 }
 
-function createLocalImagePreview(label, rawTarget, ctx) {
+function createInlineImageChip(label, rawTarget, ctx) {
   const displayPath = decodeDisplayUrl(rawTarget);
+  const cleanLabel = label || extractFileUriLabel(rawTarget);
+  const clickable = typeof ctx?.loadLocalImage === "function" || typeof ctx?.onOpenPath === "function";
+  const el = document.createElement(clickable ? "button" : "span");
+  if (el.tagName === "BUTTON") {
+    el.type = "button";
+  }
+  el.className = `mad-md-link is-code is-img-ref${clickable ? " is-path" : ""}`;
+  el.appendChild(buildPathIconSvg(true));
+  const txt = document.createElement("span");
+  txt.textContent = cleanLabel;
+  el.appendChild(txt);
+  el.title = typeof ctx?.loadLocalImage === "function"
+    ? `${cleanLabel}（点击放大预览）`
+    : (ctx?.onOpenPath ? `点击打开目录：${displayPath}` : displayPath);
+  if (clickable) {
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof ctx?.loadLocalImage === "function" && typeof ctx?.onPreviewImage === "function") {
+        Promise.resolve(ctx.loadLocalImage(rawTarget))
+          .then((url) => {
+            if (url) {
+              ctx.onPreviewImage({ url, targetPath: rawTarget, label: cleanLabel });
+            } else if (ctx?.onOpenPath) {
+              ctx.onOpenPath(rawTarget);
+            }
+          })
+          .catch(() => {
+            if (ctx?.onOpenPath) ctx.onOpenPath(rawTarget);
+          });
+      } else if (ctx?.onOpenPath) {
+        ctx.onOpenPath(rawTarget);
+      }
+    });
+  }
+  return el;
+}
+
+function createLocalImagePreview(label, rawTarget, ctx, { removeOnFail = false } = {}) {
   const cleanLabel = label || extractFileUriLabel(rawTarget);
 
   if (typeof ctx?.loadLocalImage !== "function") {
@@ -312,6 +370,14 @@ function createLocalImagePreview(label, rawTarget, ctx) {
 
   const fallbackToChip = () => {
     if (!wrap.isConnected && !wrap.parentNode) return;
+    if (removeOnFail) {
+      const parentGallery = wrap.parentNode;
+      wrap.remove();
+      if (parentGallery && parentGallery.classList?.contains("mad-md-img-gallery") && parentGallery.childElementCount === 0) {
+        parentGallery.remove();
+      }
+      return;
+    }
     wrap.textContent = "";
     wrap.appendChild(createLocalPathChip(cleanLabel, rawTarget, ctx, { isCode: true, isImage: true }));
   };
@@ -329,6 +395,16 @@ function createLocalImagePreview(label, rawTarget, ctx) {
     .catch(fallbackToChip);
 
   return wrap;
+}
+
+function appendInlineImageToken(parent, label, rawTarget, ctx) {
+  const cleanLabel = label || extractFileUriLabel(rawTarget);
+  if (typeof ctx?.collectImage === "function" && typeof ctx?.loadLocalImage === "function") {
+    ctx.collectImage(cleanLabel, rawTarget);
+    parent.appendChild(createInlineImageChip(cleanLabel, rawTarget, ctx));
+    return;
+  }
+  parent.appendChild(createLocalImagePreview(cleanLabel, rawTarget, ctx));
 }
 
 function findMatchingInlineClose(src, startIdx, delim) {
@@ -401,7 +477,7 @@ function appendMarkdownInline(parent, text, ctx = {}, depth = 0) {
         const inner = src.slice(i + 1, closeIdx);
         flushPlain();
         if (isLocalRasterImageTarget(inner)) {
-          parent.appendChild(createLocalImagePreview(extractFileUriLabel(inner), inner, ctx));
+          appendInlineImageToken(parent, extractFileUriLabel(inner), inner, ctx);
         } else if (looksLikeLocalAbsPath(inner)) {
           parent.appendChild(createLocalPathChip(inner, inner, ctx, { isCode: true }));
         } else {
@@ -430,7 +506,7 @@ function appendMarkdownInline(parent, text, ctx = {}, depth = 0) {
 
           flushPlain();
           if (isLocalRasterImageTarget(rawTarget)) {
-            parent.appendChild(createLocalImagePreview(cleanLabel || extractFileUriLabel(rawTarget), rawTarget, ctx));
+            appendInlineImageToken(parent, cleanLabel || extractFileUriLabel(rawTarget), rawTarget, ctx);
           } else if (looksLikeLocalAbsPath(rawTarget)) {
             const looksLikeFile =
               Boolean(unwrappedCode) || /[\\/]/.test(cleanLabel) || /\.[a-z0-9]{1,8}(?::\d+|#L\d+)?$/i.test(cleanLabel);
@@ -516,7 +592,7 @@ function appendMarkdownInline(parent, text, ctx = {}, depth = 0) {
         const uri = m[0].replace(/[.,;:!?。，；：！？]+$/, "");
         flushPlain();
         if (isLocalRasterImageTarget(uri)) {
-          parent.appendChild(createLocalImagePreview(extractFileUriLabel(uri), uri, ctx));
+          appendInlineImageToken(parent, extractFileUriLabel(uri), uri, ctx);
         } else {
           parent.appendChild(createLocalPathChip(extractFileUriLabel(uri), uri, ctx, { isCode: true }));
         }
@@ -581,11 +657,66 @@ const ALERT_LABEL_MAP = {
   CAUTION: { cls: "is-caution", label: "警示" },
 };
 
+function hasNonImageProse(node) {
+  if (!node || !node.childNodes) return false;
+  for (const child of node.childNodes) {
+    if (child.nodeType === 3) {
+      if (String(child.nodeValue || "").replace(/[\s,，、;；·|+]+/g, "").length > 0) return true;
+    } else if (child.nodeType === 1) {
+      if (child.classList?.contains("is-img-ref")) continue;
+      if (child.tagName === "SPAN" && !child.childElementCount) {
+        if (String(child.textContent || "").replace(/[\s,，、;；·|+]+/g, "").length > 0) return true;
+      } else if (hasNonImageProse(child)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function appendBlockContentWithGallery(hostEl, rawLine, ctx = {}) {
+  const collected = [];
+  const seen = new Set();
+  const textWrap = document.createElement("div");
+  textWrap.className = "mad-md-inline-text";
+
+  const collectCtx = {
+    ...ctx,
+    collectImage(label, rawTarget) {
+      const key = String(rawTarget || "").trim().toLowerCase();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      collected.push({ label, rawTarget });
+    },
+  };
+
+  appendMarkdownInline(textWrap, rawLine, collectCtx);
+  if (collected.length === 0) {
+    while (textWrap.firstChild) {
+      hostEl.appendChild(textWrap.firstChild);
+    }
+    return { standaloneGallery: null, images: collected };
+  }
+
+  const hasProse = hasNonImageProse(textWrap);
+  if (hasProse) {
+    hostEl.appendChild(textWrap);
+  }
+
+  const gallery = document.createElement("div");
+  gallery.className = "mad-md-img-gallery";
+  collected.forEach(({ label, rawTarget }) => {
+    gallery.appendChild(createLocalImagePreview(label, rawTarget, ctx, { removeOnFail: hasProse }));
+  });
+  hostEl.appendChild(gallery);
+  return { standaloneGallery: hasProse ? null : gallery, images: collected };
+}
+
 /**
  * Pure-DOM, zero-innerHTML native Antigravity Markdown renderer for Codex journey messages.
  * Supports headings (H1-H6), GFM tables, alert callouts, blockquotes, fenced code with language,
  * task/bullet/ordered lists, nested bold/italic/strikethrough/inline-code, clickable local path chips,
- * and inline local raster image previews that open their parent folder on click.
+ * and clean grouped local raster image galleries below prose lines.
  */
 function renderSafeMarkdown(container, rawText, ctx = {}) {
   container.textContent = "";
@@ -722,7 +853,7 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
           if (!bl.trim()) return;
           const pLine = document.createElement("div");
           pLine.className = "mad-md-alert-body";
-          appendMarkdownInline(pLine, bl, ctx);
+          appendBlockContentWithGallery(pLine, bl, ctx);
           alertBox.appendChild(pLine);
         });
         container.appendChild(alertBox);
@@ -731,7 +862,7 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
 
       const q = document.createElement("div");
       q.className = "mad-md-quote";
-      appendMarkdownInline(q, quoteMatch[1], ctx);
+      appendBlockContentWithGallery(q, quoteMatch[1], ctx);
       container.appendChild(q);
       continue;
     }
@@ -748,7 +879,7 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
       box.textContent = checked ? "✓" : "";
       const body = document.createElement("div");
       body.className = "mad-md-li-body";
-      appendMarkdownInline(body, taskMatch[3], ctx);
+      appendBlockContentWithGallery(body, taskMatch[3], ctx);
       li.appendChild(box);
       li.appendChild(body);
       container.appendChild(li);
@@ -765,7 +896,7 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
       bullet.textContent = indent >= 2 ? "◦" : "•";
       const body = document.createElement("div");
       body.className = "mad-md-li-body";
-      appendMarkdownInline(body, ulMatch[2], ctx);
+      appendBlockContentWithGallery(body, ulMatch[2], ctx);
       li.appendChild(bullet);
       li.appendChild(body);
       container.appendChild(li);
@@ -782,7 +913,7 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
       num.textContent = `${olMatch[2]}.`;
       const body = document.createElement("div");
       body.className = "mad-md-li-body";
-      appendMarkdownInline(body, olMatch[3], ctx);
+      appendBlockContentWithGallery(body, olMatch[3], ctx);
       li.appendChild(num);
       li.appendChild(body);
       container.appendChild(li);
@@ -791,7 +922,23 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
 
     const p = document.createElement("div");
     p.className = "mad-md-p";
-    appendMarkdownInline(p, line, ctx);
+    const blockRes = appendBlockContentWithGallery(p, line, ctx);
+    // Merge consecutive standalone image lines into one side-by-side gallery row
+    if (
+      blockRes.standaloneGallery &&
+      container.lastElementChild?.classList?.contains("mad-md-img-gallery") &&
+      container.lastElementChild.classList.contains("is-standalone")
+    ) {
+      while (blockRes.standaloneGallery.firstChild) {
+        container.lastElementChild.appendChild(blockRes.standaloneGallery.firstChild);
+      }
+      continue;
+    }
+    if (blockRes.standaloneGallery) {
+      blockRes.standaloneGallery.classList.add("is-standalone");
+      container.appendChild(blockRes.standaloneGallery);
+      continue;
+    }
     container.appendChild(p);
   }
 
@@ -922,7 +1069,7 @@ async function callJson(apiFetch, url, options = {}) {
   return data;
 }
 
-export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {}) {
+export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesChanged, onToast } = {}) {
   const overviewViewEl = document.getElementById("masteryOverviewView");
   const detailViewEl = document.getElementById("masteryDetailView");
   const madBackBtn = document.getElementById("madBackBtn");
@@ -1005,6 +1152,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   };
   let configMutationSeq = 0;
   let configSaveInFlight = 0;
+  let favoriteIdsState = [];
+  let favoriteMutationSeq = 0;
+  let favoriteSaveInFlight = 0;
 
   let draftProto = "openai";
   let draftModels = [...PROTOCOL_PRESETS.openai.models];
@@ -1938,7 +2088,84 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   let selectionSeq = 0;
   let pendingRefresh = false;
 
-  const renderSnapshot = (snap, { reqCfgSeq = null, reqSelSeq = null } = {}) => {
+  const applyFavoriteOrderOverlay = (sessionsList, favIds) => {
+    const favOrder = new Map();
+    favIds.forEach((id, idx) => favOrder.set(String(id), idx));
+    const statusRank = (item) =>
+      item.status === "active" ? 0 : item.status === "done" || item.isRead ? 2 : 1;
+    return sessionsList
+      .map((item) => ({
+        ...item,
+        isFavorite: favOrder.has(item.id),
+      }))
+      .sort((a, b) => {
+        const aFav = favOrder.has(a.id);
+        const bFav = favOrder.has(b.id);
+        if (aFav && bFav) return favOrder.get(a.id) - favOrder.get(b.id);
+        if (aFav !== bFav) return aFav ? -1 : 1;
+        const rankDiff = statusRank(a) - statusRank(b);
+        if (rankDiff !== 0) return rankDiff;
+        return Number(b.modifiedMs || 0) - Number(a.modifiedMs || 0);
+      });
+  };
+
+  const toggleFavoriteSession = async (session) => {
+    const id = String(session?.id || "").trim();
+    if (!id || typeof apiFetch !== "function") return;
+    const reqFavSeq = ++favoriteMutationSeq;
+    favoriteSaveInFlight += 1;
+    const prevIds = [...favoriteIdsState];
+    const willFavorite = !prevIds.includes(id);
+    const nextIds = willFavorite ? [...prevIds, id] : prevIds.filter((item) => item !== id);
+    favoriteIdsState = nextIds;
+
+    const favoriteTitles = {};
+    if (willFavorite && session?.name && session.name !== id.slice(0, 8)) {
+      favoriteTitles[id] = String(session.name);
+    }
+
+    if (lastSnapshot && Array.isArray(lastSnapshot.sessions)) {
+      const optimisticSessions = applyFavoriteOrderOverlay(lastSnapshot.sessions, nextIds);
+      renderSnapshot({
+        ...lastSnapshot,
+        sessions: optimisticSessions,
+        favoriteIds: nextIds,
+        favoriteCount: optimisticSessions.filter((item) => item.isFavorite).length,
+      });
+    }
+
+    try {
+      const resp = await callJson(apiFetch, "/api/sessions/favorites", {
+        method: "POST",
+        body: JSON.stringify({ favoriteIds: nextIds, favoriteTitles }),
+      });
+      if (destroyed) return;
+      if (reqFavSeq === favoriteMutationSeq) {
+        if (Array.isArray(resp?.favoriteIds)) {
+          favoriteIdsState = resp.favoriteIds.map(String);
+        }
+        onFavoritesChanged?.([...favoriteIdsState]);
+        const displayName = session?.name || id.slice(0, 8);
+        onToast?.(
+          willFavorite ? `已设为常用会话并置顶：${displayName}` : `已取消常用会话：${displayName}`,
+          "info"
+        );
+      }
+    } catch {
+      if (destroyed) return;
+      if (reqFavSeq === favoriteMutationSeq) {
+        favoriteIdsState = prevIds;
+        onToast?.("同步常用会话失败", "error");
+      }
+    } finally {
+      favoriteSaveInFlight = Math.max(0, favoriteSaveInFlight - 1);
+      if (!destroyed && reqFavSeq === favoriteMutationSeq) {
+        void refreshMastery({ force: true });
+      }
+    }
+  };
+
+  const renderSnapshot = (snap, { reqCfgSeq = null, reqSelSeq = null, reqFavSeq = null } = {}) => {
     if (!snap) return;
     const isStaleSelection = reqSelSeq !== null && reqSelSeq !== selectionSeq;
     if (isStaleSelection) return;
@@ -1949,21 +2176,41 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
       configState = snap.config;
       renderConfigRow();
     }
+    const allowFavoriteHydrate =
+      favoriteSaveInFlight === 0 && (reqFavSeq === null || reqFavSeq === favoriteMutationSeq);
+    if (allowFavoriteHydrate) {
+      if (Array.isArray(snap.favoriteIds)) {
+        favoriteIdsState = snap.favoriteIds.map(String);
+      } else if (Array.isArray(snap.sessions)) {
+        favoriteIdsState = snap.sessions.filter((item) => item.isFavorite).map((item) => String(item.id));
+      }
+    }
     if (snap.selectedSessionId && reqSelSeq === null) {
       selectedSessionId = snap.selectedSessionId;
     } else if (snap.selectedSessionId && reqSelSeq === selectionSeq) {
       selectedSessionId = snap.selectedSessionId;
     }
 
-    const sessions = Array.isArray(snap.sessions) ? snap.sessions : [];
+    const rawSessions = Array.isArray(snap.sessions) ? snap.sessions : [];
+    const sessions = allowFavoriteHydrate
+      ? rawSessions
+      : applyFavoriteOrderOverlay(rawSessions, favoriteIdsState);
     const activeCount = Number(snap.activeCount || 0);
     const unreadCount = Number(snap.unreadCount || 0);
+    const favCount = sessions.filter((item) => Boolean(item.isFavorite)).length;
 
     if (totalCountEl) totalCountEl.textContent = String(sessions.length);
     if (summaryEl) {
-      summaryEl.textContent = snap.isFallbackRecent
-        ? `当前无活动/未读 · 显示最近 ${sessions.length} 条会话`
-        : `${activeCount} 运行中 · ${unreadCount} 任务结束未读`;
+      if (favCount > 0) {
+        summaryEl.textContent =
+          activeCount > 0 || unreadCount > 0
+            ? `${favCount} 常用置顶 · ${activeCount} 运行中 · ${unreadCount} 任务结束未读`
+            : `${favCount} 常用置顶 · 无运行中/未读`;
+      } else {
+        summaryEl.textContent = snap.isFallbackRecent
+          ? `当前无活动/未读 · 显示最近 ${sessions.length} 条会话`
+          : `${activeCount} 运行中 · ${unreadCount} 任务结束未读`;
+      }
     }
 
     if (listEl) {
@@ -1974,20 +2221,42 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
         empty.textContent = "暂无可追踪会话，发起任意对话后将自动显示";
         listEl.appendChild(empty);
       } else {
-        sessions.forEach((s) => {
+        const hasNonFav = sessions.some((item) => !item.isFavorite);
+        let lastFavIndex = -1;
+        if (hasNonFav) {
+          sessions.forEach((item, idx) => {
+            if (item.isFavorite) lastFavIndex = idx;
+          });
+        }
+
+        sessions.forEach((s, idx) => {
           const isSelected = s.id === selectedSessionId;
+          const isFav = Boolean(s.isFavorite);
+          const isFavDivider = idx === lastFavIndex;
           const rowStatus = s.status === "active" ? "active" : s.status === "done" || s.isRead ? "done" : "unread";
           const rowMod = `is-${rowStatus}`;
 
-          const btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = `mv-f-row ${rowMod}${isSelected ? " is-selected" : ""}`;
-          btn.setAttribute("role", "option");
-          btn.setAttribute("aria-selected", String(isSelected));
-          btn.title = `${s.project} / ${s.name} · ${s.tag} (主 Agent 进度 ${s.progress}%)`;
+          const row = document.createElement("div");
+          row.className = `mv-f-row ${rowMod}${isSelected ? " is-selected" : ""}${isFav ? " is-favorite" : ""}${isFavDivider ? " is-fav-divider" : ""}`;
+          row.setAttribute("role", "option");
+          row.setAttribute("tabindex", "0");
+          row.setAttribute("aria-selected", String(isSelected));
+          row.title = `${isFav ? "★ 常用置顶 · " : ""}${s.project} / ${s.name} · ${s.tag} (主 Agent 进度 ${s.progress}%)`;
 
           const lamp = document.createElement("span");
           lamp.className = `mv-f-lamp ${rowMod}`;
+
+          const favBtn = document.createElement("button");
+          favBtn.type = "button";
+          favBtn.className = `mv-f-fav-btn${isFav ? " is-favorited" : ""}`;
+          favBtn.setAttribute("aria-label", isFav ? "取消常用会话" : "设为常用会话并置顶");
+          favBtn.setAttribute("aria-pressed", String(isFav));
+          favBtn.title = isFav ? "点击取消常用会话" : "点击设为常用会话（始终置顶）";
+          favBtn.appendChild(buildStarIconSvg(isFav));
+          favBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            void toggleFavoriteSession(s);
+          });
 
           const subCount = document.createElement("span");
           subCount.className = `mv-f-subcount${s.subAgentCount === 0 ? " is-zero" : ""}`;
@@ -2015,24 +2284,34 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
           cursor.className = "mv-f-cursor";
           cursor.textContent = isSelected ? "◀" : "";
 
-          btn.appendChild(lamp);
-          btn.appendChild(subCount);
-          btn.appendChild(proj);
-          btn.appendChild(name);
-          btn.appendChild(status);
-          btn.appendChild(ring);
-          btn.appendChild(cursor);
+          row.appendChild(lamp);
+          row.appendChild(favBtn);
+          row.appendChild(subCount);
+          row.appendChild(proj);
+          row.appendChild(name);
+          row.appendChild(status);
+          row.appendChild(ring);
+          row.appendChild(cursor);
 
-          btn.addEventListener("click", () => {
+          const selectRow = () => {
             if (selectedSessionId === s.id && !detailAgentKey) return;
             selectionSeq += 1;
             selectedSessionId = s.id;
             hoveredAgentId = null;
             if (detailAgentKey) closeAgentDetail();
             void refreshMastery({ force: true });
+          };
+
+          row.addEventListener("click", selectRow);
+          row.addEventListener("keydown", (e) => {
+            if (e.target && e.target.closest?.(".mv-f-fav-btn")) return;
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              selectRow();
+            }
           });
 
-          listEl.appendChild(btn);
+          listEl.appendChild(row);
         });
       }
     }
@@ -2123,11 +2402,12 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     inFlight = true;
     const reqCfgSeq = configMutationSeq;
     const reqSelSeq = selectionSeq;
+    const reqFavSeq = favoriteMutationSeq;
     try {
       const qs = selectedSessionId ? `?sessionId=${encodeURIComponent(selectedSessionId)}` : "";
       const data = await callJson(apiFetch, `/api/mastery${qs}`);
       if (destroyed) return;
-      renderSnapshot(data, { reqCfgSeq, reqSelSeq });
+      renderSnapshot(data, { reqCfgSeq, reqSelSeq, reqFavSeq });
     } catch {
       // Non-fatal refresh error
     } finally {
@@ -2560,9 +2840,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
         stopPolling();
       }
     },
-    refresh() {
+    refresh(opts) {
       if (tabActive) {
-        void refreshMastery();
+        void refreshMastery(opts);
       }
     },
     setTranslator() {},

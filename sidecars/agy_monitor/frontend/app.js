@@ -378,12 +378,24 @@ export function mountMonitorApp() {
   });
 
   components.tokenUsage = createTokenUsage({
+    apiFetch,
     t: translator,
+    getActiveConvContext: () => ({
+      convId: state.followLatest
+        ? state.displayConvId || state.snapshot?.activeConvId || ""
+        : state.lockedConvId || state.displayConvId || "",
+      hostConvId:
+        typeof window !== "undefined" && window.sidecar?.conversationId
+          ? String(window.sidecar.conversationId).trim()
+          : "",
+      convTitle: activeConvNameEl ? activeConvNameEl.textContent.trim() : "",
+    }),
     onFilterChange: ({ scope, range }) => {
       state.scope = scope || "current";
       state.range = range || "today";
       refreshSnapshot({ force: true });
     },
+    onToast: showToast,
   });
 
   components.modelAndPrompt = createModelAndPrompt({
@@ -437,6 +449,7 @@ export function mountMonitorApp() {
     onSelectConversation: handleConversationSelected,
     onFavoritesChanged: () => {
       refreshSnapshot({ force: true });
+      components.masteryHub?.refresh?.({ force: true });
     },
     onMarkRead: () => {
       refreshSnapshot({ force: true });
@@ -451,6 +464,9 @@ export function mountMonitorApp() {
   components.masteryHub = createMasteryHub({
     apiFetch,
     onSelectConversation: handleConversationSelected,
+    onFavoritesChanged: () => {
+      refreshSnapshot({ force: true });
+    },
     onToast: showToast,
   });
 

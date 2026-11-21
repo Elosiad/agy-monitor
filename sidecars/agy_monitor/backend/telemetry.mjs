@@ -496,3 +496,334 @@ export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap =
     };
   });
 }
+
+function classifyRequestStatus(stepType, rawStatus, errorText) {
+  const upper = typeof rawStatus === 'string' ? rawStatus.trim().toUpperCase() : '';
+  const err = typeof errorText === 'string' ? errorText.trim() : '';
+  if (stepType === 'ERROR_MESSAGE' || upper === 'ERROR') {
+    if (/stream\s+was\s+interrupted/i.test(err)) {
+      return { status: 'error', statusLabel: '流中断' };
+    }
+    if (/\battempt\s+\d+/i.test(err)) {
+      return { status: 'error', statusLabel: '重试失败' };
+    }
+    return { status: 'error', statusLabel: '失败' };
+  }
+  if (upper === 'RUNNING') {
+    return { status: 'running', statusLabel: '进行中' };
+  }
+  return { status: 'ok', statusLabel: '成功' };
+}
+
+/**
+ * Query paginated per-request LLM call records from telemetry_cache.db (step_ledger).
+ * Strictly honest: TTFT (ttftMs) is returned as null unless exposed by host logs.
+ */
+export function queryRequestLogs(cacheDbPath, opts = {}) {
+  const nowMs = typeof opts.nowMs === 'number' ? opts.nowMs : Date.now();
+  const scope = opts.scope === 'global' ? 'global' : 'current';
+  const range = ['today', '7d', '30d'].includes(opts.range) ? opts.range : 'today';
+  const convId = typeof opts.convId === 'string' ? opts.convId.trim() : '';
+  const modelFilter = typeof opts.model === 'string' ? opts.model.trim() : '';
+  const statusFilter = ['all', 'ok', 'error'].includes(opts.status) ? opts.status : 'all';
+  const limit = Math.max(1, Math.min(200, Math.trunc(Number(opts.limit) || 80)));
+  const offset = Math.max(0, Math.trunc(Number(opts.offset) || 0));
+  const convTitleMap = opts.convTitleMap instanceof Map ? opts.convTitleMap : null;
+
+  const emptySummary = {
+    totalCount: 0,
+    okCount: 0,
+    errorCount: 0,
+    totalInput: 0,
+    uncachedInput: 0,
+    cacheRead: 0,
+    totalOutput: 0,
+    avgCacheHitPct: null,
+    estimatedCostUsd: 0,
+    hasUnpriced: false,
+    avgTokPerSec: null,
+  };
+
+  if (scope === 'current' && (!convId || convId === '__new_conversation__')) {
+    return {
+      ok: true,
+      scope,
+      range,
+      convId,
+      model: modelFilter,
+      status: statusFilter,
+      limit,
+      offset,
+      totalCount: 0,
+      hasMore: false,
+      summary: emptySummary,
+      models: [],
+      items: [],
+    };
+  }
+
+  const db = openReadOnlyCacheDb(cacheDbPath);
+  if (!db) {
+    return {
+      ok: true,
+      scope,
+      range,
+      convId,
+      model: modelFilter,
+      status: statusFilter,
+      limit,
+      offset,
+      totalCount: 0,
+      hasMore: false,
+      summary: emptySummary,
+      models: [],
+      items: [],
+    };
+  }
+
+  try {
+    const cols = new Set(
+      db
+        .prepare(`PRAGMA table_info(step_ledger)`)
+        .all()
+        .map((c) => String(c.name || '').toLowerCase())
+    );
+    const hasStatus = cols.has('status');
+    const hasErrorText = cols.has('error_text');
+    const hasTtft = cols.has('ttft_ms');
+
+    const statusSelect = hasStatus ? 'status' : 'NULL AS status';
+    const errorSelect = hasErrorText ? 'error_text' : 'NULL AS error_text';
+    const ttftSelect = hasTtft ? 'ttft_ms' : 'NULL AS ttft_ms';
+    const isErrorExpr = hasStatus
+      ? `(step_type = 'ERROR_MESSAGE' OR UPPER(COALESCE(status, '')) = 'ERROR')`
+      : `(step_type = 'ERROR_MESSAGE')`;
+
+    const sinceMs = getRangeStartMs(range, nowMs);
+
+    // 1. Available models in scope + range (independent of model/status filter so dropdown stays complete)
+    const scopeWhere = [`step_type IN ('PLANNER_RESPONSE', 'ERROR_MESSAGE')`, `created_at_ms >= ?`];
+    const scopeParams = [sinceMs];
+    if (scope === 'current') {
+      scopeWhere.push(`conv_id = ?`);
+      scopeParams.push(convId);
+    }
+    const modelsSql = `
+      SELECT CASE
+               WHEN TRIM(COALESCE(model, '')) != '' THEN TRIM(model)
+               WHEN step_type = 'PLANNER_RESPONSE' THEN '__unrecorded__'
+               ELSE ''
+             END AS modelKey,
+             COUNT(*) AS calls
+      FROM step_ledger
+      WHERE ${scopeWhere.join(' AND ')}
+      GROUP BY modelKey
+      ORDER BY calls DESC
+    `;
+    const models = db
+      .prepare(modelsSql)
+      .all(...scopeParams)
+      .filter((r) => Boolean(r.modelKey))
+      .map((r) => ({ id: String(r.modelKey), calls: Number(r.calls || 0) }));
+
+    // 2. Filtered predicates
+    const whereParts = [...scopeWhere];
+    const params = [...scopeParams];
+
+    if (statusFilter === 'ok') {
+      whereParts.push(`step_type = 'PLANNER_RESPONSE' AND NOT ${isErrorExpr}`);
+    } else if (statusFilter === 'error') {
+      whereParts.push(isErrorExpr);
+    }
+
+    if (modelFilter) {
+      if (modelFilter === '__unrecorded__') {
+        whereParts.push(`(model IS NULL OR TRIM(model) = '') AND step_type = 'PLANNER_RESPONSE'`);
+      } else {
+        whereParts.push(`TRIM(COALESCE(model, '')) = ?`);
+        params.push(modelFilter);
+      }
+    }
+
+    const whereSql = whereParts.join(' AND ');
+
+    // 3. Aggregate summary across all matching rows
+    const aggRow = db
+      .prepare(
+        `SELECT COUNT(*) AS totalCount,
+                SUM(CASE WHEN ${isErrorExpr} THEN 1 ELSE 0 END) AS errorCount,
+                COALESCE(SUM(input_tokens), 0) AS sumUncachedIn,
+                COALESCE(SUM(cache_read_tokens), 0) AS sumCacheRead,
+                COALESCE(SUM(output_tokens), 0) AS sumOutput,
+                COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 1000 AND output_tokens > 0 THEN output_tokens ELSE 0 END), 0) AS speedOutSum,
+                COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 1000 AND output_tokens > 0 THEN duration_ms ELSE 0 END), 0) AS speedDurMsSum
+         FROM step_ledger
+         WHERE ${whereSql}`
+      )
+      .get(...params);
+
+    const costRows = db
+      .prepare(
+        `SELECT COALESCE(NULLIF(TRIM(model), ''), '__unrecorded__') AS modelKey,
+                step_type,
+                COALESCE(SUM(input_tokens), 0) AS sumUncachedIn,
+                COALESCE(SUM(cache_read_tokens), 0) AS sumCacheRead,
+                COALESCE(SUM(output_tokens), 0) AS sumOutput
+         FROM step_ledger
+         WHERE ${whereSql}
+         GROUP BY modelKey, step_type`
+      )
+      .all(...params);
+
+    let estimatedCostUsd = 0;
+    let hasUnpriced = false;
+    for (const cr of costRows) {
+      const mKey = String(cr.modelKey || '');
+      const uIn = Number(cr.sumUncachedIn || 0);
+      const cRead = Number(cr.sumCacheRead || 0);
+      const out = Number(cr.sumOutput || 0);
+      if (uIn === 0 && cRead === 0 && out === 0) continue;
+      if (!mKey || mKey === '__unrecorded__') {
+        hasUnpriced = true;
+      } else {
+        estimatedCostUsd += estimateModelCostUsd(mKey, uIn, cRead, out);
+      }
+    }
+
+    const totalCount = Number(aggRow?.totalCount || 0);
+    const errorCount = Number(aggRow?.errorCount || 0);
+    const okCount = Math.max(0, totalCount - errorCount);
+    const uncachedInput = Number(aggRow?.sumUncachedIn || 0);
+    const cacheRead = Number(aggRow?.sumCacheRead || 0);
+    const totalInput = uncachedInput + cacheRead;
+    const totalOutput = Number(aggRow?.sumOutput || 0);
+    const avgCacheHitPct = totalInput > 0 ? Math.round((cacheRead / totalInput) * 100) : null;
+    const speedOutSum = Number(aggRow?.speedOutSum || 0);
+    const speedDurMsSum = Number(aggRow?.speedDurMsSum || 0);
+    const avgTokPerSec =
+      speedDurMsSum > 0 && speedOutSum > 0
+        ? Number((speedOutSum / (speedDurMsSum / 1000)).toFixed(1))
+        : null;
+
+    // 4. Paginated per-request rows
+    const pageRows = db
+      .prepare(
+        `SELECT conv_id, step_index, step_type, created_at_ms, model,
+                input_tokens, cache_read_tokens, output_tokens, tool_calls_count,
+                duration_ms, ${statusSelect}, ${errorSelect}, ${ttftSelect}
+         FROM step_ledger
+         WHERE ${whereSql}
+         ORDER BY created_at_ms DESC, step_index DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(...params, limit, offset);
+
+    const items = pageRows.map((r) => {
+      const rawModel = typeof r.model === 'string' && r.model.trim() ? r.model.trim() : '';
+      const isPlanner = r.step_type === 'PLANNER_RESPONSE';
+      const modelDisplayKey = rawModel || (isPlanner ? '__unrecorded__' : '');
+      const uIn = Math.max(0, Number(r.input_tokens || 0));
+      const cRead = Math.max(0, Number(r.cache_read_tokens || 0));
+      const totalIn = uIn + cRead;
+      const out = Math.max(0, Number(r.output_tokens || 0));
+      const cacheHitPct = totalIn > 0 ? Math.round((cRead / totalIn) * 100) : null;
+
+      const rawDur = Number(r.duration_ms);
+      const durationMs = Number.isFinite(rawDur) && rawDur > 0 ? Math.trunc(rawDur) : null;
+      const rawTtft = Number(r.ttft_ms);
+      const ttftMs = Number.isFinite(rawTtft) && rawTtft > 0 ? Math.trunc(rawTtft) : null;
+      const tokPerSec =
+        durationMs && durationMs >= 1000 && out > 0
+          ? Number((out / (durationMs / 1000)).toFixed(1))
+          : null;
+
+      const errText = typeof r.error_text === 'string' ? r.error_text.trim() : '';
+      const { status: rowStatus, statusLabel } = classifyRequestStatus(
+        r.step_type,
+        r.status,
+        errText
+      );
+
+      let costUsd = null;
+      if (totalIn === 0 && out === 0) {
+        costUsd = rowStatus === 'error' ? 0 : null;
+      } else if (rawModel) {
+        costUsd = estimateModelCostUsd(rawModel, uIn, cRead, out);
+      }
+
+      const convMeta = convTitleMap ? convTitleMap.get(String(r.conv_id)) : null;
+
+      return {
+        convId: String(r.conv_id || ''),
+        convTitle: convMeta?.title || '',
+        convWorkspace: convMeta?.workspace || '',
+        stepIndex: Number(r.step_index || 0),
+        createdAtMs: Number(r.created_at_ms || 0),
+        model: modelDisplayKey,
+        uncachedInput: uIn,
+        cacheRead: cRead,
+        totalInput: totalIn,
+        output: out,
+        cacheHitPct,
+        estimatedCostUsd: costUsd,
+        ttftMs,
+        durationMs,
+        tokPerSec,
+        status: rowStatus,
+        statusLabel,
+        errorText: errText,
+        toolCallsCount: Number(r.tool_calls_count || 0),
+      };
+    });
+
+    return {
+      ok: true,
+      scope,
+      range,
+      convId,
+      model: modelFilter,
+      status: statusFilter,
+      limit,
+      offset,
+      totalCount,
+      hasMore: offset + items.length < totalCount,
+      summary: {
+        totalCount,
+        okCount,
+        errorCount,
+        totalInput,
+        uncachedInput,
+        cacheRead,
+        totalOutput,
+        avgCacheHitPct,
+        estimatedCostUsd: Number(estimatedCostUsd.toFixed(4)),
+        hasUnpriced,
+        avgTokPerSec,
+      },
+      models,
+      items,
+    };
+  } catch {
+    return {
+      ok: true,
+      scope,
+      range,
+      convId,
+      model: modelFilter,
+      status: statusFilter,
+      limit,
+      offset,
+      totalCount: 0,
+      hasMore: false,
+      summary: emptySummary,
+      models: [],
+      items: [],
+    };
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // Ignore close error
+    }
+  }
+}

@@ -90,12 +90,18 @@ export function readLocalInstallState(paths) {
 
   const metaPath = pluginDataDir ? path.join(pluginDataDir, 'install_meta.json') : '';
   const meta = metaPath ? readJsonSyncSafe(metaPath) : null;
+  const metaVersion =
+    typeof meta?.version === 'string' && meta.version.trim()
+      ? meta.version.trim().replace(/^v/i, '')
+      : '';
+  // Discard stale install_meta.json commitSha when plugin.json was upgraded locally (e.g. via sync/installer)
+  const metaStale = Boolean(metaVersion && compareSemver(currentVersion, metaVersion) > 0);
   const localFullSha =
-    typeof meta?.commitSha === 'string' && /^[0-9a-f]{7,40}$/i.test(meta.commitSha.trim())
+    !metaStale && typeof meta?.commitSha === 'string' && /^[0-9a-f]{7,40}$/i.test(meta.commitSha.trim())
       ? meta.commitSha.trim().toLowerCase()
       : '';
 
-  let localNewestMtimeMs = Number(meta?.updatedAtMs || 0);
+  let localNewestMtimeMs = metaStale ? 0 : Number(meta?.updatedAtMs || 0);
   if (pluginRoot) {
     const probes = [
       path.join(pluginRoot, 'plugin.json'),
@@ -243,18 +249,23 @@ export async function checkForUpdates(
         : '';
     const remoteVersion = releaseTag || local.currentVersion;
 
-    const semverNewer = Boolean(releaseTag && compareSemver(releaseTag, local.currentVersion) > 0);
-    let commitNewer = false;
-    if (local.localFullSha) {
-      commitNewer =
-        remoteFullSha.length >= 7 &&
-        !remoteFullSha.startsWith(local.localFullSha) &&
-        !local.localFullSha.startsWith(remoteFullSha);
-    } else if (remoteDateMs > 0 && local.localNewestMtimeMs > 0) {
-      commitNewer = remoteDateMs > local.localNewestMtimeMs + 120_000;
+    let hasUpdate = false;
+    if (releaseTag) {
+      // Official release tag exists: strictly follow semver ordering so same-version docs commits
+      // or local developer versions ahead of remote NEVER falsely trigger an update prompt.
+      hasUpdate = compareSemver(releaseTag, local.currentVersion) > 0;
+    } else {
+      // Fallback when repository has no releases yet: require strictly newer remote commit timestamp
+      const shaDiffers = Boolean(
+        !local.localFullSha ||
+          (remoteFullSha.length >= 7 &&
+            !remoteFullSha.startsWith(local.localFullSha) &&
+            !local.localFullSha.startsWith(remoteFullSha)),
+      );
+      if (shaDiffers && remoteDateMs > 0 && local.localNewestMtimeMs > 0) {
+        hasUpdate = remoteDateMs > local.localNewestMtimeMs + 120_000;
+      }
     }
-
-    const hasUpdate = Boolean(semverNewer || commitNewer);
     const payload = {
       ok: true,
       repoUrl: REPO_URL,
