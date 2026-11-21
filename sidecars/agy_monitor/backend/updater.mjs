@@ -146,6 +146,7 @@ function mirrorDirectoryInPlace(srcDir, destDir) {
   }
 
   for (const srcEntry of srcEntries) {
+    if (srcEntry.isSymbolicLink()) continue;
     const srcChild = path.join(srcDir, srcEntry.name);
     const destChild = path.join(destDir, srcEntry.name);
     if (srcEntry.isDirectory()) {
@@ -289,6 +290,8 @@ async function extractZipArchive(zipPath, extractDir, { platform = process.platf
       await execFileImpl('tar.exe', ['-xf', zipPath, '-C', extractDir], { timeout: 25000 });
       return;
     } catch {
+      await fsp.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+      await fsp.mkdir(extractDir, { recursive: true });
       await execFileImpl(
         'powershell.exe',
         [
@@ -302,7 +305,13 @@ async function extractZipArchive(zipPath, extractDir, { platform = process.platf
       return;
     }
   }
-  await execFileImpl('unzip', ['-q', '-o', zipPath, '-d', extractDir], { timeout: 25000 });
+  try {
+    await execFileImpl('unzip', ['-q', '-o', zipPath, '-d', extractDir], { timeout: 25000 });
+  } catch {
+    await fsp.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+    await fsp.mkdir(extractDir, { recursive: true });
+    await execFileImpl('python3', ['-m', 'zipfile', '-e', zipPath, extractDir], { timeout: 25000 });
+  }
 }
 
 function resolveExtractedPluginRoot(extractDir) {
@@ -396,15 +405,53 @@ export async function applyPluginUpdate(
         }
       }
 
-      // Mirror official files in place while strictly preserving rules/AGENTS.md & plugin_data/*
+      // Back up existing official files/dirs before mirroring so any mid-copy failure can roll back cleanly
+      const backupRoot = path.join(tempRoot, 'backup');
+      fs.mkdirSync(backupRoot, { recursive: true });
+      const backedUpFiles = [];
+      const backedUpDirs = [];
       for (const rel of ROOT_FILES) {
-        const src = path.join(extractedRoot, rel);
-        if (fs.existsSync(src)) {
-          fs.copyFileSync(src, path.join(pluginRoot, rel));
+        const curPath = path.join(pluginRoot, rel);
+        if (fs.existsSync(curPath)) {
+          fs.copyFileSync(curPath, path.join(backupRoot, rel));
+          backedUpFiles.push(rel);
         }
       }
       for (const rel of MIRROR_DIRS) {
-        mirrorDirectoryInPlace(path.join(extractedRoot, rel), path.join(pluginRoot, rel));
+        const curDir = path.join(pluginRoot, rel);
+        if (fs.existsSync(curDir)) {
+          mirrorDirectoryInPlace(curDir, path.join(backupRoot, rel));
+          backedUpDirs.push(rel);
+        }
+      }
+
+      // Mirror official files in place while strictly preserving rules/AGENTS.md & plugin_data/*
+      try {
+        for (const rel of ROOT_FILES) {
+          const src = path.join(extractedRoot, rel);
+          if (fs.existsSync(src)) {
+            fs.copyFileSync(src, path.join(pluginRoot, rel));
+          }
+        }
+        for (const rel of MIRROR_DIRS) {
+          mirrorDirectoryInPlace(path.join(extractedRoot, rel), path.join(pluginRoot, rel));
+        }
+      } catch (mirrorErr) {
+        for (const rel of backedUpFiles) {
+          try {
+            fs.copyFileSync(path.join(backupRoot, rel), path.join(pluginRoot, rel));
+          } catch {
+            // best-effort rollback
+          }
+        }
+        for (const rel of backedUpDirs) {
+          try {
+            mirrorDirectoryInPlace(path.join(backupRoot, rel), path.join(pluginRoot, rel));
+          } catch {
+            // best-effort rollback
+          }
+        }
+        throw mirrorErr;
       }
 
       // Initialize rules/AGENTS.md only if absent; never overwrite user rules
@@ -427,12 +474,24 @@ export async function applyPluginUpdate(
         backdropCompiled = Boolean(bd?.compiled);
       }
 
-      if (paths?.pluginDataDir) {
-        const metaPath = path.join(paths.pluginDataDir, 'install_meta.json');
+      const metaPath = paths?.pluginDataDir ? path.join(paths.pluginDataDir, 'install_meta.json') : '';
+      const prevMeta = metaPath ? readJsonSyncSafe(metaPath) : null;
+      const prevFullSha =
+        typeof prevMeta?.commitSha === 'string' && /^[0-9a-f]{7,40}$/i.test(prevMeta.commitSha.trim())
+          ? prevMeta.commitSha.trim().toLowerCase()
+          : '';
+      const prevShortSha =
+        typeof prevMeta?.shortSha === 'string' && prevMeta.shortSha.trim()
+          ? prevMeta.shortSha.trim().toLowerCase()
+          : prevFullSha.slice(0, 7);
+      const nextFullSha = latestCheck.ok && latestCheck.remoteFullSha ? latestCheck.remoteFullSha : prevFullSha;
+      const nextShortSha = latestCheck.ok && latestCheck.remoteSha ? latestCheck.remoteSha : prevShortSha;
+
+      if (metaPath) {
         await atomicWriteJson(metaPath, {
           version: nextVersion,
-          commitSha: latestCheck.remoteFullSha || '',
-          shortSha: latestCheck.remoteSha || '',
+          commitSha: nextFullSha,
+          shortSha: nextShortSha,
           updatedAtMs: nowMs,
         }).catch(() => {});
       }
@@ -442,10 +501,10 @@ export async function applyPluginUpdate(
         ok: true,
         repoUrl: REPO_URL,
         currentVersion: nextVersion,
-        localSha: latestCheck.remoteSha || '',
+        localSha: nextShortSha,
         remoteVersion: nextVersion,
-        remoteSha: latestCheck.remoteSha || '',
-        remoteFullSha: latestCheck.remoteFullSha || '',
+        remoteSha: nextShortSha,
+        remoteFullSha: nextFullSha,
         remoteDate: latestCheck.remoteDate || '',
         remoteMessage: latestCheck.remoteMessage || '',
         hasUpdate: false,
@@ -458,7 +517,7 @@ export async function applyPluginUpdate(
         updated: true,
         needsReload: true,
         version: nextVersion,
-        shortSha: latestCheck.remoteSha || '',
+        shortSha: nextShortSha,
         commitMessage: latestCheck.remoteMessage || '',
         backdropCompiled,
         status: nextStatus,
@@ -497,6 +556,7 @@ export function openRepoInBrowser({ platform = process.platform, spawnImpl = spa
     } else {
       child = spawnImpl('xdg-open', [REPO_URL], { detached: true, stdio: 'ignore' });
     }
+    child?.on?.('error', () => {});
     child?.unref?.();
     return { ok: true, url: REPO_URL };
   } catch (err) {

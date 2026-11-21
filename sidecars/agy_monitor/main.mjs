@@ -489,43 +489,51 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     lastHostConvAtMs = Date.now();
   };
 
-  const writePayload = async (telemetry) => {
-    if (!paths?.hudTelemetryFile || !telemetry) return;
-    const pie = telemetry.contextPie || {};
-    const rt = telemetry.runtimeTelemetry || {};
-    const cap = Number(pie.windowCap) || 512000;
-    const used = Math.max(0, Math.round(Number(pie.totalUsed) || 0));
-    const percent = cap > 0 ? Math.min(100, Math.max(0, Math.round((used / cap) * 100))) : 0;
-    const tokPerSec =
-      typeof rt.latestTokPerSec === 'number' && Number.isFinite(rt.latestTokPerSec) && rt.latestTokPerSec > 0
-        ? Math.round(rt.latestTokPerSec * 10) / 10
-        : null;
-    const upstreamModelId = typeof rt.upstreamModelId === 'string' ? rt.upstreamModelId.trim() : '';
-    const upstreamModelStatus = typeof rt.upstreamModelStatus === 'string' ? rt.upstreamModelStatus : 'no_baseline';
-    const activeConvId = typeof telemetry.activeConvId === 'string' ? telemetry.activeConvId : '';
+  let writeChain = Promise.resolve();
+  const writePayload = (telemetry) => {
+    if (!paths?.hudTelemetryFile || !telemetry) return Promise.resolve();
+    writeChain = writeChain.then(async () => {
+      const pie = telemetry.contextPie || {};
+      const rt = telemetry.runtimeTelemetry || {};
+      const cap = Number(pie.windowCap) || 512000;
+      const used = Math.max(0, Math.round(Number(pie.totalUsed) || 0));
+      const percent = cap > 0 ? Math.min(100, Math.max(0, Math.round((used / cap) * 100))) : 0;
+      const tokPerSec =
+        typeof rt.latestTokPerSec === 'number' && Number.isFinite(rt.latestTokPerSec) && rt.latestTokPerSec > 0
+          ? Math.round(rt.latestTokPerSec * 10) / 10
+          : null;
+      const upstreamModelId = typeof rt.upstreamModelId === 'string' ? rt.upstreamModelId.trim() : '';
+      const upstreamModelStatus = typeof rt.upstreamModelStatus === 'string' ? rt.upstreamModelStatus : 'no_baseline';
+      const activeConvId = typeof telemetry.activeConvId === 'string' ? telemetry.activeConvId : '';
 
-    const payload = {
-      activeConvId,
-      percent,
-      totalUsed: used,
-      windowCap: cap,
-      tokPerSec,
-      upstreamModelId,
-      upstreamModelStatus,
-      cdpHudActive: false,
-      updatedAtMs: Date.now(),
-    };
+      const payload = {
+        activeConvId,
+        percent,
+        totalUsed: used,
+        windowCap: cap,
+        tokPerSec,
+        upstreamModelId,
+        upstreamModelStatus,
+        cdpHudActive: false,
+        updatedAtMs: Date.now(),
+      };
 
-    if (cdpBridge && typeof cdpBridge.updateHudData === 'function') {
-      const injected = await cdpBridge.updateHudData(payload).catch(() => false);
-      payload.cdpHudActive = Boolean(injected || cdpBridge.isHudInjected?.());
-    }
+      if (cdpBridge && typeof cdpBridge.updateHudData === 'function') {
+        const injected = await cdpBridge.updateHudData(payload).catch(() => false);
+        payload.cdpHudActive = Boolean(injected || cdpBridge.isHudInjected?.());
+      }
 
-    const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}`;
-    if (sig === lastSig) return;
-    lastSig = sig;
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}`;
+      if (sig === lastSig) return;
 
-    await atomicWriteJson(paths.hudTelemetryFile, payload).catch(() => {});
+      try {
+        await atomicWriteJson(paths.hudTelemetryFile, payload);
+        lastSig = sig;
+      } catch {
+        // Retry next tick without advancing lastSig
+      }
+    });
+    return writeChain;
   };
 
   const resolveActiveConv = (topLevelIdSet, viewedInfo) => {
@@ -1244,18 +1252,36 @@ export function createMonitorHandlers({
     }
   });
 
+  const resolveSameOriginSavedKey = (saved, rawBaseUrl, rawApiKey) => {
+    if (typeof rawApiKey === 'string' && rawApiKey.trim()) {
+      return rawApiKey.trim();
+    }
+    const candidate = typeof rawBaseUrl === 'string' && rawBaseUrl.trim() ? rawBaseUrl.trim() : '';
+    if (!candidate) return saved.thirdParty.apiKey;
+    try {
+      const a = new URL(candidate);
+      const b = new URL(saved.thirdParty.baseUrl);
+      if (a.origin.toLowerCase() === b.origin.toLowerCase()) {
+        return saved.thirdParty.apiKey;
+      }
+    } catch {
+      // Malformed URL: never attach saved API key
+    }
+    return '';
+  };
+
   register('POST', '/api/mastery/thirdparty/models', async (data = {}) => {
     try {
       const saved = await store.getMasteryConfig();
-      const protocol = data.protocol === 'anthropic' ? 'anthropic' : 'openai';
+      const protocol =
+        data.protocol === 'anthropic' || data.protocol === 'openai'
+          ? data.protocol
+          : saved.thirdParty.protocol;
       const baseUrl =
         typeof data.baseUrl === 'string' && data.baseUrl.trim()
           ? data.baseUrl.trim()
           : saved.thirdParty.baseUrl;
-      const apiKey =
-        typeof data.apiKey === 'string' && data.apiKey.trim()
-          ? data.apiKey.trim()
-          : saved.thirdParty.apiKey;
+      const apiKey = resolveSameOriginSavedKey(saved, data.baseUrl, data.apiKey);
       const result = await fetchThirdPartyModels({ protocol, baseUrl, apiKey });
       return result;
     } catch (err) {
@@ -1266,15 +1292,15 @@ export function createMonitorHandlers({
   register('POST', '/api/mastery/thirdparty/test', async (data = {}) => {
     try {
       const saved = await store.getMasteryConfig();
-      const protocol = data.protocol === 'anthropic' ? 'anthropic' : 'openai';
+      const protocol =
+        data.protocol === 'anthropic' || data.protocol === 'openai'
+          ? data.protocol
+          : saved.thirdParty.protocol;
       const baseUrl =
         typeof data.baseUrl === 'string' && data.baseUrl.trim()
           ? data.baseUrl.trim()
           : saved.thirdParty.baseUrl;
-      const apiKey =
-        typeof data.apiKey === 'string' && data.apiKey.trim()
-          ? data.apiKey.trim()
-          : saved.thirdParty.apiKey;
+      const apiKey = resolveSameOriginSavedKey(saved, data.baseUrl, data.apiKey);
       const model =
         typeof data.model === 'string' && data.model.trim()
           ? data.model.trim()
@@ -1339,10 +1365,12 @@ export function createMonitorHandlers({
       Object.keys(patch).length > 0 ? store.saveThemes(patch) : store.getThemes(),
       store.getPrefs(),
     ]);
+    const effectiveCompanionAction =
+      action === 'stop' && themes.hudEnabled !== false ? 'sync' : action;
     const [result, cdpStatus] = await Promise.all([
       action === 'cdp_sync'
         ? getBackdropStatus(resolvedPaths, themes).then((status) => ({ ok: true, status }))
-        : controlBackdropCompanion(resolvedPaths, themes, action),
+        : controlBackdropCompanion(resolvedPaths, themes, effectiveCompanionAction),
       cdp.sync(themes, { hostLanguage: prefs.language }),
     ]);
     void hud.refreshFromDb();
@@ -1536,6 +1564,9 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 1000, onUpdated } = {})
       const line = buf.toString('utf8').trim();
       if (line) console.error(`[scan_worker] ${line}`);
     });
+    child.on('error', (err) => {
+      console.error(`[scan_worker] process error: ${err?.message || err}`);
+    });
     child.on('message', (msg) => {
       if (msg?.type === 'updated') {
         backoffMs = 500;
@@ -1561,7 +1592,11 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 1000, onUpdated } = {})
   return {
     rescan() {
       if (child && child.connected) {
-        child.send({ type: 'rescan', forceNotify: true });
+        try {
+          child.send({ type: 'rescan', forceNotify: true });
+        } catch {
+          // Ignore transient IPC disconnect while worker restarts
+        }
       }
     },
     async stop() {

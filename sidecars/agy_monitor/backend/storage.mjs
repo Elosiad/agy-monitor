@@ -307,16 +307,32 @@ export function sanitizePublicMasteryConfig(cfg) {
   };
 }
 
-async function readJsonSafe(filePath) {
-  try {
-    const raw = await fs.readFile(filePath, 'utf8');
-    return { exists: true, data: JSON.parse(raw) };
-  } catch (err) {
-    if (err?.code === 'ENOENT') {
-      return { exists: false, data: null };
+const TRANSIENT_FS_READ_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'EMFILE', 'ENFILE']);
+
+async function readJsonSafe(filePath, { throwOnIoError = false } = {}) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      try {
+        return { exists: true, data: JSON.parse(raw) };
+      } catch (parseErr) {
+        return { exists: true, data: null, parseError: parseErr };
+      }
+    } catch (err) {
+      if (err?.code === 'ENOENT') {
+        return { exists: false, data: null };
+      }
+      if (TRANSIENT_FS_READ_CODES.has(err?.code) && attempt < 3) {
+        await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
+        continue;
+      }
+      if (throwOnIoError) {
+        throw err;
+      }
+      return { exists: true, data: null, readError: err };
     }
-    return { exists: true, data: null, parseError: err };
   }
+  return { exists: true, data: null };
 }
 
 function clampInt(value, min, max, fallback) {
@@ -765,7 +781,7 @@ export function createStorage(paths) {
 
     async updatePrefs(patch = {}) {
       return enqueue('prefs', async () => {
-        const { data } = await readJsonSafe(paths.userPrefsFile);
+        const { data } = await readJsonSafe(paths.userPrefsFile, { throwOnIoError: true });
         const current = normalizePrefs(data);
         const resolvedCap = patch.windowCap ?? patch.contextWindowCap ?? current.windowCap;
         const next = normalizePrefs({
@@ -792,7 +808,7 @@ export function createStorage(paths) {
 
     async updateSessionsMeta(patchOrUpdater) {
       return enqueue('sessionsMeta', async () => {
-        const { data } = await readJsonSafe(paths.sessionsMetaFile);
+        const { data } = await readJsonSafe(paths.sessionsMetaFile, { throwOnIoError: true });
         const current = normalizeSessionsMeta(data);
         const draft =
           typeof patchOrUpdater === 'function'
@@ -833,7 +849,7 @@ export function createStorage(paths) {
 
     async saveThemes(nextState) {
       return enqueue('themes', async () => {
-        const { data } = await readJsonSafe(paths.themesFile);
+        const { data } = await readJsonSafe(paths.themesFile, { throwOnIoError: true });
         const current = normalizeThemes(data);
         const hasFollowFlag = typeof nextState?.followHostTheme === 'boolean';
         const hasSyncFlag = typeof nextState?.syncGlobal === 'boolean';
@@ -862,7 +878,7 @@ export function createStorage(paths) {
 
     async addCustomPalette({ id, name, colors }) {
       return enqueue('themes', async () => {
-        const { data } = await readJsonSafe(paths.themesFile);
+        const { data } = await readJsonSafe(paths.themesFile, { throwOnIoError: true });
         const current = normalizeThemes(data);
         const cleanName = sanitizeDisplayName(name, '');
         if (!cleanName) {
@@ -909,7 +925,7 @@ export function createStorage(paths) {
             code: 'BUILTIN_PALETTE',
           });
         }
-        const { data } = await readJsonSafe(paths.themesFile);
+        const { data } = await readJsonSafe(paths.themesFile, { throwOnIoError: true });
         const current = normalizeThemes(data);
         const remaining = current.customPalettes.filter((p) => p.id !== targetId);
         if (remaining.length === current.customPalettes.length) {
@@ -951,7 +967,7 @@ export function createStorage(paths) {
           await atomicWriteBuffer(thumbPath, thumbImg.buffer);
         }
 
-        const { data } = await readJsonSafe(paths.themesFile);
+        const { data } = await readJsonSafe(paths.themesFile, { throwOnIoError: true });
         const current = normalizeThemes(data);
         const entry = {
           id,
@@ -978,7 +994,7 @@ export function createStorage(paths) {
         if (!targetId) {
           throw Object.assign(new Error('Wallpaper ID is required'), { code: 'INVALID_ID' });
         }
-        const { data } = await readJsonSafe(paths.themesFile);
+        const { data } = await readJsonSafe(paths.themesFile, { throwOnIoError: true });
         const current = normalizeThemes(data);
         const found = current.customWallpapers.find((w) => w.id === targetId);
         if (!found) {
@@ -1023,7 +1039,7 @@ export function createStorage(paths) {
 
     async addCustomPreset({ id, name, filename, content, sanitizedContent, tokens }) {
       return enqueue('customPresets', async () => {
-        const { data } = await readJsonSafe(paths.customPresetsFile);
+        const { data } = await readJsonSafe(paths.customPresetsFile, { throwOnIoError: true });
         const current = normalizeCustomPresets(data);
         const finalContent =
           typeof sanitizedContent === 'string'
@@ -1055,7 +1071,7 @@ export function createStorage(paths) {
     async deleteCustomPreset(presetId) {
       return enqueue('customPresets', async () => {
         const targetId = String(presetId ?? '').trim();
-        const { data } = await readJsonSafe(paths.customPresetsFile);
+        const { data } = await readJsonSafe(paths.customPresetsFile, { throwOnIoError: true });
         const current = normalizeCustomPresets(data);
         const remaining = current.filter((p) => p.id !== targetId);
         await atomicWriteJson(paths.customPresetsFile, remaining);
@@ -1076,7 +1092,7 @@ export function createStorage(paths) {
 
     async saveQuotaAnchors(nextAnchors = {}) {
       return enqueue('quotaAnchors', async () => {
-        const { data } = await readJsonSafe(paths.quotaAnchorsFile);
+        const { data } = await readJsonSafe(paths.quotaAnchorsFile, { throwOnIoError: true });
         const current = normalizeQuotaAnchors(data);
         const merged = normalizeQuotaAnchors({
           ...current,
@@ -1105,7 +1121,7 @@ export function createStorage(paths) {
 
     async updateMasteryConfig(patch = {}) {
       return enqueue('masteryConfig', async () => {
-        const { data } = await readJsonSafe(paths.masteryConfigFile);
+        const { data } = await readJsonSafe(paths.masteryConfigFile, { throwOnIoError: true });
         const current = normalizeMasteryConfig(data);
         const tpPatch =
           patch && typeof patch === 'object' && patch.thirdParty && typeof patch.thirdParty === 'object'

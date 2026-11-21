@@ -838,7 +838,11 @@ export function createModelAndPrompt({
       if (newConvPromptInput) newConvPromptInput.value = "";
       closeNewConvDrawer();
       if (resp?.conversationId && typeof window !== "undefined") {
-        window.sidecar?.ui?.toggleConversation?.(String(resp.conversationId));
+        try {
+          window.sidecar?.ui?.toggleConversation?.(String(resp.conversationId));
+        } catch {
+          // Ignore host postMessage bridge error; conversation is already created
+        }
       }
       onSessionCreated?.(resp);
       onToast?.(
@@ -1002,6 +1006,10 @@ export function createModelAndPrompt({
       }
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
+      if (newConvDrawer && typeof newConvDrawer.remove === "function") {
+        newConvDrawer.remove();
+      }
+      newConvDrawer = null;
     },
   };
 }

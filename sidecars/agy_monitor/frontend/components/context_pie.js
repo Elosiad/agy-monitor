@@ -249,11 +249,20 @@ export function createContextPie({ apiFetch, t, onWindowCapChange, onToast } = {
     });
   }
 
+  let lastHoverX = null;
+  let lastHoverY = null;
+
   function showSliceHover(sliceId, clientX, clientY) {
     if (!stage || !tooltip) return;
     const slice = slices.find((item) => item.id === sliceId);
     if (!slice) return;
     hoveredSliceId = sliceId;
+    if (typeof clientX === "number" && typeof clientY === "number") {
+      lastHoverX = clientX;
+      lastHoverY = clientY;
+    }
+    const useX = typeof clientX === "number" ? clientX : lastHoverX;
+    const useY = typeof clientY === "number" ? clientY : lastHoverY;
 
     stage.classList.add("has-hover");
     sliceEls.forEach((el, id) => el.classList.toggle("is-hovered", id === slice.id));
@@ -274,17 +283,17 @@ export function createContextPie({ apiFetch, t, onWindowCapChange, onToast } = {
     tooltip.classList.add("is-visible");
     tooltip.setAttribute("aria-hidden", "false");
 
-    if (typeof clientX === "number" && typeof clientY === "number") {
+    if (typeof useX === "number" && typeof useY === "number") {
       const stageRect = stage.getBoundingClientRect();
       const tipWidth = tooltip.offsetWidth || 156;
       const tipHeight = tooltip.offsetHeight || 48;
-      let left = clientX - stageRect.left;
-      let top = clientY - stageRect.top - tipHeight - 10;
+      let left = useX - stageRect.left;
+      let top = useY - stageRect.top - tipHeight - 10;
 
       const minLeft = tipWidth / 2 + 4;
       const maxLeft = Math.max(minLeft, stageRect.width - tipWidth / 2 - 4);
       left = Math.min(Math.max(left, minLeft), maxLeft);
-      if (top < 0) top = clientY - stageRect.top + 14;
+      if (top < 0) top = useY - stageRect.top + 14;
 
       tooltip.style.left = `${left}px`;
       tooltip.style.top = `${top}px`;
@@ -298,6 +307,8 @@ export function createContextPie({ apiFetch, t, onWindowCapChange, onToast } = {
 
   function clearSliceHover() {
     hoveredSliceId = null;
+    lastHoverX = null;
+    lastHoverY = null;
     if (!stage || !tooltip) return;
     stage.classList.remove("has-hover");
     sliceEls.forEach((el) => el.classList.remove("is-hovered"));

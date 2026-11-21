@@ -173,9 +173,19 @@ function parseCliArgs(argv) {
   return { sourceRoot, targetDir, resetRules };
 }
 
-const isEntrypoint =
-  typeof process.argv[1] === 'string' &&
-  path.resolve(process.argv[1]) === __filename;
+function isSameEntrypoint(argvPath, modulePath) {
+  if (typeof argvPath !== 'string' || !argvPath) return false;
+  try {
+    const a = fs.realpathSync(path.resolve(argvPath));
+    const b = fs.realpathSync(modulePath);
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    const a = path.resolve(argvPath);
+    return process.platform === 'win32' ? a.toLowerCase() === modulePath.toLowerCase() : a === modulePath;
+  }
+}
+
+const isEntrypoint = isSameEntrypoint(process.argv[1], __filename);
 
 if (isEntrypoint) {
   const opts = parseCliArgs(process.argv.slice(2));

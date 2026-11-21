@@ -314,7 +314,7 @@ export async function readHostModelHint(paths) {
   if (!paths?.pbtxtPath) return null;
   try {
     const raw = await fs.readFile(paths.pbtxtPath, 'utf8');
-    const match = /^\s*last_selected_agent_model:\s*([A-Za-z0-9_.-]+)/m.exec(raw);
+    const match = /^\s*last_selected_agent_model:\s*"?([A-Za-z0-9_.-]+)"?/m.exec(raw);
     const value = match ? match[1].trim() : '';
     if (!value || PLACEHOLDER_MODEL_RE.test(value)) {
       return null;

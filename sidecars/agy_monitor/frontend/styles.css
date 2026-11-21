@@ -2489,7 +2489,7 @@ html[lang="en"] .prompt-selector-row {
 
 .preview-mini-text {
   font-size: 11px;
-  color: var(--text-primary);
+  color: var(--preview-text-primary, var(--text-primary));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2525,7 +2525,7 @@ html[lang="en"] .prompt-selector-row {
 
 .preview-mini-tag {
   font-size: 10px;
-  color: var(--text-secondary);
+  color: var(--preview-text-secondary, var(--text-secondary));
 }
 
 .preview-mini-track {
@@ -3071,7 +3071,7 @@ html[lang="en"] .prompt-selector-row {
   left: 50%;
   bottom: 14px;
   transform: translateX(-50%);
-  z-index: 70;
+  z-index: 1500;
   max-width: calc(100vw - 24px);
   padding: 7px 13px;
   border-radius: 999px;

@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
   AGY Console (agy-monitor) one-liner installer for Windows PowerShell.
@@ -40,14 +40,17 @@ if (-not (Test-NodeReady)) {
 $localRoot = $null
 if ($PSScriptRoot) {
   $candidate = Split-Path -Parent $PSScriptRoot
-  if (Test-Path (Join-Path $candidate 'plugin.json')) {
+  if (Test-Path -LiteralPath (Join-Path $candidate 'plugin.json')) {
     $localRoot = $candidate
   }
 }
 
 if ($localRoot) {
-  & node (Join-Path $localRoot 'scripts\install.mjs')
-  exit $LASTEXITCODE
+  & node (Join-Path $localRoot 'scripts\install.mjs') @args
+  if ($LASTEXITCODE -ne 0) {
+    throw "安装脚本退出异常（退出码 $LASTEXITCODE）。"
+  }
+  return
 }
 
 # Remote irm | iex mode
@@ -62,14 +65,17 @@ try {
   $zipUrl = "https://github.com/$repo/archive/refs/heads/$branch.zip"
   Write-Host "正在下载 AGY 控制台源码包：$zipUrl" -ForegroundColor Cyan
   Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
-  Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+  Expand-Archive -LiteralPath $zipPath -DestinationPath $tmpDir -Force
 
-  $extracted = Get-ChildItem -Path $tmpDir -Directory | Select-Object -First 1
-  if (-not $extracted -or -not (Test-Path (Join-Path $extracted.FullName 'scripts\install.mjs'))) {
+  $extracted = Get-ChildItem -LiteralPath $tmpDir -Directory | Select-Object -First 1
+  if (-not $extracted -or -not (Test-Path -LiteralPath (Join-Path $extracted.FullName 'scripts\install.mjs'))) {
     throw '解压后未找到 scripts\install.mjs。'
   }
-  & node (Join-Path $extracted.FullName 'scripts\install.mjs')
-  exit $LASTEXITCODE
+  & node (Join-Path $extracted.FullName 'scripts\install.mjs') @args
+  if ($LASTEXITCODE -ne 0) {
+    throw "安装脚本退出异常（退出码 $LASTEXITCODE）。"
+  }
+  return
 } finally {
-  Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }

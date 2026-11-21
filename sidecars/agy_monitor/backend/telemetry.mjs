@@ -72,7 +72,19 @@ export function classifyUpstreamModelStatus(expectedDefaultModel, upstreamModelI
   const expectedId = expectedDefaultModel?.id;
   if (!expectedId) return 'no_baseline';
 
-  const exp = modelFamilyAndRank(expectedId, expectedDefaultModel?.tier || '');
+  const normExp = String(expectedId).trim().toLowerCase();
+  const normAct = String(upstreamModelId).trim().toLowerCase();
+  if (normExp && normExp === normAct) {
+    return 'match';
+  }
+
+  // Only treat explicit tier keywords present in the model ID itself (or an explicit sub-tier suffix)
+  // so models like claude-opus-4-6 with synthesized catalog tier='high' never falsely flag downgrade.
+  const expIdInfo = modelFamilyAndRank(expectedId, '');
+  const expTierOnly = !expIdInfo.hasTier && expectedDefaultModel?.tier
+    ? (/(?:^|[-_])(?:opus|ultra)(?:$|[-_])/i.test(expectedId) ? '' : expectedDefaultModel.tier)
+    : '';
+  const exp = modelFamilyAndRank(expectedId, expTierOnly);
   const act = modelFamilyAndRank(upstreamModelId, '');
 
   const familyOrder = { flash: 1, argon: 2, sonnet: 3, hydrogen: 4, neon: 4, opus: 5, other: 2, carbon: 2 };
@@ -150,143 +162,147 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
     let latestModelRow = null;
 
     if (db) {
-      const metaRow = db.prepare(`SELECT value FROM scan_meta WHERE key = 'etag'`).get();
-      if (metaRow?.value) scanEtag = metaRow.value;
+      try {
+        const metaRow = db.prepare(`SELECT value FROM scan_meta WHERE key = 'etag'`).get();
+        if (metaRow?.value) scanEtag = metaRow.value;
 
-      if (targetConvId) {
-        targetRow = db
-          .prepare(`SELECT * FROM conv_latest_metrics WHERE conv_id = ?`)
-          .get(targetConvId);
-      } else if (!isExplicitConvId) {
-        // Follow Latest fallback: strictly filter to top-level conversations when catalog is provided
-        // so background subagent / swarm sessions never hijack the main context panel.
-        if (topLevelConvIds !== null) {
-          if (topLevelConvIds.length > 0) {
-            const placeholders = topLevelConvIds.map(() => '?').join(', ');
-            targetRow = db
-              .prepare(
-                `SELECT * FROM conv_latest_metrics
-                 WHERE conv_id IN (${placeholders})
-                 ORDER BY last_step_at_ms DESC
-                 LIMIT 1`
-              )
-              .get(...topLevelConvIds);
-          }
-        } else {
+        if (targetConvId) {
           targetRow = db
-            .prepare(`SELECT * FROM conv_latest_metrics ORDER BY last_step_at_ms DESC LIMIT 1`)
+            .prepare(`SELECT * FROM conv_latest_metrics WHERE conv_id = ?`)
+            .get(targetConvId);
+        } else if (!isExplicitConvId) {
+          // Follow Latest fallback: strictly filter to top-level conversations when catalog is provided
+          // so background subagent / swarm sessions never hijack the main context panel.
+          if (topLevelConvIds !== null) {
+            if (topLevelConvIds.length > 0) {
+              const placeholders = topLevelConvIds.map(() => '?').join(', ');
+              targetRow = db
+                .prepare(
+                  `SELECT * FROM conv_latest_metrics
+                   WHERE conv_id IN (${placeholders})
+                   ORDER BY last_step_at_ms DESC
+                   LIMIT 1`
+                )
+                .get(...topLevelConvIds);
+            }
+          } else {
+            targetRow = db
+              .prepare(`SELECT * FROM conv_latest_metrics ORDER BY last_step_at_ms DESC LIMIT 1`)
+              .get();
+          }
+          if (targetRow) {
+            targetConvId = targetRow.conv_id;
+          }
+        }
+
+        if (topLevelConvIds !== null && topLevelConvIds.length > 0) {
+          const placeholders = topLevelConvIds.map(() => '?').join(', ');
+          latestSpeedRow = db
+            .prepare(
+              `SELECT latest_speed_tok_s, avg_speed_tok_s, speed_source
+               FROM conv_latest_metrics
+               WHERE latest_speed_tok_s IS NOT NULL AND conv_id IN (${placeholders})
+               ORDER BY speed_at_ms DESC
+               LIMIT 1`
+            )
+            .get(...topLevelConvIds);
+
+          latestModelRow = db
+            .prepare(
+              `SELECT latest_model
+               FROM conv_latest_metrics
+               WHERE latest_model IS NOT NULL AND TRIM(latest_model) != '' AND conv_id IN (${placeholders})
+               ORDER BY latest_model_at_ms DESC
+               LIMIT 1`
+            )
+            .get(...topLevelConvIds);
+        } else if (topLevelConvIds === null) {
+          latestSpeedRow = db
+            .prepare(
+              `SELECT latest_speed_tok_s, avg_speed_tok_s, speed_source
+               FROM conv_latest_metrics
+               WHERE latest_speed_tok_s IS NOT NULL
+               ORDER BY speed_at_ms DESC
+               LIMIT 1`
+            )
+            .get();
+
+          latestModelRow = db
+            .prepare(
+              `SELECT latest_model
+               FROM conv_latest_metrics
+               WHERE latest_model IS NOT NULL AND TRIM(latest_model) != ''
+               ORDER BY latest_model_at_ms DESC
+               LIMIT 1`
+            )
             .get();
         }
-        if (targetRow) {
-          targetConvId = targetRow.conv_id;
-        }
-      }
 
-      if (topLevelConvIds !== null && topLevelConvIds.length > 0) {
-        const placeholders = topLevelConvIds.map(() => '?').join(', ');
-        latestSpeedRow = db
+        availableModelsFromLogs = db
           .prepare(
-            `SELECT latest_speed_tok_s, avg_speed_tok_s, speed_source
-             FROM conv_latest_metrics
-             WHERE latest_speed_tok_s IS NOT NULL AND conv_id IN (${placeholders})
-             ORDER BY speed_at_ms DESC
-             LIMIT 1`
-          )
-          .get(...topLevelConvIds);
-
-        latestModelRow = db
-          .prepare(
-            `SELECT latest_model
-             FROM conv_latest_metrics
-             WHERE latest_model IS NOT NULL AND TRIM(latest_model) != '' AND conv_id IN (${placeholders})
-             ORDER BY latest_model_at_ms DESC
-             LIMIT 1`
-          )
-          .get(...topLevelConvIds);
-      } else if (topLevelConvIds === null) {
-        latestSpeedRow = db
-          .prepare(
-            `SELECT latest_speed_tok_s, avg_speed_tok_s, speed_source
-             FROM conv_latest_metrics
-             WHERE latest_speed_tok_s IS NOT NULL
-             ORDER BY speed_at_ms DESC
-             LIMIT 1`
-          )
-          .get();
-
-        latestModelRow = db
-          .prepare(
-            `SELECT latest_model
-             FROM conv_latest_metrics
-             WHERE latest_model IS NOT NULL AND TRIM(latest_model) != ''
-             ORDER BY latest_model_at_ms DESC
-             LIMIT 1`
-          )
-          .get();
-      }
-
-      availableModelsFromLogs = db
-        .prepare(
-          `SELECT TRIM(model) AS model, MAX(created_at_ms) AS lastSeen, COUNT(*) AS calls
-           FROM step_ledger
-           WHERE model IS NOT NULL AND TRIM(model) != ''
-           GROUP BY TRIM(model)
-           ORDER BY lastSeen DESC`
-        )
-        .all()
-        .map((r) => ({ id: r.model, calls: r.calls, lastSeenMs: r.lastSeen }));
-
-      const sinceMs = getRangeStartMs(range, nowMs);
-      const usageSql =
-        scope === 'current' && targetConvId
-          ? `SELECT COALESCE(NULLIF(TRIM(model), ''), '__unrecorded__') AS modelKey,
-                    SUM(input_tokens) AS uncachedInput,
-                    SUM(cache_read_tokens) AS cacheRead,
-                    SUM(output_tokens) AS output
+            `SELECT TRIM(model) AS model, MAX(created_at_ms) AS lastSeen, COUNT(*) AS calls
              FROM step_ledger
-             WHERE step_type = 'PLANNER_RESPONSE'
-               AND conv_id = ?
-               AND created_at_ms >= ?
-             GROUP BY modelKey`
-          : `SELECT COALESCE(NULLIF(TRIM(model), ''), '__unrecorded__') AS modelKey,
-                    SUM(input_tokens) AS uncachedInput,
-                    SUM(cache_read_tokens) AS cacheRead,
-                    SUM(output_tokens) AS output
-             FROM step_ledger
-             WHERE step_type = 'PLANNER_RESPONSE'
-               AND created_at_ms >= ?
-             GROUP BY modelKey`;
+             WHERE model IS NOT NULL AND TRIM(model) != ''
+             GROUP BY TRIM(model)
+             ORDER BY lastSeen DESC`
+          )
+          .all()
+          .map((r) => ({ id: r.model, calls: r.calls, lastSeenMs: r.lastSeen }));
 
-      const usageRows =
-        scope === 'current' && targetConvId
-          ? db.prepare(usageSql).all(targetConvId, sinceMs)
-          : db.prepare(usageSql).all(sinceMs);
+        const sinceMs = getRangeStartMs(range, nowMs);
+        const usageSql =
+          scope === 'current' && targetConvId
+            ? `SELECT COALESCE(NULLIF(TRIM(model), ''), '__unrecorded__') AS modelKey,
+                      SUM(input_tokens) AS uncachedInput,
+                      SUM(cache_read_tokens) AS cacheRead,
+                      SUM(output_tokens) AS output
+               FROM step_ledger
+               WHERE step_type = 'PLANNER_RESPONSE'
+                 AND conv_id = ?
+                 AND created_at_ms >= ?
+               GROUP BY modelKey`
+            : `SELECT COALESCE(NULLIF(TRIM(model), ''), '__unrecorded__') AS modelKey,
+                      SUM(input_tokens) AS uncachedInput,
+                      SUM(cache_read_tokens) AS cacheRead,
+                      SUM(output_tokens) AS output
+               FROM step_ledger
+               WHERE step_type = 'PLANNER_RESPONSE'
+                 AND created_at_ms >= ?
+               GROUP BY modelKey`;
 
-      tokenModels = usageRows
-        .map((r) => {
-          const modelName = r.modelKey;
-          const isUnrecorded = modelName === '__unrecorded__';
-          const uncachedInput = Number(r.uncachedInput || 0);
-          const cacheRead = Number(r.cacheRead || 0);
-          const output = Number(r.output || 0);
-          const totalTokens = uncachedInput + cacheRead + output;
-          const totalIn = uncachedInput + cacheRead;
-          const cacheHitPct = totalIn > 0 ? Math.round((cacheRead / totalIn) * 100) : 0;
-          const estimatedCostUsd = isUnrecorded
-            ? null
-            : estimateModelCostUsd(modelName, uncachedInput, cacheRead, output);
-          return {
-            model: modelName,
-            totalTokens,
-            estimatedCostUsd,
-            isUnpriced: isUnrecorded,
-            uncachedInput,
-            cacheRead,
-            output,
-            cacheHitPct,
-          };
-        })
-        .sort((a, b) => b.totalTokens - a.totalTokens);
+        const usageRows =
+          scope === 'current' && targetConvId
+            ? db.prepare(usageSql).all(targetConvId, sinceMs)
+            : db.prepare(usageSql).all(sinceMs);
+
+        tokenModels = usageRows
+          .map((r) => {
+            const modelName = r.modelKey;
+            const isUnrecorded = modelName === '__unrecorded__';
+            const uncachedInput = Number(r.uncachedInput || 0);
+            const cacheRead = Number(r.cacheRead || 0);
+            const output = Number(r.output || 0);
+            const totalTokens = uncachedInput + cacheRead + output;
+            const totalIn = uncachedInput + cacheRead;
+            const cacheHitPct = totalIn > 0 ? Math.round((cacheRead / totalIn) * 100) : 0;
+            const estimatedCostUsd = isUnrecorded
+              ? null
+              : estimateModelCostUsd(modelName, uncachedInput, cacheRead, output);
+            return {
+              model: modelName,
+              totalTokens,
+              estimatedCostUsd,
+              isUnpriced: isUnrecorded,
+              uncachedInput,
+              cacheRead,
+              output,
+              cacheHitPct,
+            };
+          })
+          .sort((a, b) => b.totalTokens - a.totalTokens);
+      } catch {
+        // Transient SQLITE_BUSY or schema initialization race: degrade gracefully to empty telemetry
+      }
     }
 
     // Build honest context pie segments preserving totalUsed exactness

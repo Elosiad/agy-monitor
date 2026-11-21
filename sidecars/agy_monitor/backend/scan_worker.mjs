@@ -210,11 +210,19 @@ function parseLineToRow(convId, lineText, fallbackStepIndex) {
 /**
  * Reads complete JSONL lines from startOffset up to file size without splitting UTF-8 or half-written lines.
  */
-async function readDeltaLines(convId, filePath, startOffset, sizeBytes, mtimeMs, flushPartial) {
+async function readDeltaLines(
+  convId,
+  filePath,
+  startOffset,
+  sizeBytes,
+  mtimeMs,
+  flushPartial,
+  initialFallbackIndex = 0,
+) {
   const rows = [];
   let cursor = startOffset;
   let leftover = Buffer.alloc(0);
-  let fallbackIndex = startOffset === 0 ? 0 : Math.floor(startOffset / 100);
+  let fallbackIndex = Math.max(0, Number(initialFallbackIndex) || 0);
 
   const fh = await withRetry(() => fsp.open(filePath, 'r'));
   try {
@@ -337,10 +345,13 @@ function recomputeConvMetrics(db, convId) {
     }
 
     if (row.step_type === 'PLANNER_RESPONSE') {
-      latestUncachedInput = row.input_tokens;
-      latestCacheRead = row.cache_read_tokens;
-      latestOutputTokens = row.output_tokens;
-      latestContextTokens = row.input_tokens + row.cache_read_tokens + row.output_tokens;
+      const stepTotal = row.input_tokens + row.cache_read_tokens + row.output_tokens;
+      if (stepTotal > 0) {
+        latestUncachedInput = row.input_tokens;
+        latestCacheRead = row.cache_read_tokens;
+        latestOutputTokens = row.output_tokens;
+        latestContextTokens = stepTotal;
+      }
       if (row.tool_calls_count > 0) {
         toolCharsTotal += row.tool_calls_count * 120;
       }
@@ -430,6 +441,9 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
     const selectWatermark = db.prepare(
       `SELECT mtime_ms, size_bytes, byte_offset FROM session_watermarks WHERE conv_id = ?`
     );
+    const selectMaxStep = db.prepare(
+      `SELECT COALESCE(MAX(step_index), -1) AS max_idx FROM step_ledger WHERE conv_id = ?`
+    );
     const deleteConvSteps = db.prepare(`DELETE FROM step_ledger WHERE conv_id = ?`);
     const deleteConvMetrics = db.prepare(`DELETE FROM conv_latest_metrics WHERE conv_id = ?`);
     const upsertStep = db.prepare(
@@ -483,6 +497,9 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
 
       const truncated = Boolean(prev && item.sizeBytes < prev.byte_offset);
       const startOffset = truncated ? 0 : prev ? prev.byte_offset : 0;
+      const maxStepRow = truncated ? null : selectMaxStep.get(item.convId);
+      const initialFallbackIdx =
+        truncated || !prev ? 0 : Math.max(0, Number(maxStepRow?.max_idx ?? -1) + 1);
 
       const { rows, nextOffset } = await readDeltaLines(
         item.convId,
@@ -490,7 +507,8 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
         startOffset,
         item.sizeBytes,
         item.mtimeMs,
-        flushPartial
+        flushPartial,
+        initialFallbackIdx
       );
 
       if (!truncated && rows.length === 0 && prev && nextOffset === prev.byte_offset) {
@@ -608,18 +626,26 @@ async function runWorkerMain() {
       try {
         const transcripts = await discoverTranscripts(brainDir);
         const res = await scanDbWithConnection(db, transcripts, { flushPartial: false });
-        if ((res.etagChanged || forceNotify) && typeof process.send === 'function') {
-          process.send({
-            type: 'updated',
-            etag: res.etag,
-            changedConvs: res.changedConvs,
-            newSteps: res.newSteps,
-          });
+        if ((res.etagChanged || forceNotify) && process.connected && typeof process.send === 'function') {
+          try {
+            process.send({
+              type: 'updated',
+              etag: res.etag,
+              changedConvs: res.changedConvs,
+              newSteps: res.newSteps,
+            });
+          } catch {
+            // Ignore IPC disconnect during shutdown
+          }
         }
         return res;
       } catch (err) {
-        if (typeof process.send === 'function') {
-          process.send({ type: 'error', message: err?.message || 'scan_error' });
+        if (process.connected && typeof process.send === 'function') {
+          try {
+            process.send({ type: 'error', message: err?.message || 'scan_error' });
+          } catch {
+            // Ignore IPC disconnect during shutdown
+          }
         }
         return null;
       } finally {

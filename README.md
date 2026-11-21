@@ -44,7 +44,7 @@
 
 ### 方式一：下载 Release 压缩包，双击即装（推荐 · 最无脑）
 
-1. 前往 [Releases 最新版本页面](https://github.com/aishadiaodeqishui/agy-monitor/releases/latest) 下载 `agy-monitor-v1.0.0.zip` 并解压到任意文件夹。
+1. 前往 [Releases 最新版本页面](https://github.com/aishadiaodeqishui/agy-monitor/releases/latest) 下载 `agy-monitor-v*.zip` 并解压到任意文件夹。
 2. 运行安装器：
    - **Windows**：直接双击根目录的 **`install.cmd`**
    - **macOS / Linux**：终端进入解压目录执行 `chmod +x install.sh && ./install.sh`
@@ -86,7 +86,7 @@ node scripts/install.mjs
 - **升级**：重新运行 `install.cmd` / `./install.sh` / `node scripts/install.mjs` 即可覆盖升级，个人配置与 Prompt 规则完整保留。
 - **卸载**：
   - **Windows**：双击 **`uninstall.cmd`**（或运行 `node scripts/uninstall.mjs`）
-  - **macOS / Linux**：运行 `./uninstall.sh`
+  - **macOS / Linux**：运行 `chmod +x uninstall.sh && ./uninstall.sh`
   - 默认保留你的个人配置与自定义壁纸目录；如需彻底清除数据，执行 `node scripts/uninstall.mjs --purge-data`。
 
 ---

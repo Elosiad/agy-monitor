@@ -19,6 +19,36 @@ const DEFAULT_TARGET_DIR = path.join(os.homedir(), '.gemini', 'config', 'plugins
 const DEFAULT_DATA_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'plugin_data', 'agy-monitor');
 const DEFAULT_SIDECAR_DATA_DIR = path.join(os.homedir(), '.gemini', 'antigravity', 'sidecar_data', 'agy-monitor');
 
+function rmDirSyncWithRetry(dirPath, attempts = 12, delayMs = 200) {
+  const sab = new Int32Array(new SharedArrayBuffer(4));
+  let lastErr;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes(err?.code) || i === attempts - 1) {
+        throw err;
+      }
+      Atomics.wait(sab, 0, 0, delayMs);
+    }
+  }
+  if (lastErr) throw lastErr;
+}
+
+function isSameEntrypoint(argvPath, modulePath) {
+  if (typeof argvPath !== 'string' || !argvPath) return false;
+  try {
+    const a = fs.realpathSync(path.resolve(argvPath));
+    const b = fs.realpathSync(modulePath);
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    const a = path.resolve(argvPath);
+    return process.platform === 'win32' ? a.toLowerCase() === modulePath.toLowerCase() : a === modulePath;
+  }
+}
+
 export function uninstallPlugin({
   targetDir = DEFAULT_TARGET_DIR,
   pluginDataDir = DEFAULT_DATA_DIR,
@@ -58,7 +88,7 @@ export function uninstallPlugin({
         fs.unlinkSync(targetDir);
       }
     } else {
-      fs.rmSync(targetDir, { recursive: true, force: true });
+      rmDirSyncWithRetry(targetDir);
     }
     removedPlugin = true;
     log(`[2/3] 已移除插件目录：${targetDir}`);
@@ -69,11 +99,11 @@ export function uninstallPlugin({
   let purgedData = false;
   if (purgeData) {
     if (fs.existsSync(pluginDataDir)) {
-      fs.rmSync(pluginDataDir, { recursive: true, force: true });
+      rmDirSyncWithRetry(pluginDataDir);
       purgedData = true;
     }
     if (fs.existsSync(sidecarDataDir)) {
-      fs.rmSync(sidecarDataDir, { recursive: true, force: true });
+      rmDirSyncWithRetry(sidecarDataDir);
       purgedData = true;
     }
     log('[3/3] 已彻底清除个人配置、自定义壁纸与本地缓存数据');
@@ -106,9 +136,7 @@ function parseCliArgs(argv) {
   return opts;
 }
 
-const isEntrypoint =
-  typeof process.argv[1] === 'string' &&
-  path.resolve(process.argv[1]) === __filename;
+const isEntrypoint = isSameEntrypoint(process.argv[1], __filename);
 
 if (isEntrypoint) {
   const opts = parseCliArgs(process.argv.slice(2));

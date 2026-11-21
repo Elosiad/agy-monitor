@@ -82,9 +82,11 @@ export function createRuntimeBar({ t } = {}) {
     if (speedSubEl) {
       const sessionTag = formatSessionLabel(contextInfo, tr);
       if (!hasLatest) {
-        speedSubEl.textContent = sessionTag
+        const waitingText = sessionTag
           ? `${tr("runtime.speedSampling", "等待首轮流式输出采样", "Waiting for streamed step sample")} · ${sessionTag}`
           : tr("runtime.speedSampling", "等待首轮流式输出采样", "Waiting for streamed step sample");
+        speedSubEl.textContent = waitingText;
+        speedSubEl.title = waitingText;
         return;
       }
       const sourceLabel =

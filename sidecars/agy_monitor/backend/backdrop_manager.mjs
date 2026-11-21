@@ -3,11 +3,16 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { atomicWriteText } from './paths.mjs';
+import { atomicWriteBuffer, atomicWriteText } from './paths.mjs';
 
 const CSC_PATH = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe';
 const WPF_DIR = 'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\WPF';
 const COMPANION_ACTIVE_TTL_MS = 10_000;
+
+function writeUtf16LeBom(filePath, content) {
+  const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(String(content ?? ''), 'utf16le')]);
+  return atomicWriteBuffer(filePath, buf);
+}
 
 let cachedDesktopInfo = null;
 let compilePromise = null;
@@ -195,17 +200,15 @@ export async function ensureBackdropAssets(paths) {
         compiledNow = true;
       } catch (err) {
         await fsp.rm(tmpExe, { force: true }).catch(() => {});
-        if (!fs.existsSync(paths.backdropExeFile)) {
-          return {
-            supported: true,
-            compiled: false,
-            error: err?.stderr || err?.stdout || err?.message || 'csc compile failed',
-          };
-        }
+        return {
+          supported: true,
+          compiled: false,
+          error: err?.stderr || err?.stdout || err?.message || 'csc compile failed',
+        };
       }
     }
 
-    await atomicWriteText(
+    await writeUtf16LeBom(
       paths.backdropLauncherVbs,
       buildLauncherVbsContent(paths.backdropExeFile, paths.pluginDataDir, paths.wallpapersDir),
     );
@@ -253,8 +256,9 @@ export async function getBackdropStatus(paths, themes = {}) {
   const pid = Number(raw?.pid || 0);
   const updatedAtMs = Number(raw?.updatedAtMs || 0);
   const ageMs = updatedAtMs > 0 ? Math.max(0, nowMs - updatedAtMs) : Infinity;
+  const pidAlive = pid > 0 ? isPidAlive(pid) : true;
   const running = Boolean(
-    raw?.running === true && (ageMs <= COMPANION_ACTIVE_TTL_MS || isPidAlive(pid)),
+    raw?.running === true && ageMs <= COMPANION_ACTIVE_TTL_MS && pidAlive,
   );
 
   const launcherCmdPath = paths?.backdropLauncherCmd || '';
@@ -332,6 +336,7 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
         ['--data-dir', paths.pluginDataDir, '--assets-dir', paths.wallpapersDir],
         { detached: true, stdio: 'ignore', windowsHide: true },
       );
+      child.on('error', () => {});
       child.unref();
       launched = true;
       await new Promise((r) => setTimeout(r, 350));

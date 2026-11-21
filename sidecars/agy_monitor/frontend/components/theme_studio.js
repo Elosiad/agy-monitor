@@ -101,9 +101,32 @@ const COLOR_FIELDS = [
 const ALLOWED_IMAGE_MIME = new Set([
   "image/png",
   "image/jpeg",
+  "image/jpg",
   "image/webp",
   "image/gif",
 ]);
+
+const EXT_TO_IMAGE_MIME = Object.freeze({
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+});
+
+function resolveUploadImageMime(file) {
+  const rawType = String(file?.type || "").trim().toLowerCase();
+  if (rawType === "image/jpg") return "image/jpeg";
+  if (ALLOWED_IMAGE_MIME.has(rawType)) return rawType;
+  if (!rawType) {
+    const name = String(file?.name || "").trim().toLowerCase();
+    const dot = name.lastIndexOf(".");
+    if (dot >= 0 && EXT_TO_IMAGE_MIME[name.slice(dot)]) {
+      return EXT_TO_IMAGE_MIME[name.slice(dot)];
+    }
+  }
+  return "";
+}
 
 const MAX_WALLPAPER_BYTES = 8 * 1024 * 1024;
 
@@ -145,7 +168,12 @@ function getAssetUrl(kind, id, thumb = false) {
     id: String(id),
     thumb: thumb ? "1" : "0",
   });
-  return `/api/asset?${params.toString()}`;
+  const basePath =
+    typeof window !== "undefined" && typeof window.location?.pathname === "string"
+      ? window.location.pathname.replace(/[^/]*$/, "")
+      : "/";
+  const prefix = basePath && basePath !== "/" ? basePath.replace(/\/+$/, "") : "";
+  return `${prefix}/api/asset?${params.toString()}`;
 }
 
 function normalizeHex(hex, fallback) {
@@ -241,6 +269,15 @@ const LIGHT_TEXT_TOKENS = Object.freeze({
   "--text-dim": "#8d8c96",
   "--border-hairline": "color-mix(in srgb, var(--text-primary) 12%, var(--bg-chrome))",
   "--border-subtle": "color-mix(in srgb, var(--text-primary) 20%, var(--bg-chrome))",
+  "--mastery-running": "#2563eb",
+  "--mastery-running-bright": "#1d4ed8",
+  "--mastery-running-flow": "#3b82f6",
+  "--mastery-unread": "#0f9d58",
+  "--mastery-unread-bright": "#047857",
+  "--mastery-unread-flow": "#10b981",
+  "--mastery-peer": "#64748b",
+  "--mastery-peer-live": "#475569",
+  "--mastery-peer-hi": "#1e40af",
 });
 
 /** Renders a cover-cropped 240x148 raster thumbnail; resolves {base64, mime} or null. */
@@ -357,8 +394,21 @@ export function createThemeStudio({
   let mutationSeq = 0;
   let persistInFlight = false;
   let persistQueued = false;
+  let pendingPaletteName = "";
   let lastPersistDispatchAt = 0;
+  let destroyed = false;
+  let backdropStatusInFlight = false;
+  const trackedTimers = new Set();
   const cleanups = [];
+
+  const scheduleTrackedTimeout = (fn, delayMs) => {
+    const id = setTimeout(() => {
+      trackedTimers.delete(id);
+      if (!destroyed) fn();
+    }, delayMs);
+    trackedTimers.add(id);
+    return id;
+  };
 
   const colorInputMap = new Map();
   const colorHexMap = new Map();
@@ -630,12 +680,15 @@ export function createThemeStudio({
     const wpCssUrl = wpUrl ? `url("${wpUrl}")` : "none";
 
     if (previewStage) {
+      const previewIsLight = isLightColor(state.colors.canvas);
       previewStage.style.setProperty("--preview-accent", state.colors.accent);
       previewStage.style.setProperty("--preview-contrast", state.colors.contrast);
       previewStage.style.setProperty("--preview-tertiary", state.colors.tertiary);
       previewStage.style.setProperty("--preview-canvas", state.colors.canvas);
       previewStage.style.setProperty("--preview-chrome", state.colors.chrome);
       previewStage.style.setProperty("--preview-bubble", state.colors.bubble);
+      previewStage.style.setProperty("--preview-text-primary", previewIsLight ? "#1d1c22" : "#e8e7ec");
+      previewStage.style.setProperty("--preview-text-secondary", previewIsLight ? "#4f4e58" : "#adacb4");
       previewStage.style.setProperty("--preview-radius", `${state.radius}px`);
       previewStage.style.setProperty("--preview-wp-opacity", (state.opacity / 100).toFixed(2));
       previewStage.style.setProperty("--preview-wp-blur", `${state.blur}px`);
@@ -867,8 +920,12 @@ export function createThemeStudio({
   };
 
   const persistTheme = async ({ saveAsNewPaletteName, silent = false } = {}) => {
-    if (persistInFlight && !saveAsNewPaletteName) {
+    if (destroyed) return null;
+    if (persistInFlight) {
       persistQueued = true;
+      if (saveAsNewPaletteName) {
+        pendingPaletteName = saveAsNewPaletteName;
+      }
       return null;
     }
     const reqSeq = mutationSeq;
@@ -880,6 +937,7 @@ export function createThemeStudio({
         payload.saveAsNewPaletteName = saveAsNewPaletteName;
       }
       const res = await postJson(apiFetch, "/api/theme/save", payload);
+      if (destroyed) return null;
       if (res.backdropStatus) {
         state.backdropStatus = res.backdropStatus;
       }
@@ -887,7 +945,7 @@ export function createThemeStudio({
         state.hostThemeSynced = res.hostThemeSynced;
       }
       // Only hydrate server snapshot back into UI if the user did not keep editing while in flight
-      const isLatest = reqSeq === mutationSeq || Boolean(saveAsNewPaletteName);
+      const isLatest = reqSeq === mutationSeq;
       if (isLatest && res.themeState) {
         hydrateThemeState(res.themeState);
         renderPaletteChips();
@@ -895,6 +953,9 @@ export function createThemeStudio({
         syncSlidersAndFitUi();
         renderWallpaperThumbs();
         applyTheme();
+      } else if (saveAsNewPaletteName && res.themeState?.palettes) {
+        mergePalettesFromServer(res.themeState.palettes);
+        renderPaletteChips();
       }
       renderBackdropCompanion();
       if (!silent) {
@@ -908,17 +969,21 @@ export function createThemeStudio({
       }
       return res;
     } catch (err) {
-      onToast?.(
-        err?.message ||
-          tr("theme.customPaletteSaveFailed", "保存配色方案失败", "Failed to save theme"),
-        "error"
-      );
+      if (!destroyed) {
+        onToast?.(
+          err?.message ||
+            tr("theme.customPaletteSaveFailed", "保存配色方案失败", "Failed to save theme"),
+          "error"
+        );
+      }
       return null;
     } finally {
       persistInFlight = false;
-      if (persistQueued) {
+      if (!destroyed && (persistQueued || pendingPaletteName)) {
+        const queuedName = pendingPaletteName;
+        pendingPaletteName = "";
         persistQueued = false;
-        void persistTheme({ silent: true });
+        void persistTheme(queuedName ? { saveAsNewPaletteName: queuedName } : { silent: true });
       }
     }
   };
@@ -997,10 +1062,12 @@ export function createThemeStudio({
         delBtn.appendChild(createDeleteIconSvg());
         delBtn.addEventListener("click", async (e) => {
           e.stopPropagation();
+          mutationSeq += 1;
           try {
             const res = await postJson(apiFetch, "/api/theme/palette/delete", {
               paletteId: palette.id,
             });
+            if (destroyed) return;
             if (res.themeState) {
               hydrateThemeState(res.themeState);
             } else {
@@ -1013,16 +1080,19 @@ export function createThemeStudio({
             renderPaletteChips();
             syncColorPickers();
             applyTheme();
+            renderBackdropCompanion();
             onToast?.(
               tr("theme.customPaletteDeleted", "已删除自定义配色方案", "Deleted custom palette"),
               "info"
             );
           } catch (err) {
-            onToast?.(
-              err?.message ||
-                tr("theme.customPaletteDeleteFailed", "删除配色方案失败", "Failed to delete palette"),
-              "error"
-            );
+            if (!destroyed) {
+              onToast?.(
+                err?.message ||
+                  tr("theme.customPaletteDeleteFailed", "删除配色方案失败", "Failed to delete palette"),
+                "error"
+              );
+            }
           }
         });
         chip.appendChild(delBtn);
@@ -1157,7 +1227,7 @@ export function createThemeStudio({
           nameSpan.className = "custom-wp-name";
           nameSpan.textContent = wp.name || tr("theme.customBadge", "自定义壁纸", "Custom");
           nameSpan.title = nameSpan.textContent;
-          nameSpan.addEventListener("click", () => {
+          chip.addEventListener("click", () => {
             mutationSeq += 1;
             state.activeWallpaperId = wp.id;
             renderWallpaperThumbs();
@@ -1172,10 +1242,12 @@ export function createThemeStudio({
           delBtn.appendChild(createDeleteIconSvg());
           delBtn.addEventListener("click", async (e) => {
             e.stopPropagation();
+            mutationSeq += 1;
             try {
               const res = await postJson(apiFetch, "/api/theme/wallpaper/delete", {
                 wallpaperId: wp.id,
               });
+              if (destroyed) return;
               if (res.themeState) {
                 hydrateThemeState(res.themeState);
               } else {
@@ -1186,11 +1258,13 @@ export function createThemeStudio({
               }
               renderWallpaperThumbs();
               applyTheme();
+              renderBackdropCompanion();
               onToast?.(
                 tr("theme.wallpaperDeleted", "已删除自定义壁纸", "Deleted custom wallpaper"),
                 "info"
               );
             } catch (err) {
+              if (destroyed) return;
               onToast?.(
                 err?.message || tr("theme.customPaletteDeleteFailed", "删除失败", "Delete failed"),
                 "error"
@@ -1267,10 +1341,11 @@ export function createThemeStudio({
   // Follow host light/dark toggle (read-only; never writes host config)
   if (syncGlobalBtn) {
     const onSyncClick = async () => {
+      mutationSeq += 1;
       state.syncGlobal = !state.syncGlobal;
       applyTheme();
       const res = await persistTheme({ silent: true });
-      if (res) {
+      if (res && !destroyed) {
         onToast?.(
           state.syncGlobal
             ? tr("theme.boundarySynced", "仅监听宿主明暗", "Follows Host Light/Dark")
@@ -1336,7 +1411,8 @@ export function createThemeStudio({
       const file = wallpaperFileInput.files && wallpaperFileInput.files[0];
       if (!file) return;
 
-      if (!ALLOWED_IMAGE_MIME.has(file.type)) {
+      const resolvedMime = resolveUploadImageMime(file);
+      if (!resolvedMime) {
         onToast?.(
           tr(
             "theme.wallpaperSvgBlocked",
@@ -1358,24 +1434,37 @@ export function createThemeStudio({
       }
 
       const reader = new FileReader();
+      reader.onerror = () => {
+        if (!destroyed) {
+          onToast?.(
+            tr("theme.wallpaperUploadFailed", "上传壁纸失败", "Failed to upload wallpaper"),
+            "error"
+          );
+        }
+        wallpaperFileInput.value = "";
+      };
       reader.onload = async () => {
         const dataUrl = typeof reader.result === "string" ? reader.result : "";
         const commaIdx = dataUrl.indexOf(",");
         const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : "";
         if (!base64) {
-          onToast?.(
-            tr("theme.wallpaperUploadFailed", "上传壁纸失败", "Failed to upload wallpaper"),
-            "error"
-          );
+          if (!destroyed) {
+            onToast?.(
+              tr("theme.wallpaperUploadFailed", "上传壁纸失败", "Failed to upload wallpaper"),
+              "error"
+            );
+          }
           wallpaperFileInput.value = "";
           return;
         }
         const cleanName = file.name.replace(/\.[^.]+$/, "") || "Wallpaper";
+        mutationSeq += 1;
         try {
           const thumb = await generateThumbnail(dataUrl);
+          if (destroyed) return;
           const uploadPayload = {
             name: cleanName,
-            mime: file.type,
+            mime: resolvedMime,
             base64,
           };
           if (thumb) {
@@ -1383,6 +1472,7 @@ export function createThemeStudio({
             uploadPayload.thumbMime = thumb.mime;
           }
           const res = await postJson(apiFetch, "/api/theme/wallpaper/upload", uploadPayload);
+          if (destroyed) return;
           if (res.themeState) {
             hydrateThemeState(res.themeState);
           } else if (res.wallpaper) {
@@ -1391,6 +1481,7 @@ export function createThemeStudio({
           }
           renderWallpaperThumbs();
           applyTheme();
+          renderBackdropCompanion();
           onToast?.(
             tr(
               "theme.wallpaperUploaded",
@@ -1401,6 +1492,7 @@ export function createThemeStudio({
             "success"
           );
         } catch (err) {
+          if (destroyed) return;
           onToast?.(
             err?.message ||
               tr("theme.wallpaperUploadFailed", "上传壁纸失败", "Failed to upload wallpaper"),
@@ -1474,8 +1566,11 @@ export function createThemeStudio({
   }
 
   const refreshBackdropStatus = async () => {
+    if (destroyed || backdropStatusInFlight) return;
+    backdropStatusInFlight = true;
     try {
       const res = await fetchViaSidecar(apiFetch, "/api/theme/backdrop/status");
+      if (destroyed) return;
       if (res?.status) {
         const prevShared = Boolean(state.backdropStatus?.running && !state.backdropStatus?.paused);
         state.backdropStatus = res.status;
@@ -1487,6 +1582,8 @@ export function createThemeStudio({
       }
     } catch {
       // Ignore transient status fetch failure
+    } finally {
+      backdropStatusInFlight = false;
     }
   };
 
@@ -1502,11 +1599,12 @@ export function createThemeStudio({
           backdropEnabled: state.backdropEnabled,
           hostBlendPct: state.hostBlendPct,
         });
+        if (destroyed) return;
         if (res?.themeState) hydrateThemeState(res.themeState);
         if (res?.status) state.backdropStatus = res.status;
         applyTheme();
         renderBackdropCompanion();
-        setTimeout(() => void refreshBackdropStatus(), 180);
+        scheduleTrackedTimeout(() => void refreshBackdropStatus(), 180);
         onToast?.(
           state.backdropEnabled
             ? tr("backdrop.enabledToast", "已开启整机贴背壁纸模式", "Desktop backdrop companion enabled")
@@ -1514,6 +1612,7 @@ export function createThemeStudio({
           "info"
         );
       } catch (err) {
+        if (destroyed) return;
         state.backdropEnabled = !state.backdropEnabled;
         applyTheme();
         renderBackdropCompanion();
@@ -1541,11 +1640,12 @@ export function createThemeStudio({
           cdpPort: state.cdpPort,
           hostBlendPct: state.hostBlendPct,
         });
+        if (destroyed) return;
         if (res?.themeState) hydrateThemeState(res.themeState);
         if (res?.status) state.backdropStatus = res.status;
         applyTheme();
         renderBackdropCompanion();
-        setTimeout(() => void refreshBackdropStatus(), 200);
+        scheduleTrackedTimeout(() => void refreshBackdropStatus(), 200);
         onToast?.(
           nextMode === "cdp"
             ? tr("backdrop.modeSwitchedCdp", "已切换到方案二（CDP 高清纯 CSS，主窗文字已恢复 100% 实心）", "Switched to Mode 2 (CDP Crisp CSS; host opacity restored 100%)")
@@ -1553,6 +1653,7 @@ export function createThemeStudio({
           "info"
         );
       } catch (err) {
+        if (destroyed) return;
         state.hostThemeMode = prevMode;
         applyTheme();
         renderBackdropCompanion();
@@ -1604,7 +1705,9 @@ export function createThemeStudio({
 
   let backdropPollTicks = 0;
   backdropPollTimer = setInterval(() => {
+    if (destroyed) return;
     if (document.visibilityState === "hidden") return;
+    if (typeof window !== "undefined" && (window.innerWidth === 0 || window.innerHeight === 0)) return;
     backdropPollTicks += 1;
     const themePanel = document.getElementById("panelTheme");
     const onThemeTab = Boolean(themePanel && !themePanel.hidden);
@@ -1635,11 +1738,13 @@ export function createThemeStudio({
       const onLangClick = async () => {
         const nextLang = btn.getAttribute("data-lang");
         if (!nextLang || nextLang === currentLang) return;
+        const prevLang = currentLang;
         syncLanguageButtons(nextLang);
         onLanguageChange?.(nextLang);
         const langLabel = nextLang === "en" ? "English" : "简体中文";
         try {
           const res = await postJson(apiFetch, "/api/language", { language: nextLang });
+          if (destroyed) return;
           if (res?.cdp) {
             state.backdropStatus = {
               ...(state.backdropStatus || {}),
@@ -1666,6 +1771,9 @@ export function createThemeStudio({
             );
           }
         } catch (err) {
+          if (destroyed) return;
+          syncLanguageButtons(prevLang);
+          onLanguageChange?.(prevLang);
           onToast?.(
             err?.message ||
               tr("theme.languageSaveFailed", "保存语言设置失败", "Failed to save language preference"),
@@ -1680,13 +1788,14 @@ export function createThemeStudio({
 
   return {
     update(prefs) {
+      if (destroyed) return;
       if (prefs?.language) {
         syncLanguageButtons(prefs.language);
       }
       if (prefs?.backdropStatus) {
         state.backdropStatus = prefs.backdropStatus;
       }
-      if (prefs?.themeState) {
+      if (prefs?.themeState && !persistInFlight && saveTimer === null) {
         hydrateThemeState(prefs.themeState);
         renderPaletteChips();
         syncColorPickers();
@@ -1736,10 +1845,13 @@ export function createThemeStudio({
       renderBackdropCompanion();
     },
     destroy() {
+      destroyed = true;
       clearTimeout(saveTimer);
       clearTimeout(dragClassTimer);
       clearTimeout(statusTimer);
       clearInterval(backdropPollTimer);
+      trackedTimers.forEach((id) => clearTimeout(id));
+      trackedTimers.clear();
       if (typeof document !== "undefined") {
         document.documentElement?.classList?.remove("is-dragging-theme");
       }

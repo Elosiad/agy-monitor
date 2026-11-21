@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { syncPluginToConfig } from './sync_to_plugins.mjs';
-import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
+import { atomicWriteJson, resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 import { ensureBackdropAssets } from '../sidecars/agy_monitor/backend/backdrop_manager.mjs';
 
@@ -122,6 +122,32 @@ export async function installPlugin({
     log('[4/4] 当前平台无需编译 Windows 壁纸伴侣，控制台面板已就绪');
   }
 
+  // Record installed version in install_meta.json so the update badge matches local ZIP installs accurately
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(syncRes.targetDir, 'plugin.json'), 'utf8'));
+    const installedVersion =
+      typeof manifest?.version === 'string' && manifest.version.trim()
+        ? manifest.version.trim().replace(/^v/i, '')
+        : '1.0.0';
+    const metaPath = path.join(paths.pluginDataDir, 'install_meta.json');
+    let prevMeta = null;
+    try {
+      prevMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    } catch {
+      prevMeta = null;
+    }
+    const prevVersion = typeof prevMeta?.version === 'string' ? prevMeta.version.trim().replace(/^v/i, '') : '';
+    const keepSha = prevVersion === installedVersion && typeof prevMeta?.commitSha === 'string';
+    await atomicWriteJson(metaPath, {
+      version: installedVersion,
+      commitSha: keepSha ? prevMeta.commitSha : '',
+      shortSha: keepSha ? (prevMeta.shortSha || prevMeta.commitSha.slice(0, 7)) : '',
+      updatedAtMs: Date.now(),
+    });
+  } catch {
+    // Non-fatal metadata update failure
+  }
+
   log('');
   log('✓ 安装完成！零侵入设计，未修改任何 Antigravity 宿主核心文件。');
   log('');
@@ -155,9 +181,19 @@ function parseCliArgs(argv) {
   return opts;
 }
 
-const isEntrypoint =
-  typeof process.argv[1] === 'string' &&
-  path.resolve(process.argv[1]) === __filename;
+function isSameEntrypoint(argvPath, modulePath) {
+  if (typeof argvPath !== 'string' || !argvPath) return false;
+  try {
+    const a = fs.realpathSync(path.resolve(argvPath));
+    const b = fs.realpathSync(modulePath);
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    const a = path.resolve(argvPath);
+    return process.platform === 'win32' ? a.toLowerCase() === modulePath.toLowerCase() : a === modulePath;
+  }
+}
+
+const isEntrypoint = isSameEntrypoint(process.argv[1], __filename);
 
 if (isEntrypoint) {
   const opts = parseCliArgs(process.argv.slice(2));

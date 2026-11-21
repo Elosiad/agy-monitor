@@ -144,10 +144,9 @@ const RASTER_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|gif|bmp)(?:[?#].*)?$/i;
 function looksLikeLocalAbsPath(raw) {
   const s = String(raw || "").trim();
   if (!s || /[\r\n<>"]/.test(s)) return false;
-  if (/^file:\/\//i.test(s)) return true;
-  if (/^[a-zA-Z]:[\\/][^\s*?"<>|]+/.test(s)) return true;
-  if (/^\\\\[^\\/\s]+\\[^\\/\s]+/.test(s)) return true;
-  if (/^\/(?:Users|home|var|tmp|opt|etc|mnt|Volumes)\/[^\s]+/.test(s)) return true;
+  if (/^file:\/\/(?:\/|localhost\/)/i.test(s)) return true;
+  if (/^[a-zA-Z]:[\\/][^\s*?"<>|]+$/.test(s)) return true;
+  if (/^\/(?:Users|home|var|tmp|opt|etc|mnt|Volumes)\/[^\s]+$/.test(s)) return true;
   return false;
 }
 
@@ -613,22 +612,26 @@ function renderSafeMarkdown(container, rawText, ctx = {}) {
     fenceLang = "";
   };
 
+  let fenceTickLen = 3;
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    const fenceMatch = /^\s*```([a-zA-Z0-9_+#.-]*)\s*$/.exec(line);
-    if (fenceMatch) {
-      if (inFence) {
+    if (inFence) {
+      const closeRe = new RegExp(`^\\s*\`{${fenceTickLen},}\\s*$`);
+      if (closeRe.test(line)) {
         flushFence();
         inFence = false;
       } else {
-        inFence = true;
-        fenceLang = fenceMatch[1] || "";
-        fenceLines = [];
+        fenceLines.push(line);
       }
       continue;
     }
-    if (inFence) {
-      fenceLines.push(line);
+    const openMatch = /^\s*(`{3,})([^\n`]*)$/.exec(line);
+    if (openMatch) {
+      inFence = true;
+      fenceTickLen = openMatch[1].length;
+      const infoToken = String(openMatch[2] || "").trim().split(/\s+/)[0] || "";
+      fenceLang = /^[a-zA-Z0-9_+#.-]+$/.test(infoToken) ? infoToken : "";
+      fenceLines = [];
       continue;
     }
     if (!line.trim()) continue;
@@ -1095,11 +1098,13 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
           `/api/mastery/local-image?format=json&path=${encodeURIComponent(key)}`
         );
         if (!res || !res.ok) return "";
-        if (typeof res.json === "function") {
+        const ct = String(res.headers?.get?.("content-type") || "").toLowerCase();
+        if (typeof res.json === "function" && (!ct || ct.includes("json"))) {
           const data = await res.json().catch(() => null);
           if (data && typeof data.dataUrl === "string" && data.dataUrl.startsWith("data:image/")) {
             return data.dataUrl;
           }
+          return "";
         }
         if (typeof res.blob === "function" && typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
           const blob = await res.blob();
@@ -1110,7 +1115,13 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
         }
         return "";
       })
-      .catch(() => "");
+      .catch(() => "")
+      .then((result) => {
+        if (!result && localImageUrlCache.get(key) === req) {
+          localImageUrlCache.delete(key);
+        }
+        return result;
+      });
     localImageUrlCache.set(key, req);
     return req;
   };
@@ -1935,8 +1946,13 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     return btn;
   };
 
-  const renderSnapshot = (snap, { reqCfgSeq = null } = {}) => {
+  let selectionSeq = 0;
+  let pendingRefresh = false;
+
+  const renderSnapshot = (snap, { reqCfgSeq = null, reqSelSeq = null } = {}) => {
     if (!snap) return;
+    const isStaleSelection = reqSelSeq !== null && reqSelSeq !== selectionSeq;
+    if (isStaleSelection) return;
     lastSnapshot = snap;
     const allowConfigHydrate =
       configSaveInFlight === 0 && (reqCfgSeq === null || reqCfgSeq === configMutationSeq);
@@ -1944,7 +1960,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
       configState = snap.config;
       renderConfigRow();
     }
-    if (snap.selectedSessionId) {
+    if (snap.selectedSessionId && reqSelSeq === null) {
+      selectedSessionId = snap.selectedSessionId;
+    } else if (snap.selectedSessionId && reqSelSeq === selectionSeq) {
       selectedSessionId = snap.selectedSessionId;
     }
 
@@ -2018,6 +2036,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
 
           btn.addEventListener("click", () => {
             if (selectedSessionId === s.id && !detailAgentKey) return;
+            selectionSeq += 1;
             selectedSessionId = s.id;
             hoveredAgentId = null;
             if (detailAgentKey) closeAgentDetail();
@@ -2106,19 +2125,28 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     }
   };
 
-  const refreshMastery = async () => {
-    if (destroyed || inFlight || typeof apiFetch !== "function") return;
+  const refreshMastery = async ({ force = false } = {}) => {
+    if (destroyed || typeof apiFetch !== "function") return;
+    if (inFlight) {
+      if (force) pendingRefresh = true;
+      return;
+    }
     inFlight = true;
     const reqCfgSeq = configMutationSeq;
+    const reqSelSeq = selectionSeq;
     try {
       const qs = selectedSessionId ? `?sessionId=${encodeURIComponent(selectedSessionId)}` : "";
       const data = await callJson(apiFetch, `/api/mastery${qs}`);
       if (destroyed) return;
-      renderSnapshot(data, { reqCfgSeq });
+      renderSnapshot(data, { reqCfgSeq, reqSelSeq });
     } catch {
       // Non-fatal refresh error
     } finally {
       inFlight = false;
+      if (pendingRefresh && !destroyed) {
+        pendingRefresh = false;
+        void refreshMastery({ force: false });
+      }
     }
   };
 
@@ -2138,6 +2166,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   };
 
   // ========== Third-Party Modal Logic ==========
+  let tpModalSeq = 0;
+  let tpSaveInFlight = false;
+
   const populateModelSelect = (models, selectedValue) => {
     if (!tpModelSelect) return;
     tpModelSelect.textContent = "";
@@ -2182,6 +2213,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
 
   const openThirdPartyModal = () => {
     if (!modalBackdrop) return;
+    tpModalSeq += 1;
     const tp = configState.thirdParty || {};
     draftProto = tp.protocol === "anthropic" ? "anthropic" : "openai";
     const preset = PROTOCOL_PRESETS[draftProto];
@@ -2212,6 +2244,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   };
 
   const closeThirdPartyModal = () => {
+    tpModalSeq += 1;
     if (modalBackdrop) modalBackdrop.hidden = true;
   };
 
@@ -2224,6 +2257,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     document,
     "keydown",
     (e) => {
+      if (!tabActive) return;
       if (lightboxBackdrop && !lightboxBackdrop.hidden) {
         if (e.key === "Escape") {
           e.stopImmediatePropagation?.();
@@ -2367,6 +2401,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     on(btn, "click", () => {
       const nextProto = btn.getAttribute("data-tp-proto") || "openai";
       if (nextProto === draftProto) return;
+      tpModalSeq += 1;
       applyProtocolUi(nextProto, true);
       draftModels = [...(PROTOCOL_PRESETS[nextProto] || PROTOCOL_PRESETS.openai).models];
       populateModelSelect(draftModels, draftModels[0]);
@@ -2389,6 +2424,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
   });
 
   on(tpFetchBtn, "click", async () => {
+    const reqSeq = tpModalSeq;
+    const reqProto = draftProto;
+    const prevSelected = tpModelSelect ? tpModelSelect.value : "";
     const baseUrl = tpUrlInput ? tpUrlInput.value.trim() : "";
     const apiKey = tpKeyInput ? tpKeyInput.value.trim() : "";
     tpFetchBtn.disabled = true;
@@ -2400,28 +2438,36 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
     try {
       const res = await callJson(apiFetch, "/api/mastery/thirdparty/models", {
         method: "POST",
-        body: JSON.stringify({ protocol: draftProto, baseUrl, apiKey }),
+        body: JSON.stringify({ protocol: reqProto, baseUrl, apiKey }),
       });
+      if (destroyed || reqSeq !== tpModalSeq) return;
       if (Array.isArray(res?.models) && res.models.length > 0) {
         draftModels = res.models;
-        populateModelSelect(draftModels, draftModels[0]);
+        const preferredModel =
+          prevSelected && draftModels.includes(prevSelected) ? prevSelected : draftModels[0];
+        populateModelSelect(draftModels, preferredModel);
         if (tpFetchStatus) {
           tpFetchStatus.textContent = `✓ 已实时拉取 ${draftModels.length} 个模型 (${res.latencyMs || 0}ms)`;
           tpFetchStatus.className = "tp-fetch-status is-ok";
         }
       }
     } catch (err) {
+      if (destroyed || reqSeq !== tpModalSeq) return;
       if (tpFetchStatus) {
         tpFetchStatus.textContent = err?.message || "拉取模型失败，已保留当前列表";
         tpFetchStatus.className = "tp-fetch-status is-warn";
       }
     } finally {
-      tpFetchBtn.disabled = false;
-      tpFetchBtn.textContent = "获取模型";
+      if (!destroyed) {
+        tpFetchBtn.disabled = false;
+        tpFetchBtn.textContent = "获取模型";
+      }
     }
   });
 
   on(tpTestConnBtn, "click", async () => {
+    const reqSeq = tpModalSeq;
+    const reqProto = draftProto;
     const baseUrl = tpUrlInput ? tpUrlInput.value.trim() : "";
     const apiKey = tpKeyInput ? tpKeyInput.value.trim() : "";
     const model = tpModelSelect ? tpModelSelect.value : "";
@@ -2442,51 +2488,63 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onToast } = {
       const res = await callJson(apiFetch, "/api/mastery/thirdparty/test", {
         method: "POST",
         body: JSON.stringify({
-          protocol: draftProto,
+          protocol: reqProto,
           baseUrl,
           apiKey,
           model,
           thinking: configState.thinking,
         }),
       });
+      if (destroyed || reqSeq !== tpModalSeq) return;
       if (tpTestResult) {
-        tpTestResult.textContent = `✓ ${PROTOCOL_PRESETS[draftProto].name} 连通正常 · ${model} (${res.latencyMs}ms)`;
+        tpTestResult.textContent = `✓ ${(PROTOCOL_PRESETS[reqProto] || PROTOCOL_PRESETS.openai).name} 连通正常 · ${model} (${res.latencyMs}ms)`;
         tpTestResult.className = "tp-test-result is-ok";
       }
     } catch (err) {
+      if (destroyed || reqSeq !== tpModalSeq) return;
       if (tpTestResult) {
         tpTestResult.textContent = err?.message || "连通测试失败";
         tpTestResult.className = "tp-test-result is-err";
       }
     } finally {
-      tpTestConnBtn.disabled = false;
-      tpTestConnBtn.textContent = "测试连通";
+      if (!destroyed) {
+        tpTestConnBtn.disabled = false;
+        tpTestConnBtn.textContent = "测试连通";
+      }
     }
   });
 
   on(tpSaveBtn, "click", async () => {
+    if (tpSaveInFlight) return;
+    tpSaveInFlight = true;
+    if (tpSaveBtn) tpSaveBtn.disabled = true;
     const baseUrl =
       (tpUrlInput ? tpUrlInput.value.trim() : "") || PROTOCOL_PRESETS[draftProto].urlPlaceholder;
     const apiKey = tpKeyInput ? tpKeyInput.value.trim() : "";
     const selectedModel = tpModelSelect ? tpModelSelect.value : draftModels[0] || "gpt-4o-mini";
 
-    const saved = await saveConfigPatch(
-      {
-        enabled: true,
-        source: "thirdparty",
-        thirdParty: {
-          protocol: draftProto,
-          baseUrl,
-          ...(apiKey ? { apiKey } : {}),
-          fetchedModels: [...draftModels],
-          selectedModel,
+    try {
+      const saved = await saveConfigPatch(
+        {
+          enabled: true,
+          source: "thirdparty",
+          thirdParty: {
+            protocol: draftProto,
+            baseUrl,
+            ...(apiKey ? { apiKey } : {}),
+            fetchedModels: [...draftModels],
+            selectedModel,
+          },
         },
-      },
-      { toastText: `已保存并启用第三方总结模型：${selectedModel}` }
-    );
-    if (saved) {
-      closeThirdPartyModal();
-      void refreshMastery();
+        { toastText: `已保存并启用第三方总结模型：${selectedModel}` }
+      );
+      if (saved && !destroyed) {
+        closeThirdPartyModal();
+        void refreshMastery();
+      }
+    } finally {
+      tpSaveInFlight = false;
+      if (!destroyed && tpSaveBtn) tpSaveBtn.disabled = false;
     }
   });
 

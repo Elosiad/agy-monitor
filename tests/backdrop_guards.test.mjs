@@ -49,4 +49,14 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   const lbAssign = lbBlock.indexOf('_lightbox = win;');
   const lbShow = lbBlock.indexOf('win.Show();');
   assert.ok(lbAssign > 0 && lbShow > 0 && lbAssign < lbShow, '_lightbox must be bound before win.Show()');
+
+  // 7. v1.0.5 companion resource safety, mixed-DPI lightbox & comma-safe Explorer selection
+  assert.match(src, /SHOpenFolderAndSelectItems/, 'OpenTargetFolder should use SHOpenFolderAndSelectItems');
+  assert.match(src, /using\s*\(\s*Process\s+/, 'Process instances must be disposed with using');
+  assert.match(src, /private\s+volatile\s+bool\s+_disposed\s*=\s*false;/, '_disposed must be volatile across threads');
+  const lbClassStart = src.indexOf('internal sealed class ImageLightboxWindow');
+  const hudClassStart = src.indexOf('internal sealed class HudOverlayWindow');
+  assert.ok(lbClassStart > 0 && hudClassStart > lbClassStart);
+  const lbClassSrc = src.slice(lbClassStart, hudClassStart);
+  assert.match(lbClassSrc, /TransformToDevice/, 'ImageLightboxWindow must compensate mixed-DPI via TransformToDevice');
 });

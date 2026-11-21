@@ -4,7 +4,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { atomicWriteJson, atomicWriteText } from './paths.mjs';
+import { atomicWriteBuffer, atomicWriteJson, atomicWriteText } from './paths.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -130,13 +130,15 @@ export async function ensureCdpLauncher(paths, cdpPort = DEFAULT_CDP_PORT) {
         `sh.Run """${escapeVbsString(exePath)}"" ${cdpArg}", 1, False`,
         '',
       ].join('\r\n');
-      await atomicWriteText(launcherVbsPath, vbsContent).catch(() => {});
+      const vbsBuf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(vbsContent, 'utf16le')]);
+      await atomicWriteBuffer(launcherVbsPath, vbsBuf).catch(() => {});
     }
 
     if (launcherCmdPath) {
       const cmdContent = launcherVbsPath
         ? [
             '@echo off',
+            'chcp 65001 >nul',
             'rem 静默无黑窗启动 Antigravity 高清壁纸模式 (纯 CSS CDP 通道，不修改 app.asar)',
             `start "" wscript.exe //Nologo "${launcherVbsPath}"`,
             'exit /b 0',
@@ -144,6 +146,7 @@ export async function ensureCdpLauncher(paths, cdpPort = DEFAULT_CDP_PORT) {
           ].join('\r\n')
         : [
             '@echo off',
+            'chcp 65001 >nul',
             `start "" /b "${exePath}" ${cdpArg}`,
             'exit /b 0',
             '',
@@ -641,9 +644,10 @@ function buildHudSyncExpr(hudPayload, accentColor) {
 
     var anchor = findComposerAnchor();
     var hud = document.getElementById(HUD_ID);
+    var focused = typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
     if (!anchor) {
       if (hud && hud.parentNode) hud.parentNode.removeChild(hud);
-      return { hudInjected: false, activeView: readActiveView() };
+      return { hudInjected: false, activeView: readActiveView(), focused: focused };
     }
 
     if (!hud) {
@@ -720,7 +724,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       metaBtn.style.display = parentRect.width < 220 ? 'none' : 'inline-flex';
     }
 
-    return { hudInjected: true, activeView: readActiveView() };
+    return { hudInjected: true, activeView: readActiveView(), focused: focused };
   })(${safePayload})`;
 }
 
@@ -988,6 +992,18 @@ function buildHostI18nApplyExpr() {
 
       var pending = new Set();
       var flushTimer = null;
+      function pruneDisconnected() {
+        if (origText.size > 400) {
+          origText.forEach(function(_, node) {
+            if (!node || !node.isConnected) origText.delete(node);
+          });
+        }
+        if (origAttr.size > 200) {
+          origAttr.forEach(function(_, el) {
+            if (!el || !el.isConnected) origAttr.delete(el);
+          });
+        }
+      }
       function flushPending() {
         flushTimer = null;
         var list = Array.from(pending);
@@ -995,6 +1011,7 @@ function buildHostI18nApplyExpr() {
         for (var i = 0; i < list.length; i++) {
           scanRoot(list[i]);
         }
+        pruneDisconnected();
       }
 
       var observer = new MutationObserver(function(muts) {
@@ -1018,6 +1035,7 @@ function buildHostI18nApplyExpr() {
         observer.observe(document.body, { childList: true, subtree: true, characterData: true });
       }
 
+      window.__agyHostI18nApplied = true;
       window.__agyMonI18n = {
         rescan: function() { if (document.body) scanRoot(document.body); },
         stop: function() {
@@ -1035,10 +1053,12 @@ function buildHostI18nApplyExpr() {
             } catch (e) {}
           });
           origAttr.clear();
+          delete window.__agyHostI18nApplied;
           delete window.__agyMonI18n;
         }
       };
     } else {
+      window.__agyHostI18nApplied = true;
       window.__agyMonI18n.rescan();
     }
     return true;
@@ -1063,10 +1083,12 @@ function buildHostI18nRestoreExpr() {
 export function createCdpThemeBridge(paths) {
   /** @type {Map<string, { ws: WebSocket, wsUrl: string, title: string, url: string, type: string, cssApplied: boolean, hudInjected: boolean, hostLocalized: boolean }>} */
   const sessions = new Map();
+  const connectingUrls = new Set();
   let lastError = '';
   let activePort = DEFAULT_CDP_PORT;
   let cmdSeq = 1;
   let retryTimer = null;
+  let retryTickCount = 0;
   let hudTickTimer = null;
   let latestThemes = null;
   let latestHostLanguage = 'zh-CN';
@@ -1157,19 +1179,51 @@ export function createCdpThemeBridge(paths) {
         return;
       }
       const id = cmdSeq++;
-      const timer = setTimeout(() => {
+      let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timer);
         sock.removeEventListener?.('message', onMsg);
-        reject(new Error('CDP evaluate timeout'));
+        sock.removeEventListener?.('close', onClose);
+        sock.removeEventListener?.('error', onError);
+      };
+
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+
+      const succeed = (val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(val);
+      };
+
+      const timer = setTimeout(() => {
+        fail(new Error('CDP evaluate timeout'));
       }, 1500);
+
+      const onClose = () => fail(new Error('CDP WebSocket closed'));
+      const onError = () => fail(new Error('CDP WebSocket error'));
 
       const onMsg = (evt) => {
         try {
           const parsed = JSON.parse(String(evt.data || ''));
           if (parsed.id === id) {
-            clearTimeout(timer);
-            sock.removeEventListener?.('message', onMsg);
-            if (parsed.error) reject(new Error(parsed.error.message || 'CDP error'));
-            else resolve(parsed.result);
+            if (parsed.error) {
+              fail(new Error(parsed.error.message || 'CDP error'));
+            } else if (parsed.result?.exceptionDetails) {
+              const exMsg =
+                parsed.result.exceptionDetails.exception?.description ||
+                parsed.result.exceptionDetails.text ||
+                'CDP evaluation exception';
+              fail(new Error(exMsg));
+            } else {
+              succeed(parsed.result);
+            }
           }
         } catch {
           // ignore non-matching frames
@@ -1177,24 +1231,47 @@ export function createCdpThemeBridge(paths) {
       };
 
       sock.addEventListener('message', onMsg);
-      sock.send(
-        JSON.stringify({
-          id,
-          method: 'Runtime.evaluate',
-          params: { expression, returnByValue: true },
-        }),
-      );
+      sock.addEventListener('close', onClose);
+      sock.addEventListener('error', onError);
+      try {
+        sock.send(
+          JSON.stringify({
+            id,
+            method: 'Runtime.evaluate',
+            params: { expression, returnByValue: true },
+          }),
+        );
+      } catch (err) {
+        fail(err instanceof Error ? err : new Error('CDP send failed'));
+      }
     });
 
   const openSession = (target) =>
     new Promise((resolve) => {
       const url = target.webSocketDebuggerUrl;
+      if (disposed || !url) {
+        resolve(null);
+        return;
+      }
       const existing = sessions.get(url);
       if (existing && existing.ws && existing.ws.readyState === 1) {
         existing.title = String(target.title || existing.title || '');
         resolve(existing);
         return;
       }
+      if (connectingUrls.has(url)) {
+        resolve(null);
+        return;
+      }
+      connectingUrls.add(url);
+
+      let settled = false;
+      const finish = (val) => {
+        if (settled) return;
+        settled = true;
+        connectingUrls.delete(url);
+        resolve(val);
+      };
 
       try {
         const sock = new globalThis.WebSocket(url);
@@ -1204,11 +1281,28 @@ export function createCdpThemeBridge(paths) {
           } catch {
             // ignore
           }
-          resolve(null);
+          finish(null);
         }, 750);
 
         sock.addEventListener('open', () => {
           clearTimeout(openTimer);
+          if (disposed) {
+            try {
+              sock.close();
+            } catch {
+              // ignore
+            }
+            finish(null);
+            return;
+          }
+          const prev = sessions.get(url);
+          if (prev && prev.ws && prev.ws !== sock) {
+            try {
+              prev.ws.close();
+            } catch {
+              // ignore
+            }
+          }
           const entry = {
             ws: sock,
             wsUrl: url,
@@ -1220,7 +1314,7 @@ export function createCdpThemeBridge(paths) {
             hostLocalized: false,
           };
           sessions.set(url, entry);
-          resolve(entry);
+          finish(entry);
         });
 
         sock.addEventListener('close', () => {
@@ -1229,14 +1323,15 @@ export function createCdpThemeBridge(paths) {
           if (cur && cur.ws === sock) {
             sessions.delete(url);
           }
+          finish(null);
         });
 
         sock.addEventListener('error', () => {
           clearTimeout(openTimer);
-          resolve(null);
+          finish(null);
         });
       } catch {
-        resolve(null);
+        finish(null);
       }
     });
 
@@ -1319,17 +1414,43 @@ export function createCdpThemeBridge(paths) {
     );
   };
 
-  const maybeWriteActiveView = async (view) => {
+  const maybeWriteActiveView = async (view, { focused = true } = {}) => {
     if (!view || !paths?.hudActiveViewFile) return;
+    if (sessions.size > 1 && !focused) return;
     const title = String(view.title || '').trim();
     const workspace = String(view.workspace || '').trim();
     if (!title || title.length < 2) return;
     const key = `${workspace}|${title}`;
     if (key === lastActiveViewKey) return;
+
+    // Preserve recent explicit sidecar_focus selections from being clobbered by title-only DOM reads
+    try {
+      const existingRaw = await fsp.readFile(paths.hudActiveViewFile, 'utf8');
+      const existing = JSON.parse(existingRaw);
+      if (
+        existing &&
+        existing.source === 'sidecar_focus' &&
+        typeof existing.conversationId === 'string' &&
+        existing.conversationId.trim()
+      ) {
+        const ageMs = Date.now() - Number(existing.updatedAtMs || 0);
+        if (ageMs >= 0 && ageMs < 3000) {
+          return;
+        }
+        if (String(existing.title || '').trim().toLowerCase() === title.toLowerCase()) {
+          lastActiveViewKey = key;
+          return;
+        }
+      }
+    } catch {
+      // ignore missing/corrupt active view file
+    }
+
     lastActiveViewKey = key;
     await atomicWriteJson(paths.hudActiveViewFile, {
       workspace,
       title,
+      source: 'cdp_header',
       updatedAtMs: Date.now(),
     }).catch(() => {});
   };
@@ -1361,7 +1482,7 @@ export function createCdpThemeBridge(paths) {
         entry.hudInjected = Boolean(val?.hudInjected);
         if (entry.hudInjected) anyInjected = true;
         if (val?.activeView) {
-          await maybeWriteActiveView(val.activeView);
+          await maybeWriteActiveView(val.activeView, { focused: val?.focused !== false });
         }
       }),
     );
@@ -1385,8 +1506,12 @@ export function createCdpThemeBridge(paths) {
     await Promise.allSettled(
       [...sessions.values()].map(async (entry) => {
         if (entry.ws.readyState !== 1) return;
-        await sendEvaluateOn(entry, expr).catch(() => {});
-        entry.hostLocalized = true;
+        try {
+          await sendEvaluateOn(entry, expr);
+          entry.hostLocalized = true;
+        } catch {
+          entry.hostLocalized = false;
+        }
       }),
     );
   };
@@ -1412,6 +1537,28 @@ export function createCdpThemeBridge(paths) {
     }
   };
 
+  const probeSessionMarkers = async (needCss, needI18n) => {
+    const probeExpr = `(function(){ return { hasCss: Boolean(document.getElementById(${JSON.stringify(STYLE_ELEMENT_ID)})), hasI18n: Boolean(window.__agyHostI18nApplied) }; })()`;
+    let needsResync = false;
+    await Promise.allSettled(
+      [...sessions.values()].map(async (entry) => {
+        if (entry.ws.readyState !== 1) return;
+        const res = await sendEvaluateOn(entry, probeExpr).catch(() => null);
+        const val = res?.result?.value;
+        if (!val) return;
+        if (needCss && !val.hasCss) {
+          entry.cssApplied = false;
+          needsResync = true;
+        }
+        if (needI18n && !val.hasI18n) {
+          entry.hostLocalized = false;
+          needsResync = true;
+        }
+      }),
+    );
+    return needsResync;
+  };
+
   const ensureLoops = (wantCdp) => {
     if (wantCdp && !retryTimer && !disposed) {
       retryTimer = setInterval(() => {
@@ -1424,19 +1571,38 @@ export function createCdpThemeBridge(paths) {
           retryTimer = null;
           return;
         }
+        retryTickCount += 1;
         const needCss =
           latestThemes.hostThemeMode === 'cdp' &&
           Boolean(latestThemes.backdropEnabled) &&
           Boolean(latestThemes.activeWallpaperId);
-        const needI18n = latestHostLanguage === 'zh-CN' && !isAnyHostLocalized();
-        if (!hasOpenSessions() || (needCss && !isAnyStyleApplied()) || needI18n) {
+        const needI18n = latestHostLanguage === 'zh-CN';
+        if (!hasOpenSessions() || (needCss && !isAnyStyleApplied()) || (needI18n && !isAnyHostLocalized())) {
           void sync(latestThemes, { hostLanguage: latestHostLanguage });
+          return;
+        }
+        // Periodically detect newly opened windows & Ctrl+R page reloads whose DOM lost injected nodes
+        if (retryTickCount % 3 === 0) {
+          void (async () => {
+            const lostMarkers = await probeSessionMarkers(needCss, needI18n);
+            if (disposed || !latestThemes) return;
+            if (lostMarkers) {
+              await sync(latestThemes, { hostLanguage: latestHostLanguage });
+              return;
+            }
+            const prevCount = sessions.size;
+            const ok = await ensureConnected(activePort);
+            if (!disposed && ok && sessions.size > prevCount) {
+              await sync(latestThemes, { hostLanguage: latestHostLanguage });
+            }
+          })();
         }
       }, 2200);
       if (typeof retryTimer.unref === 'function') retryTimer.unref();
     } else if (!wantCdp && retryTimer) {
       clearInterval(retryTimer);
       retryTimer = null;
+      retryTickCount = 0;
     }
 
     if (wantCdp && !hudTickTimer && !disposed) {
@@ -1466,6 +1632,12 @@ export function createCdpThemeBridge(paths) {
       latestHostLanguage = options.hostLanguage;
     }
     const port = clampInt(themes.cdpPort, 1024, 65535, DEFAULT_CDP_PORT);
+    if (port !== activePort && sessions.size > 0) {
+      await restoreHostI18nAll().catch(() => {});
+      await removeCssAll().catch(() => {});
+      await removeHudAll().catch(() => {});
+      closeAllSessions();
+    }
     activePort = port;
     await ensureCdpLauncher(paths, port);
 
@@ -1481,8 +1653,8 @@ export function createCdpThemeBridge(paths) {
       return getStatus(themes);
     }
 
-    ensureLoops(isCdpMode || (hasOpenSessions() && latestHostLanguage === 'zh-CN'));
     const ok = await ensureConnected(port);
+    ensureLoops(isCdpMode || (hasOpenSessions() && latestHostLanguage === 'zh-CN'));
     if (!ok) {
       return getStatus(themes);
     }

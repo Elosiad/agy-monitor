@@ -258,7 +258,14 @@ export function createSessionsHub({
     return badge;
   }
 
+  let favoritesSeq = 0;
+  let favoritesInFlight = 0;
+  let destroyed = false;
+  let lastAddMenuSig = "";
+
   async function syncFavorites(nextIds) {
+    const reqSeq = ++favoritesSeq;
+    favoritesInFlight += 1;
     const prevIds = [...favoriteIds];
     favoriteIds = [...new Set(nextIds.map(String).filter(Boolean))];
     const lookup = buildSessionLookup();
@@ -277,18 +284,26 @@ export function createSessionsHub({
         method: "POST",
         body: JSON.stringify({ favoriteIds, favoriteTitles }),
       });
+      if (destroyed) return;
       if (resp?.ok === false) {
         throw new Error(resp.reason || resp.error || "favorites sync failed");
       }
-      if (Array.isArray(resp?.favoriteIds)) {
+      if (reqSeq === favoritesSeq && Array.isArray(resp?.favoriteIds)) {
         favoriteIds = resp.favoriteIds.map(String);
         renderAll();
       }
-      onFavoritesChanged?.([...favoriteIds]);
+      if (reqSeq === favoritesSeq) {
+        onFavoritesChanged?.([...favoriteIds]);
+      }
     } catch {
-      favoriteIds = prevIds;
-      renderAll();
-      onToast?.(tr("sessions.favoritesSyncFailed", "同步常用会话列表失败"), "error");
+      if (destroyed) return;
+      if (reqSeq === favoritesSeq) {
+        favoriteIds = prevIds;
+        renderAll();
+        onToast?.(tr("sessions.favoritesSyncFailed", "同步常用会话列表失败"), "error");
+      }
+    } finally {
+      favoritesInFlight = Math.max(0, favoritesInFlight - 1);
     }
   }
 
@@ -321,6 +336,7 @@ export function createSessionsHub({
         method: "POST",
         body: JSON.stringify({ conversationId: session.id, modifiedMs }),
       });
+      if (destroyed) return;
       if (showNotice) {
         showFeedback(tr("sessions.markedReadNotice", "已标记为已读"));
       }
@@ -573,9 +589,8 @@ export function createSessionsHub({
     container.appendChild(tip);
   }
 
-  function renderFavoriteAddMenu(lookup) {
+  function renderFavoriteAddMenu(lookup, { force = false } = {}) {
     if (!favoriteAddDropdown) return;
-    favoriteAddDropdown.innerHTML = "";
 
     const candidates = [];
     const seen = new Set();
@@ -590,6 +605,13 @@ export function createSessionsHub({
       seen.add(item.id);
       candidates.push(lookup.get(item.id) || item);
     });
+
+    const sig = candidates.map((c) => `${c.id}:${c.title || ""}:${c.workspace || ""}`).join("|");
+    if (!force && !favoriteAddDropdown.hidden && sig === lastAddMenuSig) {
+      return;
+    }
+    lastAddMenuSig = sig;
+    favoriteAddDropdown.innerHTML = "";
 
     if (candidates.length === 0) {
       const empty = document.createElement("div");
@@ -624,6 +646,9 @@ export function createSessionsHub({
 
   function setAddMenuOpen(open) {
     if (!favoriteAddWrap || !favoriteAddBtn || !favoriteAddDropdown) return;
+    if (open) {
+      renderFavoriteAddMenu(buildSessionLookup(), { force: true });
+    }
     favoriteAddDropdown.hidden = !open;
     favoriteAddWrap.classList.toggle("is-open", open);
     favoriteAddBtn.setAttribute("aria-expanded", String(open));
@@ -738,7 +763,9 @@ export function createSessionsHub({
             knownTitleMap.set(String(item.id), String(item.title));
           }
         });
-        favoriteIds = hubData.favorites.map((s) => String(s.id)).filter(Boolean);
+        if (favoritesInFlight === 0) {
+          favoriteIds = hubData.favorites.map((s) => String(s.id)).filter(Boolean);
+        }
 
         // Prune local optimistic read entries once backend caught up
         const unreadIdSet = new Set(hubData.unread.map((s) => s.id));
@@ -755,6 +782,7 @@ export function createSessionsHub({
       renderAll();
     },
     destroy() {
+      destroyed = true;
       if (feedbackTimer) {
         clearTimeout(feedbackTimer);
         feedbackTimer = null;

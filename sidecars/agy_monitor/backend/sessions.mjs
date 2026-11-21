@@ -139,22 +139,25 @@ export async function querySessionsHub(summariesDbPath, storage, telemetryMeta =
     return saved || convId.slice(0, 8);
   };
 
+  const fallbackResult = () => ({
+    active: [],
+    waiting: [],
+    unread: [],
+    recent: [],
+    favorites: favoriteIds.map((id) => ({
+      id,
+      title: resolveFavoriteFallbackTitle(id),
+      workspace: '',
+      modifiedMs: 0,
+      agoText: '',
+    })),
+    allSelectable: [],
+    subStatusById: {},
+  });
+
   const db = openSummariesReadOnly(summariesDbPath);
   if (!db) {
-    return {
-      active: [],
-      waiting: [],
-      unread: [],
-      recent: [],
-      favorites: favoriteIds.map((id) => ({
-        id,
-        title: resolveFavoriteFallbackTitle(id),
-        workspace: '',
-        modifiedMs: 0,
-        agoText: '',
-      })),
-      allSelectable: [],
-    };
+    return fallbackResult();
   }
 
   try {
@@ -169,6 +172,35 @@ export async function querySessionsHub(summariesDbPath, storage, telemetryMeta =
          LIMIT 200`
       )
       .all();
+
+    const subStatusById = {};
+    try {
+      const childRows = db
+        .prepare(
+          `SELECT conversation_id, parent_conversation_id, status, not_fully_idle,
+                  killed, step_count, last_modified_time
+           FROM conversation_summaries
+           WHERE COALESCE(parent_conversation_id, '') != ''
+              OR COALESCE(nesting_depth, 0) > 0
+           ORDER BY last_modified_time DESC
+           LIMIT 400`
+        )
+        .all();
+      for (const r of childRows) {
+        const cid = typeof r?.conversation_id === 'string' ? r.conversation_id.trim() : '';
+        if (!cid) continue;
+        subStatusById[cid] = {
+          parentId: typeof r.parent_conversation_id === 'string' ? r.parent_conversation_id.trim() : '',
+          status: typeof r.status === 'string' ? r.status : '',
+          notFullyIdle: Number(r.not_fully_idle || 0) === 1,
+          killed: Number(r.killed || 0) === 1,
+          stepCount: Number(r.step_count || 0),
+          modifiedMs: parseTimestampMs(r.last_modified_time),
+        };
+      }
+    } catch {
+      // Optional child-row index on older/minimal test schemas lacking nesting_depth
+    }
 
     const mapped = rawRows.map((r) => mapRow(r, favoriteSet, nowMs));
     const byId = new Map(mapped.map((m) => [m.id, m]));
@@ -287,7 +319,10 @@ export async function querySessionsHub(summariesDbPath, storage, telemetryMeta =
       recent,
       favorites,
       allSelectable,
+      subStatusById,
     };
+  } catch {
+    return fallbackResult();
   } finally {
     try {
       db.close();
@@ -302,26 +337,36 @@ export async function markRead(storage, { conversationId, modifiedMs } = {}) {
   if (!id) {
     throw new Error('conversationId is required');
   }
-  const meta = (await storage?.getSessionsMeta?.()) || {};
-  const existingMap =
-    meta.lastSeenModifiedMs || meta.lastSeenByConv || {};
-  const prevMap =
-    existingMap && typeof existingMap === 'object' ? { ...existingMap } : {};
-  const ts = Math.max(Number(prevMap[id] || 0), Number(modifiedMs) || Date.now());
-  prevMap[id] = ts;
 
-  const watermark = Number(meta.firstTrackWatermarkMs || meta.initializedAtMs || 0) || Date.now();
-  const nextMeta = {
-    favoriteIds: Array.isArray(meta.favoriteIds) ? meta.favoriteIds : [],
-    favoriteTitles:
-      meta.favoriteTitles && typeof meta.favoriteTitles === 'object' ? meta.favoriteTitles : {},
-    lastSeenModifiedMs: prevMap,
-    lastSeenByConv: { ...prevMap },
-    firstTrackWatermarkMs: watermark,
-    initializedAtMs: watermark,
+  let resolvedTs = Number(modifiedMs) || Date.now();
+  const buildNext = (meta = {}) => {
+    const existingMap = meta.lastSeenModifiedMs || meta.lastSeenByConv || {};
+    const prevMap = existingMap && typeof existingMap === 'object' ? { ...existingMap } : {};
+    const ts = Math.max(Number(prevMap[id] || 0), Number(modifiedMs) || Date.now());
+    resolvedTs = ts;
+    prevMap[id] = ts;
+    const watermark = Number(meta.firstTrackWatermarkMs || meta.initializedAtMs || 0) || Date.now();
+    return {
+      ...meta,
+      favoriteIds: Array.isArray(meta.favoriteIds) ? meta.favoriteIds : [],
+      favoriteTitles:
+        meta.favoriteTitles && typeof meta.favoriteTitles === 'object' ? { ...meta.favoriteTitles } : {},
+      lastSeenModifiedMs: prevMap,
+      lastSeenByConv: { ...prevMap },
+      lastSeenByAgent:
+        meta.lastSeenByAgent && typeof meta.lastSeenByAgent === 'object' ? { ...meta.lastSeenByAgent } : {},
+      firstTrackWatermarkMs: watermark,
+      initializedAtMs: watermark,
+    };
   };
-  await saveSessionsMetaCompat(storage, nextMeta);
-  return { ok: true, conversationId: id, modifiedMs: ts };
+
+  if (typeof storage?.updateSessionsMeta === 'function') {
+    await storage.updateSessionsMeta(buildNext);
+  } else {
+    const meta = (await storage?.getSessionsMeta?.()) || {};
+    await saveSessionsMetaCompat(storage, buildNext(meta));
+  }
+  return { ok: true, conversationId: id, modifiedMs: resolvedTs };
 }
 
 export async function setFavorites(storage, { favoriteIds, favoriteTitles } = {}) {
@@ -329,21 +374,30 @@ export async function setFavorites(storage, { favoriteIds, favoriteTitles } = {}
     throw new Error('favoriteIds must be an array');
   }
   const cleaned = [...new Set(favoriteIds.map((x) => String(x || '').trim()).filter(Boolean))];
-  const meta = (await storage?.getSessionsMeta?.()) || {};
-  const existingMap =
-    meta.lastSeenModifiedMs || meta.lastSeenByConv || {};
-  const watermark = Number(meta.firstTrackWatermarkMs || meta.initializedAtMs || 0) || Date.now();
-  const nextMeta = {
-    favoriteIds: cleaned,
-    favoriteTitles: {
-      ...(meta.favoriteTitles && typeof meta.favoriteTitles === 'object' ? meta.favoriteTitles : {}),
-      ...(favoriteTitles && typeof favoriteTitles === 'object' ? favoriteTitles : {}),
-    },
-    lastSeenModifiedMs: { ...existingMap },
-    lastSeenByConv: { ...existingMap },
-    firstTrackWatermarkMs: watermark,
-    initializedAtMs: watermark,
+  const buildNext = (meta = {}) => {
+    const existingMap = meta.lastSeenModifiedMs || meta.lastSeenByConv || {};
+    const watermark = Number(meta.firstTrackWatermarkMs || meta.initializedAtMs || 0) || Date.now();
+    return {
+      ...meta,
+      favoriteIds: cleaned,
+      favoriteTitles: {
+        ...(meta.favoriteTitles && typeof meta.favoriteTitles === 'object' ? meta.favoriteTitles : {}),
+        ...(favoriteTitles && typeof favoriteTitles === 'object' ? favoriteTitles : {}),
+      },
+      lastSeenModifiedMs: { ...existingMap },
+      lastSeenByConv: { ...existingMap },
+      lastSeenByAgent:
+        meta.lastSeenByAgent && typeof meta.lastSeenByAgent === 'object' ? { ...meta.lastSeenByAgent } : {},
+      firstTrackWatermarkMs: watermark,
+      initializedAtMs: watermark,
+    };
   };
-  await saveSessionsMetaCompat(storage, nextMeta);
+
+  if (typeof storage?.updateSessionsMeta === 'function') {
+    await storage.updateSessionsMeta(buildNext);
+  } else {
+    const meta = (await storage?.getSessionsMeta?.()) || {};
+    await saveSessionsMetaCompat(storage, buildNext(meta));
+  }
   return { ok: true, favoriteIds: cleaned };
 }

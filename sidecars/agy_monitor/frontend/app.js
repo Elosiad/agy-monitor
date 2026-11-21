@@ -234,6 +234,7 @@ export function mountMonitorApp() {
     });
     updateFollowModeUi();
     updateActiveConvBadge();
+    renderUpdateButtonUi?.();
   }
 
   async function refreshPreferences() {
@@ -301,6 +302,8 @@ export function mountMonitorApp() {
       }
       const data = await fetchJson(`/api/snapshot?${params.toString()}`);
       if (destroyed) return;
+      // Discard stale poll response when user already changed scope/range/session while request was in flight
+      if (pendingForcedRefresh) return;
 
       if (data && !data.unchanged) {
         const nextConvId = String(

@@ -270,10 +270,17 @@ export function classifyToolCall(tc) {
     if (name === 'write_file') {
       addCount = countLines(args.Content || '');
     } else if (typeof args.Replacement === 'string' || typeof args.Target === 'string') {
-      const tLines = countLines(args.Target || '');
-      const rLines = countLines(args.Replacement || '');
-      addCount = rLines;
-      delCount = tLines;
+      addCount = countLines(args.Replacement || '');
+      delCount = countLines(args.Target || '');
+    } else if (typeof args.ReplacementContent === 'string' || typeof args.TargetContent === 'string') {
+      addCount = countLines(args.ReplacementContent || '');
+      delCount = countLines(args.TargetContent || '');
+    } else if (Array.isArray(args.ReplacementChunks)) {
+      for (const ch of args.ReplacementChunks) {
+        if (!ch || typeof ch !== 'object') continue;
+        addCount += countLines(ch.ReplacementContent || '');
+        delCount += countLines(ch.TargetContent || '');
+      }
     }
     return {
       category: 'edit',
@@ -577,12 +584,9 @@ export async function parseAgentJourney(
     }
 
     const rawContent = typeof entry.content === 'string' ? entry.content.trim() : '';
-    const rawThinking = typeof entry.thinking === 'string' ? entry.thinking.trim() : '';
 
-    // Check explicit [AGY_PROGRESS|pct%|summary] in content first, then thinking
-    const tagFromContent = parseProgressTag(rawContent);
-    const tagFromThinking = !tagFromContent ? parseProgressTag(rawThinking) : null;
-    const tag = tagFromContent || tagFromThinking;
+    // Parse [AGY_PROGRESS|pct%|summary] strictly from visible content (never leak private thinking prose)
+    const tag = parseProgressTag(rawContent);
 
     if (tag) {
       if (inCurrentRun) {
@@ -762,7 +766,7 @@ function buildCompactDigest(brief, steps) {
   return `任务：${stripMarkdownForPlainLine(brief).slice(0, 160)}\n最近步骤：\n${recent.join('\n')}`;
 }
 
-async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
+async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning, subStatusById = {}) {
   const sysDir = path.join(brainDir, convId, '.system_generated');
   const swarmDir = path.join(sysDir, 'swarm');
   const subDir = path.join(sysDir, 'subagents');
@@ -771,6 +775,15 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
   const subsByConv = new Map();
   const rosterNameToId = new Map();
   let swarmTitle = '';
+
+  const resolveDbSubState = (subConvId) => {
+    const dbSub = subStatusById && typeof subStatusById === 'object' ? subStatusById[subConvId] : null;
+    if (!dbSub || typeof dbSub !== 'object') return null;
+    if (dbSub.killed) return 'killed';
+    if (dbSub.status === 'CASCADE_RUN_STATUS_RUNNING' || dbSub.notFullyIdle) return 'running';
+    if (dbSub.status === 'CASCADE_RUN_STATUS_IDLE') return 'idle';
+    return null;
+  };
 
   // 1. Read swarm/members.json if present
   const membersDoc = await readJsonFileSafe(path.join(swarmDir, 'members.json'));
@@ -789,9 +802,15 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
       rosterNameToId.set(rosterName.toLowerCase(), nodeId);
 
       const phase = String(info.phase || info.desired_state || '').toUpperCase();
+      const dbState = resolveDbSubState(subConvId);
       let stateKind = 'sleep';
-      if (info.killed || phase === 'STOPPED' || phase === 'DONE' || phase === 'COMPLETED') {
+      let authoritativeState = Boolean(dbState);
+      if (info.killed || dbState === 'killed' || phase === 'STOPPED' || phase === 'DONE' || phase === 'COMPLETED') {
         stateKind = 'unread';
+      } else if (dbState === 'running') {
+        stateKind = 'running';
+      } else if (dbState === 'idle') {
+        stateKind = parentIsRunning ? 'sleep' : 'unread';
       } else if (parentIsRunning && (phase === 'RUNNING' || phase === 'WORKING')) {
         stateKind = 'running';
       } else if (!parentIsRunning) {
@@ -805,6 +824,7 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
         name: rosterName,
         typeName: 'worker',
         stateKind,
+        authoritativeState,
         model: String(info.applied_model || info.model || ''),
         spawnStep: 0,
       });
@@ -822,6 +842,7 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
       const desc = doc.subagentDescriptor && typeof doc.subagentDescriptor === 'object' ? doc.subagentDescriptor : {};
       const roleTitle = String(desc.role || desc.typeName || subConvId.slice(0, 8)).trim();
       const rawState = String(doc.state || '').toUpperCase();
+      const dbState = resolveDbSubState(subConvId);
 
       const existing = subsByConv.get(subConvId);
       if (existing) {
@@ -829,14 +850,24 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
           existing.name = roleTitle;
         }
         existing.spawnStep = Number(doc.spawnStepIndex || existing.spawnStep || 0);
-        if (rawState.includes('KILLED') || rawState.includes('DONE') || rawState.includes('COMPLETED')) {
+        if (dbState === 'running') {
+          existing.stateKind = 'running';
+          existing.authoritativeState = true;
+        } else if (dbState === 'killed' || rawState.includes('KILLED') || rawState.includes('DONE') || rawState.includes('COMPLETED')) {
           existing.stateKind = 'unread';
         }
         continue;
       }
 
       let stateKind = 'sleep';
-      if (!parentIsRunning || rawState.includes('DONE') || rawState.includes('COMPLETED') || rawState.includes('KILLED')) {
+      const authoritativeState = Boolean(dbState);
+      if (dbState === 'killed' || rawState.includes('DONE') || rawState.includes('COMPLETED') || rawState.includes('KILLED')) {
+        stateKind = 'unread';
+      } else if (dbState === 'running') {
+        stateKind = 'running';
+      } else if (dbState === 'idle') {
+        stateKind = parentIsRunning ? 'sleep' : 'unread';
+      } else if (!parentIsRunning) {
         stateKind = 'unread';
       } else if (rawState.includes('RUNNING') || rawState.includes('WORKING')) {
         stateKind = 'running';
@@ -850,6 +881,7 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
         name: roleTitle,
         typeName: String(desc.typeName || 'subagent'),
         stateKind,
+        authoritativeState,
         model: '',
         spawnStep: Number(doc.spawnStepIndex || 0),
       });
@@ -932,17 +964,29 @@ async function discoverSubagentsAndSwarm(brainDir, convId, parentIsRunning) {
   return { subs, peerEdges, swarmTitle };
 }
 
-async function countActiveSubagentsQuick(brainDir, convId, parentIsRunning) {
+async function countActiveSubagentsQuick(brainDir, convId, parentIsRunning, subStatusById = {}) {
   if (!parentIsRunning) return 0;
   const sysDir = path.join(brainDir, convId, '.system_generated');
   let activeCount = 0;
+
+  const isDbRunning = (cid) => {
+    const row = subStatusById && typeof subStatusById === 'object' ? subStatusById[cid] : null;
+    if (!row || row.killed) return null;
+    return Boolean(row.status === 'CASCADE_RUN_STATUS_RUNNING' || row.notFullyIdle);
+  };
 
   const membersDoc = await readJsonFileSafe(path.join(sysDir, 'swarm', 'members.json'));
   const seen = new Set();
   if (membersDoc?.members && typeof membersDoc.members === 'object') {
     for (const info of Object.values(membersDoc.members)) {
       if (!info || info.role === 'coordinator' || info.conversation_id === convId) continue;
-      if (info.conversation_id) seen.add(String(info.conversation_id));
+      const cid = String(info.conversation_id || '').trim();
+      if (cid) seen.add(cid);
+      const dbRun = cid ? isDbRunning(cid) : null;
+      if (dbRun !== null) {
+        if (dbRun && !info.killed) activeCount += 1;
+        continue;
+      }
       const phase = String(info.phase || info.desired_state || '').toUpperCase();
       if (!info.killed && (phase === 'RUNNING' || phase === 'WORKING')) {
         activeCount += 1;
@@ -955,7 +999,13 @@ async function countActiveSubagentsQuick(brainDir, convId, parentIsRunning) {
     for (const fn of files) {
       if (!fn.endsWith('.json')) continue;
       const doc = await readJsonFileSafe(path.join(sysDir, 'subagents', fn));
-      if (!doc?.conversationId || seen.has(String(doc.conversationId))) continue;
+      const cid = String(doc?.conversationId || '').trim();
+      if (!cid || seen.has(cid)) continue;
+      const dbRun = isDbRunning(cid);
+      if (dbRun !== null) {
+        if (dbRun) activeCount += 1;
+        continue;
+      }
       const st = String(doc.state || '').toUpperCase();
       if (st.includes('RUNNING') || st.includes('WORKING')) {
         activeCount += 1;
@@ -981,6 +1031,10 @@ export async function buildMasterySnapshot(
   } = {},
 ) {
   const brainDir = paths.brainDir;
+  const subStatusById =
+    sessionsHub?.subStatusById && typeof sessionsHub.subStatusById === 'object'
+      ? sessionsHub.subStatusById
+      : {};
   const lastSeenByConv =
     sessionsMeta?.lastSeenByConv && typeof sessionsMeta.lastSeenByConv === 'object'
       ? sessionsMeta.lastSeenByConv
@@ -1024,15 +1078,15 @@ export async function buildMasterySnapshot(
     }
     isFallbackRecent = candidateList.length > 0;
   } else {
+    candidateList = candidateList.slice(0, 12);
     // Keep currently viewed session visible right after the user marks it read so it flips smoothly to "任务结束"
-    if (selectedSessionId && !seenIds.has(selectedSessionId)) {
+    if (selectedSessionId && !candidateList.some((c) => c.id === selectedSessionId)) {
       const justRead = recentRaw.find((r) => r && r.id === selectedSessionId);
       if (justRead) {
-        seenIds.add(justRead.id);
+        if (candidateList.length >= 12) candidateList.pop();
         candidateList.push({ ...justRead, masteryStatus: 'unread', isRecentFallback: false, sessionIsRead: true });
       }
     }
-    candidateList = candidateList.slice(0, 12);
   }
 
   const effectiveSelectedId =
@@ -1048,8 +1102,12 @@ export async function buildMasterySnapshot(
     const isSelected = s.id === effectiveSelectedId;
     const extMaster = summariesCache?.[`${s.id}:coord`] || summariesCache?.[s.id] || null;
     const convSeenMs = Number(lastSeenByConv[s.id] || 0);
+    const agentSeenMs = Number(lastSeenByAgent[s.id] || 0);
     const sessionMarkedRead =
-      !isActive && (Boolean(s.sessionIsRead) || (convSeenMs > 0 && convSeenMs >= Number(s.modifiedMs || 0)));
+      !isActive &&
+      (Boolean(s.sessionIsRead) ||
+        (convSeenMs > 0 && convSeenMs >= Number(s.modifiedMs || 0)) ||
+        (agentSeenMs > 0 && agentSeenMs >= Number(s.modifiedMs || 0)));
 
     if (isSelected) {
       const masterJourney = await parseAgentJourney(brainDir, s.id, {
@@ -1065,6 +1123,7 @@ export async function buildMasterySnapshot(
         brainDir,
         s.id,
         isActive,
+        subStatusById,
       );
 
       const hydratedSubs = [];
@@ -1072,6 +1131,7 @@ export async function buildMasterySnapshot(
       let sleepSubCount = 0;
       let unreadSubCount = 0;
       let doneSubCount = 0;
+      let hasRunningSwarmWorker = false;
 
       for (const rawSub of rawSubs) {
         const subCompleted = rawSub.stateKind === 'unread';
@@ -1087,9 +1147,9 @@ export async function buildMasterySnapshot(
           externalSummary: extSub,
         });
 
-        // Refine subagent stateKind using transcript recency when parent is running
+        // Only apply heuristic recency demotion when authoritative DB status is absent
         let finalStateKind = rawSub.stateKind;
-        if (isActive && finalStateKind === 'running' && subJourney.lastStepMs > 0) {
+        if (isActive && finalStateKind === 'running' && !rawSub.authoritativeState && subJourney.lastStepMs > 0) {
           const idleMs = nowMs - subJourney.lastStepMs;
           if (idleMs > 90_000 && subJourney.turnPlannerSteps > 0) {
             finalStateKind = 'sleep';
@@ -1104,10 +1164,16 @@ export async function buildMasterySnapshot(
           finalStateKind = 'done';
         }
 
-        if (finalStateKind === 'running') runningSubCount += 1;
-        else if (finalStateKind === 'sleep') sleepSubCount += 1;
-        else if (finalStateKind === 'done') doneSubCount += 1;
-        else unreadSubCount += 1;
+        if (finalStateKind === 'running') {
+          runningSubCount += 1;
+          if (rawSub.typeName === 'worker') hasRunningSwarmWorker = true;
+        } else if (finalStateKind === 'sleep') {
+          sleepSubCount += 1;
+        } else if (finalStateKind === 'done') {
+          doneSubCount += 1;
+        } else {
+          unreadSubCount += 1;
+        }
 
         const stateLabel =
           finalStateKind === 'running'
@@ -1117,6 +1183,12 @@ export async function buildMasterySnapshot(
               : finalStateKind === 'done'
                 ? '任务结束'
                 : '任务结束未读';
+
+        const subFoot = subIsRead
+          ? '本角色任务已结束 · 你已查阅'
+          : finalStateKind === 'sleep'
+            ? '当前休眠待命中 · 等待主 Agent 或协作消息唤醒'
+            : subJourney.foot;
 
         hydratedSubs.push({
           id: rawSub.id,
@@ -1134,7 +1206,7 @@ export async function buildMasterySnapshot(
             brief: subJourney.brief,
             duration: subJourney.duration,
             steps: subJourney.steps,
-            foot: subIsRead ? '本角色任务已结束 · 你已查阅' : subJourney.foot,
+            foot: subFoot,
           },
         });
       }
@@ -1190,9 +1262,13 @@ export async function buildMasterySnapshot(
       };
       sessions.push(rowEntry);
 
+      const goalSource = hasRunningSwarmWorker
+        ? swarmTitle || masterJourney.openingThought || masterJourney.brief || rowEntry.name
+        : masterJourney.openingThought || masterJourney.brief || rowEntry.name;
+
       detailSession = {
         ...rowEntry,
-        goal: stripMarkdownForPlainLine(swarmTitle || masterJourney.openingThought || masterJourney.brief || rowEntry.name).slice(0, 140),
+        goal: stripMarkdownForPlainLine(goalSource).slice(0, 140),
         summaryText: summaryParts.join(' · '),
         master: {
           id: 'coord',
@@ -1219,7 +1295,7 @@ export async function buildMasterySnapshot(
     } else {
       // Lightweight list item hydration for non-selected sessions
       const [quickSubCount, quickJourney] = await Promise.all([
-        countActiveSubagentsQuick(brainDir, s.id, isActive),
+        countActiveSubagentsQuick(brainDir, s.id, isActive, subStatusById),
         parseAgentJourney(brainDir, s.id, {
           isMaster: true,
           isCompleted: !isActive,
@@ -1260,6 +1336,8 @@ export async function buildMasterySnapshot(
  * Resolve a file:/// URI or absolute local path into a clean normalized OS path.
  * Rejects non-local protocols, relative paths, quotes, and control characters.
  */
+const SAFE_DIRECT_OPEN_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+
 export function resolveLocalTargetPath(rawInput, { platform = process.platform } = {}) {
   if (typeof rawInput !== 'string') return '';
   let s = rawInput.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
@@ -1274,6 +1352,10 @@ export function resolveLocalTargetPath(rawInput, { platform = process.platform }
   }
 
   if (/^file:\/\//i.test(s)) {
+    // Block remote UNC file://host/share URIs (only allow file:///... or file://localhost/...)
+    if (/^file:\/\/(?!\/|localhost\/)/i.test(s)) {
+      return '';
+    }
     s = s.replace(/^file:\/\/localhost\//i, '/').replace(/^file:\/\/+/i, '/');
     // Strip #L10-L20 line anchors and ?query from file URIs
     const hashIdx = s.indexOf('#');
@@ -1303,13 +1385,22 @@ export function resolveLocalTargetPath(rawInput, { platform = process.platform }
   s = s.trim();
   if (!s || /[\0\r\n"<>|]/.test(s)) return '';
 
-  const isWinDrive = /^[a-zA-Z]:[\\/]/.test(s);
-  const isWinUnc = /^\\\\[^\\]+\\[^\\]+/.test(s);
-  const isPosixAbs = s.startsWith('/');
-  if (!isWinDrive && !isWinUnc && !isPosixAbs) return '';
+  // Block UNC paths (\\host\share or //host/share) to prevent outbound Windows SMB/NTLM leaks
+  if (/^(?:\\\\|\/\/)/.test(s)) {
+    return '';
+  }
 
-  const pathApi = platform === 'win32' || isWinDrive || isWinUnc ? path.win32 : path.posix;
-  return pathApi.resolve(s);
+  const isWinDrive = /^[a-zA-Z]:[\\/]/.test(s);
+  const isPosixAbs = s.startsWith('/');
+  if (platform === 'win32') {
+    if (!isWinDrive) return '';
+    return path.win32.resolve(s);
+  }
+  if (isWinDrive) {
+    return path.win32.resolve(s);
+  }
+  if (!isPosixAbs) return '';
+  return path.posix.resolve(s);
 }
 
 /**
@@ -1338,8 +1429,12 @@ export async function openLocalPathTarget(
     kind = 'missing';
   }
 
-  // Direct file open mode (e.g. clicking "打开文件" in image preview lightbox)
+  // Direct file open mode (strictly restricted to safe raster images to prevent arbitrary executable launch)
   if (openMode === 'file' && kind === 'file') {
+    const ext = pathApi.extname(resolved).toLowerCase();
+    if (!SAFE_DIRECT_OPEN_IMAGE_EXTS.has(ext)) {
+      return { ok: false, status: 403, error: '出于安全限制，仅允许直接打开常见图片文件；其他文件请打开所在位置' };
+    }
     try {
       let child = null;
       if (platform === 'win32') {
@@ -1353,6 +1448,7 @@ export async function openLocalPathTarget(
       } else {
         child = spawnImpl('xdg-open', [resolved], { detached: true, stdio: 'ignore' });
       }
+      child?.on?.('error', () => {});
       child?.unref?.();
       return {
         ok: true,
@@ -1429,6 +1525,7 @@ export async function openLocalPathTarget(
         stdio: 'ignore',
       });
     }
+    child?.on?.('error', () => {});
     child?.unref?.();
     return {
       ok: true,

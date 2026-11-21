@@ -203,6 +203,63 @@ namespace AgyBackdropCompanion
         public static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
+        public static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        public static extern int SHParseDisplayName(
+            [MarshalAs(UnmanagedType.LPWStr)] string name,
+            IntPtr bindingContext,
+            out IntPtr pidl,
+            uint sfgaoIn,
+            out uint psfgaoOut
+        );
+
+        [DllImport("shell32.dll")]
+        public static extern int SHOpenFolderAndSelectItems(
+            IntPtr pidlFolder,
+            uint cidl,
+            IntPtr apidl,
+            uint dwFlags
+        );
+
+        [DllImport("ole32.dll")]
+        public static extern void CoTaskMemFree(IntPtr pv);
+
+        public static void ForceActivateWindow(IntPtr targetHwnd)
+        {
+            if (targetHwnd == IntPtr.Zero || !IsWindow(targetHwnd)) return;
+            uint fgTid = 0;
+            uint curTid = GetCurrentThreadId();
+            bool attached = false;
+            try
+            {
+                IntPtr fg = GetForegroundWindow();
+                if (fg != IntPtr.Zero && fg != targetHwnd)
+                {
+                    uint fgPid;
+                    fgTid = GetWindowThreadProcessId(fg, out fgPid);
+                    if (fgTid != 0 && fgTid != curTid)
+                    {
+                        attached = AttachThreadInput(fgTid, curTid, true);
+                    }
+                }
+                BringWindowToTop(targetHwnd);
+                SetForegroundWindow(targetHwnd);
+            }
+            catch { }
+            finally
+            {
+                if (attached)
+                {
+                    try { AttachThreadInput(fgTid, curTid, false); } catch { }
+                }
+            }
+        }
+
+        [DllImport("user32.dll")]
         public static extern bool DestroyIcon(IntPtr hIcon);
 
         [DllImport("user32.dll")]
@@ -590,6 +647,7 @@ namespace AgyBackdropCompanion
     internal sealed class ImageLightboxWindow : Window
     {
         private readonly IntPtr _ownerHwnd;
+        private readonly ScaleTransform _rootScale = new ScaleTransform(1.0, 1.0);
         private readonly Border _rootFrame;
         private readonly Grid _stageGrid;
         private readonly Border _imageFrame;
@@ -607,6 +665,13 @@ namespace AgyBackdropCompanion
         private System.Windows.Point _dragStart;
         private double _dragOriginX = 0.0;
         private double _dragOriginY = 0.0;
+        private int _lastBoundsLeft = int.MinValue;
+        private int _lastBoundsTop = int.MinValue;
+        private int _lastBoundsW = -1;
+        private int _lastBoundsH = -1;
+        private double _lastBoundsDpi = -1.0;
+        private bool _lastBoundsMax = false;
+        private int _lastBoundsRadius = -1;
 
         public IntPtr Handle { get { return _hwnd; } }
 
@@ -900,6 +965,7 @@ namespace AgyBackdropCompanion
                 CornerRadius = new CornerRadius(10),
                 ClipToBounds = true,
                 Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(236, 15, 17, 24)),
+                LayoutTransform = _rootScale,
                 Child = rootGrid
             };
             _rootFrame.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
@@ -1000,25 +1066,73 @@ namespace AgyBackdropCompanion
 
         public void PositionOverBounds(Native.RECT winRect, double dpiScale, bool isMaximized, int radius)
         {
+            PositionOverBounds(winRect, dpiScale, isMaximized, radius, false);
+        }
+
+        public void PositionOverBounds(Native.RECT winRect, double dpiScale, bool isMaximized, int radius, bool noActivate)
+        {
             double safeScale = Math.Max(0.5, dpiScale);
             int physW = Math.Max(320, winRect.Right - winRect.Left);
             int physH = Math.Max(240, winRect.Bottom - winRect.Top);
-            double dipW = physW / safeScale;
-            double dipH = physH / safeScale;
+
+            if (noActivate &&
+                _hwnd != IntPtr.Zero &&
+                winRect.Left == _lastBoundsLeft &&
+                winRect.Top == _lastBoundsTop &&
+                physW == _lastBoundsW &&
+                physH == _lastBoundsH &&
+                Math.Abs(safeScale - _lastBoundsDpi) < 0.01 &&
+                isMaximized == _lastBoundsMax &&
+                radius == _lastBoundsRadius)
+            {
+                return;
+            }
+
+            double wpfDpiX = 1.0;
+            double wpfDpiY = 1.0;
+            try
+            {
+                PresentationSource src = PresentationSource.FromVisual(this);
+                if (src != null && src.CompositionTarget != null)
+                {
+                    Matrix m = src.CompositionTarget.TransformToDevice;
+                    if (m.M11 > 0.1) wpfDpiX = m.M11;
+                    if (m.M22 > 0.1) wpfDpiY = m.M22;
+                }
+            }
+            catch { }
+
+            double relX = safeScale / wpfDpiX;
+            double relY = safeScale / wpfDpiY;
+            _rootScale.ScaleX = relX;
+            _rootScale.ScaleY = relY;
+
+            double logicalDipW = physW / safeScale;
+            double logicalDipH = physH / safeScale;
 
             _rootFrame.CornerRadius = isMaximized ? new CornerRadius(0) : new CornerRadius(Math.Max(0, Math.Min(18, radius)));
-            _image.MaxWidth = Math.Max(180.0, dipW - 96.0);
-            _image.MaxHeight = Math.Max(120.0, dipH - 136.0);
+            _image.MaxWidth = Math.Max(180.0, logicalDipW - 96.0);
+            _image.MaxHeight = Math.Max(120.0, logicalDipH - 136.0);
 
-            Left = winRect.Left / safeScale;
-            Top = winRect.Top / safeScale;
-            Width = dipW;
-            Height = dipH;
+            Left = winRect.Left / wpfDpiX;
+            Top = winRect.Top / wpfDpiY;
+            Width = physW / wpfDpiX;
+            Height = physH / wpfDpiY;
 
             if (_hwnd != IntPtr.Zero && Native.IsWindow(_hwnd))
             {
-                Native.SetWindowPos(_hwnd, IntPtr.Zero, winRect.Left, winRect.Top, physW, physH, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+                uint flags = Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW;
+                if (noActivate) flags |= Native.SWP_NOACTIVATE;
+                Native.SetWindowPos(_hwnd, IntPtr.Zero, winRect.Left, winRect.Top, physW, physH, flags);
             }
+
+            _lastBoundsLeft = winRect.Left;
+            _lastBoundsTop = winRect.Top;
+            _lastBoundsW = physW;
+            _lastBoundsH = physH;
+            _lastBoundsDpi = safeScale;
+            _lastBoundsMax = isMaximized;
+            _lastBoundsRadius = radius;
         }
 
         private void SetZoom(double nextScale)
@@ -1113,7 +1227,9 @@ namespace AgyBackdropCompanion
             if (string.IsNullOrEmpty(_filePath) || !File.Exists(_filePath)) return;
             try
             {
-                Process.Start(new ProcessStartInfo(_filePath) { UseShellExecute = true });
+                using (Process proc = Process.Start(new ProcessStartInfo(_filePath) { UseShellExecute = true }))
+                {
+                }
             }
             catch { }
         }
@@ -1123,16 +1239,37 @@ namespace AgyBackdropCompanion
             if (string.IsNullOrEmpty(_filePath)) return;
             try
             {
-                if (File.Exists(_filePath))
+                string fullPath = System.IO.Path.GetFullPath(_filePath);
+                if (File.Exists(fullPath))
                 {
-                    Process.Start("explorer.exe", "/select,\"" + _filePath + "\"");
+                    IntPtr pidl = IntPtr.Zero;
+                    uint sfgaoOut = 0;
+                    try
+                    {
+                        if (Native.SHParseDisplayName(fullPath, IntPtr.Zero, out pidl, 0, out sfgaoOut) == 0 && pidl != IntPtr.Zero)
+                        {
+                            if (Native.SHOpenFolderAndSelectItems(pidl, 0, IntPtr.Zero, 0) == 0)
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (pidl != IntPtr.Zero) Native.CoTaskMemFree(pidl);
+                    }
+                    using (Process proc = Process.Start("explorer.exe", "/select,\"" + fullPath + "\""))
+                    {
+                    }
                 }
                 else
                 {
-                    string parent = System.IO.Path.GetDirectoryName(_filePath);
+                    string parent = System.IO.Path.GetDirectoryName(fullPath);
                     if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
                     {
-                        Process.Start("explorer.exe", "\"" + parent + "\"");
+                        using (Process proc = Process.Start("explorer.exe", "\"" + parent + "\""))
+                        {
+                        }
                     }
                 }
             }
@@ -2154,9 +2291,10 @@ namespace AgyBackdropCompanion
                     }
 
                     // Fallback: first non-chrome title near the left of the chat canvas header
+                    int maxHeaderTitleX = winRect.Left + (int)Math.Round(560 * dpiScale);
                     for (int i = 0; i < headerItems.Count; i++)
                     {
-                        if (headerItems[i].Key > winRect.Left + 560) break;
+                        if (headerItems[i].Key > maxHeaderTitleX) break;
                         string candidate = headerItems[i].Value;
                         if (candidate == "/" || IsHeaderChromeText(candidate)) continue;
                         info.Title = candidate;
@@ -2246,6 +2384,14 @@ namespace AgyBackdropCompanion
                 AutomationElement root = AutomationElement.FromHandle(hwnd);
                 if (root == null) return "no-uia";
 
+                double dpiScale = Native.GetWindowDpiScale(hwnd);
+                int tabBandMaxY = winRect.Top + (int)Math.Round(110 * dpiScale);
+                int toggleBandMaxY = winRect.Top + (int)Math.Round(72 * dpiScale);
+                int toggleMinX = winRect.Right - (int)Math.Round(260 * dpiScale);
+                int addTabMinY = winRect.Top + (int)Math.Round(20 * dpiScale);
+                int addTabMaxY = winRect.Top + (int)Math.Round(100 * dpiScale);
+                int addTabMaxX = winRect.Right - (int)Math.Round(40 * dpiScale);
+
                 string[] consoleNames = new string[] { "agy 控制台", "antigravity monitor" };
 
                 // 1. If AGY 控制台 tab is already open in the top tab strip, activate it directly
@@ -2253,7 +2399,7 @@ namespace AgyBackdropCompanion
                     root,
                     consoleNames,
                     winRect.Top,
-                    winRect.Top + 110,
+                    tabBandMaxY,
                     winRect.Left,
                     winRect.Right
                 );
@@ -2267,8 +2413,8 @@ namespace AgyBackdropCompanion
                     root,
                     SidePaneToggleKeywords,
                     winRect.Top,
-                    winRect.Top + 72,
-                    winRect.Right - 260,
+                    toggleBandMaxY,
+                    toggleMinX,
                     winRect.Right
                 );
                 if (toggleBtn != null && ActivateElement(toggleBtn))
@@ -2278,7 +2424,7 @@ namespace AgyBackdropCompanion
                         root,
                         consoleNames,
                         winRect.Top,
-                        winRect.Top + 110,
+                        tabBandMaxY,
                         winRect.Left,
                         winRect.Right
                     );
@@ -2292,10 +2438,10 @@ namespace AgyBackdropCompanion
                 AutomationElement addTabBtn = FindNamedElement(
                     root,
                     new string[] { "new tab", "add tab", "open tab", "open view", "新建标签", "+" },
-                    winRect.Top + 20,
-                    winRect.Top + 100,
+                    addTabMinY,
+                    addTabMaxY,
                     winRect.Left + (winRect.Right - winRect.Left) / 2,
-                    winRect.Right - 40
+                    addTabMaxX
                 );
                 if (addTabBtn != null && ActivateElement(addTabBtn))
                 {
@@ -2380,7 +2526,10 @@ namespace AgyBackdropCompanion
         private EventWaitHandle _stopEvent;
         private readonly AutoResetEvent _uiaWakeEvent = new AutoResetEvent(false);
         private NotifyIcon _trayIcon;
+        private Icon _trayIconGlyph;
+        private ContextMenuStrip _trayMenu;
         private IntPtr _trayIconHandle = IntPtr.Zero;
+        private readonly int _selfPid;
         private ToolStripMenuItem _statusMenuItem;
         private ToolStripMenuItem _pauseMenuItem;
         private ToolStripMenuItem _hudMenuItem;
@@ -2410,7 +2559,7 @@ namespace AgyBackdropCompanion
         private string _lastViewTitle = "";
         private bool _pausedByTray = false;
         private bool _hudEnabledByTray = true;
-        private bool _disposed = false;
+        private volatile bool _disposed = false;
         private bool _inSync = false;
         private bool _syncPending = false;
         private string _hudLastAction = "";
@@ -2425,6 +2574,10 @@ namespace AgyBackdropCompanion
             _statusPath = System.IO.Path.Combine(_dataDir, "backdrop_status.json");
             _lightboxCmdPath = System.IO.Path.Combine(_dataDir, "lightbox_cmd.json");
             _dispatcher = dispatcher;
+            using (Process cur = Process.GetCurrentProcess())
+            {
+                _selfPid = cur.Id;
+            }
         }
 
         public void Start()
@@ -2491,9 +2644,10 @@ namespace AgyBackdropCompanion
                 }
                 _trayIconHandle = bmp.GetHicon();
             }
-            Icon trayGlyph = Icon.FromHandle(_trayIconHandle);
+            _trayIconGlyph = Icon.FromHandle(_trayIconHandle);
 
-            var menu = new ContextMenuStrip();
+            _trayMenu = new ContextMenuStrip();
+            var menu = _trayMenu;
             _statusMenuItem = new ToolStripMenuItem("AGY 桌面伴侣");
             _statusMenuItem.Enabled = false;
             menu.Items.Add(_statusMenuItem);
@@ -2549,9 +2703,9 @@ namespace AgyBackdropCompanion
 
             _trayIcon = new NotifyIcon
             {
-                Icon = trayGlyph,
+                Icon = _trayIconGlyph,
                 Text = "AGY 桌面伴侣（壁纸 + 输入框 HUD）",
-                ContextMenuStrip = menu,
+                ContextMenuStrip = _trayMenu,
                 Visible = true
             };
         }
@@ -2599,6 +2753,9 @@ namespace AgyBackdropCompanion
                 string key = ws + "|" + t;
                 if (string.Equals(key, _lastViewKey, StringComparison.Ordinal)) return;
 
+                // Use a local serializer because WriteActiveViewFile runs on the background UIA worker thread
+                var localJson = new JavaScriptSerializer();
+
                 // Protect recent sidecar_focus UUID writes (from clicking a session row in AGY Console)
                 // from being clobbered by a stale or title-only UIA header read.
                 try
@@ -2607,7 +2764,7 @@ namespace AgyBackdropCompanion
                     {
                         string existingRaw = ReadTextWithRetry(_hudActiveViewPath);
                         var existingDoc = !string.IsNullOrEmpty(existingRaw)
-                            ? (_json.DeserializeObject(existingRaw) as Dictionary<string, object>)
+                            ? (localJson.DeserializeObject(existingRaw) as Dictionary<string, object>)
                             : null;
                         if (existingDoc != null)
                         {
@@ -2649,7 +2806,7 @@ namespace AgyBackdropCompanion
                     { "updatedAtMs", epochMs }
                 };
                 string tmp = _hudActiveViewPath + ".tmp";
-                File.WriteAllText(tmp, _json.Serialize(payload), Encoding.UTF8);
+                File.WriteAllText(tmp, localJson.Serialize(payload), Encoding.UTF8);
                 try
                 {
                     if (File.Exists(_hudActiveViewPath))
@@ -2672,7 +2829,7 @@ namespace AgyBackdropCompanion
 
         private void StartUiaAnchorWorker()
         {
-            int selfPid = Process.GetCurrentProcess().Id;
+            int selfPid = _selfPid;
             _uiaWorkerThread = new Thread(delegate()
             {
                 bool prevMouseDownOnHost = false;
@@ -2845,6 +3002,11 @@ namespace AgyBackdropCompanion
                                                 finally
                                                 {
                                                     _inSync = prevInSync;
+                                                    if (_syncPending && !_inSync && !_disposed && _debounceTimer != null && !_debounceTimer.IsEnabled)
+                                                    {
+                                                        _syncPending = false;
+                                                        _debounceTimer.Start();
+                                                    }
                                                 }
                                             }
                                         }
@@ -3140,8 +3302,10 @@ namespace AgyBackdropCompanion
                 win.PositionOverBounds(winRect, dpiScale, isMaximized, _config.radius);
                 win.Show();
                 win.PositionOverBounds(winRect, dpiScale, isMaximized, _config.radius);
+                Native.ForceActivateWindow(win.Handle);
                 win.Activate();
                 win.Focus();
+                Keyboard.Focus(win);
             }
             else
             {
@@ -3151,8 +3315,10 @@ namespace AgyBackdropCompanion
                 }
                 _lightbox.PositionOverBounds(winRect, dpiScale, isMaximized, _config.radius);
                 if (!_lightbox.IsVisible) _lightbox.Show();
+                Native.ForceActivateWindow(_lightbox.Handle);
                 _lightbox.Activate();
                 _lightbox.Focus();
+                Keyboard.Focus(_lightbox);
             }
 
             foreach (TrackedHostWindow item in _tracked.Values)
@@ -3584,7 +3750,16 @@ namespace AgyBackdropCompanion
 
                 foreach (TrackedHostWindow item in _tracked.Values)
                 {
-                    if (!Native.IsWindow(item.Hwnd)) continue;
+                    if (!Native.IsWindow(item.Hwnd))
+                    {
+                        HideHudIfVisible(item);
+                        if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
+                        {
+                            Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
+                            item.BackdropVisible = false;
+                        }
+                        continue;
+                    }
 
                     Native.RECT r;
                     bool hasBounds = Native.TryGetVisibleBounds(item.Hwnd, out r);
@@ -3664,6 +3839,37 @@ namespace AgyBackdropCompanion
                     }
                 }
 
+                if (_lightbox != null)
+                {
+                    bool ownerAlive =
+                        _lightboxOwnerHwnd != IntPtr.Zero &&
+                        Native.IsWindow(_lightboxOwnerHwnd) &&
+                        Native.IsWindowVisible(_lightboxOwnerHwnd) &&
+                        !Native.IsIconic(_lightboxOwnerHwnd) &&
+                        !Native.IsWindowCloaked(_lightboxOwnerHwnd);
+                    if (!ownerAlive)
+                    {
+                        ImageLightboxWindow closingLb = _lightbox;
+                        _lightbox = null;
+                        _lightboxOwnerHwnd = IntPtr.Zero;
+                        ForceCloseOwnedWindow(closingLb);
+                    }
+                    else
+                    {
+                        Native.RECT lbRect;
+                        if (Native.TryGetVisibleBounds(_lightboxOwnerHwnd, out lbRect))
+                        {
+                            _lightbox.PositionOverBounds(
+                                lbRect,
+                                Native.GetWindowDpiScale(_lightboxOwnerHwnd),
+                                Native.IsZoomed(_lightboxOwnerHwnd),
+                                _config.radius,
+                                true
+                            );
+                        }
+                    }
+                }
+
                 if (_statusMenuItem != null)
                 {
                     string stateDesc = _pausedByTray ? "已暂停" : activeEffect ? "壁纸运行中" : "待机";
@@ -3703,7 +3909,13 @@ namespace AgyBackdropCompanion
                 string procName;
                 if (!pidCache.TryGetValue(pid, out procName))
                 {
-                    try { procName = Process.GetProcessById((int)pid).ProcessName; }
+                    try
+                    {
+                        using (Process proc = Process.GetProcessById((int)pid))
+                        {
+                            procName = proc.ProcessName;
+                        }
+                    }
                     catch { procName = ""; }
                     pidCache[pid] = procName;
                 }
@@ -3814,7 +4026,7 @@ namespace AgyBackdropCompanion
 
                 var payload = new Dictionary<string, object>
                 {
-                    { "pid", Process.GetCurrentProcess().Id },
+                    { "pid", _selfPid },
                     { "running", running },
                     { "activeEffect", activeEffect },
                     { "supportsLightbox", true },
@@ -3897,8 +4109,20 @@ namespace AgyBackdropCompanion
                 if (_trayIcon != null)
                 {
                     _trayIcon.Visible = false;
+                    _trayIcon.Icon = null;
+                    _trayIcon.ContextMenuStrip = null;
                     _trayIcon.Dispose();
                     _trayIcon = null;
+                }
+                if (_trayMenu != null)
+                {
+                    _trayMenu.Dispose();
+                    _trayMenu = null;
+                }
+                if (_trayIconGlyph != null)
+                {
+                    _trayIconGlyph.Dispose();
+                    _trayIconGlyph = null;
                 }
                 if (_trayIconHandle != IntPtr.Zero)
                 {
@@ -4019,7 +4243,24 @@ namespace AgyBackdropCompanion
                 };
 
                 var controller = new CompanionController(dataDir, assetsDir, app.Dispatcher);
-                AppDomain.CurrentDomain.ProcessExit += delegate { controller.Dispose(); };
+                AppDomain.CurrentDomain.ProcessExit += delegate
+                {
+                    try
+                    {
+                        if (app.Dispatcher != null && !app.Dispatcher.CheckAccess() && !app.Dispatcher.HasShutdownStarted)
+                        {
+                            app.Dispatcher.Invoke(DispatcherPriority.Send, TimeSpan.FromSeconds(2), new Action(controller.Dispose));
+                        }
+                        else
+                        {
+                            controller.Dispose();
+                        }
+                    }
+                    catch
+                    {
+                        try { controller.Dispose(); } catch { }
+                    }
+                };
                 app.Exit += delegate { controller.Dispose(); };
 
                 controller.Start();

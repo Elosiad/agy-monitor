@@ -45,12 +45,25 @@ function writeJsonAtomicSync(filePath, obj) {
   try {
     const dir = path.dirname(filePath);
     fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+    const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
     fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
-    try {
-      fs.renameSync(tmp, filePath);
-    } catch {
-      fs.copyFileSync(tmp, filePath);
+    let renamed = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        fs.renameSync(tmp, filePath);
+        renamed = true;
+        break;
+      } catch (err) {
+        if (attempt === 4 || (err?.code !== 'EPERM' && err?.code !== 'EBUSY' && err?.code !== 'EACCES')) {
+          break;
+        }
+        const until = Date.now() + 12 * (attempt + 1);
+        while (Date.now() < until) {
+          // Short bounded backoff for Windows atomic rename contention
+        }
+      }
+    }
+    if (!renamed) {
       try {
         fs.rmSync(tmp, { force: true });
       } catch {
@@ -60,6 +73,18 @@ function writeJsonAtomicSync(filePath, obj) {
   } catch {
     // Non-fatal state write failure
   }
+}
+
+function inferAppDataFromExecDir(rawDir) {
+  if (!rawDir || !String(rawDir).trim()) return '';
+  let cursor = path.resolve(String(rawDir).trim());
+  while (cursor && cursor !== path.dirname(cursor)) {
+    if (path.basename(cursor) === 'sidecar_data') {
+      return path.dirname(cursor);
+    }
+    cursor = path.dirname(cursor);
+  }
+  return '';
 }
 
 function resolvePluginDataDirs(explicitDir) {
@@ -76,10 +101,57 @@ function resolvePluginDataDirs(explicitDir) {
   };
   addDir(process.env.AGY_MONITOR_PLUGIN_DATA_DIR);
   addDir(process.env.PLUGIN_DATA);
+  const inferredExecAppData = inferAppDataFromExecDir(process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR);
+  if (inferredExecAppData) {
+    addDir(path.join(inferredExecAppData, 'plugin_data', 'agy-monitor'));
+  }
   const appData =
     process.env.AGY_MONITOR_APP_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity');
   addDir(path.join(path.resolve(appData), 'plugin_data', 'agy-monitor'));
   return dirs;
+}
+
+function safeConvStateFile(activeDataDir, convId) {
+  const safe = String(convId || 'default').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 96) || 'default';
+  return path.join(activeDataDir, 'hook_state', `${safe}.json`);
+}
+
+function readConvHookState(activeDataDir, convId) {
+  const perConvPath = safeConvStateFile(activeDataDir, convId);
+  const perConv = readJsonSafe(perConvPath);
+  if (perConv && typeof perConv === 'object') {
+    return { prev: perConv, perConvPath };
+  }
+  // One-time read-only migration fallback from legacy monolithic mastery_hook_state.json
+  const legacyPath = path.join(activeDataDir, 'mastery_hook_state.json');
+  const legacy = readJsonSafe(legacyPath);
+  const legacyEntry =
+    legacy?.convs && typeof legacy.convs === 'object' && legacy.convs[convId] && typeof legacy.convs[convId] === 'object'
+      ? legacy.convs[convId]
+      : null;
+  return { prev: legacyEntry, perConvPath };
+}
+
+function pruneOldConvStates(stateDir, keepBasename, nowMs) {
+  try {
+    const cutoff = nowMs - 7 * 24 * 3600 * 1000;
+    const files = fs.readdirSync(stateDir);
+    if (files.length <= 24) return;
+    for (const name of files) {
+      if (name === keepBasename || !name.endsWith('.json')) continue;
+      const full = path.join(stateDir, name);
+      try {
+        const st = fs.statSync(full);
+        if (st.isFile() && st.mtimeMs < cutoff) {
+          fs.rmSync(full, { force: true });
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function readLatestMasteryConfig(candidateDirs) {
@@ -114,7 +186,6 @@ function hashText(raw) {
 export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now() } = {}) {
   const candidateDirs = resolvePluginDataDirs(pluginDataDir);
   const { rawCfg, activeDataDir } = readLatestMasteryConfig(candidateDirs);
-  const statePath = path.join(activeDataDir, 'mastery_hook_state.json');
 
   const convId =
     typeof payload?.conversationId === 'string' && payload.conversationId.trim()
@@ -126,19 +197,18 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
       ? rawCfg
       : { enabled: false, source: 'self', frequency: '1m', thinking: 'low' };
 
+  const { prev: existingPrev, perConvPath } = readConvHookState(activeDataDir, convId);
+
   if (cfg.enabled !== true || cfg.source !== 'self') {
     // If this ongoing conversation previously received [AGY_PROGRESS] prompts, emit a single
     // one-shot stop notice so the LLM immediately breaks few-shot format inertia; new conversations
     // or subsequent turns return `{}` with zero overhead.
-    const state = readJsonSafe(statePath);
-    const prev = state?.convs && typeof state.convs === 'object' ? state.convs[convId] : null;
-    if (prev && prev.introSent === true && prev.stopNoticeSent !== true) {
-      state.convs[convId] = {
-        ...prev,
+    if (existingPrev && existingPrev.introSent === true && existingPrev.stopNoticeSent !== true) {
+      writeJsonAtomicSync(perConvPath, {
+        ...existingPrev,
         stopNoticeSent: true,
         updatedAtMs: nowMs,
-      };
-      writeJsonAtomicSync(statePath, state);
+      });
       return {
         injectSteps: [
           {
@@ -156,25 +226,21 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
   const freqMs = FREQ_MS[cfg.frequency] || FREQ_MS['1m'];
   const invocationNum = Number(payload?.invocationNum || 0);
   const inputHash = hashText(payload?.lastUserInput || '');
+  const prev = existingPrev || {};
 
-  const state = readJsonSafe(statePath) || { version: 1, convs: {} };
-  if (!state.convs || typeof state.convs !== 'object') {
-    state.convs = {};
-  }
-
-  const prev = state.convs[convId] || {};
   const isNewUserTask =
     (inputHash && inputHash !== prev.lastInputHash) ||
     (!prev.introSent && invocationNum <= 1) ||
     prev.stopNoticeSent === true;
 
   let instruction = '';
+  let nextConvState = null;
   if (isNewUserTask) {
     instruction =
       '【AGY掌握·开场汇报】在你开始调用工具执行命令前，请先在回复最开头单独输出1行**纯简体中文**：' +
       '`[AGY_PROGRESS|10%|<10字以内纯中文、五岁孩童能懂的状态>]`，然后**必须在标签后空一行（双换行）**再写约30字纯中文大白话汇报正文，' +
       '说明你对用户任务的理解以及接下来第一步打算做什么（严禁使用英文句子）；然后**本轮立刻继续调用工具，不要停下来等用户**。';
-    state.convs[convId] = {
+    nextConvState = {
       lastInputHash: inputHash || prev.lastInputHash || '',
       introSent: true,
       stopNoticeSent: false,
@@ -189,7 +255,7 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
         '`[AGY_PROGRESS|<0-100整数>%|<10字以内纯中文、给五岁孩童都能看懂的当前进度总结>]`' +
         '（例如 `[AGY_PROGRESS|60%|修好报错准备复测]`）；如需附1句简短中文进展，**必须在标签后空一行（双换行）**与汇报正文分隔开（严禁使用英文句子）；' +
         '**同一步直接继续调用工具，不要停顿等用户**。';
-      state.convs[convId] = {
+      nextConvState = {
         lastInputHash: inputHash || prev.lastInputHash || '',
         introSent: true,
         stopNoticeSent: false,
@@ -203,14 +269,8 @@ export function evaluateMasteryHook(payload, { pluginDataDir, nowMs = Date.now()
     return {};
   }
 
-  // Prune stale conversation entries (>7d) so state file stays tiny
-  const cutoff = nowMs - 7 * 24 * 3600 * 1000;
-  for (const [k, v] of Object.entries(state.convs)) {
-    if (k !== convId && Number(v?.updatedAtMs || 0) < cutoff) {
-      delete state.convs[k];
-    }
-  }
-  writeJsonAtomicSync(statePath, state);
+  writeJsonAtomicSync(perConvPath, nextConvState);
+  pruneOldConvStates(path.dirname(perConvPath), path.basename(perConvPath), nowMs);
 
   return {
     injectSteps: [

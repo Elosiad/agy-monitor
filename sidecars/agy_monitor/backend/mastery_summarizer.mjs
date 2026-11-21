@@ -119,32 +119,48 @@ export async function fetchThirdPartyModels({ protocol = 'openai', baseUrl, apiK
   return { ok: true, models, latencyMs: res.latencyMs };
 }
 
+function supportsOpenAiReasoningEffort(modelId) {
+  const m = String(modelId || '').toLowerCase();
+  return /^(?:o1|o3|o4)(?:[-_.]|$)|(?:^|\/)gpt-5|deepseek-r1|qwq|gemini-2\.5|gemini-3|thinking|reasoner/.test(m);
+}
+
+function supportsAnthropicThinking(modelId) {
+  const m = String(modelId || '').toLowerCase();
+  return /claude-(?:3-7|sonnet-4|opus-4|4)/.test(m);
+}
+
 function buildCompletionPayload({ protocol, model, thinking, systemPrompt, userPrompt, maxTokens = 220 }) {
   if (protocol === 'anthropic') {
     const budgetMap = { low: 1024, medium: 2048, high: 4096 };
+    const allowThink = Boolean(thinking && thinking !== 'off' && budgetMap[thinking] && supportsAnthropicThinking(model));
     const body = {
       model,
-      max_tokens: thinking && thinking !== 'off' ? Math.max(maxTokens, (budgetMap[thinking] || 1024) + 256) : maxTokens,
+      max_tokens: allowThink ? Math.max(maxTokens, budgetMap[thinking] + 256) : maxTokens,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
     };
-    if (thinking && thinking !== 'off' && budgetMap[thinking]) {
+    if (allowThink) {
       body.thinking = { type: 'enabled', budget_tokens: budgetMap[thinking] };
     }
     return body;
   }
 
+  const isReasoning = supportsOpenAiReasoningEffort(model);
   const body = {
     model,
-    max_tokens: maxTokens,
-    temperature: 0.2,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
   };
-  if (thinking && thinking !== 'off') {
-    body.reasoning_effort = thinking;
+  if (isReasoning) {
+    body.max_completion_tokens = maxTokens;
+    if (thinking && thinking !== 'off') {
+      body.reasoning_effort = thinking;
+    }
+  } else {
+    body.max_tokens = maxTokens;
+    body.temperature = 0.2;
   }
   return body;
 }
@@ -249,6 +265,7 @@ function parseSummaryJson(rawText) {
 export function createMasterySummarizer(paths, store) {
   let cache = null;
   const inFlightKeys = new Set();
+  const attemptState = new Map();
 
   const loadCache = async () => {
     if (cache) return cache;
@@ -262,14 +279,34 @@ export function createMasterySummarizer(paths, store) {
     return cache;
   };
 
+  const pruneCache = (obj, nowMs = Date.now()) => {
+    const cutoff = nowMs - 7 * 24 * 3600 * 1000;
+    const entries = Object.entries(obj || {}).filter(
+      ([, v]) => v && typeof v === 'object' && Number(v.updatedAtMs || 0) >= cutoff,
+    );
+    entries.sort((a, b) => Number(b[1]?.updatedAtMs || 0) - Number(a[1]?.updatedAtMs || 0));
+    const pruned = {};
+    for (const [k, v] of entries.slice(0, 200)) {
+      pruned[k] = v;
+    }
+    return pruned;
+  };
+
   const saveCache = async () => {
     if (!cache || !paths?.masterySummariesFile) return;
+    cache = pruneCache(cache);
     await atomicWriteJson(paths.masterySummariesFile, cache).catch(() => {});
   };
 
   const summarizeSingleAgent = async (cfg, cacheKey, agentDigest, stepCount) => {
     if (inFlightKeys.has(cacheKey)) return;
     inFlightKeys.add(cacheKey);
+    const prevAttempt = attemptState.get(cacheKey) || { failCount: 0, lastAttemptAtMs: 0 };
+    attemptState.set(cacheKey, {
+      failCount: prevAttempt.failCount,
+      lastAttemptAtMs: Date.now(),
+    });
+    let succeeded = false;
     try {
       const tp = cfg.thirdParty;
       const proto = tp.protocol === 'anthropic' ? 'anthropic' : 'openai';
@@ -318,11 +355,17 @@ export function createMasterySummarizer(paths, store) {
         updatedAtMs: Date.now(),
         model: tp.selectedModel,
       };
+      succeeded = true;
       await saveCache();
     } catch {
       // Non-fatal third-party summary error
     } finally {
       inFlightKeys.delete(cacheKey);
+      const nextFail = succeeded ? 0 : Math.min(6, (prevAttempt.failCount || 0) + 1);
+      attemptState.set(cacheKey, {
+        failCount: nextFail,
+        lastAttemptAtMs: Date.now(),
+      });
     }
   };
 
@@ -357,9 +400,13 @@ export function createMasterySummarizer(paths, store) {
     for (const target of targets) {
       if (!target.digest) continue;
       const prev = cur[target.key];
-      const elapsed = nowMs - Number(prev?.updatedAtMs || 0);
+      const att = attemptState.get(target.key);
+      const backoffMs =
+        att && att.failCount > 0 ? Math.min(10 * 60_000, freqMs * Math.pow(2, Math.min(att.failCount - 1, 4))) : freqMs;
+      const lastTouchMs = Math.max(Number(prev?.updatedAtMs || 0), Number(att?.lastAttemptAtMs || 0));
+      const elapsed = nowMs - lastTouchMs;
       const stepsChanged = !prev || target.stepCount !== prev.stepCount;
-      if (elapsed >= freqMs && stepsChanged) {
+      if (elapsed >= backoffMs && stepsChanged) {
         void summarizeSingleAgent(cfg, target.key, target.digest, target.stepCount);
       }
     }
