@@ -521,7 +521,7 @@ function buildApplyThemeAndScanExpr(cssText) {
     }
     el.textContent = ${JSON.stringify(cssText)};
 
-    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 2) {
+    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 3) {
       try { window.__agyMonLayerEngine.stop(); } catch (e) {}
     }
 
@@ -621,7 +621,17 @@ function buildApplyThemeAndScanExpr(cssText) {
 
         if (isLeftSidebar || isRightSidebar) {
           var hasSidebarAnc = node.parentElement && node.parentElement.closest('[data-agy-mon-layer="sidebar"]');
-          node.setAttribute('data-agy-mon-layer', hasSidebarAnc ? 'transparent' : 'sidebar');
+          if (hasSidebarAnc) {
+            node.setAttribute('data-agy-mon-layer', 'transparent');
+          } else {
+            node.setAttribute('data-agy-mon-layer', 'sidebar');
+            try {
+              var nestedSidebars = node.querySelectorAll('[data-agy-mon-layer="sidebar"]');
+              for (var nsi = 0; nsi < nestedSidebars.length; nsi++) {
+                nestedSidebars[nsi].setAttribute('data-agy-mon-layer', 'transparent');
+              }
+            } catch (e) {}
+          }
           return 1;
         }
         if (isTopBar || isBottomBar || isMainPane) {
@@ -665,7 +675,8 @@ function buildApplyThemeAndScanExpr(cssText) {
         for (var xi = 0; xi < xs.length; xi++) {
           for (var yi = 0; yi < ys.length; yi++) {
             var stack = document.elementsFromPoint(xs[xi], ys[yi]);
-            for (var si = 0; si < stack.length; si++) {
+            // Traverse outermost ancestor -> innermost child so nested sidebar layers never stack double tints
+            for (var si = stack.length - 1; si >= 0; si--) {
               var node = stack[si];
               if (!node || seen.has(node)) continue;
               seen.add(node);
@@ -704,7 +715,7 @@ function buildApplyThemeAndScanExpr(cssText) {
       }
 
       window.__agyMonLayerEngine = {
-        version: 2,
+        version: 3,
         scan: scanLayers,
         stop: function() {
           clearInterval(timer);

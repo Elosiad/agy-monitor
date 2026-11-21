@@ -226,6 +226,9 @@ export async function ensureBackdropAssets(paths) {
   }
 
   const doWork = async () => {
+    if (paths?.pluginDataDir) {
+      await fsp.mkdir(paths.pluginDataDir, { recursive: true }).catch(() => {});
+    }
     const rt = await resolveBackdropRuntimePaths(paths, hostInfo);
     const sourceBuf = await fsp.readFile(paths.backdropSourceFile);
     const sourceHash = crypto.createHash('sha1').update(sourceBuf).digest('hex');

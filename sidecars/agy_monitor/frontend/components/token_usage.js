@@ -722,6 +722,13 @@ export function createTokenUsage({ apiFetch, t, onFilterChange, getActiveConvCon
       }
       const data = await requestJson(apiFetch, `/api/telemetry/requests?${qs.toString()}`);
       if (destroyed || !reqState.open || seq !== reqState.fetchSeq) return;
+      const fetchedTotal = Number(data?.totalCount || 0);
+      const fetchedItems = Array.isArray(data?.items) ? data.items : [];
+      if (fetchedTotal > 0 && fetchedItems.length === 0 && reqState.page > 0) {
+        reqState.page = Math.max(0, Math.ceil(fetchedTotal / REQ_PAGE_SIZE) - 1);
+        void fetchRequestLogs();
+        return;
+      }
       reqState.lastData = data;
       renderReqRows(data);
       if (reqTableWrap) reqTableWrap.scrollTop = 0;

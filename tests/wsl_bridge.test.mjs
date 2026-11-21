@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -78,6 +79,22 @@ test('detectWindowsHostEnv & WSL2 path helpers handle native Win, pure Linux, /m
       },
     }),
     '\\\\wsl.localhost\\Ubuntu-24.04\\home\\alice\\fallback',
+  );
+  // Non-existent leaf path walks up to nearest existing parent for wslpath -w (even when distroName is empty)
+  assert.equal(
+    await toWindowsPath(
+      '/home/alice/.gemini/antigravity/plugin_data/agy-monitor',
+      { ...wslMnt, distroName: '' },
+      {
+        execImpl: async (_cmd, args) => {
+          if (args[1] === '/home/alice') {
+            return { stdout: '\\\\wsl.localhost\\Ubuntu\\home\\alice\n' };
+          }
+          throw new Error('No such file or directory');
+        },
+      },
+    ),
+    '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.gemini\\antigravity\\plugin_data\\agy-monitor',
   );
 
   // Custom root=/ mount (/c)
@@ -248,16 +265,80 @@ test('WSL CDP loopback tunnel C# binary compiles cleanly and proxies HTTP /json/
     res.writeHead(404);
     res.end();
   });
+  // Also handle real RFC6455 WebSocket upgrade (echoing a JSON-RPC CDP reply frame)
+  mockCdpServer.on('upgrade', (req, socket) => {
+    socket.on('error', () => {});
+    const key = String(req.headers['sec-websocket-key'] || '');
+    const accept = crypto
+      .createHash('sha1')
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64');
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    socket.on('data', (buf) => {
+      if (!buf || buf.length < 6) return;
+      const opcode = buf[0] & 0x0f;
+      if (opcode === 0x08) {
+        socket.end();
+        return;
+      }
+      if (opcode !== 0x01) return;
+      const payloadLen = buf[1] & 0x7f;
+      const mask = buf.subarray(2, 6);
+      const raw = Buffer.alloc(payloadLen);
+      for (let i = 0; i < payloadLen; i += 1) {
+        raw[i] = buf[6 + i] ^ mask[i % 4];
+      }
+      const msg = JSON.parse(raw.toString('utf8'));
+      const replyBytes = Buffer.from(
+        JSON.stringify({ id: msg.id, result: { value: 'wsl-cdp-ok' } }),
+        'utf8',
+      );
+      const header = Buffer.from([0x81, replyBytes.length]);
+      socket.write(Buffer.concat([header, replyBytes]));
+    });
+  });
   await new Promise((resolve) => mockCdpServer.listen(0, '127.0.0.1', resolve));
   const targetPort = mockCdpServer.address().port;
 
   proxy = await createWslCdpLocalProxy(targetPort, { tunnelExePosix: exePath });
   assert.ok(proxy && proxy.localPort > 0);
 
+  // 1. HTTP /json/list through tunnel
   const resp = await fetch(`http://127.0.0.1:${proxy.localPort}/json/list`, {
     headers: { Connection: 'close' },
   });
   assert.equal(resp.status, 200);
   const body = await resp.json();
   assert.deepEqual(body, fakeTargets);
+
+  // 2. Real full-duplex WebSocket JSON-RPC through tunnel
+  const wsUrl = rewriteTargetWsUrl(
+    `ws://127.0.0.1:${targetPort}/devtools/page/TUNNEL1`,
+    targetPort,
+    '127.0.0.1',
+    proxy.localPort,
+  );
+  const wsReply = await new Promise((resolve, reject) => {
+    const ws = new globalThis.WebSocket(wsUrl);
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error('WS tunnel timeout'));
+    }, 3000);
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ id: 7, method: 'Runtime.evaluate' }));
+    });
+    ws.addEventListener('message', (ev) => {
+      clearTimeout(timer);
+      const parsed = JSON.parse(String(ev.data || '{}'));
+      ws.close();
+      resolve(parsed);
+    });
+    ws.addEventListener('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+  assert.deepEqual(wsReply, { id: 7, result: { value: 'wsl-cdp-ok' } });
 });

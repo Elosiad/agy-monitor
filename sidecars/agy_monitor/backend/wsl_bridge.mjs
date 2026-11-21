@@ -290,6 +290,8 @@ export async function toWindowsPath(inputPath, hostInfo = detectWindowsHostEnv()
   }
 
   // Official WSL path conversion for ext4 paths (/home/... -> \\wsl.localhost\<distro>\home\...)
+  // Walk up to the nearest existing ancestor if the leaf path does not exist yet on disk,
+  // because older WSL builds fail `wslpath -w` on non-existent target paths.
   const runner = execImpl || execFileAsync;
   try {
     const { stdout } = await runner('wslpath', ['-w', trimmed], { timeout: 3000 });
@@ -299,7 +301,25 @@ export async function toWindowsPath(inputPath, hostInfo = detectWindowsHostEnv()
       return converted;
     }
   } catch {
-    // Fallback below
+    let cursor = trimmed;
+    const tailParts = [];
+    while (cursor && cursor !== '/' && tailParts.length < 12) {
+      const parent = path.posix.dirname(cursor);
+      if (!parent || parent === cursor) break;
+      tailParts.unshift(path.posix.basename(cursor));
+      cursor = parent;
+      try {
+        const { stdout } = await runner('wslpath', ['-w', cursor], { timeout: 3000 });
+        const baseWin = String(stdout || '').trim().replace(/[\\/]+$/, '');
+        if (baseWin) {
+          const joined = `${baseWin}\\${tailParts.join('\\')}`;
+          if (!execImpl) winPathCache.set(cacheKey, joined);
+          return joined;
+        }
+      } catch {
+        // Keep walking up
+      }
+    }
   }
 
   if (hostInfo.distroName) {
@@ -475,26 +495,18 @@ export async function ensureWslCdpTunnelBinary(hostInfo = detectWindowsHostEnv()
     }
 
     const srcHash = crypto.createHash('sha1').update(WSL_CDP_TUNNEL_CS).digest('hex');
+    const shortHash = srcHash.slice(0, 8);
+    const exeName = `agy_wsl_cdp_tunnel_${shortHash}.exe`;
     const exePosix = hostInfo.isNativeWindows
-      ? path.join(binDirPosix, 'agy_wsl_cdp_tunnel.exe')
-      : `${binDirPosix}/agy_wsl_cdp_tunnel.exe`;
-    const exeWin = `${binDirWin}\\agy_wsl_cdp_tunnel.exe`;
-    const hashPosix = hostInfo.isNativeWindows
-      ? path.join(binDirPosix, 'agy_wsl_cdp_tunnel.sha1')
-      : `${binDirPosix}/agy_wsl_cdp_tunnel.sha1`;
+      ? path.join(binDirPosix, exeName)
+      : `${binDirPosix}/${exeName}`;
+    const exeWin = `${binDirWin}\\${exeName}`;
     const srcPosix = hostInfo.isNativeWindows
       ? path.join(binDirPosix, 'AgyWslCdpTunnel.cs')
       : `${binDirPosix}/AgyWslCdpTunnel.cs`;
     const srcWin = `${binDirWin}\\AgyWslCdpTunnel.cs`;
 
-    let prevHash = '';
-    try {
-      prevHash = (await fsp.readFile(hashPosix, 'utf8')).trim();
-    } catch {
-      prevHash = '';
-    }
-
-    if (fs.existsSync(exePosix) && prevHash === srcHash) {
+    if (fs.existsSync(exePosix)) {
       return { ok: true, exePosix, exeWin, compiledNow: false };
     }
 
@@ -510,7 +522,23 @@ export async function ensureWslCdpTunnelBinary(hostInfo = detectWindowsHostEnv()
         { timeout: 15000 },
       );
       await fsp.rename(tmpExePosix, exePosix);
-      await fsp.writeFile(hashPosix, `${srcHash}\n`, 'utf8');
+      // Best-effort cleanup of superseded tunnel binaries (ignores files locked by active sessions)
+      try {
+        const entries = await fsp.readdir(binDirPosix);
+        for (const name of entries) {
+          if (
+            /^agy_wsl_cdp_tunnel(?:_[0-9a-f]{8})?\.exe$/i.test(name) &&
+            name.toLowerCase() !== exeName.toLowerCase()
+          ) {
+            const oldPath = hostInfo.isNativeWindows
+              ? path.join(binDirPosix, name)
+              : `${binDirPosix}/${name}`;
+            await fsp.rm(oldPath, { force: true }).catch(() => {});
+          }
+        }
+      } catch {
+        // ignore cleanup error
+      }
       return { ok: true, exePosix, exeWin, compiledNow: true };
     } catch (err) {
       await fsp.rm(tmpExePosix, { force: true }).catch(() => {});
@@ -588,13 +616,17 @@ export async function createWslCdpLocalProxy(targetPort, { tunnelExePosix, hostI
     socket.on('error', cleanup);
     socket.on('close', cleanup);
     child.on('error', cleanup);
-    child.on('exit', () => {
-      try {
-        socket.end();
-      } catch {
-        // ignore
+    // Use 'close' (not 'exit') so child.stdout finishes flushing all buffered bytes to socket before teardown.
+    child.on('close', () => {
+      activeChildren.delete(child);
+      if (!socket.destroyed && !socket.writableEnded) {
+        try {
+          socket.end();
+        } catch {
+          // ignore
+        }
       }
-      const t = setTimeout(cleanup, 25);
+      const t = setTimeout(cleanup, 120);
       if (typeof t.unref === 'function') t.unref();
     });
 

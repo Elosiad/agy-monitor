@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ensureBackdropAssets } from './backdrop_manager.mjs';
 import { atomicWriteJson } from './paths.mjs';
+import { detectWindowsHostEnv } from './wsl_bridge.mjs';
 
 export const REPO_OWNER = 'aishadiaodeqishui';
 export const REPO_NAME = 'agy-monitor';
@@ -480,7 +481,9 @@ export async function applyPluginUpdate(
           : latestCheck.remoteVersion || '1.0.0';
 
       let backdropCompiled = false;
-      if (platform === 'win32' && typeof ensureBackdropFn === 'function') {
+      const shouldCompileBackdrop =
+        platform === 'win32' || detectWindowsHostEnv({ platform }).hasWindowsHost;
+      if (shouldCompileBackdrop && typeof ensureBackdropFn === 'function') {
         const bd = await ensureBackdropFn(paths).catch(() => ({ compiled: false }));
         backdropCompiled = Boolean(bd?.compiled);
       }
@@ -565,7 +568,19 @@ export function openRepoInBrowser({ platform = process.platform, spawnImpl = spa
     } else if (platform === 'darwin') {
       child = spawnImpl('open', [REPO_URL], { detached: true, stdio: 'ignore' });
     } else {
-      child = spawnImpl('xdg-open', [REPO_URL], { detached: true, stdio: 'ignore' });
+      const hostInfo = detectWindowsHostEnv({ platform });
+      const wslRundll =
+        hostInfo.isWsl && hostInfo.winMountRoot
+          ? `${hostInfo.winMountRoot}/Windows/System32/rundll32.exe`
+          : '';
+      if (wslRundll && fs.existsSync(wslRundll)) {
+        child = spawnImpl(wslRundll, ['url.dll,FileProtocolHandler', REPO_URL], {
+          detached: true,
+          stdio: 'ignore',
+        });
+      } else {
+        child = spawnImpl('xdg-open', [REPO_URL], { detached: true, stdio: 'ignore' });
+      }
     }
     child?.on?.('error', () => {});
     child?.unref?.();
