@@ -59,4 +59,16 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   assert.ok(lbClassStart > 0 && hudClassStart > lbClassStart);
   const lbClassSrc = src.slice(lbClassStart, hudClassStart);
   assert.match(lbClassSrc, /TransformToDevice/, 'ImageLightboxWindow must compensate mixed-DPI via TransformToDevice');
+
+  // 8. v1.0.6 GPU hardware-accelerated backdrop, atomic DeferWindowPos, VSync render-follow & progress-tag header filter
+  const bdStart = src.indexOf('internal sealed class BackdropSurfaceWindow');
+  assert.ok(bdStart > 0 && lbClassStart > bdStart);
+  const bdSrc = src.slice(bdStart, lbClassStart);
+  assert.match(bdSrc, /AllowsTransparency\s*=\s*false;/, 'BackdropSurfaceWindow must use hardware-accelerated AllowsTransparency=false');
+  assert.match(bdSrc, /DwmSetWindowAttribute/, 'BackdropSurfaceWindow must apply native DWM rounded corners');
+  assert.match(src, /BeginDeferWindowPos/, 'SyncAllWindows must batch Backdrop + HUD updates via DeferWindowPos');
+  assert.match(src, /CompositionTarget\.Rendering\s*\+=\s*OnCompositionRendering/, 'Companion must VSync-track window moves/resizes');
+  assert.match(src, /EVENT_OBJECT_REORDER/, 'Companion must hook EVENT_OBJECT_REORDER for instant Z-order sync');
+  assert.match(src, /\[AGY_PROGRESS/, 'IsHeaderChromeText must reject [AGY_PROGRESS...] chat lines as titles');
+  assert.match(src, /IsNewConversationTitle/, 'ProbeActiveConversationView must detect blank New Conversation headers');
 });

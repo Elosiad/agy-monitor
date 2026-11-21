@@ -446,11 +446,25 @@ function buildApplyThemeAndScanExpr(cssText) {
       var timer = setInterval(scanLayers, 1100);
       var onResize = function() { setTimeout(scanLayers, 40); };
       window.addEventListener('resize', onResize, { passive: true });
+      var mutTimer = null;
+      var layerObserver = null;
+      if (typeof MutationObserver === 'function' && document.body) {
+        layerObserver = new MutationObserver(function() {
+          if (mutTimer) return;
+          mutTimer = setTimeout(function() {
+            mutTimer = null;
+            scanLayers();
+          }, 32);
+        });
+        layerObserver.observe(document.body, { childList: true, subtree: true });
+      }
 
       window.__agyMonLayerEngine = {
         scan: scanLayers,
         stop: function() {
           clearInterval(timer);
+          if (mutTimer) { clearTimeout(mutTimer); mutTimer = null; }
+          if (layerObserver) { layerObserver.disconnect(); layerObserver = null; }
           window.removeEventListener('resize', onResize);
           var nodes = document.querySelectorAll('[data-agy-mon-layer]');
           for (var i = 0; i < nodes.length; i++) {
@@ -479,7 +493,7 @@ function buildRemoveThemeExpr() {
 
 function buildHudSyncExpr(hudPayload, accentColor) {
   const safePayload = JSON.stringify({
-    percent: clampInt(hudPayload?.percent, 0, 100, 0),
+    percent: clampInt(hudPayload?.percent, 0, 999, 0),
     tokPerSec:
       typeof hudPayload?.tokPerSec === 'number' && Number.isFinite(hudPayload.tokPerSec) && hudPayload.tokPerSec > 0
         ? hudPayload.tokPerSec
@@ -503,7 +517,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
         '#' + HUD_ID + ' .agy-hud-ring-pill { display: inline-flex; align-items: center; height: 22px; padding: 0 3px; border-radius: 999px; border: 1px solid transparent; background: transparent; cursor: pointer; flex-shrink: 0; transition: background 0.14s ease, border-color 0.14s ease, padding 0.14s ease; }',
         '#' + HUD_ID + ' .agy-hud-ring-pill:hover { background: rgba(22, 24, 32, 0.90); border-color: rgba(255, 255, 255, 0.22); padding: 0 7px 0 5px; }',
         '#' + HUD_ID + ' .agy-hud-pct { max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; font-size: 11px; font-weight: 600; color: #eae9ef; font-variant-numeric: tabular-nums; margin-left: 0; transition: max-width 0.14s ease, opacity 0.12s ease, margin-left 0.14s ease; }',
-        '#' + HUD_ID + ' .agy-hud-ring-pill:hover .agy-hud-pct { max-width: 44px; opacity: 1; margin-left: 5px; }',
+        '#' + HUD_ID + ' .agy-hud-ring-pill:hover .agy-hud-pct { max-width: 52px; opacity: 1; margin-left: 5px; }',
         '#' + HUD_ID + ' .agy-hud-meta-pill { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(19, 21, 28, 0.78); cursor: pointer; min-width: 0; max-width: 245px; overflow: hidden; transition: background 0.14s ease, border-color 0.14s ease; }',
         '#' + HUD_ID + ' .agy-hud-meta-pill:hover { background: rgba(28, 31, 41, 0.94); border-color: rgba(255, 255, 255, 0.28); }',
         '#' + HUD_ID + ' .agy-hud-speed { font-size: 11px; font-weight: 500; color: #e2e1e8; white-space: nowrap; flex-shrink: 0; font-variant-numeric: tabular-nums; }',
@@ -555,7 +569,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       for (var i = 0; i < inputs.length; i++) {
         var ir = inputs[i].getBoundingClientRect();
         if (!ir || ir.width < 160 || ir.height < 16) continue;
-        if (ir.bottom < vh - 240 || ir.top > vh - 12) continue;
+        if (ir.bottom < vh - 280 || ir.top > vh - 12) continue;
         if (ir.bottom > bestBottom) {
           bestBottom = ir.bottom;
           bestInput = inputs[i];
@@ -565,6 +579,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
 
       var card = bestInput;
       var chosenBtn = null;
+      var cardRect = null;
       var MODE_RE = /turbo|planning|fast|auto|strict|review|proceed|sandbox|permission|ask|极速|规划|快速|自动|严格|审查|权限/i;
       var MIC_RE = /microphone|voice|dictate|speech|audio|麦克风|语音/i;
       var SEND_RE = /send|stop|submit|cancel|发送|停止/i;
@@ -572,7 +587,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       for (var up = 0; up < 6 && card && card.parentElement && card.parentElement !== document.body; up++) {
         card = card.parentElement;
         var cr = card.getBoundingClientRect();
-        if (cr.height < 52 || cr.height > 290 || cr.width < 200) continue;
+        if (cr.height < 52 || cr.height > 360 || cr.width < 200) continue;
         var btns = card.querySelectorAll('button');
         if (btns.length < 3) continue;
 
@@ -606,11 +621,22 @@ function buildHudSyncExpr(hudPayload, accentColor) {
         }
 
         chosenBtn = modeBtn || micBtn || sendBtn;
-        if (chosenBtn) break;
+        if (chosenBtn) {
+          cardRect = cr;
+          break;
+        }
       }
 
       if (!chosenBtn || !chosenBtn.parentElement) return null;
-      return { parent: chosenBtn.parentElement, before: chosenBtn };
+      return { parent: chosenBtn.parentElement, before: chosenBtn, cardWidth: cardRect ? cardRect.width : 0 };
+    }
+
+    function isBadHeaderTitle(txt) {
+      if (!txt || txt.length < 2 || txt.length > 120) return true;
+      if (txt.indexOf('[AGY_PROGRESS') >= 0) return true;
+      var low = txt.toLowerCase();
+      if (low === 'antigravity' || low === 'workspace' || low === 'view' || low === 'window' || low === 'swarm' || low === 'agy 控制台') return true;
+      return false;
     }
 
     function readActiveView() {
@@ -631,12 +657,22 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       parts.sort(function(a, b) { return a.x - b.x; });
       for (var p = 0; p < parts.length; p++) {
         var s = parts[p].text;
+        var low = s.toLowerCase();
+        if (low === 'new conversation' || low === '新建对话') {
+          return { workspace: '', title: s, isNewConversation: true };
+        }
         var idx = s.indexOf(' / ');
         if (idx > 0 && idx < s.length - 3) {
-          return { workspace: s.slice(0, idx).trim(), title: s.slice(idx + 3).trim() };
+          var t1 = s.slice(idx + 3).trim();
+          if (!isBadHeaderTitle(t1)) {
+            return { workspace: s.slice(0, idx).trim(), title: t1, isNewConversation: false };
+          }
         }
         if (s === '/' && p + 1 < parts.length) {
-          return { workspace: p > 0 ? parts[p - 1].text : '', title: parts[p + 1].text };
+          var t2 = parts[p + 1].text;
+          if (!isBadHeaderTitle(t2)) {
+            return { workspace: p > 0 ? parts[p - 1].text : '', title: t2, isNewConversation: false };
+          }
         }
       }
       return null;
@@ -661,7 +697,7 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       ringPill.innerHTML =
         '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">' +
           '<circle cx="8" cy="8" r="6" fill="none" stroke="rgba(255,255,255,0.24)" stroke-width="2"></circle>' +
-          '<circle class="agy-hud-arc" cx="8" cy="8" r="6" fill="none" stroke="#5b8cff" stroke-width="2" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="37.7" stroke-dashoffset="37.7"></circle>' +
+          '<circle class="agy-hud-arc" cx="8" cy="8" r="6" fill="none" stroke="#5b8cff" stroke-width="2" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="37.7" stroke-dashoffset="37.7" style="opacity:0"></circle>' +
         '</svg>' +
         '<span class="agy-hud-pct">0%</span>';
       ringPill.addEventListener('click', function(e) {
@@ -692,17 +728,19 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       anchor.parent.insertBefore(hud, anchor.before);
     }
 
-    var pct = Math.max(0, Math.min(100, Number(data.percent) || 0));
-    var arcColor = pct >= 90 ? '#ef5350' : (pct >= 75 ? '#e99315' : (data.accent || '#5b8cff'));
+    var rawPct = Math.max(0, Math.min(999, Math.round(Number(data.percent) || 0)));
+    var clampedArcPct = Math.min(100, rawPct);
+    var arcColor = rawPct >= 90 ? '#ef5350' : (rawPct >= 75 ? '#e99315' : (data.accent || '#5b8cff'));
     var circ = 2 * Math.PI * 6;
-    var offset = circ * (1 - pct / 100);
+    var offset = circ * (1 - clampedArcPct / 100);
     var arc = hud.querySelector('.agy-hud-arc');
     if (arc) {
       arc.setAttribute('stroke', arcColor);
       arc.setAttribute('stroke-dashoffset', offset.toFixed(2));
+      arc.style.opacity = rawPct > 0 ? '1' : '0';
     }
     var pctEl = hud.querySelector('.agy-hud-pct');
-    if (pctEl) pctEl.textContent = pct + '%';
+    if (pctEl) pctEl.textContent = rawPct + '%';
 
     var speedEl = hud.querySelector('.agy-hud-speed');
     if (speedEl) {
@@ -717,11 +755,28 @@ function buildHudSyncExpr(hudPayload, accentColor) {
       modelEl.textContent = data.upstreamModelId || '--';
     }
 
-    // Hide meta pill cleanly only when composer toolbar gets ultra narrow
-    var parentRect = anchor.parent.getBoundingClientRect();
+    // Measure full composer card width rather than the narrow button-group flex wrapper
+    var effectiveWidth = anchor.cardWidth || (anchor.parent.getBoundingClientRect ? anchor.parent.getBoundingClientRect().width : 0);
     var metaBtn = hud.querySelector('.agy-hud-meta-pill');
-    if (metaBtn && parentRect) {
-      metaBtn.style.display = parentRect.width < 220 ? 'none' : 'inline-flex';
+    if (metaBtn && effectiveWidth > 0) {
+      metaBtn.style.display = effectiveWidth < 360 ? 'none' : 'inline-flex';
+    }
+
+    if (!window.__agyMonHudObserver && typeof MutationObserver === 'function' && document.body) {
+      var hudObsTimer = null;
+      var hudObs = new MutationObserver(function() {
+        if (document.getElementById(HUD_ID)) return;
+        if (hudObsTimer) return;
+        hudObsTimer = setTimeout(function() {
+          hudObsTimer = null;
+          var nextAnchor = findComposerAnchor();
+          if (nextAnchor && hud && hud.parentElement !== nextAnchor.parent) {
+            nextAnchor.parent.insertBefore(hud, nextAnchor.before);
+          }
+        }, 40);
+      });
+      hudObs.observe(document.body, { childList: true, subtree: true });
+      window.__agyMonHudObserver = hudObs;
     }
 
     return { hudInjected: true, activeView: readActiveView(), focused: focused };
@@ -730,6 +785,10 @@ function buildHudSyncExpr(hudPayload, accentColor) {
 
 function buildRemoveHudExpr() {
   return `(function(){
+    if (window.__agyMonHudObserver) {
+      try { window.__agyMonHudObserver.disconnect(); } catch (e) {}
+      delete window.__agyMonHudObserver;
+    }
     var el = document.getElementById(${JSON.stringify(HUD_ELEMENT_ID)});
     if (el && el.parentNode) el.parentNode.removeChild(el);
     var st = document.getElementById(${JSON.stringify(HUD_STYLE_ID)});
@@ -1080,7 +1139,7 @@ function buildHostI18nRestoreExpr() {
  * 2) Renders a 120fps native inline composer HUD when CDP is connected (zero drag lag!);
  * 3) Provides reversible in-memory Chinese UI localization for Antigravity host without editing app.asar.
  */
-export function createCdpThemeBridge(paths) {
+export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   /** @type {Map<string, { ws: WebSocket, wsUrl: string, title: string, url: string, type: string, cssApplied: boolean, hudInjected: boolean, hostLocalized: boolean }>} */
   const sessions = new Map();
   const connectingUrls = new Set();
@@ -1094,7 +1153,20 @@ export function createCdpThemeBridge(paths) {
   let latestHostLanguage = 'zh-CN';
   let latestHudData = null;
   let lastActiveViewKey = '';
+  let lastNotifiedHudInjected = false;
   let disposed = false;
+
+  const notifyHudStateIfChanged = () => {
+    const next = isHudInjected();
+    if (next !== lastNotifiedHudInjected) {
+      lastNotifiedHudInjected = next;
+      try {
+        onHudStateChange?.(next);
+      } catch {
+        // Ignore callback error
+      }
+    }
+  };
 
   let cachedWpId = '';
   let cachedWpMtime = 0;
@@ -1322,6 +1394,7 @@ export function createCdpThemeBridge(paths) {
           const cur = sessions.get(url);
           if (cur && cur.ws === sock) {
             sessions.delete(url);
+            notifyHudStateIfChanged();
           }
           finish(null);
         });
@@ -1417,10 +1490,11 @@ export function createCdpThemeBridge(paths) {
   const maybeWriteActiveView = async (view, { focused = true } = {}) => {
     if (!view || !paths?.hudActiveViewFile) return;
     if (sessions.size > 1 && !focused) return;
+    const isNewConv = Boolean(view.isNewConversation);
     const title = String(view.title || '').trim();
     const workspace = String(view.workspace || '').trim();
-    if (!title || title.length < 2) return;
-    const key = `${workspace}|${title}`;
+    if (!isNewConv && (!title || title.length < 2)) return;
+    const key = isNewConv ? '__new_conversation__' : `${workspace}|${title}`;
     if (key === lastActiveViewKey) return;
 
     // Preserve recent explicit sidecar_focus selections from being clobbered by title-only DOM reads
@@ -1437,7 +1511,7 @@ export function createCdpThemeBridge(paths) {
         if (ageMs >= 0 && ageMs < 3000) {
           return;
         }
-        if (String(existing.title || '').trim().toLowerCase() === title.toLowerCase()) {
+        if (!isNewConv && String(existing.title || '').trim().toLowerCase() === title.toLowerCase()) {
           lastActiveViewKey = key;
           return;
         }
@@ -1450,13 +1524,17 @@ export function createCdpThemeBridge(paths) {
     await atomicWriteJson(paths.hudActiveViewFile, {
       workspace,
       title,
+      isNewConversation: isNewConv,
       source: 'cdp_header',
       updatedAtMs: Date.now(),
     }).catch(() => {});
   };
 
   const syncHudAll = async () => {
-    if (disposed || !hasOpenSessions()) return false;
+    if (disposed || !hasOpenSessions()) {
+      notifyHudStateIfChanged();
+      return false;
+    }
     const hudEnabled = latestThemes?.hudEnabled !== false;
     if (!hudEnabled) {
       const rem = buildRemoveHudExpr();
@@ -1468,6 +1546,7 @@ export function createCdpThemeBridge(paths) {
           entry.hudInjected = false;
         }),
       );
+      notifyHudStateIfChanged();
       return false;
     }
 
@@ -1486,6 +1565,7 @@ export function createCdpThemeBridge(paths) {
         }
       }),
     );
+    notifyHudStateIfChanged();
     return anyInjected;
   };
 
@@ -1499,6 +1579,7 @@ export function createCdpThemeBridge(paths) {
         entry.hudInjected = false;
       }),
     );
+    notifyHudStateIfChanged();
   };
 
   const applyHostI18nAll = async () => {

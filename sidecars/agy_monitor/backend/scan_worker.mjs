@@ -331,10 +331,20 @@ function recomputeConvMetrics(db, convId) {
       // CHECKPOINT resets current conversation context segment breakdown, NEVER deletes step_ledger burn history.
       userCharsTotal = 0;
       toolCharsTotal = 0;
+      const checkpointIn = row.input_tokens + row.cache_read_tokens;
+      // Real Antigravity CHECKPOINT logs the summarizer call itself (input+cache = pre-compaction full context,
+      // output = compacted summary). Estimate post-compaction occupancy from summary + system base instead of spiking to 100%.
+      const looksLikeSummarizerCall =
+        latestContextTokens > 0 &&
+        checkpointIn >= latestContextTokens * 0.85 &&
+        row.output_tokens > 0 &&
+        row.output_tokens < checkpointIn * 0.5;
       latestUncachedInput = row.input_tokens;
       latestCacheRead = row.cache_read_tokens;
       latestOutputTokens = row.output_tokens;
-      latestContextTokens = row.input_tokens + row.cache_read_tokens;
+      latestContextTokens = looksLikeSummarizerCall
+        ? Math.min(checkpointIn, row.output_tokens + 12800)
+        : checkpointIn;
       continue;
     }
 

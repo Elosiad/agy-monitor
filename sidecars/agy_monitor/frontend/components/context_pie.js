@@ -514,8 +514,10 @@ export function createContextPie({ apiFetch, t, onWindowCapChange, onToast } = {
       if (options && typeof options.configuredRulesTokens === "number") {
         configuredRulesTokens = Math.max(0, Math.round(options.configuredRulesTokens));
       }
-      const nextCap = Number(windowCap || contextPie?.windowCap || activeCap) || activeCap;
-      syncWindowBadge(nextCap);
+      if (!isSavingCap) {
+        const nextCap = Number(windowCap || contextPie?.windowCap || activeCap) || activeCap;
+        syncWindowBadge(nextCap);
+      }
       animatePieRefresh();
       if (hoveredSliceId) {
         showSliceHover(hoveredSliceId);

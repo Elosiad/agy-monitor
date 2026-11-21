@@ -45,7 +45,7 @@ import {
   createStorage,
   sanitizePublicMasteryConfig,
 } from './backend/storage.mjs';
-import { queryTelemetrySnapshot } from './backend/telemetry.mjs';
+import { queryBatchConvHudMetrics, queryTelemetrySnapshot } from './backend/telemetry.mjs';
 import {
   applyPluginUpdate,
   checkForUpdates,
@@ -361,39 +361,46 @@ function normalizeViewTitle(raw) {
 
 async function resolveViewedConvInfo(paths, sessionsHub) {
   const viewFile = paths?.hudActiveViewFile;
-  if (!viewFile) return { convId: '', source: '', updatedAtMs: 0, ageMs: Infinity };
+  if (!viewFile) return { convId: '', isNewConversation: false, source: '', updatedAtMs: 0, ageMs: Infinity };
 
   let doc = null;
   try {
     const text = await fs.readFile(viewFile, 'utf8');
     doc = JSON.parse(text);
   } catch {
-    return { convId: '', source: '', updatedAtMs: 0, ageMs: Infinity };
+    return { convId: '', isNewConversation: false, source: '', updatedAtMs: 0, ageMs: Infinity };
   }
-  if (!doc || typeof doc !== 'object') return { convId: '', source: '', updatedAtMs: 0, ageMs: Infinity };
+  if (!doc || typeof doc !== 'object') return { convId: '', isNewConversation: false, source: '', updatedAtMs: 0, ageMs: Infinity };
 
   const updatedAtMs = Number(doc.updatedAtMs || 0);
   const ageMs = updatedAtMs > 0 ? Math.max(0, Date.now() - updatedAtMs) : Infinity;
   if (updatedAtMs > 0 && ageMs > 12 * 3600 * 1000) {
-    return { convId: '', source: '', updatedAtMs: 0, ageMs };
+    return { convId: '', isNewConversation: false, source: '', updatedAtMs: 0, ageMs };
   }
 
   const source = typeof doc.source === 'string' ? doc.source : '';
+  if (doc.isNewConversation === true) {
+    return { convId: '', isNewConversation: true, source, updatedAtMs, ageMs };
+  }
   const exactConvId = typeof doc.conversationId === 'string' ? doc.conversationId.trim() : '';
   if (exactConvId) {
-    return { convId: exactConvId, source, updatedAtMs, ageMs };
+    return { convId: exactConvId, isNewConversation: false, source, updatedAtMs, ageMs };
   }
 
   const all = Array.isArray(sessionsHub?.allSelectable) ? sessionsHub.allSelectable : [];
-  if (all.length === 0) return { convId: '', source, updatedAtMs, ageMs };
+  if (all.length === 0) return { convId: '', isNewConversation: false, source, updatedAtMs, ageMs };
 
   const rawTitle = normalizeViewTitle(doc.title);
   const rawWorkspace = normalizeViewTitle(doc.workspace).toLowerCase();
-  if (!rawTitle || rawTitle.length < 2) return { convId: '', source, updatedAtMs, ageMs };
+  if (!rawTitle || rawTitle.length < 2) return { convId: '', isNewConversation: false, source, updatedAtMs, ageMs };
+
+  const targetLow = rawTitle.toLowerCase();
+  if (targetLow === 'new conversation' || targetLow === '新建对话') {
+    return { convId: '', isNewConversation: true, source, updatedAtMs, ageMs };
+  }
 
   const isEllipsized = /(?:\.{2,}|…)$/.test(rawTitle);
   const stripped = rawTitle.replace(/(?:\.{2,}|…)+$/, '').trim();
-  const targetLow = rawTitle.toLowerCase();
   const strippedLow = stripped.toLowerCase();
 
   const workspaceMatches = (s) => {
@@ -411,7 +418,7 @@ async function resolveViewedConvInfo(paths, sessionsHub) {
       return (b.modifiedMs || 0) - (a.modifiedMs || 0);
     });
   if (exact.length > 0 && exact[0]?.id) {
-    return { convId: String(exact[0].id), source, updatedAtMs, ageMs };
+    return { convId: String(exact[0].id), isNewConversation: false, source, updatedAtMs, ageMs };
   }
 
   // 2. Ellipsized prefix match (e.g. "Antigravity Tool Improve..." -> "Antigravity Tool Improvement Ideas")
@@ -428,11 +435,11 @@ async function resolveViewedConvInfo(paths, sessionsHub) {
         return (b.modifiedMs || 0) - (a.modifiedMs || 0);
       });
     if (prefix.length > 0 && prefix[0]?.id) {
-      return { convId: String(prefix[0].id), source, updatedAtMs, ageMs };
+      return { convId: String(prefix[0].id), isNewConversation: false, source, updatedAtMs, ageMs };
     }
   }
 
-  return { convId: '', source, updatedAtMs: 0, ageMs };
+  return { convId: '', isNewConversation: false, source, updatedAtMs: 0, ageMs };
 }
 
 async function resolveViewedConvId(paths, sessionsHub) {
@@ -441,6 +448,9 @@ async function resolveViewedConvId(paths, sessionsHub) {
 }
 
 function pickFollowLatestTopLevelConvId(sessionsHub, viewedConvId = '') {
+  if (viewedConvId === '__new_conversation__') {
+    return '';
+  }
   if (viewedConvId) {
     return String(viewedConvId);
   }
@@ -490,21 +500,29 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
   };
 
   let writeChain = Promise.resolve();
-  const writePayload = (telemetry) => {
-    if (!paths?.hudTelemetryFile || !telemetry) return Promise.resolve();
+  let lastSessionsSnapshot = [];
+  const writePayload = (telemetry, { sessionsHudList = null, forceEmpty = false } = {}) => {
+    if (!paths?.hudTelemetryFile || (!telemetry && !forceEmpty)) return Promise.resolve();
     writeChain = writeChain.then(async () => {
-      const pie = telemetry.contextPie || {};
-      const rt = telemetry.runtimeTelemetry || {};
-      const cap = Number(pie.windowCap) || 512000;
-      const used = Math.max(0, Math.round(Number(pie.totalUsed) || 0));
-      const percent = cap > 0 ? Math.min(100, Math.max(0, Math.round((used / cap) * 100))) : 0;
+      const pie = forceEmpty ? {} : (telemetry?.contextPie || {});
+      const rt = forceEmpty ? {} : (telemetry?.runtimeTelemetry || {});
+      const cap = Number(pie.windowCap) || Number((await store?.getPrefs?.().catch(() => null))?.windowCap) || 512000;
+      const used = forceEmpty ? 0 : Math.max(0, Math.round(Number(pie.totalUsed) || 0));
+      const percent = cap > 0 ? Math.max(0, Math.round((used / cap) * 100)) : 0;
       const tokPerSec =
-        typeof rt.latestTokPerSec === 'number' && Number.isFinite(rt.latestTokPerSec) && rt.latestTokPerSec > 0
+        !forceEmpty &&
+        typeof rt.latestTokPerSec === 'number' &&
+        Number.isFinite(rt.latestTokPerSec) &&
+        rt.latestTokPerSec > 0
           ? Math.round(rt.latestTokPerSec * 10) / 10
           : null;
-      const upstreamModelId = typeof rt.upstreamModelId === 'string' ? rt.upstreamModelId.trim() : '';
-      const upstreamModelStatus = typeof rt.upstreamModelStatus === 'string' ? rt.upstreamModelStatus : 'no_baseline';
-      const activeConvId = typeof telemetry.activeConvId === 'string' ? telemetry.activeConvId : '';
+      const upstreamModelId = !forceEmpty && typeof rt.upstreamModelId === 'string' ? rt.upstreamModelId.trim() : '';
+      const upstreamModelStatus = !forceEmpty && typeof rt.upstreamModelStatus === 'string' ? rt.upstreamModelStatus : 'unreported';
+      const activeConvId = forceEmpty ? '' : (typeof telemetry?.activeConvId === 'string' ? telemetry.activeConvId : '');
+
+      if (Array.isArray(sessionsHudList)) {
+        lastSessionsSnapshot = sessionsHudList;
+      }
 
       const payload = {
         activeConvId,
@@ -515,6 +533,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         upstreamModelId,
         upstreamModelStatus,
         cdpHudActive: false,
+        sessions: lastSessionsSnapshot,
         updatedAtMs: Date.now(),
       };
 
@@ -523,7 +542,10 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         payload.cdpHudActive = Boolean(injected || cdpBridge.isHudInjected?.());
       }
 
-      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}`;
+      const sessionsSig = lastSessionsSnapshot
+        .map((s) => `${s.id}:${s.percent}:${s.tokPerSec ?? ''}:${s.upstreamModelId}`)
+        .join(',');
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
       try {
@@ -537,6 +559,10 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
   };
 
   const resolveActiveConv = (topLevelIdSet, viewedInfo) => {
+    // Explicit blank New Conversation detected in foreground header -> immediately reset HUD to 0%
+    if (viewedInfo?.isNewConversation && (viewedInfo.updatedAtMs || 0) >= lastHostConvAtMs) {
+      return '__new_conversation__';
+    }
     // Arbitrate by latest foreground timestamp: sidebar UIA header / sidecar_focus vs foreground hostConvId
     if (viewedInfo?.convId && (viewedInfo.updatedAtMs || 0) > lastHostConvAtMs) {
       return viewedInfo.convId;
@@ -558,11 +584,26 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     }
     inFlight = true;
     try {
-      const sessionsHub = await querySessionsHub(paths.summariesDbPath, store, {});
-      const topLevelConvIds = (sessionsHub?.allSelectable || []).map((s) => s.id).filter(Boolean);
+      const [sessionsHub, prefs] = await Promise.all([
+        querySessionsHub(paths.summariesDbPath, store, {}),
+        store.getPrefs(),
+      ]);
+      const allSelectable = Array.isArray(sessionsHub?.allSelectable) ? sessionsHub.allSelectable : [];
+      const topLevelConvIds = allSelectable.map((s) => s.id).filter(Boolean);
       const topLevelIdSet = new Set(topLevelConvIds);
+      const windowCap = Number(prefs?.windowCap) || 512000;
+      const sessionsHudList = queryBatchConvHudMetrics(paths.cacheDbPath, allSelectable, windowCap);
+
       const viewedInfo = await resolveViewedConvInfo(paths, sessionsHub);
       const viewedConvId = resolveActiveConv(topLevelIdSet, viewedInfo);
+      if (viewedConvId === '__new_conversation__') {
+        await writePayload(
+          { contextPie: { windowCap, totalUsed: 0 }, runtimeTelemetry: {} },
+          { sessionsHudList, forceEmpty: true },
+        );
+        return;
+      }
+
       const followConvId = pickFollowLatestTopLevelConvId(sessionsHub, viewedConvId);
       const telemetry = await queryTelemetrySnapshot(paths.cacheDbPath, store, paths, {
         convId: followConvId || '',
@@ -572,7 +613,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         scope: 'current',
         range: '30d',
       });
-      await writePayload(telemetry);
+      await writePayload(telemetry, { sessionsHudList });
     } catch {
       // Non-fatal HUD publish failure
     } finally {
@@ -784,13 +825,14 @@ export function createMonitorHandlers({
             : viewedInfo.convId || '';
       }
     }
+    const isNewConv = viewedConvId === '__new_conversation__';
     const followConvId = pickFollowLatestTopLevelConvId(sessionsHub, viewedConvId);
 
     const targetConvId = explicitConvId || followConvId || '';
     const isExplicitConvId = Boolean(explicitConvId);
 
     const telemetry = await queryTelemetrySnapshot(resolvedPaths.cacheDbPath, store, resolvedPaths, {
-      convId: targetConvId,
+      convId: isNewConv ? '__new_conversation__' : targetConvId,
       isExplicitConvId: isExplicitConvId || Boolean(viewedConvId),
       followLatest: !isExplicitConvId && !viewedConvId,
       topLevelConvIds: hasTopLevelCatalog ? topLevelConvIds : undefined,
@@ -800,7 +842,7 @@ export function createMonitorHandlers({
     });
 
     if (!isExplicitConvId && (syncHud || !rawHostConvId)) {
-      void hud.writePayload(telemetry);
+      void hud.writePayload(telemetry, { forceEmpty: isNewConv });
     }
 
     const observedModels =
@@ -1673,8 +1715,13 @@ export async function startSidecarServer({
   const app = new SidecarApp();
   const paths = resolvePaths(pathsOverrides);
   const storage = createStorage(paths);
-  const cdpBridge = createCdpThemeBridge(paths);
-  const hudPublisher = createHudTelemetryPublisher(paths, storage, cdpBridge);
+  let hudPublisher = null;
+  const cdpBridge = createCdpThemeBridge(paths, {
+    onHudStateChange() {
+      void hudPublisher?.refreshFromDb?.();
+    },
+  });
+  hudPublisher = createHudTelemetryPublisher(paths, storage, cdpBridge);
 
   let latestWorkerEtag = '';
   const worker = skipWorker

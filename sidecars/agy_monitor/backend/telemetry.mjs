@@ -352,6 +352,7 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
     }
 
     const activeRow = targetRow || {};
+    const hasSelectedConv = Boolean(targetConvId);
     const isEmptySelectedConv = Boolean(targetConvId && !targetRow);
     const rowIn = Number(activeRow.latest_uncached_input || 0);
     const rowCache = Number(activeRow.latest_cache_read || 0);
@@ -362,11 +363,14 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
       ? 0
       : rowTotalIn > 0
         ? Math.round((rowCache / rowTotalIn) * 100)
-        : globalTodayHit;
+        : hasSelectedConv
+          ? 0
+          : globalTodayHit;
 
+    // Never borrow another conversation's model or speed when a specific conversation is active
     const upstreamModelId = isEmptySelectedConv
       ? null
-      : activeRow.latest_model || latestModelRow?.latest_model || null;
+      : activeRow.latest_model || (hasSelectedConv ? null : latestModelRow?.latest_model || null);
     const upstreamModelStatus = classifyUpstreamModelStatus(
       prefs.defaultModel,
       upstreamModelId
@@ -397,13 +401,13 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
       runtimeTelemetry: {
         latestTokPerSec: isEmptySelectedConv
           ? null
-          : activeRow.latest_speed_tok_s ?? latestSpeedRow?.latest_speed_tok_s ?? null,
+          : activeRow.latest_speed_tok_s ?? (hasSelectedConv ? null : latestSpeedRow?.latest_speed_tok_s ?? null),
         avgTokPerSec: isEmptySelectedConv
           ? null
-          : activeRow.avg_speed_tok_s ?? latestSpeedRow?.avg_speed_tok_s ?? null,
+          : activeRow.avg_speed_tok_s ?? (hasSelectedConv ? null : latestSpeedRow?.avg_speed_tok_s ?? null),
         speedSource: isEmptySelectedConv
           ? null
-          : activeRow.speed_source ?? latestSpeedRow?.speed_source ?? null,
+          : activeRow.speed_source ?? (hasSelectedConv ? null : latestSpeedRow?.speed_source ?? null),
         upstreamModelId,
         upstreamModelStatus,
         cacheHitPct,
@@ -419,4 +423,60 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
       }
     }
   }
+}
+
+/**
+ * Batch-query lightweight context ring metrics for up to 16 recent top-level conversations
+ * so multi-window Antigravity hosts can display independent per-window HUD rings.
+ */
+export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap = 512000) {
+  if (!Array.isArray(sessions) || sessions.length === 0) return [];
+  const cap = Number(windowCap) || 512000;
+  const top = sessions.filter((s) => s && s.id).slice(0, 16);
+  if (top.length === 0) return [];
+
+  const db = openReadOnlyCacheDb(cacheDbPath);
+  const byId = new Map();
+  if (db) {
+    try {
+      const ids = top.map((s) => String(s.id));
+      const placeholders = ids.map(() => '?').join(', ');
+      const rows = db
+        .prepare(
+          `SELECT conv_id, latest_model, latest_context_tokens, latest_speed_tok_s
+           FROM conv_latest_metrics
+           WHERE conv_id IN (${placeholders})`,
+        )
+        .all(...ids);
+      for (const r of rows) {
+        if (r && r.conv_id) byId.set(String(r.conv_id), r);
+      }
+    } catch {
+      // Non-fatal SQLite read error
+    } finally {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  return top.map((s) => {
+    const row = byId.get(String(s.id));
+    const used = Math.max(0, Math.round(Number(row?.latest_context_tokens || 0)));
+    const percent = cap > 0 ? Math.max(0, Math.round((used / cap) * 100)) : 0;
+    const rawSpeed = Number(row?.latest_speed_tok_s);
+    const tokPerSec = Number.isFinite(rawSpeed) && rawSpeed > 0 ? Math.round(rawSpeed * 10) / 10 : null;
+    return {
+      id: String(s.id),
+      title: String(s.title || '').trim(),
+      workspace: String(s.workspace || '').trim(),
+      percent,
+      totalUsed: used,
+      windowCap: cap,
+      tokPerSec,
+      upstreamModelId: typeof row?.latest_model === 'string' ? row.latest_model.trim() : '',
+    };
+  });
 }
