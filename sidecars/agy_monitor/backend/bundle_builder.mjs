@@ -4,6 +4,7 @@ import path from 'node:path';
 const COMPONENT_EXPORTS = [
   ['context_pie.js', 'createContextPie'],
   ['token_usage.js', 'createTokenUsage'],
+  ['quota_cards.js', 'createQuotaCards'],
   ['model_and_prompt.js', 'createModelAndPrompt'],
   ['sessions_hub.js', 'createSessionsHub'],
   ['runtime_bar.js', 'createRuntimeBar'],
@@ -82,6 +83,7 @@ export async function buildFrontendBundle(frontendDir) {
       `  } = __mods.i18n;\n` +
       `  const { createContextPie } = __mods.context_pie;\n` +
       `  const { createTokenUsage } = __mods.token_usage;\n` +
+      `  const { createQuotaCards } = __mods.quota_cards;\n` +
       `  const { createModelAndPrompt } = __mods.model_and_prompt;\n` +
       `  const { createSessionsHub } = __mods.sessions_hub;\n` +
       `  const { createRuntimeBar } = __mods.runtime_bar;\n` +

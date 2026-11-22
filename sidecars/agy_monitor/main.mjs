@@ -50,6 +50,7 @@ import {
   queryRequestLogs,
   queryTelemetrySnapshot,
 } from './backend/telemetry.mjs';
+import { createQuotaClient } from './backend/quota.mjs';
 import {
   applyPluginUpdate,
   checkForUpdates,
@@ -100,6 +101,10 @@ const STATIC_ASSETS = new Map([
   [
     '/components/token_usage.js',
     { relPath: 'components/token_usage.js', contentType: 'application/javascript; charset=utf-8' },
+  ],
+  [
+    '/components/quota_cards.js',
+    { relPath: 'components/quota_cards.js', contentType: 'application/javascript; charset=utf-8' },
   ],
   [
     '/components/model_and_prompt.js',
@@ -653,11 +658,13 @@ export function createMonitorHandlers({
   triggerRescan = null,
   hudPublisher = null,
   cdpBridge = null,
+  quotaClient = null,
 } = {}) {
   const resolvedPaths = paths || resolvePaths();
   const store = storage || createStorage(resolvedPaths);
   const cdp = cdpBridge || createCdpThemeBridge(resolvedPaths);
   const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp);
+  const quota = quotaClient || createQuotaClient();
   const masterySummarizer = createMasterySummarizer(resolvedPaths, store);
   const consoleViewports = new Map();
   let lastViewportDiskSig = '';
@@ -984,6 +991,11 @@ export function createMonitorHandlers({
       offset,
       convTitleMap,
     });
+  });
+
+  register('GET', '/api/quota', async (data = {}) => {
+    const force = data.force === '1' || data.force === 'true' || data.force === true;
+    return quota.getQuotaSummary({ force });
   });
 
   register('POST', '/api/rescan', async () => {

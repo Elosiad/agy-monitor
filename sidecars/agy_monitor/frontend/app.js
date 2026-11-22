@@ -12,6 +12,7 @@ import {
 } from "./i18n.js";
 import { createContextPie } from "./components/context_pie.js";
 import { createTokenUsage } from "./components/token_usage.js";
+import { createQuotaCards } from "./components/quota_cards.js";
 import { createModelAndPrompt } from "./components/model_and_prompt.js";
 import { createSessionsHub } from "./components/sessions_hub.js";
 import { createRuntimeBar } from "./components/runtime_bar.js";
@@ -328,6 +329,7 @@ export function mountMonitorApp() {
           configuredRulesTokens: state.configuredRulesTokens,
         });
         components.tokenUsage?.update(data.tokenUsage);
+        components.quotaCards?.notifyTokenActivity?.(data.tokenUsage?.totalTokens);
         components.sessionsHub?.update(data.sessionsHub, nextConvId);
         lastKnownActiveCount = Array.isArray(data.sessionsHub?.active)
           ? data.sessionsHub.active.length
@@ -396,6 +398,11 @@ export function mountMonitorApp() {
       refreshSnapshot({ force: true });
     },
     onToast: showToast,
+  });
+
+  components.quotaCards = createQuotaCards({
+    apiFetch,
+    t: translator,
   });
 
   components.modelAndPrompt = createModelAndPrompt({
@@ -666,6 +673,7 @@ export function mountMonitorApp() {
     const onManualRefresh = () => {
       refreshPreferences();
       refreshSnapshot({ force: true, syncHud: true });
+      components.quotaCards?.refresh?.({ force: true });
       components.masteryHub?.refresh?.();
     };
     manualRefreshBtn.addEventListener("click", onManualRefresh);
@@ -836,6 +844,7 @@ export function mountMonitorApp() {
       state.etag = "";
       sendConsoleViewport({ force: true });
       refreshSnapshot({ force: false, syncHud: true });
+      components.quotaCards?.refresh?.({ force: false });
       startPolling();
     }
   };
@@ -852,6 +861,7 @@ export function mountMonitorApp() {
         state.etag = "";
         sendConsoleViewport({ force: false });
         refreshSnapshot({ force: false, syncHud: true });
+        components.quotaCards?.refresh?.({ force: false });
       }
     };
     const onWindowResize = () => {
@@ -899,6 +909,7 @@ export function mountMonitorApp() {
   const readyPromise = Promise.all([
     refreshPreferences(),
     refreshSnapshot({ force: true, syncHud: true }),
+    components.quotaCards?.refresh?.({ force: false }),
   ]).finally(() => {
     startPolling();
     if (!destroyed && updateStatusBtn) {

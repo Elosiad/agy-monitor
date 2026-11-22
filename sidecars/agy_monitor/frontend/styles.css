@@ -814,9 +814,23 @@ body.host-backdrop-shared .right-pane-canvas {
   white-space: nowrap;
 }
 
-/* 右侧：各模型 Token 用量模块 */
+/* 右侧：各模型 Token 用量模块（高度严格跟随左侧上下文占用，展开列表绝不撑高行高） */
 .token-usage-card {
-  max-height: 280px;
+  position: relative;
+  min-height: 0;
+  max-height: none;
+  padding: 0;
+  align-self: stretch;
+  overflow: hidden;
+}
+
+.token-usage-inner {
+  position: absolute;
+  inset: 0;
+  padding: 2px 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .token-card-header {
@@ -938,7 +952,7 @@ body.host-backdrop-shared .right-pane-canvas {
 }
 
 .token-models-list {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   display: flex;
@@ -956,6 +970,244 @@ body.host-backdrop-shared .right-pane-canvas {
 .token-models-list::-webkit-scrollbar-thumb {
   background: var(--border-subtle);
   border-radius: 2px;
+}
+
+/* 官方 5 小时 / 周额度三联小卡片（位于模型 Token 用量正下方） */
+.quota-cards-strip {
+  flex-shrink: 0;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-hairline);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  transition: opacity 0.16s ease;
+}
+
+.quota-cards-strip.is-refreshing {
+  opacity: 0.78;
+}
+
+.quota-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 7px 7px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  background: color-mix(in srgb, var(--bg-control) 74%, transparent);
+  border: 1px solid var(--border-hairline);
+  text-align: left;
+  min-width: 0;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, transform 0.12s ease;
+}
+
+.quota-card:hover {
+  background: color-mix(in srgb, var(--bg-control-hover) 84%, transparent);
+  border-color: var(--border-subtle);
+}
+
+.quota-card:active {
+  transform: translateY(0.5px);
+}
+
+.quota-card:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.quota-card-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.quota-group-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--accent-teal);
+}
+
+.quota-group-dot.is-gemini {
+  background: var(--accent-blue);
+}
+
+.quota-group-dot.is-gpt_claude {
+  background: var(--accent-amber);
+}
+
+.quota-group-dot.is-argon {
+  background: var(--accent-purple);
+}
+
+.quota-card-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quota-card-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.quota-metric-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.quota-ring-wrap {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.quota-ring-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.quota-ring-track {
+  stroke: var(--bg-track);
+  stroke-width: 2.8;
+}
+
+.quota-metric-row.is-na .quota-ring-track {
+  stroke-dasharray: 2.4 2.4;
+  opacity: 0.65;
+}
+
+.quota-ring-fill {
+  stroke: var(--mastery-unread);
+  stroke-width: 2.8;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.35s ease, stroke 0.2s ease;
+}
+
+.quota-metric-row.is-healthy .quota-ring-fill {
+  stroke: var(--mastery-unread);
+}
+
+.quota-metric-row.is-warn .quota-ring-fill {
+  stroke: var(--accent-amber);
+}
+
+.quota-metric-row.is-danger .quota-ring-fill {
+  stroke: var(--accent-danger);
+}
+
+.quota-metric-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.quota-metric-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px;
+  line-height: 1.18;
+  min-width: 0;
+}
+
+.quota-metric-name {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quota-metric-pct {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.quota-metric-row.is-warn .quota-metric-pct {
+  color: var(--accent-amber);
+}
+
+.quota-metric-row.is-danger .quota-metric-pct {
+  color: var(--accent-danger);
+}
+
+.quota-metric-row.is-na .quota-metric-pct {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.quota-metric-label {
+  font-size: 9.5px;
+  line-height: 1.15;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quota-metric-row.is-na .quota-metric-label {
+  color: var(--text-dim);
+}
+
+.quota-cards-strip.is-stale .quota-card {
+  border-style: dashed;
+}
+
+@container aux-pane (max-width: 640px) {
+  .quota-cards-strip {
+    gap: 5px;
+  }
+
+  .quota-card {
+    padding: 5px 5px 6px;
+    gap: 4px;
+  }
+
+  .quota-metric-row {
+    gap: 4px;
+  }
+
+  .quota-ring-wrap {
+    width: 20px;
+    height: 20px;
+  }
+
+  .quota-card-title {
+    font-size: 10px;
+  }
+
+  .quota-metric-name,
+  .quota-metric-pct {
+    font-size: 9.5px;
+  }
+
+  .quota-metric-label {
+    font-size: 9px;
+  }
 }
 
 .token-empty-tip {
@@ -3533,7 +3785,15 @@ html[lang="en"] .prompt-selector-row {
   }
 
   .token-usage-card {
-    max-height: 250px;
+    height: 278px;
+    max-height: 278px;
+  }
+
+  .token-usage-inner {
+    position: relative;
+    inset: auto;
+    height: 100%;
+    padding: 2px 0;
   }
 
   .sessions-hub-row {
@@ -6313,7 +6573,11 @@ body.host-backdrop-shared .mad-lightbox-img {
   }
 
   .token-usage-card {
-    max-height: 308px;
+    padding: 0;
+  }
+
+  .token-usage-inner {
+    padding: 14px 16px;
   }
 
   .config-rows-stack {
@@ -6662,7 +6926,28 @@ body.host-backdrop-shared .mad-lightbox-img {
   }
 
   .token-usage-card {
-    max-height: 216px;
+    padding: 0;
+  }
+
+  .token-usage-inner {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .quota-cards-strip {
+    margin-top: 6px;
+    padding-top: 6px;
+    gap: 5px;
+  }
+
+  .quota-card {
+    padding: 4px 6px 5px;
+    gap: 4px;
+  }
+
+  .quota-ring-wrap {
+    width: 20px;
+    height: 20px;
   }
 
   .sessions-hub-row {
@@ -6699,10 +6984,6 @@ body.host-backdrop-shared .mad-lightbox-img {
     height: 90px;
   }
 
-  .token-usage-card {
-    max-height: 176px;
-  }
-
   .session-list {
     max-height: 76px;
   }
@@ -6719,10 +7000,6 @@ body.host-backdrop-shared .mad-lightbox-img {
 @media (min-height: 860px) {
   .monitor-tab-panel {
     gap: 18px;
-  }
-
-  .token-usage-card {
-    max-height: 344px;
   }
 
   .sessions-hub-row {

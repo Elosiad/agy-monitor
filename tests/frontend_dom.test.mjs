@@ -558,13 +558,95 @@ test('mountMonitorApp E2E DOM behavior: Follow Latest, force=1, honest no_baseli
     };
   };
 
+  const mockQuota = {
+    ok: true,
+    available: true,
+    stale: false,
+    fetchedAtMs: Date.now(),
+    groups: [
+      {
+        key: 'gemini',
+        label: 'Gemini',
+        displayName: 'Gemini Models',
+        description: 'Gemini 4 Neon, Gemini 3.8 Flash',
+        fiveHour: {
+          bucketId: 'gemini-5h',
+          window: '5h',
+          remainingFraction: 0.919,
+          remainingPct: 92,
+          remainingPctExact: 91.9,
+          resetTimeMs: Date.now() + 4 * 3600_000 + 47 * 60_000,
+          isFull: false,
+          disabled: false,
+        },
+        weekly: {
+          bucketId: 'gemini-weekly',
+          window: 'weekly',
+          remainingFraction: 0.61,
+          remainingPct: 61,
+          remainingPctExact: 61,
+          resetTimeMs: Date.now() + 6 * 86400_000 + 8 * 3600_000,
+          isFull: false,
+          disabled: false,
+        },
+      },
+      {
+        key: 'gpt_claude',
+        label: 'GPT&Claude',
+        displayName: 'Claude and GPT models',
+        description: 'Claude Opus 5.5, GPT-OSS 120B',
+        fiveHour: {
+          bucketId: '3p-5h',
+          window: '5h',
+          remainingFraction: 1,
+          remainingPct: 100,
+          remainingPctExact: 100,
+          resetTimeMs: Date.now() + 5 * 3600_000,
+          isFull: true,
+          disabled: false,
+        },
+        weekly: {
+          bucketId: '3p-weekly',
+          window: 'weekly',
+          remainingFraction: 0.27,
+          remainingPct: 27,
+          remainingPctExact: 27,
+          resetTimeMs: Date.now() + 3 * 86400_000 + 2 * 3600_000,
+          isFull: false,
+          disabled: false,
+        },
+      },
+      {
+        key: 'argon',
+        label: 'Argon',
+        displayName: 'Gemini 4 Argon',
+        description: 'Argon weekly bucket',
+        fiveHour: null,
+        weekly: {
+          bucketId: 'gemini-argon-wtu-weekly',
+          window: 'weekly',
+          remainingFraction: 0.9997,
+          remainingPct: 100,
+          remainingPctExact: 100,
+          resetTimeMs: Date.now() + 6 * 86400_000 + 11 * 3600_000,
+          isFull: false,
+          disabled: false,
+        },
+      },
+    ],
+  };
+
   const mockWindow = {
     location: { search: '?token=tok-1&conversationId=conv-boot' },
     sidecar: {
       conversationId: 'conv-boot',
       async fetch(url, options = {}) {
         requests.push({ url: String(url), method: options.method || 'GET', body: options.body || null });
-        const payload = url.startsWith('/api/preferences') ? mockPrefs : makeMockSnapshot();
+        const payload = url.startsWith('/api/preferences')
+          ? mockPrefs
+          : url.startsWith('/api/quota')
+            ? mockQuota
+            : makeMockSnapshot();
         return {
           ok: true,
           status: 200,
@@ -674,6 +756,23 @@ test('mountMonitorApp E2E DOM behavior: Follow Latest, force=1, honest no_baseli
   }
   assert.ok(tokenModelsEl.textContent.includes('历史未记录模型'));
   assert.ok(tokenModelsEl.textContent.includes('未定价参考'));
+
+  // 7. Native quota cards strip renders Gemini / GPT&Claude / Argon with rings and click-to-refresh
+  const quotaStripEl = document.getElementById('quotaCardsStrip');
+  assert.ok(quotaStripEl);
+  assert.equal(quotaStripEl.children.length, 3);
+  assert.ok(quotaStripEl.textContent.includes('Gemini'));
+  assert.ok(quotaStripEl.textContent.includes('GPT&Claude'));
+  assert.ok(quotaStripEl.textContent.includes('Argon'));
+  assert.ok(quotaStripEl.textContent.includes('92%'));
+  assert.ok(quotaStripEl.textContent.includes('61%'));
+  assert.ok(quotaStripEl.textContent.includes('27%'));
+  assert.ok(quotaStripEl.textContent.includes('满额可用'));
+  assert.ok(quotaStripEl.textContent.includes('无独立限额'));
+  assert.equal(quotaStripEl.querySelectorAll('svg').length, 6);
+  quotaStripEl.children[0].click();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(requests.some((r) => r.url === '/api/quota?force=1'));
 });
 
 test('buildFrontendBundle compiles valid non-module classic script and mounts cleanly', async () => {

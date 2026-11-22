@@ -143,44 +143,47 @@
 
             <!-- 顶部右侧：各模型 Token 用量 -->
             <section class="metric-card token-usage-card" aria-label="各模型 Token 用量" data-i18n-aria="usage.ariaLabel">
-              <div class="card-header token-card-header">
-                <div class="card-title token-card-title">
-                  <div class="token-title-bar">
-                    <div class="token-title-left">
-                      <h2 class="card-title-text" data-i18n="usage.title">模型 Token 用量</h2>
-                      <button
-                        class="token-requests-btn"
-                        id="tokenRequestsBtn"
-                        type="button"
-                        title="查看每一次模型请求的详细指标与状态"
-                        data-i18n-title="usage.requestsTitle"
-                      >
-                        <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                          <path d="M2.5 4h11M2.5 8h11M2.5 12h7.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-                        </svg>
-                        <span data-i18n="usage.requestsBtn">请求记录</span>
-                      </button>
+              <div class="token-usage-inner">
+                <div class="card-header token-card-header">
+                  <div class="card-title token-card-title">
+                    <div class="token-title-bar">
+                      <div class="token-title-left">
+                        <h2 class="card-title-text" data-i18n="usage.title">模型 Token 用量</h2>
+                        <button
+                          class="token-requests-btn"
+                          id="tokenRequestsBtn"
+                          type="button"
+                          title="查看每一次模型请求的详细指标与状态"
+                          data-i18n-title="usage.requestsTitle"
+                        >
+                          <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <path d="M2.5 4h11M2.5 8h11M2.5 12h7.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                          </svg>
+                          <span data-i18n="usage.requestsBtn">请求记录</span>
+                        </button>
+                      </div>
+                      <div class="token-total-meta">
+                        <span class="token-total-count" id="tokenTotalCount">0</span>
+                        <span class="token-total-cost" id="tokenTotalCost">$0.00</span>
+                      </div>
                     </div>
-                    <div class="token-total-meta">
-                      <span class="token-total-count" id="tokenTotalCount">0</span>
-                      <span class="token-total-cost" id="tokenTotalCost">$0.00</span>
-                    </div>
-                  </div>
-                  <div class="card-title-filters" role="group" aria-label="Token 用量筛选">
-                    <div class="filter-tab-group" data-filter-group="scope" role="tablist" aria-label="统计范围">
-                      <button class="filter-tab" type="button" role="tab" aria-selected="false" data-scope="global" data-i18n="usage.scopeGlobal">全局</button>
-                      <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-scope="current" data-i18n="usage.scopeCurrent">当前</button>
-                    </div>
-                    <div class="filter-tab-group" data-filter-group="range" role="tablist" aria-label="时间范围">
-                      <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-range="today" data-i18n="usage.rangeToday">今天</button>
-                      <button class="filter-tab" type="button" role="tab" aria-selected="false" data-range="7d" data-i18n="usage.range7d">近七天</button>
-                      <button class="filter-tab" type="button" role="tab" aria-selected="false" data-range="30d" data-i18n="usage.range30d">近一个月</button>
+                    <div class="card-title-filters" role="group" aria-label="Token 用量筛选">
+                      <div class="filter-tab-group" data-filter-group="scope" role="tablist" aria-label="统计范围">
+                        <button class="filter-tab" type="button" role="tab" aria-selected="false" data-scope="global" data-i18n="usage.scopeGlobal">全局</button>
+                        <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-scope="current" data-i18n="usage.scopeCurrent">当前</button>
+                      </div>
+                      <div class="filter-tab-group" data-filter-group="range" role="tablist" aria-label="时间范围">
+                        <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-range="today" data-i18n="usage.rangeToday">今天</button>
+                        <button class="filter-tab" type="button" role="tab" aria-selected="false" data-range="7d" data-i18n="usage.range7d">近七天</button>
+                        <button class="filter-tab" type="button" role="tab" aria-selected="false" data-range="30d" data-i18n="usage.range30d">近一个月</button>
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
 
-              <div class="token-models-list" id="tokenModelsList"></div>
+                <div class="token-models-list" id="tokenModelsList"></div>
+                <div class="quota-cards-strip" id="quotaCardsStrip" aria-label="官方配额余量" data-i18n-aria="quota.ariaLabel"></div>
+              </div>
             </section>
           </div>
 
