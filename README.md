@@ -40,9 +40,10 @@
 
 ## 版本更新日志（Changelog）
 
-### `v1.0.12`（2026-11-22）— 桌面伴侣防崩与休眠防透底、HUD 多会话实时同步与分屏防误隐
+### `v1.0.12`（2026-11-22）— 桌面伴侣防崩与防闪黑加固、HUD 多会话实时同步与分屏防误隐
 
-- **彻底根治主窗残留半透明透底与弹窗重入崩溃**：
+- **彻底根治主窗残留半透明透底、壁纸反复闪黑与弹窗重入崩溃**：
+  - 修复 `OnWinEvent` 监听 `EVENT_OBJECT_HIDE / DESTROY` 漏校验 `CHILDID_SELF`（`idChild == 0`）与主窗真实可见性导致 Chromium 子元素隐藏误杀壁纸的问题；优化 `EVENT_OBJECT_REORDER` 为跳过不可见/透明/不重叠辅助窗（`IsDirectlyBehindVisible`）并加 80ms 防抖，纯 Z 序微调附带 `SWP_NOMOVE | SWP_NOSIZE`，消除壁纸反复黑屏与重排 CPU 飙高；同步前紧急保护收严至壁纸真正越界至主窗上方时才触发隐藏。
   - 修复点击底部上下文圆环弹窗时重入关闭引发的 `HwndSource ObjectDisposedException` 崩溃，补充 `_hudPopupOpening` 重入锁与非致命 UI 异常自愈。
   - 接入 Windows 电源休眠（`PowerModeChanged`）与锁屏（`SessionSwitch`）事件：休眠/锁屏前自动还原主窗 100% 不透明，唤醒解锁后自动重贴壁纸；新增 `--restore-opacity` 全桌面应急还原与真实 Win32 透明度核验补刷。
   - 桌面环境探测改用原生 `agy_backdrop.exe --probe-desktop`（~59ms 极速响应，永不缓存瞬态超时失败），Sidecar 新增 15 秒轻量伴侣看门狗断线自愈。

@@ -560,11 +560,65 @@ namespace AgyBackdropCompanion
             // Walk DOWN from hostHwnd: confirm wpHwnd actually sits below hostHwnd in Z-order
             cur = GetWindow(hostHwnd, GW_HWNDNEXT);
             int downSteps = 0;
-            while (cur != IntPtr.Zero && downSteps < 64)
+            while (cur != IntPtr.Zero && downSteps < 128)
             {
                 if (cur == wpHwnd) return true;
                 cur = GetWindow(cur, GW_HWNDNEXT);
                 downSteps++;
+            }
+            return false;
+        }
+
+        public static bool IsDirectlyBehindVisible(IntPtr wpHwnd, IntPtr hostHwnd, RECT hostRect, out string blockerClass)
+        {
+            blockerClass = "";
+            if (wpHwnd == IntPtr.Zero || hostHwnd == IntPtr.Zero) return false;
+            IntPtr cur = GetWindow(hostHwnd, GW_HWNDNEXT);
+            int steps = 0;
+            while (cur != IntPtr.Zero && steps < 48)
+            {
+                if (cur == wpHwnd) return true;
+                // Skip invisible / cloaked / zero-size / non-overlapping / zero-alpha helper windows between host and backdrop
+                if (IsWindowVisible(cur) && !IsIconic(cur) && !IsWindowCloaked(cur))
+                {
+                    RECT cr;
+                    if (GetWindowRect(cur, out cr) &&
+                        (cr.Right - cr.Left) > 4 &&
+                        (cr.Bottom - cr.Top) > 4 &&
+                        cr.Right > hostRect.Left &&
+                        cr.Left < hostRect.Right &&
+                        cr.Bottom > hostRect.Top &&
+                        cr.Top < hostRect.Bottom)
+                    {
+                        bool zeroAlpha = false;
+                        try
+                        {
+                            long curEx = GetWindowLongPtrCompat(cur, GWL_EXSTYLE);
+                            if ((curEx & WS_EX_LAYERED) != 0)
+                            {
+                                uint ck, lf;
+                                byte a;
+                                if (GetLayeredWindowAttributes(cur, out ck, out a, out lf) && (lf & LWA_ALPHA) != 0 && a == 0)
+                                {
+                                    zeroAlpha = true;
+                                }
+                            }
+                        }
+                        catch { }
+                        if (!zeroAlpha)
+                        {
+                            try
+                            {
+                                var sb = new StringBuilder(128);
+                                if (GetClassName(cur, sb, sb.Capacity) > 0) blockerClass = sb.ToString();
+                            }
+                            catch { }
+                            return false;
+                        }
+                    }
+                }
+                cur = GetWindow(cur, GW_HWNDNEXT);
+                steps++;
             }
             return false;
         }
@@ -4302,6 +4356,11 @@ namespace AgyBackdropCompanion
         private bool _pausedByTray = false;
         private bool _hudEnabledByTray = true;
         private volatile bool _disposed = false;
+        private int _backdropHideCount = 0;
+        private string _backdropLastHideReason = "";
+        private int _backdropZFixCount = 0;
+        private string _backdropZBlockerClass = "";
+        private DateTime _lastReorderSyncUtc = DateTime.MinValue;
         private bool _inSync = false;
         private bool _syncPending = false;
         private string _hudLastAction = "";
@@ -5205,20 +5264,26 @@ namespace AgyBackdropCompanion
 
         private void OnWinEvent(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
         {
-            if (_disposed || hwnd == IntPtr.Zero || idObject != 0) return;
+            // Strictly require OBJID_WINDOW (0) AND CHILDID_SELF (0) so child DOM/UIA hides in Chromium never hide our backdrop!
+            if (_disposed || hwnd == IntPtr.Zero || idObject != 0 || idChild != 0) return;
 
             bool isTracked = _tracked.ContainsKey(hwnd);
             if (eventType == Native.EVENT_OBJECT_REORDER)
             {
                 if (_tracked.Count > 0 && !_inSync)
                 {
+                    DateTime nowUtc = DateTime.UtcNow;
+                    if ((nowUtc - _lastReorderSyncUtc).TotalMilliseconds < 80.0) return;
                     bool needsZFix = false;
                     foreach (TrackedHostWindow item in _tracked.Values)
                     {
                         if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero &&
                             Native.IsWindow(item.Hwnd) && Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd))
                         {
-                            if (Native.GetWindow(item.Hwnd, Native.GW_HWNDNEXT) != item.Backdrop.Handle)
+                            Native.RECT hr;
+                            string blk;
+                            if (Native.TryGetVisibleBounds(item.Hwnd, out hr) &&
+                                !Native.IsDirectlyBehindVisible(item.Backdrop.Handle, item.Hwnd, hr, out blk))
                             {
                                 needsZFix = true;
                                 break;
@@ -5227,7 +5292,11 @@ namespace AgyBackdropCompanion
                     }
                     if (needsZFix)
                     {
-                        SyncAllWindows(false);
+                        _lastReorderSyncUtc = nowUtc;
+                        if (_debounceTimer != null && !_debounceTimer.IsEnabled)
+                        {
+                            _debounceTimer.Start();
+                        }
                     }
                 }
                 return;
@@ -5253,9 +5322,20 @@ namespace AgyBackdropCompanion
                     }
                 }
 
-                // Immediate zero-debounce hide on minimize/hide/destroy prevents lingering backdrop/HUD ghosts
+                // Immediate zero-debounce hide ONLY when host window is actually minimized, hidden, cloaked, or destroyed!
+                // Never hide backdrop on spurious Chromium child/transient EVENT_OBJECT_HIDE when the top-level window is still visible.
                 if (isTracked && (eventType == Native.EVENT_SYSTEM_MINIMIZESTART || eventType == Native.EVENT_OBJECT_HIDE || eventType == Native.EVENT_OBJECT_DESTROY))
                 {
+                    bool actuallyGone =
+                        eventType == Native.EVENT_SYSTEM_MINIMIZESTART ||
+                        !Native.IsWindow(hwnd) ||
+                        !Native.IsWindowVisible(hwnd) ||
+                        Native.IsIconic(hwnd) ||
+                        Native.IsWindowCloaked(hwnd);
+                    if (!actuallyGone)
+                    {
+                        return;
+                    }
                     TrackedHostWindow item;
                     if (_tracked.TryGetValue(hwnd, out item))
                     {
@@ -5264,6 +5344,8 @@ namespace AgyBackdropCompanion
                         {
                             Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
                             item.BackdropVisible = false;
+                            _backdropHideCount++;
+                            _backdropLastHideReason = "winevent-" + eventType.ToString("X");
                         }
                     }
                     if (_moveSizingHwnd == hwnd) StopRenderFollow();
@@ -6620,13 +6702,18 @@ namespace AgyBackdropCompanion
                         continue;
                     }
 
-                    bool visible = Native.IsWindowVisible(item.Hwnd) && !Native.IsIconic(item.Hwnd) && !Native.IsWindowCloaked(item.Hwnd);
+                    bool isHostVisible = Native.IsWindowVisible(item.Hwnd);
+                    bool isHostIconic = Native.IsIconic(item.Hwnd);
+                    bool isHostCloaked = Native.IsWindowCloaked(item.Hwnd);
+                    bool visible = isHostVisible && !isHostIconic && !isHostCloaked;
                     if (!visible)
                     {
                         if (item.Backdrop != null && item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
                         {
                             Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
                             item.BackdropVisible = false;
+                            _backdropHideCount++;
+                            _backdropLastHideReason = isHostIconic ? "host-iconic" : (isHostCloaked ? "host-cloaked" : "host-invisible");
                         }
                         continue;
                     }
@@ -6657,11 +6744,27 @@ namespace AgyBackdropCompanion
                     IntPtr wpHwnd = item.Backdrop.Handle;
                     if (wpHwnd == IntPtr.Zero || !hasBounds) continue;
 
-                    // Emergency guard: if Wallpaper Engine / multi-monitor DWM ever popped wpHwnd ABOVE item.Hwnd, hide IMMEDIATELY!
+                    // Emergency guard: ONLY hide immediately if wpHwnd actually jumped ABOVE item.Hwnd!
+                    // (Do not blink-hide merely because >64 windows exist below host; let Phase 1 SetWindowPos pull it back smoothly!)
                     if (item.BackdropVisible && !Native.IsWindowStrictlyBehind(wpHwnd, item.Hwnd))
                     {
-                        Native.ShowWindow(wpHwnd, Native.SW_HIDE);
-                        item.BackdropVisible = false;
+                        // Check if wpHwnd is truly ABOVE hostHwnd before hiding
+                        bool isAboveHost = false;
+                        IntPtr upCur = Native.GetWindow(item.Hwnd, Native.GW_HWNDPREV);
+                        int upChk = 0;
+                        while (upCur != IntPtr.Zero && upChk < 512)
+                        {
+                            if (upCur == wpHwnd) { isAboveHost = true; break; }
+                            upCur = Native.GetWindow(upCur, Native.GW_HWNDPREV);
+                            upChk++;
+                        }
+                        if (isAboveHost)
+                        {
+                            Native.ShowWindow(wpHwnd, Native.SW_HIDE);
+                            item.BackdropVisible = false;
+                            _backdropHideCount++;
+                            _backdropLastHideReason = "emergency-above-host";
+                        }
                     }
 
                     int w = Math.Max(1, r.Right - r.Left);
@@ -6669,13 +6772,24 @@ namespace AgyBackdropCompanion
                     double hostDpi = Native.GetWindowDpiScale(item.Hwnd);
                     item.Backdrop.ApplyNativeRoundedCorners(w, h, hostDpi, isMaximized, _config.radius);
 
-                    bool zMismatch = Native.GetWindow(item.Hwnd, Native.GW_HWNDNEXT) != wpHwnd;
+                    string zBlocker = "";
+                    bool zMismatch = !Native.IsDirectlyBehindVisible(wpHwnd, item.Hwnd, r, out zBlocker);
                     bool rectChanged = !item.BackdropVisible || r.Left != item.LastLeft || r.Top != item.LastTop || w != item.LastWidth || h != item.LastHeight;
 
                     if (zMismatch || rectChanged)
                     {
+                        if (zMismatch && item.BackdropVisible)
+                        {
+                            _backdropZFixCount++;
+                            if (!string.IsNullOrEmpty(zBlocker)) _backdropZBlockerClass = zBlocker;
+                        }
                         // Phase 1: position behind host WITHOUT SWP_SHOWWINDOW first when newly showing or Z-mismatched
                         uint flags = Native.SWP_NOACTIVATE | (item.BackdropVisible && !zMismatch ? Native.SWP_SHOWWINDOW : 0u);
+                        if (!rectChanged && item.BackdropVisible)
+                        {
+                            // Pure Z-order adjust: skip move/resize notifications to prevent WPF/DWM surface repaint flicker
+                            flags |= Native.SWP_NOMOVE | Native.SWP_NOSIZE;
+                        }
                         backdropMoves.Add(new PendingWinMove
                         {
                             Hwnd = wpHwnd,
@@ -6725,6 +6839,8 @@ namespace AgyBackdropCompanion
                         // NEVER allow an opaque backdrop window to sit above Antigravity!
                         Native.ShowWindow(wpHwnd, Native.SW_HIDE);
                         item.BackdropVisible = false;
+                        _backdropHideCount++;
+                        _backdropLastHideReason = "phase2-not-behind";
                         RestoreHostAlphaOnly(item);
                         item.BackdropZFailCount++;
                         if (item.BackdropZFailCount >= 3)
@@ -6988,9 +7104,25 @@ namespace AgyBackdropCompanion
                 string blockReason = "";
                 bool anyBackdropVisible = false;
                 bool anyHostTranslucent = false;
+                bool anyHostVisible = false;
+                string hostHiddenReason = "";
                 byte observedAlpha = 255;
                 foreach (TrackedHostWindow item in _tracked.Values)
                 {
+                    if (Native.IsWindow(item.Hwnd))
+                    {
+                        bool hv = Native.IsWindowVisible(item.Hwnd);
+                        bool hi = Native.IsIconic(item.Hwnd);
+                        bool hc = Native.IsWindowCloaked(item.Hwnd);
+                        if (hv && !hi && !hc)
+                        {
+                            anyHostVisible = true;
+                        }
+                        else if (string.IsNullOrEmpty(hostHiddenReason))
+                        {
+                            hostHiddenReason = hi ? "iconic" : (hc ? "cloaked" : "invisible");
+                        }
+                    }
                     if (item.Backdrop != null && item.Backdrop.Handle != IntPtr.Zero && Native.IsWindowVisible(item.Backdrop.Handle))
                     {
                         anyBackdropVisible = true;
@@ -7033,6 +7165,12 @@ namespace AgyBackdropCompanion
                     { "appliedAlpha", anyHostTranslucent ? (int)observedAlpha : (int)alpha },
                     { "actualBackdropVisible", running && anyBackdropVisible },
                     { "actualHostTranslucent", running && anyHostTranslucent },
+                    { "hostVisible", running && anyHostVisible },
+                    { "hostHiddenReason", running ? (anyHostVisible ? "" : hostHiddenReason) : "" },
+                    { "backdropHideCount", _backdropHideCount },
+                    { "backdropLastHideReason", _backdropLastHideReason },
+                    { "backdropZFixCount", _backdropZFixCount },
+                    { "backdropZBlockerClass", _backdropZBlockerClass },
                     { "hostBlendPct", _config.hostBlendPct },
                     { "activeWallpaperId", _config.activeWallpaperId ?? "" },
                     { "hudEnabled", _config.hudEnabled && _hudEnabledByTray },
