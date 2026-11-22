@@ -81,7 +81,10 @@ function formatTtftMs(ms) {
   const n = Number(ms);
   if (!Number.isFinite(n) || n <= 0) return "—";
   if (n < 1000) return `${Math.round(n)}ms`;
-  return `${(n / 1000).toFixed(2)}s`;
+  if (n < 60_000) return `${(n / 1000).toFixed(2)}s`;
+  const mins = Math.floor(n / 60_000);
+  const secs = Math.round((n % 60_000) / 1000);
+  return `${mins}m ${secs}s`;
 }
 
 async function requestJson(apiFetch, url) {
@@ -639,7 +642,9 @@ export function createTokenUsage({ apiFetch, t, onFilterChange, getActiveConvCon
       tdTtft.textContent = formatTtftMs(row.ttftMs);
       if (!row.ttftMs) {
         tdTtft.classList.add("is-muted");
-        tdTtft.title = "宿主日志未暴露流式首字时间 (TTFT)";
+        tdTtft.title = "当前会话库未记录首字时间 (TTFT)";
+      } else {
+        tdTtft.title = `首字延迟 (TTFT) ${formatTtftMs(row.ttftMs)}（${row.ttftMs}ms）`;
       }
 
       // 8. 耗时
@@ -651,9 +656,12 @@ export function createTokenUsage({ apiFetch, t, onFilterChange, getActiveConvCon
         tdDur.title =
           row.status === "error"
             ? "异常中断请求未记录完整耗时"
-            : "纯文本回复结束步，宿主日志未记录精确结束时刻";
+            : "当前记录暂无精确结束时刻";
+      } else if (row.ttftMs && row.durationMs > row.ttftMs) {
+        const streamMs = row.durationMs - row.ttftMs;
+        tdDur.title = `总耗时 ${formatDurationMs(row.durationMs)}（首字 ${formatTtftMs(row.ttftMs)} + 生成 ${formatDurationMs(streamMs)}）`;
       } else {
-        tdDur.title = `工具步端到端耗时 ${row.durationMs}ms`;
+        tdDur.title = `端到端总耗时 ${row.durationMs}ms`;
       }
 
       // 9. tok速度
@@ -661,7 +669,14 @@ export function createTokenUsage({ apiFetch, t, onFilterChange, getActiveConvCon
       tdSpeed.className = "col-num is-mono";
       if (row.tokPerSec !== null && row.tokPerSec !== undefined) {
         tdSpeed.textContent = `${Number(row.tokPerSec).toFixed(1)}`;
-        tdSpeed.title = `${Number(row.tokPerSec).toFixed(1)} tok/s（输出 ${row.output} tokens / ${(row.durationMs / 1000).toFixed(1)}s）`;
+        const streamMs =
+          row.ttftMs && row.durationMs > row.ttftMs ? row.durationMs - row.ttftMs : 0;
+        if (streamMs >= 500 && row.output > 0) {
+          const streamTokS = (row.output / (streamMs / 1000)).toFixed(1);
+          tdSpeed.title = `${Number(row.tokPerSec).toFixed(1)} tok/s（端到端：${row.output} tokens / ${(row.durationMs / 1000).toFixed(1)}s；纯生成约 ${streamTokS} tok/s）`;
+        } else {
+          tdSpeed.title = `${Number(row.tokPerSec).toFixed(1)} tok/s（输出 ${row.output} tokens / ${(row.durationMs / 1000).toFixed(1)}s）`;
+        }
       } else {
         tdSpeed.textContent = "—";
         tdSpeed.classList.add("is-muted");

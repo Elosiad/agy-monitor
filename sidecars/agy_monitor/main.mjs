@@ -1755,6 +1755,7 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {})
       env: {
         ...process.env,
         AGY_MONITOR_BRAIN_DIR: paths.brainDir,
+        AGY_MONITOR_CONVERSATIONS_DIR: paths.conversationsDir,
         AGY_MONITOR_CACHE_DB: paths.cacheDbPath,
         AGY_MONITOR_SCAN_INTERVAL_MS: String(scanIntervalMs),
       },

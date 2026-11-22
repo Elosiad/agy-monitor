@@ -89,7 +89,7 @@ export const DICT = Object.freeze({
     'usage.reqLoadError': '加载请求记录失败',
     'usage.reqPrevPage': '上一页',
     'usage.reqNextPage': '下一页',
-    'usage.reqNote': '注：首字 (TTFT) 因宿主日志暂未提供显示「—」；耗时与速度按工具步时间戳差值参考，费用为公开 API 估算参考。',
+    'usage.reqNote': '注：首字 (TTFT) 与耗时优先取自宿主本地会话库精确时间戳（含末轮纯文本回复），费用为公开 API 估算参考。',
 
     // Native Quota Cards Strip
     'quota.ariaLabel': '官方配额余量',
@@ -200,6 +200,7 @@ export const DICT = Object.freeze({
     'runtime.speedUnitTokS': 'tok/s',
     'runtime.speedIdle': '当前空闲',
     'runtime.speedSampling': '等待首轮流式输出采样',
+    'runtime.speedSourceExact': '会话精确耗时',
     'runtime.speedSourceTool': '工具步端到端参考',
     'runtime.speedSourceRecent': '最近响应估算',
     'runtime.speedAvgOnly': '均值 {avg}',
@@ -417,7 +418,7 @@ export const DICT = Object.freeze({
     'usage.reqLoadError': 'Failed to load request records',
     'usage.reqPrevPage': 'Prev',
     'usage.reqNextPage': 'Next',
-    'usage.reqNote': 'Note: TTFT shows "—" unless exposed by host logs; duration & tok/s derive from tool-step timestamps; cost is an API reference estimate.',
+    'usage.reqNote': 'Note: TTFT & duration derive from exact local conversation timestamps (including final text turns); cost is an API reference estimate.',
 
     // Global Default Model & New Conversation
     'model.defaultLabel': 'Preferred Launch Model',
@@ -527,6 +528,7 @@ export const DICT = Object.freeze({
     'runtime.speedUnitTokS': 'tok/s',
     'runtime.speedIdle': 'Idle',
     'runtime.speedSampling': 'Waiting for streamed step sample',
+    'runtime.speedSourceExact': 'Exact turn timing',
     'runtime.speedSourceTool': 'Tool-step e2e est.',
     'runtime.speedSourceRecent': 'Recent step est.',
     'runtime.speedAvgOnly': 'Avg {avg}',

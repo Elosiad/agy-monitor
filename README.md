@@ -40,6 +40,16 @@
 
 ## 版本更新日志（Changelog）
 
+### `v1.0.13`（2026-11-22）— 请求记录真实首字 (TTFT) 与全量精确耗时打通 & 伴侣冷启动探测优化
+
+- **请求记录首字 (TTFT) 与末轮纯文本耗时全量补齐**：
+  - 后端 [scan_worker.mjs](sidecars/agy_monitor/backend/scan_worker.mjs) 新增零依赖只读解析 Antigravity 本地会话数据库 `conversations/<convId>.db` 中 `steps.metadata` 的官方纳秒级时间戳（发起 `f1`、首字 `f6`、结束 `f7`），为每一条 `PLANNER_RESPONSE`（含末轮无工具调用的纯文本回复与纯对话会话）补全精确 `首字 (TTFT)`、`总耗时` 与 `tok速度`，并在首次扫描时自动一次性回填历史记录。
+  - 底栏实时生成速率与悬浮 HUD 升级优先使用会话精确耗时（`conv_db_exact`），悬停请求记录的「耗时」与「tok速度」单元格可查看「首字 + 生成」拆解与纯流式吐字速率；同步支持 `>= 60s` 首字延迟格式化。
+- **桌面壁纸伴侣冷启动探测优化**：
+  - 将 [backdrop_manager.mjs](sidecars/agy_monitor/backend/backdrop_manager.mjs) 拉起 `agy_backdrop.exe` 后的状态检查由固定 350ms 单次等待升级为最多 1800ms（WSL 2200ms）的 200ms 短轮询，避免高负载 WPF 冷启动被误判为启动失败。
+
+---
+
 ### `v1.0.12`（2026-11-22）— 桌面伴侣防崩与防闪黑加固、HUD 多会话实时同步与分屏防误隐
 
 - **彻底根治主窗残留半透明透底、壁纸反复闪黑与弹窗重入崩溃**：

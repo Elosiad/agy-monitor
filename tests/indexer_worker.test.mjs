@@ -7,7 +7,8 @@ import { fork } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
-import { scanOnce } from '../sidecars/agy_monitor/backend/scan_worker.mjs';
+import { parseStepMetadataTiming, scanOnce } from '../sidecars/agy_monitor/backend/scan_worker.mjs';
+import { queryRequestLogs } from '../sidecars/agy_monitor/backend/telemetry.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.resolve(__dirname, '../sidecars/agy_monitor/backend/scan_worker.mjs');
@@ -215,4 +216,141 @@ test('forked scan_worker process scans on startup, processes IPC rescan, and exi
   assert.equal(messages[1].type, 'updated');
   assert.equal(messages[1].newSteps, 1);
   assert.notEqual(messages[0].etag, messages[1].etag);
+});
+
+function encodeVarint(val) {
+  let n = BigInt(val);
+  const bytes = [];
+  do {
+    let b = Number(n & 0x7fn);
+    n >>= 7n;
+    if (n > 0n) b |= 0x80;
+    bytes.push(b);
+  } while (n > 0n);
+  return Buffer.from(bytes);
+}
+
+function encodeLenField(fieldNum, payloadBuf) {
+  return Buffer.concat([encodeVarint((fieldNum << 3) | 2), encodeVarint(payloadBuf.length), payloadBuf]);
+}
+
+function encodeTimestamp(sec, nanos = 0) {
+  const parts = [encodeVarint((1 << 3) | 0), encodeVarint(sec)];
+  if (nanos > 0) {
+    parts.push(encodeVarint((2 << 3) | 0), encodeVarint(nanos));
+  }
+  return Buffer.concat(parts);
+}
+
+test('extracts exact TTFT and total duration (including final text turn) from conversations SQLite metadata', async (t) => {
+  const { root, brainDir, cacheDbPath } = createWorkerFixture(t);
+  const conversationsDir = path.join(root, 'conversations');
+  fs.mkdirSync(conversationsDir, { recursive: true });
+  const convId = 'conv-exact-timing';
+
+  const t0Sec = 1795335900;
+  // Direct f1/f6/f7 timing test + corrupt buffer safety
+  const directMeta = Buffer.concat([
+    encodeLenField(1, encodeTimestamp(t0Sec, 100_000_000)),
+    encodeLenField(6, encodeTimestamp(t0Sec + 5, 450_000_000)),
+    encodeLenField(7, encodeTimestamp(t0Sec + 18, 940_000_000)),
+  ]);
+  const parsedDirect = parseStepMetadataTiming(directMeta);
+  assert.equal(parsedDirect.ttftMs, 5350);
+  assert.equal(parsedDirect.durationMs, 18840);
+  assert.equal(parseStepMetadataTiming(Buffer.from([0xff, 0xff, 0xff])), null);
+
+  // Write transcript with a tool step AND a final pure-text reply (tool_calls = 0)
+  const lines = [
+    JSON.stringify({
+      step_index: 10,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date(t0Sec * 1000).toISOString(),
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 1000,
+      cache_read_tokens: 99000,
+      output_tokens: 500,
+      tool_calls: [{ name: 'read_file' }],
+    }),
+    JSON.stringify({
+      step_index: 11,
+      source: 'MODEL',
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: new Date((t0Sec + 11) * 1000).toISOString(),
+      content: 'file contents',
+    }),
+    JSON.stringify({
+      step_index: 12,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date((t0Sec + 20) * 1000).toISOString(),
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 1200,
+      cache_read_tokens: 99800,
+      output_tokens: 1676,
+    }),
+  ].join('\n') + '\n';
+  writeConvLines(brainDir, convId, lines);
+
+  // First scan WITHOUT conversations/<convId>.db (simulates legacy cache before backfill)
+  await scanOnce(brainDir, cacheDbPath);
+  let logs = await queryRequestLogs(cacheDbPath, {
+    scope: 'current',
+    convId,
+    range: '30d',
+    nowMs: (t0Sec + 60) * 1000,
+  });
+  assert.equal(logs.items.length, 2);
+  // Top row (step 12, pure text reply) had no next tool step -> durationMs/ttftMs null before conv db exists
+  assert.equal(logs.items[0].stepIndex, 12);
+  assert.equal(logs.items[0].ttftMs, null);
+  assert.equal(logs.items[0].durationMs, null);
+
+  // Now create conversations/<convId>.db with exact protobuf timings for BOTH step 10 and final step 12
+  const convDbPath = path.join(conversationsDir, `${convId}.db`);
+  const convDb = new DatabaseSync(convDbPath);
+  convDb.exec(`CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)`);
+  const step10Meta = Buffer.concat([
+    encodeLenField(1, encodeTimestamp(t0Sec, 0)),
+    encodeLenField(6, encodeTimestamp(t0Sec + 8, 850_000_000)),
+    encodeLenField(7, encodeTimestamp(t0Sec + 11, 860_000_000)),
+  ]);
+  const step12Meta = Buffer.concat([
+    encodeLenField(1, encodeTimestamp(t0Sec + 20, 0)),
+    encodeLenField(6, encodeTimestamp(t0Sec + 25, 350_000_000)),
+    encodeLenField(7, encodeTimestamp(t0Sec + 38, 840_000_000)),
+  ]);
+  convDb.prepare(`INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)`).run(10, step10Meta);
+  convDb.prepare(`INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)`).run(12, step12Meta);
+  convDb.close();
+
+  // Re-run scanOnce without modifying transcript.jsonl -> one-time backfill must populate BOTH rows!
+  await scanOnce(brainDir, cacheDbPath);
+  logs = await queryRequestLogs(cacheDbPath, {
+    scope: 'current',
+    convId,
+    range: '30d',
+    nowMs: (t0Sec + 60) * 1000,
+  });
+  assert.equal(logs.items.length, 2);
+  assert.equal(logs.items[0].stepIndex, 12);
+  assert.equal(logs.items[0].ttftMs, 5350);
+  assert.equal(logs.items[0].durationMs, 18840);
+  assert.equal(logs.items[0].tokPerSec, 89.0);
+
+  assert.equal(logs.items[1].stepIndex, 10);
+  assert.equal(logs.items[1].ttftMs, 8850);
+  assert.equal(logs.items[1].durationMs, 11860);
+  assert.equal(logs.items[1].tokPerSec, 42.2);
+
+  // Verify conv_latest_metrics also upgraded to exact speed from final step 12
+  const cacheDb = new DatabaseSync(cacheDbPath, { readOnly: true });
+  const latest = cacheDb.prepare(`SELECT latest_speed_tok_s, speed_source FROM conv_latest_metrics WHERE conv_id = ?`).get(convId);
+  cacheDb.close();
+  assert.equal(latest.latest_speed_tok_s, 89.0);
+  assert.equal(latest.speed_source, 'conv_db_exact');
 });

@@ -63,6 +63,213 @@ export function resolveDefaultCacheDbPath() {
   return resolvePaths().telemetryCacheDb;
 }
 
+export function resolveDefaultConversationsDir(brainDir = null) {
+  if (process.env.AGY_MONITOR_CONVERSATIONS_DIR) {
+    return path.resolve(process.env.AGY_MONITOR_CONVERSATIONS_DIR);
+  }
+  if (brainDir) {
+    return path.resolve(brainDir, '..', 'conversations');
+  }
+  return resolvePaths().conversationsDir;
+}
+
+function readProtoVarint(buf, offset) {
+  let val = 0n;
+  let shift = 0n;
+  let i = offset;
+  const maxEnd = Math.min(buf.length, offset + 10);
+  while (i < maxEnd) {
+    const b = buf[i];
+    i += 1;
+    val |= BigInt(b & 0x7f) << shift;
+    if ((b & 0x80) === 0) {
+      return { value: val, next: i, ok: true };
+    }
+    shift += 7n;
+  }
+  return { value: 0n, next: buf.length, ok: false };
+}
+
+function iterProtoFields(buf, onField) {
+  let i = 0;
+  while (i < buf.length) {
+    const tagRes = readProtoVarint(buf, i);
+    if (!tagRes.ok) break;
+    i = tagRes.next;
+    const field = Number(tagRes.value >> 3n);
+    const wire = Number(tagRes.value & 7n);
+    if (field <= 0) break;
+    if (wire === 0) {
+      const vRes = readProtoVarint(buf, i);
+      if (!vRes.ok) break;
+      i = vRes.next;
+      onField(field, wire, vRes.value);
+    } else if (wire === 1) {
+      if (i + 8 > buf.length) break;
+      onField(field, wire, buf.subarray(i, i + 8));
+      i += 8;
+    } else if (wire === 2) {
+      const lenRes = readProtoVarint(buf, i);
+      if (!lenRes.ok) break;
+      const len = Number(lenRes.value);
+      i = lenRes.next;
+      if (!Number.isSafeInteger(len) || len < 0 || i + len > buf.length) break;
+      onField(field, wire, buf.subarray(i, i + len));
+      i += len;
+    } else if (wire === 5) {
+      if (i + 4 > buf.length) break;
+      onField(field, wire, buf.subarray(i, i + 4));
+      i += 4;
+    } else {
+      break;
+    }
+  }
+}
+
+function decodeProtoTimestampMs(buf) {
+  if (!buf || buf.length === 0) return null;
+  let sec = 0n;
+  let nanos = 0n;
+  iterProtoFields(buf, (f, w, v) => {
+    if (w !== 0) return;
+    if (f === 1) sec = v;
+    else if (f === 2) nanos = v;
+  });
+  if (sec <= 0n || sec > 4_102_444_800n) return null;
+  const nanoNum = nanos >= 0n && nanos < 1_000_000_000n ? Number(nanos) : 0;
+  return Number(sec) * 1000 + nanoNum / 1e6;
+}
+
+/**
+ * Parses Antigravity conversation SQLite `steps.metadata` protobuf blob for exact
+ * request timing: field 1 = created_at, field 6 = first_token_at (status 8),
+ * field 7 = completed_at (status 3), with field 26 status_transitions fallback.
+ */
+export function parseStepMetadataTiming(rawBuf) {
+  if (!rawBuf) return null;
+  const buf = Buffer.isBuffer(rawBuf)
+    ? rawBuf
+    : rawBuf instanceof Uint8Array
+      ? Buffer.from(rawBuf.buffer, rawBuf.byteOffset, rawBuf.byteLength)
+      : null;
+  if (!buf || buf.length === 0) return null;
+
+  let createdAtMs = null;
+  let firstTokenAtMs = null;
+  let completedAtMs = null;
+  let transFirstTokenMs = null;
+  let transCompletedMs = null;
+
+  try {
+    iterProtoFields(buf, (f, w, v) => {
+      if (w !== 2) return;
+      if (f === 1 && createdAtMs === null) {
+        createdAtMs = decodeProtoTimestampMs(v);
+      } else if (f === 6 && firstTokenAtMs === null) {
+        firstTokenAtMs = decodeProtoTimestampMs(v);
+      } else if (f === 7 && completedAtMs === null) {
+        completedAtMs = decodeProtoTimestampMs(v);
+      } else if (f === 26) {
+        iterProtoFields(v, (tf, tw, tv) => {
+          if (tf !== 1 || tw !== 2) return;
+          let statusCode = -1;
+          let ts = null;
+          iterProtoFields(tv, (ef, ew, ev) => {
+            if (ef === 1 && ew === 0) statusCode = Number(ev);
+            else if (ef === 2 && ew === 2) ts = decodeProtoTimestampMs(ev);
+          });
+          if (ts !== null) {
+            if (statusCode === 8 && transFirstTokenMs === null) transFirstTokenMs = ts;
+            else if (statusCode === 3) transCompletedMs = ts;
+          }
+        });
+      }
+    });
+  } catch {
+    return null;
+  }
+
+  if (firstTokenAtMs === null) firstTokenAtMs = transFirstTokenMs;
+  if (completedAtMs === null) completedAtMs = transCompletedMs;
+  if (createdAtMs === null) return null;
+
+  let ttftMs = null;
+  if (firstTokenAtMs !== null && firstTokenAtMs > createdAtMs) {
+    const diff = Math.round(firstTokenAtMs - createdAtMs);
+    if (diff >= 1 && diff <= 600_000) {
+      ttftMs = diff;
+    }
+  }
+
+  let durationMs = null;
+  if (completedAtMs !== null && completedAtMs > createdAtMs) {
+    const diff = Math.round(completedAtMs - createdAtMs);
+    if (diff >= 1 && diff <= 1_800_000) {
+      durationMs = diff;
+    }
+  }
+
+  if (ttftMs !== null && durationMs !== null && ttftMs > durationMs) {
+    ttftMs = durationMs;
+  }
+
+  if (ttftMs === null && durationMs === null) return null;
+  return {
+    createdAtMs: Math.round(createdAtMs),
+    firstTokenAtMs: firstTokenAtMs !== null ? Math.round(firstTokenAtMs) : null,
+    completedAtMs: completedAtMs !== null ? Math.round(completedAtMs) : null,
+    ttftMs,
+    durationMs,
+  };
+}
+
+/**
+ * Reads exact per-step TTFT and total duration from Antigravity's per-conversation
+ * SQLite database (`conversations/<convId>.db`) in strictly read-only mode.
+ */
+export function readConvDbStepTimings(convDbPath, stepIndices) {
+  const result = new Map();
+  if (!convDbPath || !Array.isArray(stepIndices) || stepIndices.length === 0) {
+    return result;
+  }
+  const uniqueIds = [...new Set(stepIndices.filter((n) => Number.isInteger(n) && n >= 0))];
+  if (uniqueIds.length === 0) return result;
+  if (!fs.existsSync(convDbPath)) return result;
+
+  let convDb = null;
+  try {
+    convDb = new DatabaseSync(convDbPath, { readOnly: true, timeout: 1000 });
+    const CHUNK = 200;
+    for (let start = 0; start < uniqueIds.length; start += CHUNK) {
+      const slice = uniqueIds.slice(start, start + CHUNK);
+      const placeholders = slice.map(() => '?').join(',');
+      const rows = convDb
+        .prepare(
+          `SELECT idx, metadata FROM steps WHERE idx IN (${placeholders}) AND metadata IS NOT NULL`
+        )
+        .all(...slice);
+      for (const row of rows) {
+        const idx = Number(row.idx);
+        const timing = parseStepMetadataTiming(row.metadata);
+        if (timing && Number.isInteger(idx)) {
+          result.set(idx, timing);
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: gracefully fall back to transcript timestamp heuristic if DB is busy/missing/legacy
+  } finally {
+    if (convDb) {
+      try {
+        convDb.close();
+      } catch {
+        // Ignore close error
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * Ensures the SQLite telemetry cache schema exists and configures WAL concurrency.
  * @param {import('node:sqlite').DatabaseSync} db
@@ -364,11 +571,12 @@ async function readDeltaLines(
   };
 }
 
-function recomputeConvMetrics(db, convId) {
+function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
   const rows = db
     .prepare(
       `SELECT step_index, step_type, created_at_ms, model, input_tokens,
-              cache_read_tokens, output_tokens, tool_calls_count, content_chars
+              cache_read_tokens, output_tokens, tool_calls_count, content_chars,
+              duration_ms, ttft_ms
        FROM step_ledger
        WHERE conv_id = ?
        ORDER BY step_index ASC`
@@ -378,6 +586,24 @@ function recomputeConvMetrics(db, convId) {
   if (!rows.length) {
     db.prepare(`DELETE FROM conv_latest_metrics WHERE conv_id = ?`).run(convId);
     return;
+  }
+
+  let exactTimings = null;
+  if (conversationsDir) {
+    const missingTimingIndices = [];
+    for (let i = 0; i < rows.length; i += 1) {
+      const r = rows[i];
+      if (r.step_type === 'PLANNER_RESPONSE' && (r.ttft_ms == null || r.duration_ms == null)) {
+        missingTimingIndices.push(r.step_index);
+      }
+    }
+    if (missingTimingIndices.length > 0) {
+      const convDbPath = path.join(conversationsDir, `${convId}.db`);
+      const map = readConvDbStepTimings(convDbPath, missingTimingIndices);
+      if (map.size > 0) {
+        exactTimings = map;
+      }
+    }
   }
 
   let latestModel = null;
@@ -397,6 +623,12 @@ function recomputeConvMetrics(db, convId) {
   let speedSecSum = 0;
   const updateDurationStmt = db.prepare(
     `UPDATE step_ledger SET duration_ms = ? WHERE conv_id = ? AND step_index = ?`
+  );
+  const updateExactTimingStmt = db.prepare(
+    `UPDATE step_ledger
+     SET ttft_ms = COALESCE(?, ttft_ms),
+         duration_ms = COALESCE(?, duration_ms)
+     WHERE conv_id = ? AND step_index = ?`
   );
 
   for (let i = 0; i < rows.length; i += 1) {
@@ -448,31 +680,59 @@ function recomputeConvMetrics(db, convId) {
         toolCharsTotal += row.tool_calls_count * 120;
       }
 
-      const next = rows[i + 1];
-      const nextIsPostToolStep =
-        next &&
-        (next.step_type === 'GENERIC' ||
-          next.step_type === 'ERROR_MESSAGE' ||
-          next.step_type === 'CHECKPOINT' ||
-          next.step_type === 'CODE_ACTION' ||
-          next.step_type === 'RUN_COMMAND' ||
-          next.step_type === 'VIEW_FILE' ||
-          next.step_type === 'LIST_DIRECTORY' ||
-          next.step_type === 'SEARCH_WEB' ||
-          next.step_type === 'GREP_SEARCH' ||
-          next.step_type === 'READ_URL_CONTENT' ||
-          next.step_type === 'GENERATE_IMAGE');
-      if (row.output_tokens > 0 && row.tool_calls_count > 0 && nextIsPostToolStep) {
-        const dt = next.created_at_ms - row.created_at_ms;
-        if (dt >= 1000 && dt <= 300_000) {
-          updateDurationStmt.run(dt, convId, row.step_index);
-          if (dt <= 180_000) {
-            const tokPerSec = row.output_tokens / (dt / 1000);
-            latestSpeedTokS = Number(tokPerSec.toFixed(1));
-            speedSource = 'tool_step_e2e_est';
-            speedAtMs = next.created_at_ms;
-            speedOutSum += row.output_tokens;
-            speedSecSum += dt / 1000;
+      const dbTiming = exactTimings ? exactTimings.get(row.step_index) : null;
+      if (dbTiming && (dbTiming.ttftMs != null || dbTiming.durationMs != null)) {
+        updateExactTimingStmt.run(
+          dbTiming.ttftMs ?? null,
+          dbTiming.durationMs ?? null,
+          convId,
+          row.step_index
+        );
+        if (dbTiming.ttftMs != null) row.ttft_ms = dbTiming.ttftMs;
+        if (dbTiming.durationMs != null) row.duration_ms = dbTiming.durationMs;
+      }
+
+      const hasExactDuration =
+        (dbTiming && dbTiming.durationMs != null) ||
+        (row.ttft_ms != null && row.duration_ms != null);
+
+      if (hasExactDuration && row.output_tokens > 0) {
+        const dt = Number(row.duration_ms);
+        if (dt >= 500 && dt <= 600_000) {
+          const tokPerSec = row.output_tokens / (dt / 1000);
+          latestSpeedTokS = Number(tokPerSec.toFixed(1));
+          speedSource = 'conv_db_exact';
+          speedAtMs = (dbTiming?.completedAtMs ?? row.created_at_ms + dt);
+          speedOutSum += row.output_tokens;
+          speedSecSum += dt / 1000;
+        }
+      } else {
+        const next = rows[i + 1];
+        const nextIsPostToolStep =
+          next &&
+          (next.step_type === 'GENERIC' ||
+            next.step_type === 'ERROR_MESSAGE' ||
+            next.step_type === 'CHECKPOINT' ||
+            next.step_type === 'CODE_ACTION' ||
+            next.step_type === 'RUN_COMMAND' ||
+            next.step_type === 'VIEW_FILE' ||
+            next.step_type === 'LIST_DIRECTORY' ||
+            next.step_type === 'SEARCH_WEB' ||
+            next.step_type === 'GREP_SEARCH' ||
+            next.step_type === 'READ_URL_CONTENT' ||
+            next.step_type === 'GENERATE_IMAGE');
+        if (row.output_tokens > 0 && row.tool_calls_count > 0 && nextIsPostToolStep) {
+          const dt = next.created_at_ms - row.created_at_ms;
+          if (dt >= 1000 && dt <= 300_000) {
+            updateDurationStmt.run(dt, convId, row.step_index);
+            if (dt <= 180_000) {
+              const tokPerSec = row.output_tokens / (dt / 1000);
+              latestSpeedTokS = Number(tokPerSec.toFixed(1));
+              speedSource = 'tool_step_e2e_est';
+              speedAtMs = next.created_at_ms;
+              speedOutSum += row.output_tokens;
+              speedSecSum += dt / 1000;
+            }
           }
         }
       }
@@ -525,14 +785,15 @@ function computeDbEtag(db) {
   const agg = db
     .prepare(
       `SELECT COUNT(*) AS cnt, COALESCE(SUM(input_tokens + cache_read_tokens + output_tokens), 0) AS tokSum,
-              COALESCE(MAX(created_at_ms), 0) AS maxTs
+              COALESCE(MAX(created_at_ms), 0) AS maxTs,
+              COALESCE(SUM(COALESCE(ttft_ms, 0) + COALESCE(duration_ms, 0)), 0) AS timingSum
        FROM step_ledger`
     )
     .get();
   const wm = db
     .prepare(`SELECT COUNT(*) AS files, COALESCE(SUM(byte_offset), 0) AS offsetSum FROM session_watermarks`)
     .get();
-  const raw = `${agg.cnt}:${agg.tokSum}:${agg.maxTs}:${wm.files}:${wm.offsetSum}`;
+  const raw = `${agg.cnt}:${agg.tokSum}:${agg.maxTs}:${agg.timingSum}:${wm.files}:${wm.offsetSum}`;
   return crypto.createHash('sha1').update(raw).digest('hex').slice(0, 12);
 }
 
@@ -590,7 +851,7 @@ function getPreparedStatements(db) {
   return stmts;
 }
 
-function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
+function scanDbWithConnection(db, transcripts, { flushPartial = false, conversationsDir = null } = {}) {
   return (async () => {
     const {
       selectWatermark,
@@ -603,6 +864,7 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
     } = getPreparedStatements(db);
 
     const changedConvs = [];
+    const changedConvSet = new Set();
     let updatedFiles = 0;
     let newSteps = 0;
     const nowMs = Date.now();
@@ -672,8 +934,9 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
           nowMs
         );
         if (rows.length > 0 || truncated) {
-          recomputeConvMetrics(db, item.convId);
+          recomputeConvMetrics(db, item.convId, { conversationsDir });
           changedConvs.push(item.convId);
+          changedConvSet.add(item.convId);
           updatedFiles += 1;
           newSteps += rows.length;
         }
@@ -685,6 +948,55 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
           // Ignore rollback error
         }
         throw err;
+      }
+    }
+
+    if (conversationsDir && fs.existsSync(conversationsDir)) {
+      const backfillRow = db
+        .prepare(`SELECT value FROM scan_meta WHERE key = 'conv_db_timing_backfill_v1'`)
+        .get();
+      const needsFullBackfill = !backfillRow || backfillRow.value !== '1';
+      const candidateRows = needsFullBackfill
+        ? db
+            .prepare(
+              `SELECT DISTINCT conv_id FROM step_ledger
+               WHERE step_type = 'PLANNER_RESPONSE' AND (ttft_ms IS NULL OR duration_ms IS NULL)`
+            )
+            .all()
+        : db
+            .prepare(
+              `SELECT DISTINCT conv_id FROM step_ledger
+               WHERE step_type = 'PLANNER_RESPONSE'
+                 AND (ttft_ms IS NULL OR duration_ms IS NULL)
+                 AND created_at_ms >= ?
+               LIMIT 5`
+            )
+            .all(nowMs - 120_000);
+
+      let backfilledAny = false;
+      for (const cand of candidateRows) {
+        const cid = String(cand?.conv_id || '');
+        if (!cid || changedConvSet.has(cid)) continue;
+        const convDbPath = path.join(conversationsDir, `${cid}.db`);
+        if (!fs.existsSync(convDbPath)) continue;
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          recomputeConvMetrics(db, cid, { conversationsDir });
+          db.exec('COMMIT');
+          changedConvs.push(cid);
+          changedConvSet.add(cid);
+          backfilledAny = true;
+        } catch {
+          try {
+            db.exec('ROLLBACK');
+          } catch {
+            // Ignore rollback error
+          }
+        }
+      }
+
+      if (needsFullBackfill && (candidateRows.length === 0 || backfilledAny)) {
+        upsertMeta.run('conv_db_timing_backfill_v1', '1');
       }
     }
 
@@ -706,27 +1018,36 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false } = {}) {
 
 /**
  * Performs a single incremental scan pass across all transcript.jsonl files.
- * Accepts either `(brainDir, cacheDbPath, options)` or `({ brainDir, cacheDbPath, flushPartial })`.
+ * Accepts either `(brainDir, cacheDbPath, options)` or `({ brainDir, cacheDbPath, conversationsDir, flushPartial })`.
  */
 export async function scanOnce(brainDirOrOpts, cacheDbPathArg, options = {}) {
   let brainDir;
   let cacheDbPath;
+  let conversationsDir;
   let flushPartial = false;
 
   if (brainDirOrOpts && typeof brainDirOrOpts === 'object') {
+    const explicitBrain = Boolean(brainDirOrOpts.brainDir);
     brainDir = brainDirOrOpts.brainDir || resolveDefaultBrainDir();
     cacheDbPath = brainDirOrOpts.cacheDbPath || resolveDefaultCacheDbPath();
+    conversationsDir =
+      brainDirOrOpts.conversationsDir ||
+      (explicitBrain ? path.resolve(brainDir, '..', 'conversations') : resolveDefaultConversationsDir(brainDir));
     flushPartial = Boolean(brainDirOrOpts.flushPartial);
   } else {
+    const explicitBrain = Boolean(brainDirOrOpts);
     brainDir = brainDirOrOpts || resolveDefaultBrainDir();
     cacheDbPath = cacheDbPathArg || resolveDefaultCacheDbPath();
+    conversationsDir =
+      options.conversationsDir ||
+      (explicitBrain ? path.resolve(brainDir, '..', 'conversations') : resolveDefaultConversationsDir(brainDir));
     flushPartial = Boolean(options.flushPartial);
   }
 
   const transcripts = await discoverTranscripts(brainDir);
   const db = openCacheDb(cacheDbPath);
   try {
-    return await scanDbWithConnection(db, transcripts, { flushPartial });
+    return await scanDbWithConnection(db, transcripts, { flushPartial, conversationsDir });
   } finally {
     db.close();
   }
@@ -736,6 +1057,7 @@ export { scanOnce as runIncrementalScanOnce };
 
 async function runWorkerMain() {
   const brainDir = resolveDefaultBrainDir();
+  const conversationsDir = resolveDefaultConversationsDir(brainDir);
   const cacheDbPath = resolveDefaultCacheDbPath();
   const rawInterval = process.env.AGY_MONITOR_SCAN_INTERVAL_MS;
   const intervalMs = rawInterval === undefined ? 2500 : Number(rawInterval);
@@ -758,7 +1080,7 @@ async function runWorkerMain() {
           scanTick,
           fullSweep: Boolean(forceNotify) || scanTick === 1,
         });
-        const res = await scanDbWithConnection(db, transcripts, { flushPartial: false });
+        const res = await scanDbWithConnection(db, transcripts, { flushPartial: false, conversationsDir });
         if ((res.etagChanged || forceNotify) && process.connected && typeof process.send === 'function') {
           try {
             process.send({

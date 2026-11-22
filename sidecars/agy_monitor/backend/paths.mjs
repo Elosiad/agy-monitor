@@ -81,6 +81,12 @@ export function resolvePaths(overrides = {}) {
       path.join(appDataDir, 'brain'),
   );
 
+  const conversationsDir = path.resolve(
+    overrides.conversationsDir ||
+      process.env.AGY_MONITOR_CONVERSATIONS_DIR ||
+      path.join(appDataDir, 'conversations'),
+  );
+
   const customWallpapersDir = path.resolve(
     overrides.customWallpapersDir || path.join(pluginDataDir, 'wallpapers'),
   );
@@ -155,6 +161,7 @@ export function resolvePaths(overrides = {}) {
     cacheDbPath: telemetryCacheDb,
 
     brainDir,
+    conversationsDir,
     summariesDb,
     summariesDbPath: summariesDb,
     pbtxtPath: path.resolve(overrides.pbtxtPath || path.join(appDataDir, 'antigravity_state.pbtxt')),

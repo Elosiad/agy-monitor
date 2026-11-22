@@ -496,7 +496,13 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
       child.on('error', () => {});
       child.unref();
       launched = true;
-      await new Promise((r) => setTimeout(r, hostInfo.isWsl ? 650 : 350));
+      const maxWaitMs = hostInfo.isWsl ? 2200 : 1800;
+      const deadline = Date.now() + maxWaitMs;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 200));
+        const probe = await getBackdropStatus(paths, themes).catch(() => null);
+        if (probe?.running) break;
+      }
     } else if (!wantRunning && current.running) {
       await execFileAsync(rt.exePosix, ['--stop'], { timeout: 5000 }).catch(() => {});
       stopped = true;

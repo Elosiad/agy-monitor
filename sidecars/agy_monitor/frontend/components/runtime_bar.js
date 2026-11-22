@@ -90,9 +90,11 @@ export function createRuntimeBar({ t } = {}) {
         return;
       }
       const sourceLabel =
-        source === "tool_step_e2e_est"
-          ? tr("runtime.speedSourceTool", "工具步端到端参考", "Tool-step e2e est.")
-          : tr("runtime.speedSourceRecent", "最近响应估算", "Recent step est.");
+        source === "conv_db_exact"
+          ? tr("runtime.speedSourceExact", "会话精确耗时", "Exact turn timing")
+          : source === "tool_step_e2e_est"
+            ? tr("runtime.speedSourceTool", "工具步端到端参考", "Tool-step e2e est.")
+            : tr("runtime.speedSourceRecent", "最近响应估算", "Recent step est.");
       const hasAvg = typeof avg === "number" && Number.isFinite(avg) && avg > 0;
       const segments = [{ text: sourceLabel, highlight: false }];
       if (hasAvg) {

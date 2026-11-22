@@ -655,8 +655,8 @@ export function queryRequestLogs(cacheDbPath, opts = {}) {
                 COALESCE(SUM(input_tokens), 0) AS sumUncachedIn,
                 COALESCE(SUM(cache_read_tokens), 0) AS sumCacheRead,
                 COALESCE(SUM(output_tokens), 0) AS sumOutput,
-                COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 1000 AND output_tokens > 0 THEN output_tokens ELSE 0 END), 0) AS speedOutSum,
-                COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 1000 AND output_tokens > 0 THEN duration_ms ELSE 0 END), 0) AS speedDurMsSum
+                COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 500 AND output_tokens > 0 THEN output_tokens ELSE 0 END), 0) AS speedOutSum,
+                COALESCE(SUM(CASE WHEN duration_ms IS NOT NULL AND duration_ms >= 500 AND output_tokens > 0 THEN duration_ms ELSE 0 END), 0) AS speedDurMsSum
          FROM step_ledger
          WHERE ${whereSql}`
       )
@@ -733,7 +733,7 @@ export function queryRequestLogs(cacheDbPath, opts = {}) {
       const rawTtft = Number(r.ttft_ms);
       const ttftMs = Number.isFinite(rawTtft) && rawTtft > 0 ? Math.trunc(rawTtft) : null;
       const tokPerSec =
-        durationMs && durationMs >= 1000 && out > 0
+        durationMs && durationMs >= 500 && out > 0
           ? Number((out / (durationMs / 1000)).toFixed(1))
           : null;
 
