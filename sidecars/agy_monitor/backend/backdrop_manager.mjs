@@ -49,7 +49,7 @@ function isPidAlive(pid) {
  * In WSL2 with Windows Interop, Windows executables launched via Interop run
  * directly on the user's interactive Windows desktop.
  */
-export async function detectOwnDesktopInfo({ force = false } = {}) {
+export async function detectOwnDesktopInfo({ force = false, exePath = '' } = {}) {
   const hostInfo = detectWindowsHostEnv();
   if (!hostInfo.hasWindowsHost) {
     return {
@@ -82,6 +82,27 @@ export async function detectOwnDesktopInfo({ force = false } = {}) {
     return cachedDesktopInfo;
   }
 
+  // Fast native path (~20ms): ask compiled agy_backdrop.exe directly instead of cold-starting PowerShell + csc Add-Type
+  if (exePath && fs.existsSync(exePath)) {
+    try {
+      const { stdout } = await execFileAsync(exePath, ['--probe-desktop'], { timeout: 3000 });
+      const desktopName = String(stdout || '').trim();
+      if (desktopName && desktopName.toLowerCase() !== 'unknown') {
+        const isDefaultDesktop = desktopName.toLowerCase() === 'default';
+        cachedDesktopInfo = {
+          isWindows: true,
+          isWsl: false,
+          desktopName,
+          canAutoLaunch: isDefaultDesktop,
+          desktopIsolated: !isDefaultDesktop,
+        };
+        return cachedDesktopInfo;
+      }
+    } catch {
+      // Fall through to PowerShell probe when binary is older or busy
+    }
+  }
+
   const psScript = [
     'Add-Type -TypeDefinition @"',
     'using System;',
@@ -108,24 +129,47 @@ export async function detectOwnDesktopInfo({ force = false } = {}) {
       '-NonInteractive',
       '-EncodedCommand',
       encoded,
-    ], { timeout: 6000 });
+    ], { timeout: 12000 });
     const desktopName = String(stdout || '').trim() || 'unknown';
     const isDefaultDesktop = desktopName.toLowerCase() === 'default';
-    cachedDesktopInfo = {
+    const resolved = {
       isWindows: true,
+      isWsl: false,
       desktopName,
       canAutoLaunch: isDefaultDesktop,
       desktopIsolated: !isDefaultDesktop,
     };
+    // Never poison cache on transient "unknown" probe failures
+    if (desktopName.toLowerCase() !== 'unknown') {
+      cachedDesktopInfo = resolved;
+    }
+    return resolved;
   } catch {
-    cachedDesktopInfo = {
+    return {
       isWindows: true,
+      isWsl: false,
       desktopName: 'unknown',
       canAutoLaunch: false,
       desktopIsolated: true,
     };
   }
-  return cachedDesktopInfo;
+}
+
+/**
+ * Emergency opaque recovery: invoke agy_backdrop.exe --restore-opacity so any
+ * Antigravity host window left translucent by a crashed companion is immediately restored.
+ */
+export async function restoreHostOpacityFallback(paths) {
+  const hostInfo = detectWindowsHostEnv();
+  if (!hostInfo.hasWindowsHost) return false;
+  const rt = await resolveBackdropRuntimePaths(paths, hostInfo);
+  if (!rt?.exePosix || !fs.existsSync(rt.exePosix)) return false;
+  try {
+    await execFileAsync(rt.exePosix, ['--restore-opacity'], { timeout: 4000 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function buildLauncherVbsContent(exePath, dataDir, wallpapersDir) {
@@ -342,9 +386,9 @@ export async function ensureBackdropAssets(paths) {
  */
 export async function getBackdropStatus(paths, themes = {}) {
   const hostInfo = detectWindowsHostEnv();
-  const desk = await detectOwnDesktopInfo();
   const rt = hostInfo.hasWindowsHost ? await resolveBackdropRuntimePaths(paths, hostInfo) : null;
   const exeExists = Boolean(rt?.exePosix && fs.existsSync(rt.exePosix));
+  const desk = await detectOwnDesktopInfo({ exePath: exeExists ? rt.exePosix : '' });
 
   let raw = null;
   if (paths?.backdropStatusFile) {
@@ -422,7 +466,7 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
   }
 
   const rt = await resolveBackdropRuntimePaths(paths, hostInfo);
-  const desk = await detectOwnDesktopInfo();
+  const desk = await detectOwnDesktopInfo({ exePath: rt?.exePosix || '' });
   const current = await getBackdropStatus(paths, themes);
 
   const wantRunning =
@@ -457,6 +501,10 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
       await execFileAsync(rt.exePosix, ['--stop'], { timeout: 5000 }).catch(() => {});
       stopped = true;
       await new Promise((r) => setTimeout(r, 250));
+      await execFileAsync(rt.exePosix, ['--restore-opacity'], { timeout: 4000 }).catch(() => {});
+    } else if (!wantRunning && !current.running) {
+      // Even when companion already died, ensure any residual translucent Antigravity window is restored opaque
+      await execFileAsync(rt.exePosix, ['--restore-opacity'], { timeout: 4000 }).catch(() => {});
     }
   }
 

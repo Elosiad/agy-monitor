@@ -24,6 +24,7 @@ import {
   controlBackdropCompanion,
   ensureBackdropAssets,
   getBackdropStatus,
+  restoreHostOpacityFallback,
 } from './backend/backdrop_manager.mjs';
 import { createCdpThemeBridge, ensureCdpLauncher } from './backend/cdp_theme_bridge.mjs';
 import { buildFrontendBundle } from './backend/bundle_builder.mjs';
@@ -509,6 +510,11 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     lastHostConvAtMs = Date.now();
   };
 
+  const isActiveHostConv = (convId) => {
+    const id = typeof convId === 'string' ? convId.trim() : '';
+    return Boolean(id && lastHostConvId && id === lastHostConvId);
+  };
+
   let writeChain = Promise.resolve();
   let lastSessionsSnapshot = [];
   const writePayload = (telemetry, { sessionsHudList = null, forceEmpty = false } = {}) => {
@@ -643,7 +649,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     }
   };
 
-  return { writePayload, refreshFromDb, setActiveHostConv, resolveActiveConv };
+  return { writePayload, refreshFromDb, setActiveHostConv, isActiveHostConv, resolveActiveConv };
 }
 
 /**
@@ -900,7 +906,10 @@ export function createMonitorHandlers({
       windowCap,
     });
 
-    if (!isExplicitConvId && (syncHud || !rawHostConvId)) {
+    if (
+      !isExplicitConvId &&
+      (syncHud || !rawHostConvId || Boolean(rawHostConvId && hud.isActiveHostConv?.(rawHostConvId)))
+    ) {
       void hud.writePayload(telemetry, { forceEmpty: isNewConv });
     }
 
@@ -1943,6 +1952,49 @@ export async function startSidecarServer({
   }
 
   const startupHostEnv = detectWindowsHostEnv();
+  let companionWatchdogTimer = null;
+  let companionRestartFailures = 0;
+  let companionWatchdogBusy = false;
+
+  const ensureCompanionHealthy = async () => {
+    if (companionWatchdogBusy) return;
+    companionWatchdogBusy = true;
+    try {
+      const themes = await storage.getThemes();
+      const wantStart = Boolean(
+        (themes.backdropEnabled && themes.activeWallpaperId) || themes.hudEnabled !== false,
+      );
+      if (!wantStart) {
+        companionRestartFailures = 0;
+        return;
+      }
+      const status = await getBackdropStatus(paths, themes);
+      if (status.running) {
+        companionRestartFailures = 0;
+        return;
+      }
+      if (!status.canAutoLaunch) {
+        return;
+      }
+      if (companionRestartFailures < 3) {
+        const res = await controlBackdropCompanion(paths, themes, 'start');
+        if (res?.status?.running) {
+          companionRestartFailures = 0;
+        } else {
+          companionRestartFailures += 1;
+          if (companionRestartFailures >= 3) {
+            // Stop retry storm and guarantee host windows are never left translucent
+            await restoreHostOpacityFallback(paths);
+          }
+        }
+      }
+    } catch {
+      // Non-fatal watchdog tick
+    } finally {
+      companionWatchdogBusy = false;
+    }
+  };
+
   if (!skipWorker && startupHostEnv.hasWindowsHost) {
     void (async () => {
       try {
@@ -1951,19 +2003,24 @@ export async function startSidecarServer({
         await ensureCdpLauncher(paths, themes.cdpPort);
         await cdpBridge.sync(themes, { hostLanguage: prefs.language, probeForLang: true });
         await hudPublisher.refreshFromDb();
-        const status = await getBackdropStatus(paths, themes);
-        const wantStart = Boolean((themes.backdropEnabled && themes.activeWallpaperId) || themes.hudEnabled !== false);
-        if (status.canAutoLaunch && wantStart) {
-          await controlBackdropCompanion(paths, themes, 'start');
-        }
+        await ensureCompanionHealthy();
       } catch {
         // Non-fatal backdrop companion prep error
       }
     })();
+
+    companionWatchdogTimer = setInterval(() => {
+      void ensureCompanionHealthy();
+    }, 15_000);
+    companionWatchdogTimer.unref?.();
   }
 
   const shutdown = async () => {
     clearTimeout(activeViewTimer);
+    if (companionWatchdogTimer) {
+      clearInterval(companionWatchdogTimer);
+      companionWatchdogTimer = null;
+    }
     try {
       activeViewWatcher?.close?.();
     } catch {

@@ -138,4 +138,16 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   assert.match(src, /if\s*\(mouseDownOnHost\)\s*\{[^}]*finalAnchor\.Occluded\s*=\s*prevAnchor\.Occluded;/s, 'mouseDownOnHost must preserve occlusion state so full-screen Console never flashes HUD on click');
   assert.match(src, /IsTargetFile\(name,\s*"console_viewport\.json"\)/, 'Companion must watch console_viewport.json for instant full-screen Console occlusion');
   assert.match(src, /IsConsoleCoveringAnchor\s*\(/, 'SyncHudForWindow must check exact consoleLeftPx geometry against composer anchor');
+
+  // 12. v1.0.12 anti-bleed-through & HUD sync guards: popup re-entry crash fix, sleep/lock opaque restore,
+  // residual alpha recovery, real-session header validation, and fast CLI --probe-desktop / --restore-opacity
+  assert.match(src, /_hudPopupOpening/, 'ToggleHudConfigPopup must guard against re-entrant CloseHudPopup during popup.Show()');
+  assert.match(src, /SystemEvents\.PowerModeChanged/, 'Companion must restore full host opacity on sleep/suspend and resync on resume');
+  assert.match(src, /SystemEvents\.SessionSwitch/, 'Companion must restore full host opacity on session lock and resync on unlock');
+  assert.match(src, /RestoreAllAntigravityWindowsOpaqueStatic\s*\(/, 'Emergency opacity recovery must sweep all translucent Antigravity windows');
+  assert.match(src, /MatchesAnyKnownSession\s*\(/, 'UIA header probe must validate titles against known real sessions');
+  assert.match(src, /--probe-desktop/, 'Companion must support fast --probe-desktop CLI mode');
+  assert.match(src, /--restore-opacity/, 'Companion must support --restore-opacity emergency CLI mode');
+  assert.match(src, /RecoverFromNonFatalUiException\s*\(/, 'DispatcherUnhandledException must recover non-fatal UI glitches without killing companion');
+  assert.match(src, /_consoleViewportPhysW\s*<\s*\(int\)Math\.Round\(winW\s*\*\s*0\.62\)/, 'IsConsoleCoveringAnchor must only trigger on true full-screen console (>=62% width)');
 });

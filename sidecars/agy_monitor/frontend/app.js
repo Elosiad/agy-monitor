@@ -131,6 +131,7 @@ export function mountMonitorApp() {
   let pollTimer = null;
   let snapshotInFlight = false;
   let pendingForcedRefresh = false;
+  let lastSyncedHostConvId = "";
   let destroyed = false;
   const cleanups = [];
 
@@ -293,11 +294,20 @@ export function mountMonitorApp() {
         range: state.range,
         etag: force ? "" : state.etag || "",
       });
+      const effectiveSyncHud =
+        syncHud ||
+        Boolean(
+          state.followLatest &&
+            hostConvId &&
+            hostConvId !== lastSyncedHostConvId &&
+            isPanelVisible()
+        );
       if (state.followLatest && hostConvId) {
         params.set("hostConvId", hostConvId);
       }
-      if (syncHud) {
+      if (effectiveSyncHud) {
         params.set("syncHud", "1");
+        if (hostConvId) lastSyncedHostConvId = hostConvId;
       }
       if (force) {
         params.set("force", "1");
@@ -778,9 +788,17 @@ export function mountMonitorApp() {
     };
   }
 
+  function isFullscreenConsoleViewport(vp) {
+    if (!vp || !vp.visible || !vp.physW) return false;
+    if (vp.outerW > 0) {
+      return vp.physW >= Math.round(vp.outerW * 0.60);
+    }
+    return vp.physW >= 1100;
+  }
+
   function syncViewportHeartbeat(vp) {
     if (destroyed) return;
-    const needHeartbeat = Boolean(vp && vp.visible && vp.physW >= 520);
+    const needHeartbeat = isFullscreenConsoleViewport(vp);
     if (needHeartbeat && !viewportHeartbeatTimer) {
       viewportHeartbeatTimer = setInterval(() => {
         if (destroyed) return;
@@ -794,9 +812,11 @@ export function mountMonitorApp() {
 
   function sendConsoleViewport({ force = false, forceHidden = false } = {}) {
     if (destroyed || typeof apiFetch !== "function") return;
-    const vp = forceHidden
+    const rawVp = forceHidden
       ? { visible: false, physW: 0, physH: 0, outerW: 0 }
       : readConsoleViewport();
+    const isFullCover = isFullscreenConsoleViewport(rawVp);
+    const vp = isFullCover ? rawVp : { visible: false, physW: 0, physH: 0, outerW: rawVp.outerW || 0 };
     syncViewportHeartbeat(vp);
     if (!vp.visible && !lastReportedVisible) {
       return;

@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
+using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -566,6 +567,46 @@ namespace AgyBackdropCompanion
                 downSteps++;
             }
             return false;
+        }
+
+        public static bool IsWindowTranslucentLayered(IntPtr hwnd, out byte alpha)
+        {
+            alpha = 255;
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return false;
+            try
+            {
+                long curEx = GetWindowLongPtrCompat(hwnd, GWL_EXSTYLE);
+                if ((curEx & WS_EX_LAYERED) == 0) return false;
+                uint ck, lflags;
+                byte actualAlpha;
+                if (GetLayeredWindowAttributes(hwnd, out ck, out actualAlpha, out lflags))
+                {
+                    alpha = actualAlpha;
+                    return (lflags & LWA_ALPHA) != 0 && actualAlpha < 255;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public static void ForceRestoreWindowOpaque(IntPtr hwnd, bool originallyLayered)
+        {
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return;
+            try
+            {
+                long curEx = GetWindowLongPtrCompat(hwnd, GWL_EXSTYLE);
+                if ((curEx & WS_EX_LAYERED) == 0) return;
+                if (originallyLayered)
+                {
+                    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+                }
+                else
+                {
+                    SetWindowLongPtrCompat(hwnd, GWL_EXSTYLE, curEx & ~WS_EX_LAYERED);
+                    RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+                }
+            }
+            catch { }
         }
 
         public static void TrimWorkingSet()
@@ -2093,7 +2134,7 @@ namespace AgyBackdropCompanion
             bool showCache = wantCache;
             bool showModel = wantModel;
 
-            // Step 1: Drop model ID completely if it cannot fit comfortably (>= 76 DIP or full width)
+            // Step 1: Drop model ID completely if the full model ID cannot fit cleanly (never clip into "gemini-4-neo")
             if (showModel)
             {
                 double baseWithoutModel =
@@ -2102,7 +2143,7 @@ namespace AgyBackdropCompanion
                     (showSpeed && showCache ? sepDip : 0.0);
                 double needBeforeModel = baseWithoutModel + (baseWithoutModel > 0.0 ? sepDip : 0.0);
                 double modelRem = textBudget - needBeforeModel;
-                double minModelDip = Math.Min(_modelDipW, 76.0);
+                double minModelDip = _modelDipW + 2.0;
                 if (modelRem < minModelDip)
                 {
                     showModel = false;
@@ -4010,14 +4051,14 @@ namespace AgyBackdropCompanion
                 AutomationElementCollection elems = root.FindAll(TreeScope.Descendants, cond);
                 if (elems == null || elems.Count == 0) return info;
 
-                // Chat header breadcrumb sits strictly in the top header bar (y ~ Top+26 .. Top+62 logical px), past the left sidebar
+                // Chat header breadcrumb sits strictly in the top header bar (y ~ Top+26 .. Top+66 logical px), never inside scrolled chat messages
                 double dpiScale = Native.GetWindowDpiScale(hwnd);
                 int headTop = winRect.Top + (int)Math.Round(26 * dpiScale);
-                int headBottom = winRect.Top + (int)Math.Round(64 * dpiScale);
-                int headMinX = winRect.Left + (int)Math.Round(215 * dpiScale);
+                int headBottom = winRect.Top + (int)Math.Round(66 * dpiScale);
+                int headMinX = winRect.Left + (int)Math.Round(210 * dpiScale);
                 int headMaxX = winRect.Right - (int)Math.Round(90 * dpiScale);
-                double maxHeaderItemH = 44.0 * dpiScale;
-                double minTextItemW = 36.0 * dpiScale;
+                double maxHeaderItemH = 38.0 * dpiScale;
+                double minTextItemW = 24.0 * dpiScale;
 
                 var headerItems = new List<KeyValuePair<double, string>>();
                 for (int i = 0; i < elems.Count; i++)
@@ -4032,8 +4073,9 @@ namespace AgyBackdropCompanion
                     string name = "";
                     try { name = (el.Current.Name ?? "").Trim(); } catch { continue; }
                     if (string.IsNullOrEmpty(name)) continue;
-                    // Skip compact icon-only toolbar buttons (e.g. "Project options" 24x24 icon)
+                    // Skip tiny icon-only buttons, but keep "/" separator and short workspace names like "agy"
                     if (name != "/" && r.Width < minTextItemW) continue;
+                    if (name.Length > 140) continue;
 
                     // Single-node breadcrumb format: "CastoriceQQbot / 读取指定会话内容"
                     if (IsNewConversationTitle(name))
@@ -4109,6 +4151,14 @@ namespace AgyBackdropCompanion
                             return info;
                         }
                         if (candidate == "/" || IsHeaderChromeText(candidate)) continue;
+                        // Reject scrolled chat body fragments (starting with punctuation or ending with colon)
+                        char firstCh = candidate[0];
+                        char lastCh = candidate[candidate.Length - 1];
+                        if (firstCh == '，' || firstCh == '。' || firstCh == '、' || firstCh == '：' || firstCh == ',' || firstCh == ':' || firstCh == '•' || firstCh == '-' || lastCh == '：' || lastCh == ':')
+                        {
+                            continue;
+                        }
+                        if (candidate.Length < 3 || candidate.Length > 88) continue;
                         info.Title = candidate;
                         return info;
                     }
@@ -4159,6 +4209,7 @@ namespace AgyBackdropCompanion
         public string WindowWorkspace = "";
         public string WindowTitle = "";
         public bool WindowIsNewConv = false;
+        public DateTime WindowViewUpdatedUtc = DateTime.MinValue;
     }
 
     internal struct PendingWinMove
@@ -4216,6 +4267,8 @@ namespace AgyBackdropCompanion
         private long _lastThemesLength = -1;
         private DateTime _lastHudWriteUtc = DateTime.MinValue;
         private long _lastHudLength = -1;
+        private string _lastHudActiveConvId = "";
+        private DateTime _lastHudActiveConvChangedUtc = DateTime.MinValue;
         private DateTime _lastHudDisplayWriteUtc = DateTime.MinValue;
         private long _lastHudDisplayLength = -1;
         private DateTime _lastConsoleViewportWriteUtc = DateTime.MinValue;
@@ -4231,6 +4284,8 @@ namespace AgyBackdropCompanion
         private IntPtr _lightboxOwnerHwnd = IntPtr.Zero;
         private HudConfigPopupWindow _hudPopup = null;
         private IntPtr _hudPopupOwnerHwnd = IntPtr.Zero;
+        private bool _hudPopupOpening = false;
+        private bool _systemEventsHooked = false;
         private IntPtr _popupInitialFgHwnd = IntPtr.Zero;
         private DateTime _lastHudPopupClosedUtc = DateTime.MinValue;
         private DispatcherTimer _popupWatchTimer;
@@ -4293,6 +4348,7 @@ namespace AgyBackdropCompanion
             ReloadHudTelemetry();
             ReloadConsoleViewport();
             InstallHooks();
+            InstallSystemEvents();
             InstallWatcher();
             StartStopEventListener();
             StartUiaAnchorWorker();
@@ -4909,30 +4965,49 @@ namespace AgyBackdropCompanion
                                     string vwTitle = view.Title ?? "";
                                     bool vwIsNew = view.IsNewConversation;
                                     IntPtr targetH = h;
+                                    bool writeView = (h == fgHwnd || snapHwnds.Count == 1);
                                     if (!_disposed)
                                     {
                                         _dispatcher.BeginInvoke(new Action(delegate
                                         {
                                             TrackedHostWindow rec;
-                                            if (!_disposed && _tracked.TryGetValue(targetH, out rec))
+                                            if (_disposed || !_tracked.TryGetValue(targetH, out rec)) return;
+
+                                            // Validate UIA header title against known real sessions so scrolled chat text
+                                            // (like "Analyzed" or code snippets) can NEVER hijack or freeze the HUD!
+                                            bool knownMatch = vwIsNew || MatchesAnyKnownSession(vwTitle, vwWs);
+                                            if (!knownMatch)
                                             {
-                                                bool viewChanged =
-                                                    rec.WindowIsNewConv != vwIsNew ||
-                                                    !string.Equals(rec.WindowTitle, vwTitle, StringComparison.Ordinal) ||
-                                                    !string.Equals(rec.WindowWorkspace, vwWs, StringComparison.Ordinal);
-                                                rec.WindowWorkspace = vwWs;
-                                                rec.WindowTitle = vwTitle;
-                                                rec.WindowIsNewConv = vwIsNew;
-                                                if (viewChanged && rec.Hud != null)
+                                                if (!string.IsNullOrEmpty(rec.WindowTitle) && !MatchesAnyKnownSession(rec.WindowTitle, rec.WindowWorkspace))
                                                 {
-                                                    rec.Hud.UpdateData(ResolveTelemetryForWindow(rec), _config.accentColor);
+                                                    rec.WindowTitle = "";
+                                                    rec.WindowWorkspace = "";
+                                                    rec.WindowIsNewConv = false;
+                                                    if (rec.Hud != null)
+                                                    {
+                                                        rec.Hud.UpdateData(ResolveTelemetryForWindow(rec), _config.accentColor);
+                                                    }
                                                 }
+                                                return;
+                                            }
+
+                                            bool viewChanged =
+                                                rec.WindowIsNewConv != vwIsNew ||
+                                                !string.Equals(rec.WindowTitle, vwTitle, StringComparison.Ordinal) ||
+                                                !string.Equals(rec.WindowWorkspace, vwWs, StringComparison.Ordinal);
+                                            rec.WindowWorkspace = vwWs;
+                                            rec.WindowTitle = vwTitle;
+                                            rec.WindowIsNewConv = vwIsNew;
+                                            rec.WindowViewUpdatedUtc = DateTime.UtcNow;
+                                            if (viewChanged && rec.Hud != null)
+                                            {
+                                                rec.Hud.UpdateData(ResolveTelemetryForWindow(rec), _config.accentColor);
+                                            }
+                                            if (writeView)
+                                            {
+                                                WriteActiveViewFile(vwWs, vwTitle, vwIsNew, explicitViewTrigger);
                                             }
                                         }));
-                                    }
-                                    if (h == fgHwnd || snapHwnds.Count == 1)
-                                    {
-                                        WriteActiveViewFile(vwWs, vwTitle, vwIsNew, explicitViewTrigger);
                                     }
                                 }
                             }
@@ -4966,6 +5041,143 @@ namespace AgyBackdropCompanion
             _uiaWorkerThread.IsBackground = true;
             _uiaWorkerThread.SetApartmentState(ApartmentState.MTA);
             _uiaWorkerThread.Start();
+        }
+
+        private void InstallSystemEvents()
+        {
+            if (_systemEventsHooked) return;
+            try
+            {
+                SystemEvents.PowerModeChanged += OnPowerModeChanged;
+                SystemEvents.SessionSwitch += OnSessionSwitch;
+                _systemEventsHooked = true;
+            }
+            catch { }
+        }
+
+        private void UninstallSystemEvents()
+        {
+            if (!_systemEventsHooked) return;
+            _systemEventsHooked = false;
+            try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
+            try { SystemEvents.SessionSwitch -= OnSessionSwitch; } catch { }
+        }
+
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (_disposed || e == null) return;
+            if (e.Mode == PowerModes.Suspend)
+            {
+                // Restore full host opacity & hide backdrops before sleep so wake-up never shows stuck ghost translucency
+                try
+                {
+                    _dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        if (_disposed) return;
+                        CloseHudPopup();
+                        foreach (TrackedHostWindow item in _tracked.Values)
+                        {
+                            RestoreBackdropOnly(item, false);
+                            HideHudIfVisible(item);
+                        }
+                    }));
+                }
+                catch { RestoreAllHostOpacityEmergency(); }
+            }
+            else if (e.Mode == PowerModes.Resume)
+            {
+                ScheduleResumeResync();
+            }
+        }
+
+        private void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
+        {
+            if (_disposed || e == null) return;
+            if (e.Reason == SessionSwitchReason.SessionLock || e.Reason == SessionSwitchReason.ConsoleDisconnect)
+            {
+                try
+                {
+                    _dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        if (_disposed) return;
+                        CloseHudPopup();
+                        foreach (TrackedHostWindow item in _tracked.Values)
+                        {
+                            RestoreBackdropOnly(item, false);
+                            HideHudIfVisible(item);
+                        }
+                    }));
+                }
+                catch { RestoreAllHostOpacityEmergency(); }
+            }
+            else if (e.Reason == SessionSwitchReason.SessionUnlock || e.Reason == SessionSwitchReason.ConsoleConnect)
+            {
+                ScheduleResumeResync();
+            }
+        }
+
+        private void ScheduleResumeResync()
+        {
+            try
+            {
+                _dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (_disposed) return;
+                    foreach (TrackedHostWindow item in _tracked.Values)
+                    {
+                        item.BackdropGuardBlocked = false;
+                        item.BackdropBlockReason = "";
+                        item.BackdropZFailCount = 0;
+                    }
+                    var t1 = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
+                    {
+                        Interval = TimeSpan.FromMilliseconds(500)
+                    };
+                    t1.Tick += delegate
+                    {
+                        t1.Stop();
+                        if (!_disposed)
+                        {
+                            SyncAllWindows(true);
+                            WriteStatusFile(true);
+                        }
+                    };
+                    t1.Start();
+
+                    var t2 = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
+                    {
+                        Interval = TimeSpan.FromMilliseconds(1800)
+                    };
+                    t2.Tick += delegate
+                    {
+                        t2.Stop();
+                        if (!_disposed)
+                        {
+                            SyncAllWindows(true);
+                            WriteStatusFile(true);
+                        }
+                    };
+                    t2.Start();
+                }));
+            }
+            catch { }
+        }
+
+        public void RecoverFromNonFatalUiException()
+        {
+            try { CloseHudPopup(); } catch { }
+            try
+            {
+                if (_lightbox != null)
+                {
+                    ImageLightboxWindow closingLb = _lightbox;
+                    _lightbox = null;
+                    _lightboxOwnerHwnd = IntPtr.Zero;
+                    ForceCloseOwnedWindow(closingLb);
+                }
+            }
+            catch { }
+            try { SyncAllWindows(true); } catch { RestoreAllHostOpacityEmergency(); }
         }
 
         private void InstallHooks()
@@ -5023,9 +5235,22 @@ namespace AgyBackdropCompanion
 
             if (eventType == Native.EVENT_SYSTEM_FOREGROUND || isTracked)
             {
-                if (eventType == Native.EVENT_SYSTEM_FOREGROUND && _hudPopup != null && hwnd != _hudPopupOwnerHwnd)
+                if (eventType == Native.EVENT_SYSTEM_FOREGROUND && _hudPopup != null && !_hudPopupOpening && hwnd != _hudPopupOwnerHwnd)
                 {
-                    CloseHudPopup();
+                    IntPtr popH = _hudPopup.Handle;
+                    IntPtr guideH = IntPtr.Zero;
+                    try
+                    {
+                        if (_hudPopup.GuideWindow != null)
+                        {
+                            guideH = new WindowInteropHelper(_hudPopup.GuideWindow).Handle;
+                        }
+                    }
+                    catch { }
+                    if (hwnd != popH && hwnd != guideH)
+                    {
+                        CloseHudPopup();
+                    }
                 }
 
                 // Immediate zero-debounce hide on minimize/hide/destroy prevents lingering backdrop/HUD ghosts
@@ -5425,6 +5650,12 @@ namespace AgyBackdropCompanion
                 return false;
             }
             int winW = Math.Max(1, winRect.Right - winRect.Left);
+            // Only true full-screen / wide-overlay AGY Console (>= 62% of host window width) can cover the chat composer!
+            // Side-by-side split pane (~30%-55% width) never covers the composer and must not falsely trigger when user switches tabs to Overview.
+            if (_consoleViewportPhysW < (int)Math.Round(winW * 0.62))
+            {
+                return false;
+            }
             if (_tracked.Count > 1)
             {
                 bool outerMatches = _consoleViewportOuterW > 0 && Math.Abs(winW - _consoleViewportOuterW) <= 80;
@@ -5570,6 +5801,7 @@ namespace AgyBackdropCompanion
 
         private void OnPopupWatchTick(object sender, EventArgs e)
         {
+            if (_hudPopupOpening) return;
             if (_disposed || _hudPopup == null)
             {
                 StopPopupWatchTimer();
@@ -5659,7 +5891,7 @@ namespace AgyBackdropCompanion
 
         private void ToggleHudConfigPopup(IntPtr hostHwnd)
         {
-            if (_disposed) return;
+            if (_disposed || _hudPopupOpening) return;
             if (_hudPopup != null)
             {
                 CloseHudPopup();
@@ -5685,30 +5917,46 @@ namespace AgyBackdropCompanion
             int anchorCenterX = item.HudVisible ? (item.LastHudX + item.LastHudW / 2) : (item.Anchor.RightX - (int)Math.Round(60.0 * dpiScale));
             int anchorCenterY = item.HudVisible ? (item.LastHudY + item.LastHudH / 2) : item.Anchor.CenterY;
 
-            var popup = new HudConfigPopupWindow(hostHwnd, ResolveGuideImagePath());
-            // Bind reference BEFORE Show() so re-entrant WinEvents or SweepOrphanedWindows always track it
-            _hudPopup = popup;
-            _hudPopupOwnerHwnd = hostHwnd;
-            popup.DisplayChanged += delegate(HudDisplayConfig nextCfg)
+            _hudPopupOpening = true;
+            try
             {
-                SaveHudDisplayConfig(nextCfg);
-            };
-            popup.Closed += delegate
-            {
+                var popup = new HudConfigPopupWindow(hostHwnd, ResolveGuideImagePath());
+                // Bind reference BEFORE Show() so re-entrant WinEvents or SweepOrphanedWindows always track it
+                _hudPopup = popup;
+                _hudPopupOwnerHwnd = hostHwnd;
+                popup.DisplayChanged += delegate(HudDisplayConfig nextCfg)
+                {
+                    SaveHudDisplayConfig(nextCfg);
+                };
+                popup.Closed += delegate
+                {
+                    if (_hudPopup == popup)
+                    {
+                        StopPopupWatchTimer();
+                        _hudPopup = null;
+                        _hudPopupOwnerHwnd = IntPtr.Zero;
+                        _lastHudPopupClosedUtc = DateTime.UtcNow;
+                    }
+                };
+
+                popup.UpdateState(_hudDisplay, ResolveTelemetryForWindow(item), _config.accentColor);
+                popup.PositionAboveHud(winRect, anchorCenterX, anchorCenterY, dpiScale);
+                popup.Show();
                 if (_hudPopup == popup)
                 {
-                    StopPopupWatchTimer();
-                    _hudPopup = null;
-                    _hudPopupOwnerHwnd = IntPtr.Zero;
-                    _lastHudPopupClosedUtc = DateTime.UtcNow;
+                    popup.PositionAboveHud(winRect, anchorCenterX, anchorCenterY, dpiScale);
+                    StartPopupWatchTimer();
                 }
-            };
-
-            popup.UpdateState(_hudDisplay, ResolveTelemetryForWindow(item), _config.accentColor);
-            popup.PositionAboveHud(winRect, anchorCenterX, anchorCenterY, dpiScale);
-            popup.Show();
-            popup.PositionAboveHud(winRect, anchorCenterX, anchorCenterY, dpiScale);
-            StartPopupWatchTimer();
+            }
+            catch (Exception ex)
+            {
+                LogFatalException("ToggleHudConfigPopup", ex);
+                CloseHudPopup();
+            }
+            finally
+            {
+                _hudPopupOpening = false;
+            }
         }
 
         private void ReloadHudTelemetry()
@@ -5757,6 +6005,24 @@ namespace AgyBackdropCompanion
                         });
                     }
                 }
+                string nextActiveConvId = ReadString(doc, "activeConvId", "");
+                if (!string.Equals(nextActiveConvId, _lastHudActiveConvId, StringComparison.Ordinal))
+                {
+                    _lastHudActiveConvId = nextActiveConvId;
+                    _lastHudActiveConvChangedUtc = DateTime.UtcNow;
+                    if (_tracked.Count <= 1)
+                    {
+                        foreach (TrackedHostWindow item in _tracked.Values)
+                        {
+                            if (item.WindowViewUpdatedUtc < _lastHudActiveConvChangedUtc)
+                            {
+                                item.WindowTitle = "";
+                                item.WindowWorkspace = "";
+                                item.WindowIsNewConv = false;
+                            }
+                        }
+                    }
+                }
                 bool cdpChanged = _hudTelemetry == null || _hudTelemetry.cdpHudActive != next.cdpHudActive;
                 _hudTelemetry = next;
                 if (cdpChanged)
@@ -5765,6 +6031,31 @@ namespace AgyBackdropCompanion
                 }
             }
             catch { }
+        }
+
+        private bool MatchesAnyKnownSession(string winTitle, string winWs)
+        {
+            if (string.IsNullOrEmpty(winTitle)) return false;
+            if (_hudTelemetry == null || _hudTelemetry.sessions == null || _hudTelemetry.sessions.Count == 0)
+            {
+                return !string.IsNullOrEmpty(winWs);
+            }
+            string t = winTitle.Trim();
+            bool ellipsized = t.EndsWith("...") || t.EndsWith("…");
+            string stripped = t.TrimEnd('.', '…').Trim();
+            for (int i = 0; i < _hudTelemetry.sessions.Count; i++)
+            {
+                HudSessionEntry s = _hudTelemetry.sessions[i];
+                if (s == null || string.IsNullOrEmpty(s.title)) continue;
+                if (string.Equals(s.title, t, StringComparison.OrdinalIgnoreCase)) return true;
+                if (stripped.Length >= 4 &&
+                    (s.title.StartsWith(stripped, StringComparison.OrdinalIgnoreCase) ||
+                     (ellipsized && stripped.StartsWith(s.title, StringComparison.OrdinalIgnoreCase))))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private HudTelemetry ResolveTelemetryForWindow(TrackedHostWindow item)
@@ -6136,7 +6427,12 @@ namespace AgyBackdropCompanion
                 item.Hud = hud;
                 hud.Clicked += delegate
                 {
-                    ToggleHudConfigPopup(targetHwnd);
+                    try { ToggleHudConfigPopup(targetHwnd); }
+                    catch (Exception ex)
+                    {
+                        LogFatalException("HudClicked", ex);
+                        CloseHudPopup();
+                    }
                 };
                 hud.UpdateDisplay(_hudDisplay);
                 hud.UpdateData(ResolveTelemetryForWindow(item), _config.accentColor);
@@ -6267,11 +6563,15 @@ namespace AgyBackdropCompanion
                         if (!_tracked.ContainsKey(h))
                         {
                             long origEx = Native.GetWindowLongPtrCompat(h, Native.GWL_EXSTYLE);
+                            byte residualAlpha;
+                            bool hasResidualAlpha = Native.IsWindowTranslucentLayered(h, out residualAlpha);
                             var rec = new TrackedHostWindow
                             {
                                 Hwnd = h,
-                                OriginalExStyle = origEx,
-                                OriginallyLayered = (origEx & Native.WS_EX_LAYERED) != 0
+                                OriginalExStyle = hasResidualAlpha ? (origEx & ~Native.WS_EX_LAYERED) : origEx,
+                                OriginallyLayered = ((origEx & Native.WS_EX_LAYERED) != 0) && !hasResidualAlpha,
+                                AlphaApplied = hasResidualAlpha,
+                                LastAlpha = hasResidualAlpha ? residualAlpha : (byte)255
                             };
                             _tracked[h] = rec;
                         }
@@ -6392,7 +6692,9 @@ namespace AgyBackdropCompanion
                         item.LastHeight = h;
                     }
 
-                    if (!item.AlphaApplied || item.LastAlpha != targetAlpha)
+                    byte realAlpha;
+                    bool realTranslucent = Native.IsWindowTranslucentLayered(item.Hwnd, out realAlpha);
+                    if (!item.AlphaApplied || item.LastAlpha != targetAlpha || !realTranslucent || realAlpha != targetAlpha)
                     {
                         alphaTargets.Add(item);
                     }
@@ -6542,6 +6844,11 @@ namespace AgyBackdropCompanion
 
         private List<IntPtr> FindAntigravityTopWindows()
         {
+            return FindAntigravityTopWindowsStatic();
+        }
+
+        public static List<IntPtr> FindAntigravityTopWindowsStatic()
+        {
             var found = new List<IntPtr>();
             var cls = new StringBuilder(128);
             var pidCache = new Dictionary<uint, string>();
@@ -6597,15 +6904,20 @@ namespace AgyBackdropCompanion
             {
                 try
                 {
-                    long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
-                    if (item.OriginallyLayered)
+                    byte curAlpha;
+                    bool isTranslucent = Native.IsWindowTranslucentLayered(item.Hwnd, out curAlpha);
+                    if (item.AlphaApplied || isTranslucent)
                     {
-                        Native.SetLayeredWindowAttributes(item.Hwnd, 0, 255, Native.LWA_ALPHA);
-                    }
-                    else if ((curEx & Native.WS_EX_LAYERED) != 0)
-                    {
-                        Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx & ~Native.WS_EX_LAYERED);
-                        Native.RedrawWindow(item.Hwnd, IntPtr.Zero, IntPtr.Zero, Native.RDW_INVALIDATE | Native.RDW_FRAME | Native.RDW_UPDATENOW);
+                        long curEx = Native.GetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE);
+                        if (item.OriginallyLayered && !isTranslucent)
+                        {
+                            Native.SetLayeredWindowAttributes(item.Hwnd, 0, 255, Native.LWA_ALPHA);
+                        }
+                        else if ((curEx & Native.WS_EX_LAYERED) != 0)
+                        {
+                            Native.SetWindowLongPtrCompat(item.Hwnd, Native.GWL_EXSTYLE, curEx & ~Native.WS_EX_LAYERED);
+                            Native.RedrawWindow(item.Hwnd, IntPtr.Zero, IntPtr.Zero, Native.RDW_INVALIDATE | Native.RDW_FRAME | Native.RDW_UPDATENOW);
+                        }
                     }
                 }
                 catch { }
@@ -6617,15 +6929,7 @@ namespace AgyBackdropCompanion
         private void RestoreBackdropOnly(TrackedHostWindow item, bool closing)
         {
             if (item == null) return;
-            if (item.AlphaApplied)
-            {
-                RestoreHostAlphaOnly(item);
-            }
-            else
-            {
-                item.AlphaApplied = false;
-                item.LastAlpha = 255;
-            }
+            RestoreHostAlphaOnly(item);
 
             if (item.Backdrop != null)
             {
@@ -6682,8 +6986,21 @@ namespace AgyBackdropCompanion
                 bool anyBackdropBlocked = false;
                 string occReason = "";
                 string blockReason = "";
+                bool anyBackdropVisible = false;
+                bool anyHostTranslucent = false;
+                byte observedAlpha = 255;
                 foreach (TrackedHostWindow item in _tracked.Values)
                 {
+                    if (item.Backdrop != null && item.Backdrop.Handle != IntPtr.Zero && Native.IsWindowVisible(item.Backdrop.Handle))
+                    {
+                        anyBackdropVisible = true;
+                    }
+                    byte curA;
+                    if (Native.IsWindowTranslucentLayered(item.Hwnd, out curA))
+                    {
+                        anyHostTranslucent = true;
+                        observedAlpha = curA;
+                    }
                     if (item.HudVisible) anyHudVisible = true;
                     if (item.Anchor.HasAnchor && item.Anchor.FromUia) anyHudAnchor = true;
                     if (item.BackdropGuardBlocked)
@@ -6713,7 +7030,9 @@ namespace AgyBackdropCompanion
                     { "supportsLightbox", true },
                     { "paused", _pausedByTray },
                     { "trackedCount", _tracked.Count },
-                    { "appliedAlpha", alpha },
+                    { "appliedAlpha", anyHostTranslucent ? (int)observedAlpha : (int)alpha },
+                    { "actualBackdropVisible", running && anyBackdropVisible },
+                    { "actualHostTranslucent", running && anyHostTranslucent },
                     { "hostBlendPct", _config.hostBlendPct },
                     { "activeWallpaperId", _config.activeWallpaperId ?? "" },
                     { "hudEnabled", _config.hudEnabled && _hudEnabledByTray },
@@ -6761,6 +7080,7 @@ namespace AgyBackdropCompanion
             _disposed = true;
 
             try { StopRenderFollow(); } catch { }
+            try { UninstallSystemEvents(); } catch { }
             try { if (_debounceTimer != null) _debounceTimer.Stop(); } catch { }
             try { if (_reconcileTimer != null) _reconcileTimer.Stop(); } catch { }
             try { if (_watcher != null) _watcher.Dispose(); } catch { }
@@ -6897,6 +7217,27 @@ namespace AgyBackdropCompanion
             catch { }
         }
 
+        public static int RestoreAllAntigravityWindowsOpaqueStatic()
+        {
+            int restored = 0;
+            try
+            {
+                List<IntPtr> hosts = FindAntigravityTopWindowsStatic();
+                for (int i = 0; i < hosts.Count; i++)
+                {
+                    IntPtr h = hosts[i];
+                    byte curAlpha;
+                    if (Native.IsWindowTranslucentLayered(h, out curAlpha))
+                    {
+                        Native.ForceRestoreWindowOpaque(h, false);
+                        restored++;
+                    }
+                }
+            }
+            catch { }
+            return restored;
+        }
+
         public void RestoreAllHostOpacityEmergency()
         {
             try
@@ -6905,10 +7246,13 @@ namespace AgyBackdropCompanion
                 for (int i = 0; i < snapshot.Count; i++)
                 {
                     TrackedHostWindow item = snapshot[i];
-                    if (item == null || !item.AlphaApplied || !Native.IsWindow(item.Hwnd)) continue;
+                    if (item == null || !Native.IsWindow(item.Hwnd)) continue;
+                    byte curAlpha;
+                    bool isTranslucent = Native.IsWindowTranslucentLayered(item.Hwnd, out curAlpha);
+                    if (!item.AlphaApplied && !isTranslucent) continue;
                     try
                     {
-                        if (item.OriginallyLayered)
+                        if (item.OriginallyLayered && !isTranslucent)
                         {
                             Native.SetLayeredWindowAttributes(item.Hwnd, 0, 255, Native.LWA_ALPHA);
                         }
@@ -6925,6 +7269,7 @@ namespace AgyBackdropCompanion
                 }
             }
             catch { }
+            RestoreAllAntigravityWindowsOpaqueStatic();
         }
 
         public static void SignalExistingStop()
@@ -6951,12 +7296,28 @@ namespace AgyBackdropCompanion
             string dataDir = System.IO.Path.Combine(home, ".gemini", "antigravity", "plugin_data", "agy-monitor");
             string assetsDir = System.IO.Path.Combine(home, ".gemini", "config", "plugins", "agy-monitor", "assets", "wallpapers");
             bool stopMode = false;
+            bool probeDesktopMode = false;
+            bool restoreOpacityMode = false;
 
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--stop") stopMode = true;
+                else if (args[i] == "--probe-desktop") probeDesktopMode = true;
+                else if (args[i] == "--restore-opacity") restoreOpacityMode = true;
                 else if (args[i] == "--data-dir" && i + 1 < args.Length) dataDir = args[++i];
                 else if (args[i] == "--assets-dir" && i + 1 < args.Length) assetsDir = args[++i];
+            }
+
+            if (probeDesktopMode)
+            {
+                Console.WriteLine(Native.GetDesktopName());
+                return 0;
+            }
+
+            if (restoreOpacityMode)
+            {
+                CompanionController.RestoreAllAntigravityWindowsOpaqueStatic();
+                return 0;
             }
 
             if (stopMode)
@@ -6979,9 +7340,25 @@ namespace AgyBackdropCompanion
                 };
 
                 var controller = new CompanionController(dataDir, assetsDir, app.Dispatcher);
+                int recentUiExceptions = 0;
+                DateTime uiExceptionWindowStart = DateTime.UtcNow;
                 app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)
                 {
                     try { controller.LogFatalException("DispatcherUnhandledException", e.Exception); } catch { }
+                    DateTime nowUtc = DateTime.UtcNow;
+                    if ((nowUtc - uiExceptionWindowStart).TotalSeconds > 30.0)
+                    {
+                        uiExceptionWindowStart = nowUtc;
+                        recentUiExceptions = 0;
+                    }
+                    recentUiExceptions++;
+                    if (recentUiExceptions < 5)
+                    {
+                        // Recover non-fatal UI glitches (e.g., popup/lightbox race) without killing the backdrop companion!
+                        try { controller.RecoverFromNonFatalUiException(); } catch { }
+                        e.Handled = true;
+                        return;
+                    }
                     try { controller.Dispose(); } catch { try { controller.RestoreAllHostOpacityEmergency(); } catch { } }
                     e.Handled = false;
                 };
