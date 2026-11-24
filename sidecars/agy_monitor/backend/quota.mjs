@@ -144,7 +144,7 @@ function classifyQuotaGroup(rawGroup, index) {
     .join(' ');
 
   if (lowerName.includes('argon') || bucketIds.includes('argon')) {
-    return { key: 'argon', label: 'Argon', order: 2 };
+    return { key: 'argon', label: 'Argon', order: 2, deprecated: true };
   }
   if (
     lowerName.includes('claude') ||
@@ -176,35 +176,38 @@ export function normalizeQuotaSummary(payload, nowMs = Date.now()) {
         : {};
 
   const rawGroups = Array.isArray(root.groups) ? root.groups : [];
-  const groups = rawGroups.map((rawGroup, index) => {
-    const meta = classifyQuotaGroup(rawGroup, index);
-    const displayName = typeof rawGroup?.displayName === 'string'
-      ? rawGroup.displayName.trim()
-      : typeof rawGroup?.display_name === 'string'
-        ? rawGroup.display_name.trim()
-        : meta.label;
-    const description = typeof rawGroup?.description === 'string' ? rawGroup.description.trim() : '';
-    const rawBuckets = Array.isArray(rawGroup?.buckets) ? rawGroup.buckets : [];
-    const normalizedBuckets = rawBuckets
-      .map((b) => normalizeBucket(b, nowMs))
-      .filter(Boolean);
+  const groups = rawGroups
+    .map((rawGroup, index) => {
+      const meta = classifyQuotaGroup(rawGroup, index);
+      if (meta.deprecated) return null;
+      const displayName = typeof rawGroup?.displayName === 'string'
+        ? rawGroup.displayName.trim()
+        : typeof rawGroup?.display_name === 'string'
+          ? rawGroup.display_name.trim()
+          : meta.label;
+      const description = typeof rawGroup?.description === 'string' ? rawGroup.description.trim() : '';
+      const rawBuckets = Array.isArray(rawGroup?.buckets) ? rawGroup.buckets : [];
+      const normalizedBuckets = rawBuckets
+        .map((b) => normalizeBucket(b, nowMs))
+        .filter(Boolean);
 
-    const fiveHour = normalizedBuckets.find((b) => b.window === '5h') || null;
-    const weekly = normalizedBuckets.find((b) => b.window === 'weekly') || null;
+      const fiveHour = normalizedBuckets.find((b) => b.window === '5h') || null;
+      const weekly = normalizedBuckets.find((b) => b.window === 'weekly') || null;
 
-    return {
-      key: meta.key,
-      label: meta.label,
-      order: meta.order,
-      displayName,
-      description,
-      fiveHour,
-      weekly,
-      buckets: normalizedBuckets,
-    };
-  });
+      return {
+        key: meta.key,
+        label: meta.label,
+        order: meta.order,
+        displayName,
+        description,
+        fiveHour,
+        weekly,
+        buckets: normalizedBuckets,
+      };
+    })
+    .filter(Boolean);
 
-  // Sort consistently: Gemini -> GPT&Claude -> Argon -> any additional groups
+  // Sort consistently: Gemini -> GPT&Claude -> any additional groups
   groups.sort((a, b) => a.order - b.order);
 
   // Strip internal sort field from public output

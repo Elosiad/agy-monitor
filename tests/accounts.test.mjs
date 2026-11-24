@@ -18,6 +18,7 @@ import {
   parseImportPayload,
   parseQuotaExhaustedStepError,
   parseWindowsProxyServer,
+  refreshAccessTokenForCredential,
   requestOverProxy,
   resolveSystemProxyUrl,
   selectBestAutoSwitchCandidate,
@@ -121,7 +122,7 @@ function createFixture(t, { liveCred = null, quotaPayload = null, sendLog = [] }
   return { root, paths, storage, driver, quotaClient, sidecarBridge };
 }
 
-function makeSampleQuota(pctGemini = 80, pctGpt = 65, pctArgon = 100, resetTimeMs = Date.now() + 3600_000) {
+function makeSampleQuota(pctGemini = 80, pctGpt = 65, _legacyArgon = 100, resetTimeMs = Date.now() + 3600_000) {
   return {
     ok: true,
     available: true,
@@ -140,13 +141,6 @@ function makeSampleQuota(pctGemini = 80, pctGpt = 65, pctArgon = 100, resetTimeM
         displayName: 'Claude and GPT models',
         fiveHour: { remainingFraction: pctGpt / 100, remainingPct: pctGpt, remainingPctExact: pctGpt, resetTimeMs, isFull: pctGpt === 100, disabled: false },
         weekly: { remainingFraction: 0.75, remainingPct: 75, remainingPctExact: 75, resetTimeMs: resetTimeMs + 86400_000, isFull: false, disabled: false },
-      },
-      {
-        key: 'argon',
-        label: 'Argon',
-        displayName: 'Gemini 4 Argon',
-        fiveHour: { remainingFraction: pctArgon / 100, remainingPct: pctArgon, remainingPctExact: pctArgon, resetTimeMs: null, isFull: pctArgon === 100, disabled: false },
-        weekly: null,
       },
     ],
   };
@@ -240,7 +234,7 @@ test('capture, encrypted vault isolation, remark, toggle, export/import roundtri
   assert.equal(cap.account.email, 'main@gmail.com');
   assert.equal(cap.account.remark, '主力 Pro');
   assert.equal(cap.account.isCurrent, true);
-  assert.equal(cap.account.quota.groups.length, 3);
+  assert.equal(cap.account.quota.groups.length, 2);
   assert.equal(cap.account.quota.groups[0].fiveHour.remainingPct, 82);
 
   // 2. Verify zero plaintext token on disk (neither index nor encrypted vault contains raw token)
@@ -798,7 +792,12 @@ test('auto-switch triggers on weekly quota = 0% AND fresh step_type=17 QUOTA_EXH
   assert.deepEqual(inspectQuotaExhaustion(makeQuota(61, 27), 'gemini'), { exhausted: false, reason: null });
   assert.equal(mapModelToQuotaGroup('gemini-4-neon-xhigh'), 'gemini');
   assert.equal(mapModelToQuotaGroup('claude-opus-4-6'), 'gpt_claude');
-  assert.equal(mapModelToQuotaGroup('gemini-4-argon-medium'), 'argon');
+  assert.equal(mapModelToQuotaGroup('gemini-4-argon-medium'), 'gemini');
+
+  // Legacy saved settings targeting Argon cleanly migrate to Gemini
+  const migratedArgon = normalizeAccountSettings({ autoSwitchTarget: 'argon', sortBy: 'argon' });
+  assert.equal(migratedArgon.autoSwitchTarget, 'gemini');
+  assert.equal(migratedArgon.sortBy, 'gemini');
 
   // 2. Protobuf parser recognizes QUOTA_EXHAUSTED and rejects transient 503/network errors
   const nowSec = Math.floor(Date.now() / 1000);
@@ -1271,4 +1270,252 @@ test('fetchCloudCodeQuotaForCredential refreshes OAuth token, loads project, fet
   assert.equal(fbRes.source, 'fetchAvailableModels');
   assert.equal(fbRes.quota.groups.find((g) => g.key === 'gemini').fiveHour.remainingPct, 65);
   assert.equal(fbRes.quota.groups.find((g) => g.key === 'gpt_claude').fiveHour.remainingPct, 90);
+});
+
+test('refreshAccessTokenForCredential auto-matches JWT aud & falls back across candidateClients on 401 unauthorized_client', async () => {
+  const wrongClient = '111111111111-wrong.apps.googleusercontent.com';
+  const rightClient = '222222222222-right.apps.googleusercontent.com';
+  const multiClient = {
+    clientId: wrongClient,
+    clientSecret: 'mock-wrong-secret-0001',
+    candidateSecrets: ['mock-wrong-secret-0001', 'mock-right-secret-0002'],
+    candidateClients: [
+      {
+        clientId: wrongClient,
+        clientSecret: 'mock-wrong-secret-0001',
+        candidateSecrets: ['mock-wrong-secret-0001'],
+      },
+      {
+        clientId: rightClient,
+        clientSecret: 'mock-right-secret-0002',
+        candidateSecrets: ['mock-right-secret-0002'],
+      },
+    ],
+  };
+
+  // Case 1: No id_token -> tries wrongClient first (401 unauthorized_client), falls through to rightClient and succeeds!
+  const attempts1 = [];
+  const fakeFetch1 = async (_url, opts) => {
+    const body = new URLSearchParams(String(opts?.body || ''));
+    const cid = body.get('client_id');
+    const sec = body.get('client_secret');
+    attempts1.push(`${cid}:${sec}`);
+    if (cid === rightClient && sec === 'mock-right-secret-0002') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: 'ya29.recovered_across_clients',
+          expires_in: 3600,
+          token_type: 'Bearer',
+        }),
+      };
+    }
+    return {
+      ok: false,
+      status: 401,
+      text: async () => '{\n  "error": "unauthorized_client",\n  "error_description": "Unauthorized"\n}',
+    };
+  };
+
+  const res1 = await refreshAccessTokenForCredential(
+    {
+      token: { refresh_token: '1//0eMULTI_CLIENT_RT', expiry: '1970-01-01T00:00:00Z' },
+      auth_method: 'consumer',
+    },
+    { fetchImpl: fakeFetch1, nowMs: Date.parse('2026-11-24T08:00:00Z'), oauthClient: multiClient },
+  );
+  assert.equal(res1.renewed, true);
+  assert.equal(res1.accessToken, 'ya29.recovered_across_clients');
+  assert.equal(res1.matchedClientId, rightClient);
+  assert.equal(attempts1.length, 2);
+
+  // Case 2: id_token has aud=rightClient -> hits rightClient on the VERY FIRST request!
+  const attempts2 = [];
+  const fakeFetch2 = async (_url, opts) => {
+    const body = new URLSearchParams(String(opts?.body || ''));
+    attempts2.push(body.get('client_id'));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'ya29.aud_first_hit',
+        expires_in: 3600,
+        token_type: 'Bearer',
+      }),
+    };
+  };
+  const res2 = await refreshAccessTokenForCredential(
+    {
+      token: {
+        refresh_token: '1//0eAUD_MATCH_RT',
+        expiry: '1970-01-01T00:00:00Z',
+        id_token: makeFakeJwt({ email: 'aud@gmail.com', aud: rightClient }),
+      },
+      auth_method: 'consumer',
+    },
+    { fetchImpl: fakeFetch2, nowMs: Date.parse('2026-11-24T08:00:00Z'), oauthClient: multiClient },
+  );
+  assert.equal(res2.accessToken, 'ya29.aud_first_hit');
+  assert.deepEqual(attempts2, [rightClient]);
+
+  // Case 3: Multi-line JSON 401 error collapses cleanly onto one line (never clipped at "{")
+  const always401 = async () => ({
+    ok: false,
+    status: 401,
+    text: async () => '{\n  "error": "invalid_client",\n  "error_description": "The OAuth client was not found."\n}',
+  });
+  await assert.rejects(
+    () =>
+      refreshAccessTokenForCredential(
+        { token: { refresh_token: '1//0eFAIL_RT', expiry: '1970-01-01T00:00:00Z' } },
+        {
+          fetchImpl: always401,
+          nowMs: Date.parse('2026-11-24T08:00:00Z'),
+          oauthClient: { clientId: wrongClient, clientSecret: 'mock-bad-secret' },
+        },
+      ),
+    (err) => {
+      assert.ok(err.message.includes('invalid_client'));
+      assert.ok(!err.message.includes('\n'));
+      return true;
+    },
+  );
+});
+
+test('proactive background token renewal, live vault sync, and pre-switch auto-refresh keep credentials fresh', async (t) => {
+  let fakeNow = Date.parse('2026-11-24T08:00:00Z');
+  const { paths, storage, driver, quotaClient, sidecarBridge } = createFixture(t, {
+    liveCred: {
+      credObj: {
+        token: {
+          access_token: 'ya29.active_initial',
+          refresh_token: '1//0eACTIVE_RT_11111111',
+          expiry: new Date(fakeNow + 10 * 60_000).toISOString(),
+        },
+        auth_method: 'consumer',
+        id_token_email: 'active@gmail.com',
+      },
+    },
+    quotaPayload: makeSampleQuota(80, 90, 100, fakeNow + 3600_000),
+  });
+
+  const remoteCalls = [];
+  const preSwitchCalls = [];
+  const mgr = createAccountManager({
+    paths,
+    storage,
+    quotaClient,
+    sidecarBridge,
+    driver,
+    now: () => fakeNow,
+    remoteQuotaFetcher: async (credObj, opts) => {
+      remoteCalls.push({ email: credObj.id_token_email, preferredClientId: opts.preferredClientId });
+      const nextExpMs = opts.nowMs + 3600_000;
+      return {
+        ok: true,
+        quota: makeSampleQuota(95, 100, 100, opts.nowMs + 3600_000),
+        projectId: 'proj-proactive',
+        source: 'retrieveUserQuotaSummary',
+        matchedClientId: '222222222222-right.apps.googleusercontent.com',
+        tokenExpiryMs: nextExpMs,
+        updatedCredObj: {
+          ...credObj,
+          token: {
+            ...credObj.token,
+            access_token: `ya29.bg_renewed_${remoteCalls.length}`,
+            expiry: new Date(nextExpMs).toISOString(),
+          },
+        },
+        renewed: true,
+      };
+    },
+    tokenRefresher: async (credObj, opts) => {
+      preSwitchCalls.push({ email: credObj.id_token_email, preferredClientId: opts.preferredClientId });
+      const nextExpMs = opts.nowMs + 3600_000;
+      return {
+        accessToken: 'ya29.preswitch_fresh_token',
+        renewed: true,
+        matchedClientId: '222222222222-right.apps.googleusercontent.com',
+        expiryMs: nextExpMs,
+        credObj: {
+          ...credObj,
+          token: {
+            ...credObj.token,
+            access_token: 'ya29.preswitch_fresh_token',
+            expiry: new Date(nextExpMs).toISOString(),
+          },
+        },
+      };
+    },
+    onBeforeHostClose: async () => {},
+  });
+
+  // Set a long 60-min quota refresh interval so we prove proactive token renewal runs independently
+  await mgr.updateAccountSettings({ quotaRefreshIntervalMin: 60 });
+  const capActive = await mgr.captureCurrentAccount();
+  assert.equal(capActive.ok, true);
+
+  // Import a backup account whose token expires in 6 minutes (inside the 10-min proactive renew window)
+  const imp = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'backup@gmail.com',
+      quota: makeSampleQuota(70, 80, 100, fakeNow + 3600_000),
+      credential: {
+        token: {
+          access_token: 'ya29.backup_expiring',
+          refresh_token: '1//0eBACKUP_RT_22222222',
+          expiry: new Date(fakeNow + 6 * 60_000).toISOString(),
+        },
+        auth_method: 'consumer',
+        id_token_email: 'backup@gmail.com',
+      },
+    }),
+  });
+  assert.equal(imp.ok, true);
+  const backupId = imp.accounts[0].id;
+
+  // Initial lifecycle tick triggers scheduled refresh + proactively renews expiring backup token
+  await mgr.runLifecycleTick();
+  assert.equal(remoteCalls.length, 1);
+
+  const expAfterBg = await mgr.exportAccountJson(backupId);
+  assert.equal(expAfterBg.data.credential.token.access_token, 'ya29.bg_renewed_1');
+
+  // Advance clock by 52 minutes (still < 60 min quota interval, but backup token now expires in 8 min!)
+  fakeNow += 52 * 60_000;
+  // Also simulate language_server refreshing the active account's live credential in Windows Credential Manager
+  driver.setLive({
+    credObj: {
+      token: {
+        access_token: 'ya29.active_live_renewed',
+        refresh_token: '1//0eACTIVE_RT_11111111',
+        expiry: new Date(fakeNow + 55 * 60_000).toISOString(),
+      },
+      auth_method: 'consumer',
+      id_token_email: 'active@gmail.com',
+    },
+  });
+  await mgr.syncActiveAccountQuotaFromLive(makeSampleQuota(75, 90, 100, fakeNow + 3600_000), {
+    skipAutoSwitch: true,
+  });
+  const expActive = await mgr.exportAccountJson(capActive.account.id);
+  assert.equal(expActive.data.credential.token.access_token, 'ya29.active_live_renewed');
+
+  // Between scheduled quota cycles, proactive background renewal kicks in for backup@gmail.com
+  await mgr.runLifecycleTick();
+  assert.equal(remoteCalls.length, 2);
+  assert.equal(remoteCalls[1].preferredClientId, '222222222222-right.apps.googleusercontent.com');
+
+  // Advance clock by 70 minutes so backup token is expired, then switch to backup -> pre-switch auto-refresh runs!
+  fakeNow += 70 * 60_000;
+  const sw = await mgr.switchAccount({ accountId: backupId, autoResume: false });
+  assert.equal(sw.ok, true);
+  assert.equal(preSwitchCalls.length, 1);
+
+  const tx = driver.launchedTxs[0];
+  const sealedPayload = fs.readFileSync(tx.payloadFile, 'utf8');
+  const plainPayload = JSON.parse(await driver.unprotectSecret(sealedPayload));
+  const injectedCred = JSON.parse(plainPayload.credJson);
+  assert.equal(injectedCred.token.access_token, 'ya29.preswitch_fresh_token');
 });

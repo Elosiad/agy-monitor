@@ -63,6 +63,7 @@ import { createAccountManager, ensureAccountTool } from './backend/accounts.mjs'
 import {
   applyPluginUpdate,
   checkForUpdates,
+  listOfficialReleases,
   openRepoInBrowser,
 } from './backend/updater.mjs';
 import { detectWindowsHostEnv, toWindowsPath } from './backend/wsl_bridge.mjs';
@@ -141,6 +142,10 @@ const STATIC_ASSETS = new Map([
   [
     '/components/theme_studio.js',
     { relPath: 'components/theme_studio.js', contentType: 'application/javascript; charset=utf-8' },
+  ],
+  [
+    '/components/changelog_modal.js',
+    { relPath: 'components/changelog_modal.js', contentType: 'application/javascript; charset=utf-8' },
   ],
 ]);
 
@@ -1835,8 +1840,14 @@ export function createMonitorHandlers({
     return checkForUpdates(resolvedPaths, { force });
   });
 
-  register('POST', '/api/update/apply', async () => {
-    const result = await applyPluginUpdate(resolvedPaths);
+  register('GET', '/api/update/releases', async (data = {}) => {
+    const force = data.force === '1' || data.force === 'true' || data.force === true;
+    return listOfficialReleases(resolvedPaths, { force });
+  });
+
+  register('POST', '/api/update/apply', async (data = {}) => {
+    const targetVersion = typeof data?.targetVersion === 'string' ? data.targetVersion.trim() : '';
+    const result = await applyPluginUpdate(resolvedPaths, { targetVersion });
     if (!result.ok) {
       return errorResponse(ResponseCtor, result.status || 500, result.error || '自动更新失败');
     }

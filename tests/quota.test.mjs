@@ -98,7 +98,7 @@ test('parseLsAddress accepts loopback forms and rejects non-loopback hosts', () 
   assert.equal(parseLsAddress(''), null);
 });
 
-test('normalizeQuotaSummary orders Gemini -> GPT&Claude -> Argon and preserves bucket semantics', () => {
+test('normalizeQuotaSummary orders Gemini -> GPT&Claude, drops legacy Argon pool, and preserves bucket semantics', () => {
   const nowMs = Date.parse('2026-11-22T00:38:31Z');
   const res = normalizeQuotaSummary(OFFICIAL_SAMPLE_PAYLOAD, nowMs);
 
@@ -106,10 +106,10 @@ test('normalizeQuotaSummary orders Gemini -> GPT&Claude -> Argon and preserves b
   assert.equal(res.available, true);
   assert.deepEqual(
     res.groups.map((g) => g.label),
-    ['Gemini', 'GPT&Claude', 'Argon'],
+    ['Gemini', 'GPT&Claude'],
   );
 
-  const [gemini, gptClaude, argon] = res.groups;
+  const [gemini, gptClaude] = res.groups;
   assert.equal(gemini.fiveHour.remainingPct, 92);
   assert.equal(gemini.fiveHour.isFull, false);
   assert.equal(gemini.weekly.remainingPct, 61);
@@ -119,10 +119,6 @@ test('normalizeQuotaSummary orders Gemini -> GPT&Claude -> Argon and preserves b
   assert.equal(gptClaude.fiveHour.isFull, true);
   assert.equal(gptClaude.weekly.remainingPct, 27);
   assert.equal(gptClaude.weekly.isFull, false);
-
-  assert.equal(argon.fiveHour, null);
-  assert.equal(argon.weekly.remainingPct, 100);
-  assert.equal(argon.weekly.isFull, false);
 });
 
 test('callRetrieveUserQuotaSummary and createQuotaClient handle live HTTP, caching, and stale fallback', async (t) => {
@@ -171,7 +167,7 @@ test('callRetrieveUserQuotaSummary and createQuotaClient handle live HTTP, cachi
   fakeNow += 10_000;
   const second = await client.getQuotaSummary();
   assert.equal(reqCount, 1);
-  assert.equal(second.groups.length, 3);
+  assert.equal(second.groups.length, 2);
 
   // Force refresh after minForceIntervalMs hits server and handles failure via stale cache
   shouldFail = true;
@@ -180,7 +176,7 @@ test('callRetrieveUserQuotaSummary and createQuotaClient handle live HTTP, cachi
   assert.equal(reqCount, 2);
   assert.equal(staleRes.ok, true);
   assert.equal(staleRes.stale, true);
-  assert.equal(staleRes.groups.length, 3);
+  assert.equal(staleRes.groups.length, 2);
 
   // Missing env degrades cleanly without throwing
   const emptyClient = createQuotaClient({ env: {} });

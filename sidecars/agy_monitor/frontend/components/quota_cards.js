@@ -1,5 +1,5 @@
 /**
- * Native Antigravity quota cards strip (Gemini / GPT&Claude / Argon).
+ * Native Antigravity quota cards strip (Gemini / GPT&Claude).
  *
  * Displays official 5-hour and weekly remaining quota rings with live reset
  * countdowns directly beneath the Model Token Usage list.
@@ -15,7 +15,6 @@ const ACTIVITY_REFRESH_DEBOUNCE_MS = 2_000;
 const DEFAULT_GROUPS = [
   { key: "gemini", label: "Gemini", displayName: "Gemini Models" },
   { key: "gpt_claude", label: "GPT&Claude", displayName: "Claude and GPT models" },
-  { key: "argon", label: "Argon", displayName: "Gemini 4 Argon" },
 ];
 
 function translate(tFn, key, fallback, vars) {
@@ -278,9 +277,13 @@ export function createQuotaCards({ apiFetch, t } = {}) {
   function render() {
     if (!container) return;
     const nowMs = Date.now();
+    const activeGroups =
+      state.phase === "ready" && Array.isArray(state.groups)
+        ? state.groups.filter((g) => g && g.key !== "argon")
+        : [];
     const groupsToRender =
-      state.phase === "ready" && Array.isArray(state.groups) && state.groups.length > 0
-        ? state.groups
+      activeGroups.length > 0
+        ? activeGroups
         : DEFAULT_GROUPS.map((g) => ({ ...g, description: "", fiveHour: null, weekly: null }));
 
     container.classList.toggle("is-loading", state.phase === "loading" || inFlight);

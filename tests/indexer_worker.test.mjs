@@ -584,3 +584,152 @@ test('extracts authoritative upstream responseModel from gen_metadata.#1.#19 and
   assert.equal(snapDg.runtimeTelemetry.upstreamModelId, 'gemini-3.8-flash-n');
   assert.equal(snapDg.runtimeTelemetry.upstreamModelStatus, 'downgrade_suspected');
 });
+
+test('conversation rewind reusing earlier step_index immediately purges dead branch tail and refreshes overwritten upstream_model/timing', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-monitor-rewind-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const pluginRoot = path.join(root, 'plugin');
+  const appDataDir = path.join(root, 'agy');
+  const geminiConfigDir = path.join(root, 'cfg');
+  const conversationsDir = path.join(appDataDir, 'conversations');
+  fs.mkdirSync(conversationsDir, { recursive: true });
+
+  const paths = resolvePaths({ pluginRoot, appDataDir, geminiConfigDir });
+  const storage = createStorage(paths);
+
+  const convId = 'conv-rewind-branch';
+  const logDir = path.join(paths.brainDir, convId, '.system_generated', 'logs');
+  fs.mkdirSync(logDir, { recursive: true });
+  const trPath = path.join(logDir, 'transcript.jsonl');
+  const dbPath = path.join(conversationsDir, `${convId}.db`);
+
+  const tOld = 1795500000;
+  // Branch 1: ran on gemini-3.8-flash-high up to step_index 2514
+  fs.writeFileSync(
+    trPath,
+    [
+      JSON.stringify({
+        step_index: 2508,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(tOld * 1000).toISOString(),
+        model: 'gemini-3.8-flash-high',
+        input_tokens: 1000,
+        cache_read_tokens: 50000,
+        output_tokens: 116,
+      }),
+      JSON.stringify({
+        step_index: 2514,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date((tOld + 60) * 1000).toISOString(),
+        model: 'gemini-3.8-flash-high',
+        input_tokens: 1200,
+        cache_read_tokens: 52000,
+        output_tokens: 736,
+      }),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+
+  const encTimingAndGen = (cSec, fSec, eSec, genIdx) =>
+    Buffer.concat([
+      encodeLenField(1, encodeTimestamp(cSec, 0)),
+      encodeLenField(6, encodeTimestamp(fSec, 0)),
+      encodeLenField(7, encodeTimestamp(eSec, 0)),
+      encodeLenField(20, encodeVarintField(3, genIdx)),
+    ]);
+
+  const cdb = new DatabaseSync(dbPath);
+  cdb.exec(`CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)`);
+  cdb.exec(`CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)`);
+  cdb.prepare(`INSERT INTO steps (idx, step_type, metadata) VALUES (?, 15, ?)`).run(
+    2508,
+    encTimingAndGen(tOld, tOld + 5, tOld + 6, 1),
+  );
+  cdb.prepare(`INSERT INTO steps (idx, step_type, metadata) VALUES (?, 15, ?)`).run(
+    2514,
+    encTimingAndGen(tOld + 60, tOld + 65, tOld + 70, 2),
+  );
+  cdb.prepare(`INSERT INTO gen_metadata (idx, data) VALUES (?, ?)`).run(
+    1,
+    encodeGenMetadataBlob({ stepIndices: [2508], responseModel: 'gemini-3.8-flash-n', displayLabel: 'Gemini 3.8 Flash (High)' }),
+  );
+  cdb.prepare(`INSERT INTO gen_metadata (idx, data) VALUES (?, ?)`).run(
+    2,
+    encodeGenMetadataBlob({ stepIndices: [2514], responseModel: 'gemini-3.8-flash-n', displayLabel: 'Gemini 3.8 Flash (High)' }),
+  );
+  cdb.close();
+
+  await scanOnce(paths.brainDir, paths.telemetryCacheDb, { conversationsDir });
+  const snap1 = await queryTelemetrySnapshot(paths.telemetryCacheDb, storage, paths, {
+    convId,
+    isExplicitConvId: true,
+    scope: 'current',
+    range: '30d',
+    nowMs: (tOld + 100) * 1000,
+  });
+  assert.equal(snap1.runtimeTelemetry.upstreamModelId, 'gemini-3.8-flash-n');
+
+  // Branch 2: user rewinds to step_index 2508 and switches to gemini-4-hydrogen-xhigh (note: 2508 < old 2514!)
+  const tNew = tOld + 3600;
+  fs.appendFileSync(
+    trPath,
+    JSON.stringify({
+      step_index: 2508,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date(tNew * 1000).toISOString(),
+      model: 'gemini-4-hydrogen-xhigh',
+      input_tokens: 5000,
+      cache_read_tokens: 300000,
+      output_tokens: 2400,
+    }) + '\n',
+    'utf8',
+  );
+
+  // Antigravity overwrites step 2508 in convDb with the new hydrogen run and removes 2514
+  const cdb2 = new DatabaseSync(dbPath);
+  cdb2.prepare(`DELETE FROM steps WHERE idx = 2514`).run();
+  cdb2.prepare(`REPLACE INTO steps (idx, step_type, metadata) VALUES (?, 15, ?)`).run(
+    2508,
+    encTimingAndGen(tNew, tNew + 5, tNew + 25, 3),
+  );
+  cdb2.prepare(`REPLACE INTO gen_metadata (idx, data) VALUES (?, ?)`).run(
+    3,
+    encodeGenMetadataBlob({ stepIndices: [2508], responseModel: 'gemini-4-hydrogen', displayLabel: 'Gemini 4 Hydrogen (XHigh)' }),
+  );
+  cdb2.close();
+
+  await scanOnce(paths.brainDir, paths.telemetryCacheDb, { conversationsDir });
+
+  // Immediately on the VERY FIRST tick after rewind (even while step_index 2508 < old 2514):
+  // - dead tail step 2514 is purged
+  // - overwritten step 2508 clears stale flash-n & timing and picks up gemini-4-hydrogen (2400 / 25s = 96.0 tok/s)
+  const snap2 = await queryTelemetrySnapshot(paths.telemetryCacheDb, storage, paths, {
+    convId,
+    isExplicitConvId: true,
+    scope: 'current',
+    range: '30d',
+    nowMs: (tNew + 60) * 1000,
+  });
+  assert.equal(snap2.runtimeTelemetry.upstreamModelId, 'gemini-4-hydrogen');
+  assert.equal(snap2.runtimeTelemetry.upstreamModelStatus, 'match');
+  assert.equal(snap2.runtimeTelemetry.requestedModelLabel, 'Gemini 4 Hydrogen (XHigh)');
+  assert.equal(snap2.runtimeTelemetry.latestTokPerSec, 96);
+
+  const logsAfter = queryRequestLogs(paths.telemetryCacheDb, {
+    scope: 'current',
+    convId,
+    range: '30d',
+    nowMs: (tNew + 60) * 1000,
+  });
+  assert.equal(logsAfter.items.length, 1);
+  assert.equal(logsAfter.items[0].stepIndex, 2508);
+  assert.equal(logsAfter.items[0].upstreamModel, 'gemini-4-hydrogen');
+  assert.equal(logsAfter.items[0].durationMs, 25000);
+});

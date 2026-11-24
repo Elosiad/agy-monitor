@@ -13,7 +13,9 @@ import {
   applyPluginUpdate,
   checkForUpdates,
   compareSemver,
+  listOfficialReleases,
   openRepoInBrowser,
+  parseStrictSemver,
   resetUpdateCheckCache,
 } from '../sidecars/agy_monitor/backend/updater.mjs';
 
@@ -234,4 +236,108 @@ test('applyPluginUpdate mirrors validated zip while preserving rules/AGENTS.md a
   assert.equal(openRes.url, REPO_URL);
   assert.equal(launched[0].cmd, 'rundll32.exe');
   assert.deepEqual(launched[0].args, ['url.dll,FileProtocolHandler', REPO_URL]);
+});
+
+test('listOfficialReleases & applyPluginUpdate(targetVersion) support exact version rollback/upgrade and reject invalid semver', async (t) => {
+  const { root, pluginRoot, pluginDataDir, paths } = makeFakePluginEnv(t);
+  fs.writeFileSync(path.join(pluginRoot, 'plugin.json'), JSON.stringify({ name: 'agy-monitor', version: '1.1.1' }));
+
+  assert.equal(parseStrictSemver('v1.0.13'), '1.0.13');
+  assert.equal(parseStrictSemver('1.1.1'), '1.1.1');
+  assert.equal(parseStrictSemver('../evil'), '');
+  assert.equal(parseStrictSemver('1.0.0;rm -rf'), '');
+
+  // Reject invalid targetVersion before touching network
+  const badRes = await applyPluginUpdate(paths, { targetVersion: '../evil' });
+  assert.equal(badRes.ok, false);
+  assert.equal(badRes.status, 400);
+
+  // Build valid rollback tag zip for v1.0.13
+  const stageDir = path.join(root, 'stage-rollback', 'agy-monitor-1.0.13');
+  fs.mkdirSync(path.join(stageDir, 'hooks'), { recursive: true });
+  fs.mkdirSync(path.join(stageDir, 'rules'), { recursive: true });
+  fs.mkdirSync(path.join(stageDir, 'assets'), { recursive: true });
+  fs.mkdirSync(path.join(stageDir, 'sidecars', 'agy_monitor'), { recursive: true });
+  fs.writeFileSync(path.join(stageDir, 'plugin.json'), JSON.stringify({ name: 'agy-monitor', version: '1.0.13' }));
+  fs.writeFileSync(path.join(stageDir, 'hooks.json'), '{}');
+  fs.writeFileSync(path.join(stageDir, 'hooks', 'mastery_summary_hook.mjs'), '// hook v1.0.13\n');
+  fs.writeFileSync(path.join(stageDir, 'rules', 'AGENTS.md'), '# Upstream should not overwrite\n');
+  fs.writeFileSync(path.join(stageDir, 'sidecars', 'agy_monitor', 'sidecar.json'), '{}');
+  fs.writeFileSync(path.join(stageDir, 'sidecars', 'agy_monitor', 'main.mjs'), '// main v1.0.13\n');
+  fs.writeFileSync(path.join(stageDir, 'assets', 'payload.bin'), crypto.randomBytes(18 * 1024));
+
+  const rollbackZipPath = path.join(root, 'rollback-1.0.13.zip');
+  if (process.platform === 'win32') {
+    await execFileAsync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      `Compress-Archive -Path '${stageDir.replace(/'/g, "''")}' -DestinationPath '${rollbackZipPath.replace(/'/g, "''")}' -Force`,
+    ]);
+  } else {
+    await execFileAsync('zip', ['-rq', rollbackZipPath, 'agy-monitor-1.0.13'], {
+      cwd: path.join(root, 'stage-rollback'),
+    });
+  }
+  const zipBytes = fs.readFileSync(rollbackZipPath);
+
+  const requestedUrls = [];
+  const fakeFetch = async (url) => {
+    const u = String(url);
+    requestedUrls.push(u);
+    if (u.includes('/releases?per_page=')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => [
+          { tag_name: 'v1.0.13', name: 'v1.0.13', body: '- TTFT exact', published_at: '2026-11-22T10:00:00Z' },
+          { tag_name: 'v1.1.1', name: 'v1.1.1', body: '- Changelog modal', published_at: '2026-11-24T08:00:00Z' },
+          { tag_name: 'v9.9.9', draft: true, name: 'draft' },
+        ],
+      };
+    }
+    if (u.includes('/commits/main')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          sha: 'ddddddd444444444444444444444444444444444',
+          commit: { message: 'release v1.1.1', committer: { date: '2026-11-24T08:00:00Z' } },
+        }),
+      };
+    }
+    if (u.includes('/releases/latest')) {
+      return { ok: true, status: 200, json: async () => ({ tag_name: 'v1.1.1' }) };
+    }
+    if (u.includes('/zip/refs/tags/v1.0.13')) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => zipBytes.buffer.slice(zipBytes.byteOffset, zipBytes.byteOffset + zipBytes.byteLength),
+      };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+
+  const relList = await listOfficialReleases(paths, { force: true, fetchImpl: fakeFetch, nowMs: 10000 });
+  assert.equal(relList.ok, true);
+  assert.equal(relList.currentVersion, '1.1.1');
+  assert.deepEqual(relList.releases.map((r) => r.version), ['1.1.1', '1.0.13']);
+
+  const rbRes = await applyPluginUpdate(paths, {
+    targetVersion: '1.0.13',
+    fetchImpl: fakeFetch,
+    ensureBackdropFn: async () => ({ compiled: true }),
+    nowMs: 20000,
+  });
+  assert.equal(rbRes.ok, true);
+  assert.equal(rbRes.action, 'rollback');
+  assert.equal(rbRes.previousVersion, '1.1.1');
+  assert.equal(rbRes.version, '1.0.13');
+  assert.equal(rbRes.status.hasUpdate, true);
+  assert.equal(rbRes.status.remoteVersion, '1.1.1');
+  assert.ok(requestedUrls.some((u) => u.includes('/zip/refs/tags/v1.0.13')));
+  assert.equal(fs.readFileSync(path.join(pluginRoot, 'sidecars', 'agy_monitor', 'main.mjs'), 'utf8'), '// main v1.0.13\n');
+  assert.equal(fs.readFileSync(path.join(pluginRoot, 'rules', 'AGENTS.md'), 'utf8'), '# My Custom User Rule\n');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pluginDataDir, 'themes.json'), 'utf8')).activeWallpaperId, 'wp-3');
 });

@@ -45,8 +45,8 @@ const MAX_IMPORT_CHARS = 1024 * 1024;
 const MAX_IMPORT_BATCH = 50;
 const MAX_REMARK_CHARS = 120;
 
-const VALID_AUTO_SWITCH_TARGETS = new Set(['gemini', 'gpt_claude', 'argon']);
-const VALID_SORT_BY = new Set(['email', 'gemini', 'gpt_claude', 'argon', 'lastUsed']);
+const VALID_AUTO_SWITCH_TARGETS = new Set(['gemini', 'gpt_claude']);
+const VALID_SORT_BY = new Set(['email', 'gemini', 'gpt_claude', 'lastUsed']);
 const VALID_SORT_ORDER = new Set(['asc', 'desc']);
 
 export const DEFAULT_ACCOUNT_SETTINGS = Object.freeze({
@@ -80,7 +80,74 @@ function uniqueStrings(arr) {
 }
 
 /**
- * Discover Antigravity's desktop OAuth client dynamically from environment variables
+ * Safely read a raw file on disk even inside Electron (where `fs` treats `.asar`
+ * archives as virtual directories unless `process.noAsar = true`).
+ */
+function readRawFileBypassingAsar(filePath, maxBytes) {
+  const isElectron = Boolean(process.versions && process.versions.electron);
+  const prevNoAsar = process.noAsar;
+  try {
+    if (isElectron) process.noAsar = true;
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    return fs.readFileSync(filePath);
+  } catch {
+    return null;
+  } finally {
+    if (isElectron) process.noAsar = prevNoAsar;
+  }
+}
+
+function decodeJwtPayload(idToken) {
+  const token = String(idToken || '').trim();
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+    const parsed = JSON.parse(Buffer.from(b64 + pad, 'base64').toString('utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function extractTokenExpiryMs(credObj) {
+  if (!credObj || typeof credObj !== 'object') return 0;
+  const tok = credObj.token && typeof credObj.token === 'object' ? credObj.token : {};
+  const raw = tok.expiry || credObj.expiry || '';
+  if (!raw) return 0;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
+export function extractPreferredClientIdFromCred(credObj, hintClientId = '') {
+  const hint = typeof hintClientId === 'string' ? hintClientId.trim() : '';
+  if (hint && hint.endsWith('.apps.googleusercontent.com')) return hint;
+  if (!credObj || typeof credObj !== 'object') return hint;
+  const tok = credObj.token && typeof credObj.token === 'object' ? credObj.token : {};
+  const direct =
+    (typeof credObj.client_id === 'string' && credObj.client_id.trim()) ||
+    (typeof tok.client_id === 'string' && tok.client_id.trim()) ||
+    '';
+  if (direct) return direct;
+  const idToken =
+    (typeof tok.id_token === 'string' && tok.id_token.trim()) ||
+    (typeof credObj.id_token === 'string' && credObj.id_token.trim()) ||
+    '';
+  if (idToken) {
+    const payload = decodeJwtPayload(idToken);
+    for (const candidate of [payload?.aud, payload?.azp]) {
+      if (typeof candidate === 'string' && candidate.trim().endsWith('.apps.googleusercontent.com')) {
+        return candidate.trim();
+      }
+    }
+  }
+  return hint;
+}
+
+/**
+ * Discover Antigravity's desktop OAuth client(s) dynamically from environment variables
  * or the locally installed Antigravity binaries (zero hardcoded client secrets in repo).
  */
 export async function discoverLocalOAuthClient({
@@ -96,6 +163,13 @@ export async function discoverLocalOAuthClient({
       clientId: envId,
       clientSecret: envSecret,
       candidateSecrets: [envSecret],
+      candidateClients: [
+        {
+          clientId: envId,
+          clientSecret: envSecret,
+          candidateSecrets: [envSecret],
+        },
+      ],
       source: 'env',
     };
   }
@@ -137,17 +211,24 @@ export async function discoverLocalOAuthClient({
   for (const root of uniqueRoots) {
     for (const rel of ['app.asar', path.join('app', 'out', 'main.js')]) {
       const p = path.join(root, rel);
-      try {
-        const st = fs.statSync(p);
-        if (!st.isFile() || st.size > 160 * 1024 * 1024) continue;
-        const txt = fs.readFileSync(p).toString('latin1');
-        const hit = extractPersonalClientIdFromText(txt);
+      const rawBuf = readRawFileBypassingAsar(p, 160 * 1024 * 1024);
+      if (rawBuf) {
+        const hit = extractPersonalClientIdFromText(rawBuf.toString('latin1'));
         if (hit) {
           personalId = hit;
           break;
         }
+      }
+    }
+    if (!personalId) {
+      // Secondary fallback inside Electron virtual ASAR filesystem
+      try {
+        const virtualMain = path.join(root, 'app.asar', 'out', 'main.js');
+        const txt = fs.readFileSync(virtualMain, 'latin1');
+        const hit = extractPersonalClientIdFromText(txt);
+        if (hit) personalId = hit;
       } catch {
-        // ignore missing/unreadable candidate
+        // ignore
       }
     }
     if (personalId) break;
@@ -172,29 +253,37 @@ export async function discoverLocalOAuthClient({
   for (const root of uniqueRoots) {
     for (const rel of lsCandidates) {
       const p = path.join(root, rel);
-      try {
-        const st = fs.statSync(p);
-        if (!st.isFile() || st.size > 260 * 1024 * 1024) continue;
-        const txt = fs.readFileSync(p).toString('latin1');
-        const ids = uniqueStrings(txt.match(idRe) || []);
-        const secrets = uniqueStrings(txt.match(secRe) || []);
-        if (ids.length === 0 || secrets.length === 0) continue;
+      const rawBuf = readRawFileBypassingAsar(p, 260 * 1024 * 1024);
+      if (!rawBuf) continue;
+      const txt = rawBuf.toString('latin1');
+      const ids = uniqueStrings(txt.match(idRe) || []);
+      const secrets = uniqueStrings(txt.match(secRe) || []);
+      if (ids.length === 0 || secrets.length === 0) continue;
 
-        const chosenId = (personalId && ids.includes(personalId) ? personalId : '') || personalId || ids[0];
-        const idx = ids.indexOf(chosenId);
-        const primarySecret = (idx >= 0 && secrets[idx]) || secrets[0];
-        const candidateSecrets = uniqueStrings([primarySecret, ...secrets]);
-
-        cachedLocalOAuthClient = {
-          clientId: chosenId,
-          clientSecret: primarySecret,
-          candidateSecrets,
-          source: 'local_binary',
+      const orderedIds = uniqueStrings([
+        ...(personalId && ids.includes(personalId) ? [personalId] : []),
+        ...(personalId ? [personalId] : []),
+        ...ids,
+      ]);
+      const candidateClients = orderedIds.map((cid) => {
+        const origIdx = ids.indexOf(cid);
+        const matchedSecret = (origIdx >= 0 && secrets[origIdx]) || secrets[0];
+        return {
+          clientId: cid,
+          clientSecret: matchedSecret,
+          candidateSecrets: uniqueStrings([matchedSecret, ...secrets]),
         };
-        return cachedLocalOAuthClient;
-      } catch {
-        // ignore missing/unreadable candidate
-      }
+      });
+      const primary = candidateClients[0];
+
+      cachedLocalOAuthClient = {
+        clientId: primary.clientId,
+        clientSecret: primary.clientSecret,
+        candidateSecrets: primary.candidateSecrets,
+        candidateClients,
+        source: 'local_binary',
+      };
+      return cachedLocalOAuthClient;
     }
   }
 
@@ -642,7 +731,8 @@ export async function requestOverProxy(targetUrl, options = {}, proxyUrlStr, tim
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf8');
+        const rawBuf = Buffer.concat(chunks);
+        const text = rawBuf.toString('utf8');
         const status = Number(res.statusCode || 0);
         finish(null, {
           ok: status >= 200 && status < 300,
@@ -651,6 +741,8 @@ export async function requestOverProxy(targetUrl, options = {}, proxyUrlStr, tim
           headers: res.headers || {},
           text: async () => text,
           json: async () => JSON.parse(text),
+          arrayBuffer: async () =>
+            rawBuf.buffer.slice(rawBuf.byteOffset, rawBuf.byteOffset + rawBuf.byteLength),
         });
       });
       res.on('error', (err) => finish(err));
@@ -825,7 +917,26 @@ const CLOUD_CODE_IDE_VERSION = '2.25.0';
 const CLOUD_CODE_LOAD_UA = `antigravity/${CLOUD_CODE_IDE_VERSION} windows/amd64 google-api-nodejs-client/10.3.0`;
 const CLOUD_CODE_QUOTA_UA = `antigravity/${CLOUD_CODE_IDE_VERSION} (aidev_client; os_type=windows; arch=amd64; cl=1003475615)`;
 const CLOUD_CODE_X_GOOG_API_CLIENT = 'gl-node/22.21.1';
-const OAUTH_REFRESH_SAFETY_MS = 60_000;
+const OAUTH_REFRESH_SAFETY_MS = 5 * 60_000;
+const OAUTH_PROACTIVE_RENEW_WINDOW_MS = 10 * 60_000;
+const OAUTH_BACKGROUND_RETRY_COOLDOWN_MS = 5 * 60_000;
+const OAUTH_INVALID_GRANT_BACKOFF_MS = 30 * 60_000;
+
+function formatOAuthErrorDetail(rawText = '') {
+  const s = String(rawText || '').trim();
+  if (!s) return '';
+  try {
+    const parsed = JSON.parse(s);
+    const code = typeof parsed?.error === 'string' ? parsed.error.trim() : '';
+    const desc = typeof parsed?.error_description === 'string' ? parsed.error_description.trim() : '';
+    if (code && desc) return `${code}: ${desc}`;
+    if (code) return code;
+    if (desc) return desc;
+  } catch {
+    // non-JSON body
+  }
+  return s.replace(/\s+/g, ' ').slice(0, 140);
+}
 
 function validCloudCodeProjectId(raw) {
   const s = typeof raw === 'string' ? raw.trim() : '';
@@ -885,7 +996,14 @@ function parseGoogleCloudCodeError(status, rawText = '') {
 
 export async function refreshAccessTokenForCredential(
   credObj,
-  { fetchImpl = proxyAwareFetch, nowMs = Date.now(), forceRefresh = false, oauthClient = null } = {},
+  {
+    fetchImpl = proxyAwareFetch,
+    nowMs = Date.now(),
+    forceRefresh = false,
+    oauthClient = null,
+    preferredClientId = '',
+    signal = undefined,
+  } = {},
 ) {
   if (!credObj || typeof credObj !== 'object') {
     const err = new Error('该账号缺少有效凭据，无法刷新额度');
@@ -898,16 +1016,23 @@ export async function refreshAccessTokenForCredential(
     (typeof credObj.access_token === 'string' && credObj.access_token.trim()) ||
     '';
   const refreshToken = extractRefreshToken(credObj);
-  const expiryRaw = existingToken.expiry || credObj.expiry || '';
-  const expiryMs = expiryRaw ? Date.parse(expiryRaw) : Number.NaN;
+  const expiryMs = extractTokenExpiryMs(credObj);
+  const preferredCid = extractPreferredClientIdFromCred(credObj, preferredClientId);
 
-  if (!forceRefresh && existingAccess && Number.isFinite(expiryMs) && expiryMs - nowMs > OAUTH_REFRESH_SAFETY_MS) {
-    return { accessToken: existingAccess, credObj, renewed: false };
+  if (!forceRefresh && existingAccess && expiryMs > 0 && expiryMs - nowMs > OAUTH_REFRESH_SAFETY_MS) {
+    return {
+      accessToken: existingAccess,
+      credObj,
+      renewed: false,
+      matchedClientId: preferredCid,
+      expiryMs,
+    };
   }
 
   if (!refreshToken) {
     const err = new Error('该账号缺少 refresh_token，请重新通过 OAuth 授权');
     err.status = 401;
+    err.code = 'MISSING_REFRESH_TOKEN';
     throw err;
   }
 
@@ -919,47 +1044,121 @@ export async function refreshAccessTokenForCredential(
     err.status = 500;
     throw err;
   }
-  const secretsToTry = uniqueStrings([client.clientSecret, ...(client.candidateSecrets || [])]);
+
+  const rawClients =
+    Array.isArray(client.candidateClients) && client.candidateClients.length > 0
+      ? client.candidateClients
+      : [
+          {
+            clientId: client.clientId,
+            clientSecret: client.clientSecret,
+            candidateSecrets: uniqueStrings([client.clientSecret, ...(client.candidateSecrets || [])]),
+          },
+        ];
+  const allSecrets = uniqueStrings(
+    rawClients.flatMap((c) => [c.clientSecret, ...(c.candidateSecrets || [])]),
+  );
+
+  // Build ordered (clientId, clientSecret) attempts:
+  // 1) preferredClientId (from account cache / JWT aud) with its matched secret first
+  // 2) primary & alternate discovered clients with their primary matched secrets
+  // 3) cross-secret fallbacks only if primary pairs return invalid_client/unauthorized_client
+  const attempts = [];
+  const seenAttempt = new Set();
+  const pushAttempt = (cid, sec) => {
+    const cleanId = String(cid || '').trim();
+    const cleanSec = String(sec || '').trim();
+    if (!cleanId || !cleanSec) return;
+    const key = `${cleanId}\0${cleanSec}`;
+    if (seenAttempt.has(key)) return;
+    seenAttempt.add(key);
+    attempts.push({ clientId: cleanId, clientSecret: cleanSec });
+  };
+
+  if (preferredCid) {
+    const matchedEntry = rawClients.find((c) => c.clientId === preferredCid);
+    if (matchedEntry) {
+      pushAttempt(preferredCid, matchedEntry.clientSecret);
+    } else if (allSecrets[0]) {
+      pushAttempt(preferredCid, allSecrets[0]);
+    }
+  }
+  for (const c of rawClients) {
+    pushAttempt(c.clientId, c.clientSecret);
+  }
+  if (preferredCid) {
+    for (const sec of allSecrets) pushAttempt(preferredCid, sec);
+  }
+  for (const c of rawClients) {
+    for (const sec of uniqueStrings([...(c.candidateSecrets || []), ...allSecrets])) {
+      pushAttempt(c.clientId, sec);
+    }
+  }
 
   let payload = null;
-  let lastErr = null;
-  for (const secret of secretsToTry) {
+  let matchedClientId = '';
+  let lastClientErr = null;
+  let invalidGrantErr = null;
+
+  for (const attempt of attempts) {
     const res = await fetchImpl('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      ...(signal ? { signal } : {}),
       body: new URLSearchParams({
-        client_id: client.clientId,
-        client_secret: secret,
+        client_id: attempt.clientId,
+        client_secret: attempt.clientSecret,
         refresh_token: refreshToken,
         grant_type: 'refresh_token',
       }).toString(),
     });
 
     if (res.ok) {
-      if (cachedLocalOAuthClient && cachedLocalOAuthClient.clientId === client.clientId) {
-        cachedLocalOAuthClient = { ...cachedLocalOAuthClient, clientSecret: secret };
+      matchedClientId = attempt.clientId;
+      if (cachedLocalOAuthClient) {
+        if (cachedLocalOAuthClient.clientId === attempt.clientId) {
+          cachedLocalOAuthClient = { ...cachedLocalOAuthClient, clientSecret: attempt.clientSecret };
+        }
+        if (Array.isArray(cachedLocalOAuthClient.candidateClients)) {
+          const hit = cachedLocalOAuthClient.candidateClients.find((c) => c.clientId === attempt.clientId);
+          if (hit) hit.clientSecret = attempt.clientSecret;
+        }
       }
       payload = await res.json();
       break;
     }
 
     const errText = await res.text().catch(() => '');
+    const errDetail = formatOAuthErrorDetail(errText);
     if (res.status === 401 && /invalid_client|unauthorized_client/i.test(errText)) {
-      lastErr = new Error(`Google OAuth 客户端校验失败 (HTTP 401): ${errText.slice(0, 120)}`);
-      lastErr.status = 401;
+      lastClientErr = new Error(
+        `Google OAuth 客户端校验失败 (HTTP 401)${errDetail ? `: ${errDetail}` : ''}`,
+      );
+      lastClientErr.status = 401;
+      lastClientErr.code = 'CLIENT_MISMATCH';
+      continue;
+    }
+    if ((res.status === 400 || res.status === 401) && /invalid_grant/i.test(errText)) {
+      invalidGrantErr = new Error('该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权');
+      invalidGrantErr.status = 401;
+      invalidGrantErr.code = 'INVALID_GRANT';
+      if (preferredCid && attempt.clientId === preferredCid) {
+        throw invalidGrantErr;
+      }
+      // Keep checking remaining distinct client_ids if we weren't sure which client minted the token
       continue;
     }
     const err = new Error(
       res.status === 400 || res.status === 401
-        ? '该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权'
-        : `刷新 Google OAuth 令牌失败 (HTTP ${res.status}): ${errText.slice(0, 160)}`,
+        ? `该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权${errDetail ? ` (${errDetail})` : ''}`
+        : `刷新 Google OAuth 令牌失败 (HTTP ${res.status})${errDetail ? `: ${errDetail}` : ''}`,
     );
     err.status = res.status === 400 || res.status === 401 ? 401 : res.status || 502;
     throw err;
   }
 
   if (!payload) {
-    throw lastErr || new Error('刷新 Google OAuth 令牌失败');
+    throw invalidGrantErr || lastClientErr || new Error('刷新 Google OAuth 令牌失败');
   }
   const accessToken = typeof payload?.access_token === 'string' ? payload.access_token.trim() : '';
   if (!accessToken) {
@@ -969,7 +1168,8 @@ export async function refreshAccessTokenForCredential(
   }
 
   const expiresIn = Math.max(60, Number(payload.expires_in) || 3600);
-  const nextExpiry = new Date(nowMs + expiresIn * 1000).toISOString();
+  const nextExpiryMs = nowMs + expiresIn * 1000;
+  const nextExpiry = new Date(nextExpiryMs).toISOString();
   const nextToken = {
     ...existingToken,
     access_token: accessToken,
@@ -993,7 +1193,13 @@ export async function refreshAccessTokenForCredential(
       (typeof credObj.auth_method === 'string' && credObj.auth_method.trim()) || 'consumer',
   };
 
-  return { accessToken, credObj: updatedCredObj, renewed: true };
+  return {
+    accessToken,
+    credObj: updatedCredObj,
+    renewed: true,
+    matchedClientId,
+    expiryMs: nextExpiryMs,
+  };
 }
 
 export function buildQuotaFromAvailableModels(modelsResponse, nowMs = Date.now()) {
@@ -1004,7 +1210,6 @@ export function buildQuotaFromAvailableModels(modelsResponse, nowMs = Date.now()
   const groupMeta = {
     gemini: { key: 'gemini', label: 'Gemini', displayName: 'Gemini Models', order: 0 },
     gpt_claude: { key: 'gpt_claude', label: 'GPT&Claude', displayName: 'GPT & Claude', order: 1 },
-    argon: { key: 'argon', label: 'Argon', displayName: 'Argon', order: 2 },
   };
 
   for (const [modelId, info] of Object.entries(models)) {
@@ -1037,7 +1242,7 @@ export function buildQuotaFromAvailableModels(modelsResponse, nowMs = Date.now()
 
   if (groupBuckets.size === 0) return null;
 
-  const groups = ['gemini', 'gpt_claude', 'argon']
+  const groups = ['gemini', 'gpt_claude']
     .filter((k) => groupBuckets.has(k))
     .map((k) => {
       const m = groupMeta[k];
@@ -1174,13 +1379,20 @@ async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl) 
  */
 export async function fetchCloudCodeQuotaForCredential(
   credObj,
-  { cachedProjectId = '', fetchImpl = proxyAwareFetch, nowMs = Date.now(), oauthClient = null } = {},
+  {
+    cachedProjectId = '',
+    fetchImpl = proxyAwareFetch,
+    nowMs = Date.now(),
+    oauthClient = null,
+    preferredClientId = '',
+  } = {},
 ) {
   let tokenState = await refreshAccessTokenForCredential(credObj, {
     fetchImpl,
     nowMs,
     forceRefresh: false,
     oauthClient,
+    preferredClientId,
   });
 
   const runWithToken = async (accessToken) => {
@@ -1295,6 +1507,8 @@ export async function fetchCloudCodeQuotaForCredential(
       ...fetched,
       updatedCredObj: tokenState.credObj,
       renewed: tokenState.renewed,
+      matchedClientId: tokenState.matchedClientId || '',
+      tokenExpiryMs: tokenState.expiryMs || extractTokenExpiryMs(tokenState.credObj),
     };
   } catch (err) {
     if (err?.status === 401 && !tokenState.renewed) {
@@ -1303,6 +1517,7 @@ export async function fetchCloudCodeQuotaForCredential(
         nowMs,
         forceRefresh: true,
         oauthClient,
+        preferredClientId,
       });
       const fetched = await runWithToken(tokenState.accessToken);
       return {
@@ -1310,6 +1525,8 @@ export async function fetchCloudCodeQuotaForCredential(
         ...fetched,
         updatedCredObj: tokenState.credObj,
         renewed: true,
+        matchedClientId: tokenState.matchedClientId || '',
+        tokenExpiryMs: tokenState.expiryMs || extractTokenExpiryMs(tokenState.credObj),
       };
     }
     throw err;
@@ -1519,6 +1736,8 @@ export function normalizeAccountSettings(raw = {}) {
   let rawTarget = String(src.autoSwitchTarget || DEFAULT_ACCOUNT_SETTINGS.autoSwitchTarget).trim().toLowerCase();
   if (rawTarget === 'claude' || rawTarget === 'gpt' || rawTarget === 'gptclaude') {
     rawTarget = 'gpt_claude';
+  } else if (rawTarget === 'argon') {
+    rawTarget = 'gemini';
   }
   const autoSwitchTarget = VALID_AUTO_SWITCH_TARGETS.has(rawTarget)
     ? rawTarget
@@ -1526,7 +1745,8 @@ export function normalizeAccountSettings(raw = {}) {
 
   const autoSwitchEnabled = Boolean(src.autoSwitchEnabled);
 
-  const rawSortBy = String(src.sortBy || DEFAULT_ACCOUNT_SETTINGS.sortBy).trim();
+  let rawSortBy = String(src.sortBy || DEFAULT_ACCOUNT_SETTINGS.sortBy).trim();
+  if (rawSortBy === 'argon') rawSortBy = 'gemini';
   const sortBy = VALID_SORT_BY.has(rawSortBy) ? rawSortBy : DEFAULT_ACCOUNT_SETTINGS.sortBy;
 
   const rawSortOrder = String(src.sortOrder || DEFAULT_ACCOUNT_SETTINGS.sortOrder).trim().toLowerCase();
@@ -1593,7 +1813,6 @@ export function isFiveHourQuotaExhausted(quota, targetGroupKey = 'gemini', nowMs
 export function mapModelToQuotaGroup(modelId) {
   const s = String(modelId || '').trim().toLowerCase();
   if (!s) return null;
-  if (s.includes('argon')) return 'argon';
   if (
     s.includes('claude') ||
     s.includes('opus') ||
@@ -1610,7 +1829,8 @@ export function mapModelToQuotaGroup(modelId) {
     s.includes('flash') ||
     s.includes('hydrogen') ||
     s.includes('neon') ||
-    s.includes('carbon')
+    s.includes('carbon') ||
+    s.includes('argon')
   ) {
     return 'gemini';
   }
@@ -2043,7 +2263,6 @@ export function selectBestAutoSwitchCandidate(
 const DEFAULT_QUOTA_GROUPS = Object.freeze([
   { key: 'gemini', label: 'Gemini', displayName: 'Gemini Models' },
   { key: 'gpt_claude', label: 'GPT&Claude', displayName: 'Claude and GPT models' },
-  { key: 'argon', label: 'Argon', displayName: 'Gemini 4 Argon' },
 ]);
 
 let compilePromise = null;
@@ -2386,8 +2605,8 @@ function normalizeQuotaBucket(bucket) {
 }
 
 /**
- * Normalize quota payload into the 3 fixed account quota categories:
- * Gemini / GPT&Claude / Argon.
+ * Normalize quota payload into the 2 fixed account quota categories:
+ * Gemini / GPT&Claude (Argon merged into Gemini).
  */
 export function normalizeStoredQuota(rawQuota, nowMs = Date.now()) {
   if (!rawQuota || typeof rawQuota !== 'object') return null;
@@ -2421,7 +2640,9 @@ export function normalizeStoredQuota(rawQuota, nowMs = Date.now()) {
 function enrichQuotaWithResetStatus(quota, nowMs = Date.now()) {
   if (!quota || !Array.isArray(quota.groups)) return null;
   let resetPassedAny = false;
-  const groups = quota.groups.map((g) => {
+  const groups = quota.groups
+    .filter((g) => g && g.key !== 'argon')
+    .map((g) => {
     const check = (b) => {
       if (!b) return null;
       const resetPassed = Boolean(
@@ -2748,13 +2969,18 @@ export function createAccountManager({
   getRunningConversations,
   driver,
   remoteQuotaFetcher,
+  tokenRefresher,
   now = () => Date.now(),
   onBeforeHostClose,
 } = {}) {
   const activeDriver = driver || createWindowsAccountDriver(paths, storage);
   const activeRemoteQuotaFetcher =
     typeof remoteQuotaFetcher === 'function' ? remoteQuotaFetcher : fetchCloudCodeQuotaForCredential;
+  const activeTokenRefresher =
+    typeof tokenRefresher === 'function' ? tokenRefresher : refreshAccessTokenForCredential;
   const allowBackgroundRemoteRefresh = !driver || typeof remoteQuotaFetcher === 'function';
+  const allowPreSwitchTokenRefresh =
+    !driver || typeof tokenRefresher === 'function';
   let storeLock = Promise.resolve();
   let lastResumeResult = null;
   let lastOauthCaptureResult = null;
@@ -2767,6 +2993,7 @@ export function createAccountManager({
   let watcherBusy = false;
   let activeDirectOauth = null;
   const quotaErrorFileStampCache = new Map();
+  const autoTokenAttemptAtMs = new Map();
 
   function withStoreLock(fn) {
     const next = storeLock.then(fn, fn);
@@ -3076,28 +3303,82 @@ export function createAccountManager({
     }
   }
 
+  function syncLiveCredentialIntoVaultLocked(acc, vault, liveInfo, ts) {
+    if (!acc || !vault || !liveInfo?.found || !liveInfo.live?.credJson || !liveInfo.parsed) {
+      return false;
+    }
+    if (sanitizeEmail(acc.email) !== sanitizeEmail(liveInfo.email)) return false;
+    const liveRefresh = extractRefreshToken(liveInfo.parsed);
+    if (!liveRefresh) return false;
+    const liveExpiryMs = extractTokenExpiryMs(liveInfo.parsed);
+    const liveClientId = extractPreferredClientIdFromCred(liveInfo.parsed, acc.oauthClientId || '');
+
+    const existingSecret = vault.secrets?.[acc.id];
+    let existingParsed = null;
+    if (existingSecret?.credJson) {
+      try {
+        existingParsed = JSON.parse(existingSecret.credJson);
+      } catch {
+        existingParsed = null;
+      }
+    }
+    const existingRefresh = existingParsed ? extractRefreshToken(existingParsed) : '';
+    const existingExpiryMs = existingParsed ? extractTokenExpiryMs(existingParsed) : 0;
+    const shouldUpdateVault =
+      !existingSecret ||
+      existingRefresh !== liveRefresh ||
+      (liveExpiryMs > 0 && liveExpiryMs > existingExpiryMs + 5_000);
+
+    if (liveExpiryMs > 0 && liveExpiryMs > (Number(acc.tokenExpiryMs) || 0)) {
+      acc.tokenExpiryMs = liveExpiryMs;
+    }
+    if (liveClientId && !acc.oauthClientId) {
+      acc.oauthClientId = liveClientId;
+    }
+    if (shouldUpdateVault) {
+      vault.secrets[acc.id] = {
+        credTarget: liveInfo.live.credTarget || existingSecret?.credTarget || 'gemini:antigravity',
+        credUserName: liveInfo.live.credUserName || existingSecret?.credUserName || 'antigravity',
+        credPersist: Number(liveInfo.live.credPersist) || Number(existingSecret?.credPersist) || 2,
+        credJson: liveInfo.live.credJson,
+        credentialUserScope: liveInfo.live.credentialUserScope || existingSecret?.credentialUserScope || '',
+        capturedAtMs: ts,
+      };
+      acc.authError = '';
+      acc.authErrorCode = '';
+      acc.authErrorAtMs = 0;
+      return true;
+    }
+    return false;
+  }
+
   /**
-   * Keep the currently active account's cached quota fresh whenever general quota cards refresh,
+   * Keep the currently active account's cached quota & live token fresh whenever general quota cards refresh,
    * and trigger auto-switch when the configured target's 5h quota hits 0%.
    */
   async function syncActiveAccountQuotaFromLive(rawQuotaSummary, { skipAutoSwitch = false } = {}) {
     if (!rawQuotaSummary || !rawQuotaSummary.ok || !Array.isArray(rawQuotaSummary.groups)) {
       return false;
     }
-    const normalized = normalizeStoredQuota(rawQuotaSummary, now());
+    const nowMs = now();
+    const normalized = normalizeStoredQuota(rawQuotaSummary, nowMs);
     if (!normalized) return false;
     const liveInfo = await readLiveEmailSafe();
     if (!liveInfo.email) return false;
 
     const synced = await withStoreLock(async () => {
-      const index = await readIndex();
+      const [index, vault] = await Promise.all([readIndex(), readVault()]);
       const target = index.accounts.find(
         (a) => sanitizeEmail(a.email) === liveInfo.email,
       );
       if (!target) return false;
       target.quota = normalized;
-      target.updatedAtMs = now();
+      target.updatedAtMs = nowMs;
       index.activeAccountId = target.id;
+      const vaultUpdated = syncLiveCredentialIntoVaultLocked(target, vault, liveInfo, nowMs);
+      if (vaultUpdated) {
+        await writeVault(vault);
+      }
       await writeIndex(index);
       return true;
     });
@@ -3137,6 +3418,8 @@ export function createAccountManager({
       createdAtMs: Number(acc.createdAtMs) || 0,
       updatedAtMs: Number(acc.updatedAtMs) || 0,
       lastUsedAtMs: Number(acc.lastUsedAtMs) || 0,
+      tokenExpiryMs: Number(acc.tokenExpiryMs) || 0,
+      ...(acc.authError ? { authError: String(acc.authError) } : {}),
       quota: enrichQuotaWithResetStatus(acc.quota || null, nowMs),
     };
   }
@@ -3250,6 +3533,8 @@ export function createAccountManager({
       const [index, vault] = await Promise.all([readIndex(), readVault()]);
       let existing = index.accounts.find((a) => sanitizeEmail(a.email) === email);
       const isNew = !existing;
+      const credExpiryMs = extractTokenExpiryMs(norm.credObj);
+      const credClientId = extractPreferredClientIdFromCred(norm.credObj);
       if (!existing) {
         existing = {
           id: `acc_${crypto.randomBytes(6).toString('hex')}`,
@@ -3261,6 +3546,8 @@ export function createAccountManager({
           createdAtMs: ts,
           updatedAtMs: ts,
           lastUsedAtMs: ts,
+          tokenExpiryMs: credExpiryMs,
+          ...(credClientId ? { oauthClientId: credClientId } : {}),
           quota: liveQuota,
         };
         index.accounts.unshift(existing);
@@ -3268,6 +3555,11 @@ export function createAccountManager({
         existing.updatedAtMs = ts;
         existing.lastUsedAtMs = ts;
         existing.authMethod = norm.credObj.auth_method || existing.authMethod || 'oauth';
+        if (credExpiryMs > 0) existing.tokenExpiryMs = credExpiryMs;
+        if (credClientId) existing.oauthClientId = credClientId;
+        existing.authError = '';
+        existing.authErrorCode = '';
+        existing.authErrorAtMs = 0;
         if (remark && sanitizeRemark(remark)) {
           existing.remark = sanitizeRemark(remark);
         }
@@ -3320,6 +3612,14 @@ export function createAccountManager({
       const imported = [];
 
       for (const item of parsed.items) {
+        let itemCredObj = null;
+        try {
+          itemCredObj = JSON.parse(item.credJson);
+        } catch {
+          itemCredObj = null;
+        }
+        const itemExpiryMs = extractTokenExpiryMs(itemCredObj);
+        const itemClientId = extractPreferredClientIdFromCred(itemCredObj);
         let existing = index.accounts.find((a) => sanitizeEmail(a.email) === sanitizeEmail(item.email));
         if (!existing) {
           existing = {
@@ -3332,12 +3632,19 @@ export function createAccountManager({
             createdAtMs: ts,
             updatedAtMs: ts,
             lastUsedAtMs: 0,
+            tokenExpiryMs: itemExpiryMs,
+            ...(itemClientId ? { oauthClientId: itemClientId } : {}),
             quota: item.quota || null,
           };
           index.accounts.push(existing);
           addedCount += 1;
         } else {
           existing.updatedAtMs = ts;
+          if (itemExpiryMs > 0) existing.tokenExpiryMs = itemExpiryMs;
+          if (itemClientId) existing.oauthClientId = itemClientId;
+          existing.authError = '';
+          existing.authErrorCode = '';
+          existing.authErrorAtMs = 0;
           if (item.remark) existing.remark = item.remark;
           if (item.quota && !existing.quota) existing.quota = item.quota;
           updatedCount += 1;
@@ -3483,6 +3790,7 @@ export function createAccountManager({
         missing: false,
         email: acc.email,
         projectId: typeof acc.projectId === 'string' ? acc.projectId : '',
+        oauthClientId: typeof acc.oauthClientId === 'string' ? acc.oauthClientId : '',
         hasQuota: Boolean(acc.quota),
         secretCredJson: typeof secret?.credJson === 'string' ? secret.credJson : '',
       };
@@ -3497,17 +3805,24 @@ export function createAccountManager({
       const freshQuota = await fetchLiveQuotaNormalized();
       if (freshQuota) {
         return withStoreLock(async () => {
-          const index = await readIndex();
+          const [index, vault] = await Promise.all([readIndex(), readVault()]);
           const acc = index.accounts.find((a) => a.id === id);
           if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
           acc.quota = freshQuota;
           acc.updatedAtMs = nowMs;
+          acc.authError = '';
+          acc.authErrorCode = '';
+          acc.authErrorAtMs = 0;
           index.activeAccountId = acc.id;
+          const vaultUpdated = syncLiveCredentialIntoVaultLocked(acc, vault, liveInfo, nowMs);
+          if (vaultUpdated) {
+            await writeVault(vault);
+          }
           await writeIndex(index);
           return {
             ok: true,
             mode: 'live',
-            message: `已实时同步 ${acc.email} 的官方三类额度`,
+            message: `已实时同步 ${acc.email} 的官方额度`,
             account: formatPublicAccount(acc, liveInfo.email, nowMs),
           };
         });
@@ -3521,6 +3836,13 @@ export function createAccountManager({
         parsedCred = JSON.parse(snap.secretCredJson);
       } catch {
         parsedCred = null;
+      }
+    }
+    if (isCurrent && liveInfo.parsed && extractRefreshToken(liveInfo.parsed)) {
+      const liveExp = extractTokenExpiryMs(liveInfo.parsed);
+      const storedExp = extractTokenExpiryMs(parsedCred);
+      if (!parsedCred || !extractRefreshToken(parsedCred) || liveExp > storedExp) {
+        parsedCred = liveInfo.parsed;
       }
     }
     if (!parsedCred || !extractRefreshToken(parsedCred)) {
@@ -3540,15 +3862,23 @@ export function createAccountManager({
     try {
       remote = await activeRemoteQuotaFetcher(parsedCred, {
         cachedProjectId: snap.projectId,
+        preferredClientId: snap.oauthClientId,
         nowMs,
       });
     } catch (err) {
       return withStoreLock(async () => {
         const index = await readIndex();
         const acc = index.accounts.find((a) => a.id === id);
+        if (acc && err?.code === 'INVALID_GRANT') {
+          acc.authError = err?.message || 'OAuth 凭据已失效或被撤销';
+          acc.authErrorCode = 'INVALID_GRANT';
+          acc.authErrorAtMs = nowMs;
+          await writeIndex(index);
+        }
         return {
           ok: false,
           status: Number(err?.status) || 502,
+          code: err?.code || '',
           error: err?.message || `同步 ${snap.email} 官方额度失败`,
           account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
         };
@@ -3577,6 +3907,18 @@ export function createAccountManager({
       if (remote.projectId) {
         acc.projectId = remote.projectId;
       }
+      if (remote.matchedClientId) {
+        acc.oauthClientId = remote.matchedClientId;
+      }
+      const nextExpiryMs =
+        Number(remote.tokenExpiryMs) ||
+        extractTokenExpiryMs(remote.updatedCredObj || parsedCred);
+      if (nextExpiryMs > 0) {
+        acc.tokenExpiryMs = nextExpiryMs;
+      }
+      acc.authError = '';
+      acc.authErrorCode = '';
+      acc.authErrorAtMs = 0;
       acc.updatedAtMs = nowMs;
 
       if (remote.renewed && remote.updatedCredObj && vault?.secrets?.[acc.id]) {
@@ -3592,7 +3934,10 @@ export function createAccountManager({
         ok: true,
         mode: 'remote_oauth',
         source: remote.source || 'cloudcode',
-        message: `已实时同步 ${acc.email} 的官方三类额度`,
+        renewed: Boolean(remote.renewed),
+        message: remote.renewed
+          ? `已自动续签凭证并实时同步 ${acc.email} 的官方额度`
+          : `已实时同步 ${acc.email} 的官方额度`,
         account: formatPublicAccount(acc, liveInfo.email, nowMs),
       };
     });
@@ -3698,6 +4043,49 @@ export function createAccountManager({
       return { ok: false, status: 422, error: '目标账号缺少有效的 refresh_token，已中止切换' };
     }
 
+    // Best-effort pre-switch token auto-renewal (Cockpit Tools style): if target access_token is
+    // expired or near expiry, renew it right before injecting into Windows Credential Manager.
+    let effectiveCredJson = secret.credJson;
+    if (allowPreSwitchTokenRefresh) {
+      const storedExp = extractTokenExpiryMs(parsedTargetCred);
+      const needsRenew = !storedExp || storedExp - ts <= OAUTH_REFRESH_SAFETY_MS;
+      if (needsRenew) {
+        try {
+          const renewed = await activeTokenRefresher(parsedTargetCred, {
+            nowMs: ts,
+            forceRefresh: false,
+            preferredClientId: target.oauthClientId || '',
+            signal: AbortSignal.timeout(6000),
+          });
+          if (renewed?.renewed && renewed.credObj) {
+            effectiveCredJson = JSON.stringify(renewed.credObj);
+            await withStoreLock(async () => {
+              const [freshIndex, freshVault] = await Promise.all([readIndex(), readVault()]);
+              const freshAcc = freshIndex.accounts.find((a) => a.id === id);
+              if (freshAcc) {
+                if (renewed.expiryMs > 0) freshAcc.tokenExpiryMs = renewed.expiryMs;
+                if (renewed.matchedClientId) freshAcc.oauthClientId = renewed.matchedClientId;
+                freshAcc.authError = '';
+                freshAcc.authErrorCode = '';
+                freshAcc.authErrorAtMs = 0;
+                freshAcc.updatedAtMs = ts;
+                await writeIndex(freshIndex);
+              }
+              if (freshVault?.secrets?.[id]) {
+                freshVault.secrets[id] = {
+                  ...freshVault.secrets[id],
+                  credJson: effectiveCredJson,
+                };
+                await writeVault(freshVault);
+              }
+            }).catch(() => {});
+          }
+        } catch {
+          // Non-fatal: offline or transient error still falls back to stored refresh_token
+        }
+      }
+    }
+
     // Also ensure current account is safely backed up inside vault or backup dir before leaving
     const launchCfg = await activeDriver.detectAntigravityLaunchConfig();
     if (!launchCfg?.exePath) {
@@ -3714,7 +4102,7 @@ export function createAccountManager({
         credTarget: secret.credTarget || 'gemini:antigravity',
         credUserName: secret.credUserName || 'antigravity',
         credPersist: Number(secret.credPersist) || 2,
-        credJson: secret.credJson,
+        credJson: effectiveCredJson,
         credentialUserScope: secret.credentialUserScope || '',
       }),
     );
@@ -4047,6 +4435,8 @@ export function createAccountManager({
           const [index, vault] = await Promise.all([readIndex(), readVault()]);
           let existing = index.accounts.find((a) => sanitizeEmail(a.email) === email);
           isNew = !existing;
+          const oauthExpiryMs = extractTokenExpiryMs(norm.credObj);
+          const oauthCid = extractPreferredClientIdFromCred(norm.credObj, clientId);
           if (!existing) {
             existing = {
               id: `acc_${crypto.randomBytes(6).toString('hex')}`,
@@ -4058,12 +4448,19 @@ export function createAccountManager({
               createdAtMs: ts,
               updatedAtMs: ts,
               lastUsedAtMs: 0,
+              tokenExpiryMs: oauthExpiryMs,
+              ...(oauthCid ? { oauthClientId: oauthCid } : {}),
               quota: null,
             };
             index.accounts.push(existing);
           } else {
             existing.updatedAtMs = ts;
             existing.authMethod = norm.credObj.auth_method || 'consumer';
+            if (oauthExpiryMs > 0) existing.tokenExpiryMs = oauthExpiryMs;
+            if (oauthCid) existing.oauthClientId = oauthCid;
+            existing.authError = '';
+            existing.authErrorCode = '';
+            existing.authErrorAtMs = 0;
             if (session.remark && sanitizeRemark(session.remark)) {
               existing.remark = sanitizeRemark(session.remark);
             }
@@ -4327,7 +4724,7 @@ export function createAccountManager({
         }
       }
 
-      // 4. Scheduled automatic quota refresh + 5h/weekly-exhausted auto-switch check
+      // 4. Scheduled automatic quota refresh + proactive OAuth token auto-renewal (Cockpit Tools style)
       const refreshIntervalMs = settings.quotaRefreshIntervalMin * 60 * 1000;
       const shouldAutoRefresh =
         !switchedThisTick &&
@@ -4348,14 +4745,55 @@ export function createAccountManager({
           for (const acc of indexForSchedule.accounts) {
             if (!acc || acc.enabled === false) continue;
             if (liveInfo.email && sanitizeEmail(acc.email) === liveInfo.email) continue;
+            const lastAttempt = autoTokenAttemptAtMs.get(acc.id) || 0;
+            const isInvalidGrantBackoff =
+              acc.authErrorCode === 'INVALID_GRANT' &&
+              nowMs - Number(acc.authErrorAtMs || lastAttempt || 0) < OAUTH_INVALID_GRANT_BACKOFF_MS;
+            if (isInvalidGrantBackoff) continue;
             const fetchedAt = Number(acc.quota?.fetchedAtMs || 0);
-            if (!fetchedAt || nowMs - fetchedAt >= refreshIntervalMs) {
+            const expMs = Number(acc.tokenExpiryMs || 0);
+            const tokenExpiringSoon = expMs > 0 && expMs - nowMs <= OAUTH_PROACTIVE_RENEW_WINDOW_MS;
+            if (!fetchedAt || nowMs - fetchedAt >= refreshIntervalMs || tokenExpiringSoon) {
+              autoTokenAttemptAtMs.set(acc.id, nowMs);
               await refreshAccountQuota(acc.id).catch(() => {});
             }
           }
         }
         if (freshQuota && liveInfo.email) {
           await maybeTriggerAutoSwitch(liveInfo.email, freshQuota).catch(() => {});
+        }
+      } else if (!switchedThisTick && allowBackgroundRemoteRefresh && indexForSchedule.accounts.length > 0) {
+        // Between scheduled quota cycles, proactively auto-renew any enabled account whose
+        // access_token is expiring within 10 minutes (keeps stored tokens always warm like Cockpit Tools)
+        const dueForProactiveRenew = indexForSchedule.accounts.filter((acc) => {
+          if (!acc || acc.enabled === false) return false;
+          const expMs = Number(acc.tokenExpiryMs || 0);
+          if (!expMs || expMs - nowMs > OAUTH_PROACTIVE_RENEW_WINDOW_MS) return false;
+          const lastAttempt = autoTokenAttemptAtMs.get(acc.id) || 0;
+          const cooldown =
+            acc.authErrorCode === 'INVALID_GRANT'
+              ? OAUTH_INVALID_GRANT_BACKOFF_MS
+              : OAUTH_BACKGROUND_RETRY_COOLDOWN_MS;
+          return nowMs - Math.max(lastAttempt, Number(acc.authErrorAtMs || 0)) >= cooldown;
+        });
+        if (dueForProactiveRenew.length > 0) {
+          const liveInfo = await readLiveEmailSafe();
+          for (const acc of dueForProactiveRenew) {
+            if (liveInfo.email && sanitizeEmail(acc.email) === liveInfo.email) {
+              // Active account is refreshed natively by language_server; sync into vault if newer
+              await withStoreLock(async () => {
+                const [idx, vlt] = await Promise.all([readIndex(), readVault()]);
+                const target = idx.accounts.find((a) => a.id === acc.id);
+                if (target && syncLiveCredentialIntoVaultLocked(target, vlt, liveInfo, nowMs)) {
+                  await writeVault(vlt);
+                  await writeIndex(idx);
+                }
+              }).catch(() => {});
+              continue;
+            }
+            autoTokenAttemptAtMs.set(acc.id, nowMs);
+            await refreshAccountQuota(acc.id).catch(() => {});
+          }
         }
       }
     } finally {

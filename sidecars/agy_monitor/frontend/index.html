@@ -56,6 +56,21 @@
               <span class="subnav-update-dot" aria-hidden="true"></span>
               <span class="subnav-update-label" id="updateStatusLabel" data-i18n="nav.updateCheck">检查更新</span>
             </button>
+            <button
+              class="subnav-changelog-btn"
+              id="changelogBtn"
+              type="button"
+              title="查看各版本更新公告"
+              aria-label="查看各版本更新公告"
+              data-i18n-title="nav.changelogTitle"
+              data-i18n-aria="nav.changelogTitle"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M2.6 6.4h2.5l5.4-2.8v8.8L5.1 9.6H2.6a.8.8 0 0 1-.8-.8V7.2a.8.8 0 0 1 .8-.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                <path d="M5.1 9.6 6 12.9a.7.7 0 0 1-.68.9h-.5a.7.7 0 0 1-.68-.53L3.3 9.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M12.6 5.8a3.2 3.2 0 0 1 0 4.4M14 4.3a5.2 5.2 0 0 1 0 7.4" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
+              </svg>
+            </button>
             <a
               class="subnav-repo-btn"
               id="repoLinkBtn"
@@ -941,10 +956,6 @@
                       <span>GPTClaude 额度</span>
                       <span class="acc-sort-check" aria-hidden="true">✓</span>
                     </button>
-                    <button class="acc-sort-option" type="button" role="menuitemradio" data-sort-by="argon" aria-checked="false">
-                      <span>Argon</span>
-                      <span class="acc-sort-check" aria-hidden="true">✓</span>
-                    </button>
                     <button class="acc-sort-option is-active" type="button" role="menuitemradio" data-sort-by="lastUsed" aria-checked="true">
                       <span>上一次使用时间</span>
                       <span class="acc-sort-check" aria-hidden="true">✓</span>
@@ -966,11 +977,11 @@
             </div>
           </section>
 
-          <!-- 三类额度总余量汇总卡片（统计全部已启用账号的 5h / 周 余量与全部总量） -->
-          <section class="acc-summary-card" id="accSummaryCard" aria-label="三类额度总余量汇总" hidden>
+          <!-- 官方额度总余量汇总卡片（统计全部已启用账号的 5h / 周 余量与全部总量） -->
+          <section class="acc-summary-card" id="accSummaryCard" aria-label="额度总余量汇总" hidden>
             <div class="acc-summary-head">
               <div class="acc-summary-title-wrap">
-                <span class="acc-summary-title">三类额度总余量</span>
+                <span class="acc-summary-title">额度总余量</span>
                 <span class="acc-summary-meta" id="accSummaryMeta">0 个账号</span>
               </div>
               <span class="acc-summary-hint" id="accSummaryHint">全部启用号累计余量 / 总量</span>
@@ -1244,7 +1255,7 @@
               <span class="acc-oauth-tag is-fast">零重启 · 推荐</span>
             </div>
             <p class="acc-oauth-option-desc" id="accOauthCurrentHint">
-              自动读取当前 Antigravity 登录凭证与官方三类实时额度，使用本机 DPAPI 加密入库。
+              自动读取当前 Antigravity 登录凭证与官方实时额度，使用本机 DPAPI 加密入库。
             </p>
             <div class="acc-field-inline">
               <input class="acc-input" id="accCaptureRemarkInput" type="text" maxlength="120" placeholder="可选：给该账号写个备注（如 主力 Pro）…" />
@@ -1359,7 +1370,7 @@
                 <span class="acc-setting-unit">min</span>
               </div>
             </div>
-            <p class="acc-setting-hint">按此间隔在后台自动同步当前账号实时三类额度，填 0 表示关闭定时自动刷新。</p>
+            <p class="acc-setting-hint">按此间隔在后台自动续签凭证并同步官方实时额度，填 0 表示关闭定时自动刷新。</p>
           </div>
 
           <div class="acc-setting-card">
@@ -1368,7 +1379,6 @@
               <select class="acc-setting-select" id="accSettingAutoTargetSelect" aria-label="监控耗尽的额度类型">
                 <option value="gemini" selected>Gemini</option>
                 <option value="gpt_claude">Claude</option>
-                <option value="argon">Argon</option>
               </select>
               <span>的 5h/周额度耗尽或出现额度为空报错时，自动切号</span>
               <button
@@ -1462,6 +1472,29 @@
         <div class="modal-footer acc-modal-footer">
           <button class="acc-cancel-btn" type="button" data-acc-modal-close="delete">取消</button>
           <button class="acc-danger-btn" id="accDeleteConfirmBtn" type="button">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 更新公告弹窗（展示每个版本的更新内容） -->
+    <div class="modal-overlay" id="changelogModal" hidden role="dialog" aria-modal="true" aria-labelledby="changelogModalTitle">
+      <div class="modal-backdrop" data-changelog-close></div>
+      <div class="modal-dialog changelog-modal-dialog">
+        <div class="modal-header changelog-modal-header">
+          <div class="changelog-modal-title-wrap">
+            <h3 class="modal-title" id="changelogModalTitle" data-i18n="changelog.title">更新公告</h3>
+            <span class="changelog-current-ver" id="changelogCurrentVer">v1.1.1</span>
+          </div>
+          <button class="modal-close-btn" type="button" data-changelog-close aria-label="关闭" data-i18n-aria="common.close">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body changelog-modal-body" id="changelogList"></div>
+        <div class="modal-footer changelog-modal-footer">
+          <span class="changelog-footer-meta" id="changelogFooterMeta">共 16 个版本</span>
+          <button class="modal-confirm-btn" type="button" data-changelog-close data-i18n="common.gotIt">我知道了</button>
         </div>
       </div>
     </div>

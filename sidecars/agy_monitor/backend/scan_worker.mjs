@@ -716,7 +716,7 @@ function openCacheDb(cacheDbPath) {
 }
 
 const COLD_CONV_AGE_MS = 10 * 60 * 1000;
-const COLD_RESCAN_MODULO = 5;
+const COLD_RESCAN_MODULO = 2;
 
 async function discoverTranscripts(brainDir, { coldCache = null, scanTick = 0, fullSweep = true } = {}) {
   let entries;
@@ -928,7 +928,7 @@ async function readDeltaLines(
   };
 }
 
-function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
+function recomputeConvMetrics(db, convId, { conversationsDir = null, forceRefreshConvDb = false } = {}) {
   const rows = db
     .prepare(
       `SELECT step_index, step_type, created_at_ms, model, upstream_model, requested_model_label,
@@ -948,14 +948,29 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
   let convDbStepTelemetry = null;
   if (conversationsDir) {
     const missingConvDbIndices = [];
+    const recentPlannerIndices = [];
     for (let i = 0; i < rows.length; i += 1) {
       const r = rows[i];
+      if (r.step_type !== 'PLANNER_RESPONSE') continue;
+      recentPlannerIndices.push(r.step_index);
+      const hasStaleFamilyMismatch = Boolean(
+        r.model &&
+          r.upstream_model &&
+          coarseModelFamilyKey(r.model) !== coarseModelFamilyKey(r.upstream_model),
+      );
       if (
-        r.step_type === 'PLANNER_RESPONSE' &&
-        (r.ttft_ms == null || r.duration_ms == null || r.upstream_model == null)
+        forceRefreshConvDb ||
+        hasStaleFamilyMismatch ||
+        r.ttft_ms == null ||
+        r.duration_ms == null ||
+        r.upstream_model == null
       ) {
         missingConvDbIndices.push(r.step_index);
       }
+    }
+    // Always verify the tail 4 PLANNER_RESPONSE steps against convDb so in-place rewrites never lag
+    for (const tailIdx of recentPlannerIndices.slice(-4)) {
+      missingConvDbIndices.push(tailIdx);
     }
     if (missingConvDbIndices.length > 0) {
       const convDbPath = path.join(conversationsDir, `${convId}.db`);
@@ -1064,13 +1079,11 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
         );
         if (dbTiming?.ttftMs != null) row.ttft_ms = dbTiming.ttftMs;
         if (dbTiming?.durationMs != null) row.duration_ms = dbTiming.durationMs;
-        if (dbUpstreamModel != null && !row.upstream_model) row.upstream_model = dbUpstreamModel;
-        if (dbRequestedLabel != null && !row.requested_model_label) {
-          row.requested_model_label = dbRequestedLabel;
-        }
+        if (dbUpstreamModel != null) row.upstream_model = dbUpstreamModel;
+        if (dbRequestedLabel != null) row.requested_model_label = dbRequestedLabel;
       }
 
-      if (row.model || row.upstream_model) {
+      if ((row.model || row.upstream_model) && row.created_at_ms >= latestModelAtMs) {
         if (row.model) {
           latestModel = row.model;
         }
@@ -1095,9 +1108,12 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
         const dt = Number(row.duration_ms);
         if (dt >= 500 && dt <= 600_000) {
           const tokPerSec = row.output_tokens / (dt / 1000);
-          latestSpeedTokS = Number(tokPerSec.toFixed(1));
-          speedSource = 'conv_db_exact';
-          speedAtMs = (dbTiming?.completedAtMs ?? row.created_at_ms + dt);
+          const completedAt = dbTiming?.completedAtMs ?? row.created_at_ms + dt;
+          if (completedAt >= speedAtMs) {
+            latestSpeedTokS = Number(tokPerSec.toFixed(1));
+            speedSource = 'conv_db_exact';
+            speedAtMs = completedAt;
+          }
           speedOutSum += row.output_tokens;
           speedSecSum += dt / 1000;
         }
@@ -1122,16 +1138,18 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
             updateDurationStmt.run(dt, convId, row.step_index);
             if (dt <= 180_000) {
               const tokPerSec = row.output_tokens / (dt / 1000);
-              latestSpeedTokS = Number(tokPerSec.toFixed(1));
-              speedSource = 'tool_step_e2e_est';
-              speedAtMs = next.created_at_ms;
+              if (next.created_at_ms >= speedAtMs) {
+                latestSpeedTokS = Number(tokPerSec.toFixed(1));
+                speedSource = 'tool_step_e2e_est';
+                speedAtMs = next.created_at_ms;
+              }
               speedOutSum += row.output_tokens;
               speedSecSum += dt / 1000;
             }
           }
         }
       }
-    } else if (row.model && row.step_type !== 'ERROR_MESSAGE') {
+    } else if (row.model && row.step_type !== 'ERROR_MESSAGE' && row.created_at_ms >= latestModelAtMs) {
       latestModel = row.model;
       latestModelAtMs = row.created_at_ms;
     }
@@ -1215,6 +1233,9 @@ function getPreparedStatements(db) {
       `SELECT COALESCE(MAX(step_index), -1) AS max_idx FROM step_ledger WHERE conv_id = ?`
     ),
     deleteConvSteps: db.prepare(`DELETE FROM step_ledger WHERE conv_id = ?`),
+    deleteRewoundTail: db.prepare(
+      `DELETE FROM step_ledger WHERE conv_id = ? AND step_index > ? AND created_at_ms < ?`
+    ),
     deleteConvMetrics: db.prepare(`DELETE FROM conv_latest_metrics WHERE conv_id = ?`),
     upsertStep: db.prepare(
       `INSERT INTO step_ledger (
@@ -1234,7 +1255,34 @@ function getPreparedStatements(db) {
          thinking_chars = excluded.thinking_chars,
          status = COALESCE(excluded.status, step_ledger.status),
          error_text = COALESCE(excluded.error_text, step_ledger.error_text),
-         ttft_ms = COALESCE(excluded.ttft_ms, step_ledger.ttft_ms)`
+         ttft_ms = CASE
+           WHEN excluded.created_at_ms != step_ledger.created_at_ms
+             OR excluded.step_type != step_ledger.step_type
+             OR COALESCE(excluded.model, '') != COALESCE(step_ledger.model, '')
+           THEN excluded.ttft_ms
+           ELSE COALESCE(excluded.ttft_ms, step_ledger.ttft_ms)
+         END,
+         duration_ms = CASE
+           WHEN excluded.created_at_ms != step_ledger.created_at_ms
+             OR excluded.step_type != step_ledger.step_type
+             OR COALESCE(excluded.model, '') != COALESCE(step_ledger.model, '')
+           THEN NULL
+           ELSE step_ledger.duration_ms
+         END,
+         upstream_model = CASE
+           WHEN excluded.created_at_ms != step_ledger.created_at_ms
+             OR excluded.step_type != step_ledger.step_type
+             OR COALESCE(excluded.model, '') != COALESCE(step_ledger.model, '')
+           THEN NULL
+           ELSE step_ledger.upstream_model
+         END,
+         requested_model_label = CASE
+           WHEN excluded.created_at_ms != step_ledger.created_at_ms
+             OR excluded.step_type != step_ledger.step_type
+             OR COALESCE(excluded.model, '') != COALESCE(step_ledger.model, '')
+           THEN NULL
+           ELSE step_ledger.requested_model_label
+         END`
     ),
     upsertWatermark: db.prepare(
       `INSERT INTO session_watermarks (
@@ -1262,6 +1310,7 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
       selectWatermark,
       selectMaxStep,
       deleteConvSteps,
+      deleteRewoundTail,
       deleteConvMetrics,
       upsertStep,
       upsertWatermark,
@@ -1312,7 +1361,16 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
           deleteConvSteps.run(item.convId);
           deleteConvMetrics.run(item.convId);
         }
+        let highWaterStep = truncated ? -1 : Number(maxStepRow?.max_idx ?? -1);
         for (const r of rows) {
+          // Detect Antigravity conversation rewind / retry reusing an earlier step_index:
+          // purge obsolete future step_index rows from the abandoned older branch immediately.
+          if (highWaterStep >= 0 && r.step_index < highWaterStep && r.created_at_ms > 1000) {
+            deleteRewoundTail.run(item.convId, r.step_index, r.created_at_ms - 1000);
+            highWaterStep = r.step_index;
+          } else if (r.step_index > highWaterStep) {
+            highWaterStep = r.step_index;
+          }
           upsertStep.run(
             r.conv_id,
             r.step_index,
@@ -1363,10 +1421,18 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
       const upstreamBackfillRow = db
         .prepare(`SELECT value FROM scan_meta WHERE key = 'conv_db_upstream_model_backfill_v1'`)
         .get();
+      const rewindRepairRow = db
+        .prepare(`SELECT value FROM scan_meta WHERE key = 'conv_db_rewind_repair_v2'`)
+        .get();
       const needsTimingBackfill = !timingBackfillRow || timingBackfillRow.value !== '1';
       const needsUpstreamBackfill = !upstreamBackfillRow || upstreamBackfillRow.value !== '1';
-      const needsFullBackfill = needsTimingBackfill || needsUpstreamBackfill;
-      const candidateRows = needsFullBackfill
+      const needsRewindRepair = !rewindRepairRow || rewindRepairRow.value !== '1';
+      const needsFullBackfill = needsTimingBackfill || needsUpstreamBackfill || needsRewindRepair;
+      const candidateRows = needsRewindRepair
+        ? db
+            .prepare(`SELECT DISTINCT conv_id FROM step_ledger WHERE step_type = 'PLANNER_RESPONSE'`)
+            .all()
+        : needsFullBackfill
         ? db
             .prepare(
               `SELECT DISTINCT conv_id FROM step_ledger
@@ -1387,15 +1453,17 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
       let backfilledAny = false;
       for (const cand of candidateRows) {
         const cid = String(cand?.conv_id || '');
-        if (!cid || changedConvSet.has(cid)) continue;
+        if (!cid || (changedConvSet.has(cid) && !needsRewindRepair)) continue;
         const convDbPath = path.join(conversationsDir, `${cid}.db`);
         if (!fs.existsSync(convDbPath)) continue;
         db.exec('BEGIN IMMEDIATE');
         try {
-          recomputeConvMetrics(db, cid, { conversationsDir });
+          recomputeConvMetrics(db, cid, { conversationsDir, forceRefreshConvDb: needsRewindRepair });
           db.exec('COMMIT');
-          changedConvs.push(cid);
-          changedConvSet.add(cid);
+          if (!changedConvSet.has(cid)) {
+            changedConvs.push(cid);
+            changedConvSet.add(cid);
+          }
           backfilledAny = true;
         } catch {
           try {
@@ -1411,6 +1479,9 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
       }
       if (needsUpstreamBackfill && (candidateRows.length === 0 || backfilledAny)) {
         upsertMeta.run('conv_db_upstream_model_backfill_v1', '1');
+      }
+      if (needsRewindRepair && (candidateRows.length === 0 || backfilledAny)) {
+        upsertMeta.run('conv_db_rewind_repair_v2', '1');
       }
     }
 
@@ -1474,7 +1545,7 @@ async function runWorkerMain() {
   const conversationsDir = resolveDefaultConversationsDir(brainDir);
   const cacheDbPath = resolveDefaultCacheDbPath();
   const rawInterval = process.env.AGY_MONITOR_SCAN_INTERVAL_MS;
-  const intervalMs = rawInterval === undefined ? 2500 : Number(rawInterval);
+  const intervalMs = rawInterval === undefined ? 1500 : Number(rawInterval);
 
   const db = openCacheDb(cacheDbPath);
   const coldCache = new Map();

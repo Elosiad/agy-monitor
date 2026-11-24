@@ -1,7 +1,7 @@
 /**
  * Multi-Account Management Hub (`accounts` top-level tab):
  * - Top toolbar: OAuth 授权 / Token/Json 导入 / 设置 + DPAPI badge & rollback
- * - Account list items: email, 3 quota groups (Gemini / GPT&Claude / Argon),
+ * - Account list items: email, 2 quota groups (Gemini / GPT&Claude),
  *   enable/disable toggle, switch account (with auto-resume), delete,
  *   export JSON, edit remark, and refresh quota.
  */
@@ -9,14 +9,12 @@
 const DEFAULT_GROUPS = [
   { key: "gemini", label: "Gemini" },
   { key: "gpt_claude", label: "GPT&Claude" },
-  { key: "argon", label: "Argon" },
 ];
 
 const SORT_FIELDS = [
   { key: "email", shortLabel: "a-z", label: "a-z（邮箱首字母）" },
   { key: "gemini", shortLabel: "Gemini", label: "Gemini 额度" },
   { key: "gpt_claude", shortLabel: "GPTClaude", label: "GPTClaude 额度" },
-  { key: "argon", shortLabel: "Argon", label: "Argon" },
   { key: "lastUsed", shortLabel: "上次使用", label: "上一次使用时间" },
 ];
 
@@ -55,7 +53,7 @@ function sortAccountsList(accounts, sortBy = "lastUsed", sortOrder = "desc", now
       return cmp * dir;
     }
 
-    if (sortBy === "gemini" || sortBy === "gpt_claude" || sortBy === "argon") {
+    if (sortBy === "gemini" || sortBy === "gpt_claude") {
       const sa = getGroupSortScore(a, sortBy, nowMs);
       const sb = getGroupSortScore(b, sortBy, nowMs);
       // Always keep accounts without quota snapshot at the end so unknown rows don't obscure real quotas
@@ -597,8 +595,8 @@ export function createAccountsHub({
       refreshLabel.textContent = isRefreshing ? "刷新中" : "刷新额度";
       refreshBtn.appendChild(refreshLabel);
       refreshBtn.title = acc.isCurrent
-        ? "立即实时同步该账号官方三类额度"
-        : "刷新该账号三类额度的重置倒计时状态";
+        ? "立即实时同步该账号官方额度并同步最新凭证"
+        : "自动续签凭证并实时同步该账号官方额度";
       refreshBtn.addEventListener("click", () => void handleRefreshQuota(acc));
       actionsRow.appendChild(refreshBtn);
 
@@ -955,7 +953,7 @@ export function createAccountsHub({
     resetDirectOauthUI();
     if (oauthCurrentHintEl) {
       oauthCurrentHintEl.textContent = state.currentEmail
-        ? `当前检测到已登录账号：${state.currentEmail}。点击下方按钮立即加密收录并同步三类实时额度。`
+        ? `当前检测到已登录账号：${state.currentEmail}。点击下方按钮立即加密收录并同步官方实时额度。`
         : "未检测到活跃登录凭据。请先登录 Antigravity，或使用下方「打开浏览器授权新号」。";
     }
     if (captureRemarkInput) captureRemarkInput.value = "";
@@ -1333,12 +1331,7 @@ export function createAccountsHub({
       );
       if (res?.ok) {
         closeModal("settings");
-        const targetLabel =
-          autoSwitchTarget === "gpt_claude"
-            ? "Claude"
-            : autoSwitchTarget === "argon"
-              ? "Argon"
-              : "Gemini";
+        const targetLabel = autoSwitchTarget === "gpt_claude" ? "Claude" : "Gemini";
         const refreshDesc =
           quotaRefreshIntervalMin > 0 ? `每 ${quotaRefreshIntervalMin} min 自动刷新` : "已关闭定时刷新";
         const autoDesc = draftAutoSwitchEnabled

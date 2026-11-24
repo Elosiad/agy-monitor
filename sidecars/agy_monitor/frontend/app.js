@@ -19,6 +19,7 @@ import { createRuntimeBar } from "./components/runtime_bar.js";
 import { createMasteryHub } from "./components/mastery_hub.js";
 import { createAccountsHub } from "./components/accounts_hub.js";
 import { createThemeStudio } from "./components/theme_studio.js";
+import { createChangelogModal } from "./components/changelog_modal.js";
 
 const POLL_ACTIVE_MS = 1200;
 const POLL_IDLE_MS = 2500;
@@ -138,7 +139,7 @@ export function mountMonitorApp() {
 
   const updateState = {
     phase: "idle", // idle | checking | latest | available | updating | updated | error
-    currentVersion: "1.0.0",
+    currentVersion: "1.1.1",
     remoteVersion: "",
     remoteSha: "",
     remoteMessage: "",
@@ -508,6 +509,25 @@ export function mountMonitorApp() {
     onToast: showToast,
   });
 
+  components.changelogModal = createChangelogModal({
+    apiFetch,
+    t: translator,
+    initialVersion: updateState.currentVersion,
+    onToast: showToast,
+    onVersionApplied: (res) => {
+      if (!res || !res.ok) return;
+      updateState.currentVersion = String(res.version || updateState.currentVersion);
+      if (res.status?.remoteVersion) {
+        updateState.remoteVersion = String(res.status.remoteVersion);
+      }
+      updateState.remoteSha = String(res.shortSha || updateState.remoteSha || "");
+      updateState.hasUpdate = Boolean(res.status?.hasUpdate);
+      updateState.needsReload = true;
+      updateState.phase = "updated";
+      renderUpdateButtonUi();
+    },
+  });
+
   // Sync initial filter state from tokenUsage DOM
   const initialFilter = components.tokenUsage.getFilter?.();
   if (initialFilter) {
@@ -582,7 +602,8 @@ export function mountMonitorApp() {
       const data = await fetchJson(`/api/update/status${force ? "?force=1" : ""}`);
       if (destroyed) return;
       if (data && data.ok) {
-        updateState.currentVersion = String(data.currentVersion || "1.0.0");
+        updateState.currentVersion = String(data.currentVersion || "1.1.1");
+        components.changelogModal?.setCurrentVersion?.(updateState.currentVersion);
         updateState.remoteVersion = String(data.remoteVersion || updateState.currentVersion);
         updateState.remoteSha = String(data.remoteSha || "");
         updateState.remoteMessage = String(data.remoteMessage || "");
@@ -631,6 +652,7 @@ export function mountMonitorApp() {
       if (destroyed) return;
       if (res && res.ok) {
         updateState.currentVersion = String(res.version || updateState.remoteVersion || updateState.currentVersion);
+        components.changelogModal?.setCurrentVersion?.(updateState.currentVersion);
         updateState.remoteSha = String(res.shortSha || updateState.remoteSha || "");
         updateState.hasUpdate = false;
         updateState.needsReload = true;

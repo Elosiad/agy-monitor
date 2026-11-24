@@ -646,7 +646,33 @@ test('mountMonitorApp E2E DOM behavior: Follow Latest, force=1, honest no_baseli
           ? mockPrefs
           : url.startsWith('/api/quota')
             ? mockQuota
-            : makeMockSnapshot();
+            : url.startsWith('/api/update/releases')
+              ? {
+                  ok: true,
+                  currentVersion: '1.1.1',
+                  releases: [
+                    {
+                      version: '1.2.0',
+                      tag: 'v1.2.0',
+                      date: '2026-11-25',
+                      title: 'v1.2.0 Next Release',
+                      body: '- Upcoming cool feature',
+                    },
+                  ],
+                }
+              : url.startsWith('/api/update/apply')
+                ? (() => {
+                    const parsedBody = options.body ? JSON.parse(String(options.body)) : {};
+                    const ver = parsedBody.targetVersion || '1.1.1';
+                    return {
+                      ok: true,
+                      updated: true,
+                      action: ver === '1.1.0' ? 'rollback' : 'update',
+                      version: ver,
+                      status: { currentVersion: ver, remoteVersion: '1.2.0', hasUpdate: ver !== '1.2.0' },
+                    };
+                  })()
+                : makeMockSnapshot();
         return {
           ok: true,
           status: 200,
@@ -757,22 +783,47 @@ test('mountMonitorApp E2E DOM behavior: Follow Latest, force=1, honest no_baseli
   assert.ok(tokenModelsEl.textContent.includes('历史未记录模型'));
   assert.ok(tokenModelsEl.textContent.includes('未定价参考'));
 
-  // 7. Native quota cards strip renders Gemini / GPT&Claude / Argon with rings and click-to-refresh
+  // 7. Native quota cards strip renders Gemini / GPT&Claude (dropping legacy Argon) with rings and click-to-refresh
   const quotaStripEl = document.getElementById('quotaCardsStrip');
   assert.ok(quotaStripEl);
-  assert.equal(quotaStripEl.children.length, 3);
+  assert.equal(quotaStripEl.children.length, 2);
   assert.ok(quotaStripEl.textContent.includes('Gemini'));
   assert.ok(quotaStripEl.textContent.includes('GPT&Claude'));
-  assert.ok(quotaStripEl.textContent.includes('Argon'));
+  assert.equal(quotaStripEl.textContent.includes('Argon'), false);
   assert.ok(quotaStripEl.textContent.includes('92%'));
   assert.ok(quotaStripEl.textContent.includes('61%'));
   assert.ok(quotaStripEl.textContent.includes('27%'));
   assert.ok(quotaStripEl.textContent.includes('满额可用'));
-  assert.ok(quotaStripEl.textContent.includes('无独立限额'));
-  assert.equal(quotaStripEl.querySelectorAll('svg').length, 6);
+  assert.equal(quotaStripEl.querySelectorAll('svg').length, 4);
   quotaStripEl.children[0].click();
   await new Promise((r) => setTimeout(r, 15));
   assert.ok(requests.some((r) => r.url === '/api/quota?force=1'));
+
+  // 8. Topbar changelog button opens release notes modal with per-version 更新 / 当前版本 / 回退 buttons
+  const changelogBtn = document.getElementById('changelogBtn');
+  const changelogModal = document.getElementById('changelogModal');
+  assert.ok(changelogBtn && changelogModal);
+  assert.equal(changelogModal.hidden, true);
+  changelogBtn.click();
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(changelogModal.hidden, false);
+
+  const btn120 = changelogModal.querySelector('[data-changelog-action-version="1.2.0"]');
+  const btn111 = changelogModal.querySelector('[data-changelog-action-version="1.1.1"]');
+  const btn110 = changelogModal.querySelector('[data-changelog-action-version="1.1.0"]');
+  assert.equal(btn120?.textContent, '更新');
+  assert.equal(btn111?.textContent, '当前版本');
+  assert.equal(btn111?.disabled, true);
+  assert.equal(btn110?.textContent, '回退');
+
+  // Clicking 回退 on v1.1.0 posts targetVersion='1.1.0' and immediately flips v1.1.0 -> 当前版本 & v1.1.1 -> 更新
+  btn110.click();
+  await new Promise((r) => setTimeout(r, 25));
+  const applyReq = requests.find((r) => r.url === '/api/update/apply');
+  assert.ok(applyReq);
+  assert.equal(JSON.parse(String(applyReq.body)).targetVersion, '1.1.0');
+  assert.equal(changelogModal.querySelector('[data-changelog-action-version="1.1.0"]')?.textContent, '当前版本');
+  assert.equal(changelogModal.querySelector('[data-changelog-action-version="1.1.1"]')?.textContent, '更新');
 });
 
 test('buildFrontendBundle compiles valid non-module classic script and mounts cleanly', async () => {

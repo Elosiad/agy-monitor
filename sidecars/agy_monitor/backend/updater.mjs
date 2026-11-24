@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { proxyAwareFetch } from './accounts.mjs';
 import { ensureBackdropAssets } from './backdrop_manager.mjs';
 import { atomicWriteJson } from './paths.mjs';
 import { detectWindowsHostEnv } from './wsl_bridge.mjs';
@@ -21,7 +22,17 @@ export const REPO_NAME = 'agy-monitor';
 export const REPO_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}`;
 const GITHUB_COMMIT_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/commits/main`;
 const GITHUB_RELEASE_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`;
+const GITHUB_RELEASES_LIST_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=30`;
 const GITHUB_ARCHIVE_ZIP_URL = `https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/zip/refs/heads/main`;
+
+function buildTagArchiveZipUrl(cleanSemver) {
+  return `https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/zip/refs/tags/v${cleanSemver}`;
+}
+
+export function parseStrictSemver(raw) {
+  const m = String(raw || '').trim().match(/^v?(\d+\.\d+\.\d+)$/i);
+  return m ? m[1] : '';
+}
 
 const CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
 const MIN_ARCHIVE_BYTES = 10 * 1024;
@@ -38,6 +49,7 @@ const REQUIRED_CORE_FILES = [
 ];
 
 const checkCache = new Map();
+const releasesCache = new Map();
 let updateInFlight = null;
 
 function execFileAsync(file, args, options = {}) {
@@ -195,7 +207,7 @@ async function fetchJsonWithTimeout(fetchImpl, url, timeoutMs = 7000) {
  */
 export async function checkForUpdates(
   paths,
-  { force = false, fetchImpl = globalThis.fetch, nowMs = Date.now() } = {},
+  { force = false, fetchImpl = proxyAwareFetch, nowMs = Date.now() } = {},
 ) {
   const cacheKey = paths?.pluginRoot || 'default';
   const cached = checkCache.get(cacheKey);
@@ -342,19 +354,104 @@ function resolveExtractedPluginRoot(extractDir) {
 }
 
 /**
- * Download official main archive from GitHub, validate integrity, mirror into installed pluginRoot
- * while preserving user configs & rules/AGENTS.md, and recompile Windows backdrop companion.
+ * List official GitHub releases for the Changelog modal so newer versions can be
+ * discovered and upgraded directly from the announcement dialog.
+ */
+export async function listOfficialReleases(
+  paths,
+  { force = false, fetchImpl = proxyAwareFetch, nowMs = Date.now() } = {},
+) {
+  const local = readLocalInstallState(paths);
+  const cacheKey = paths?.pluginRoot || 'default';
+  const cached = releasesCache.get(cacheKey);
+  if (!force && cached && nowMs - cached.fetchedAtMs < CHECK_CACHE_TTL_MS) {
+    return {
+      ...cached,
+      currentVersion: local.currentVersion,
+      cached: true,
+    };
+  }
+
+  if (typeof fetchImpl !== 'function') {
+    return {
+      ok: false,
+      currentVersion: local.currentVersion,
+      releases: [],
+      fetchedAtMs: nowMs,
+    };
+  }
+
+  try {
+    const res = await fetchJsonWithTimeout(fetchImpl, GITHUB_RELEASES_LIST_API, 7000);
+    if (!res.ok || !Array.isArray(res.data)) {
+      return {
+        ok: false,
+        currentVersion: local.currentVersion,
+        releases: cached?.releases || [],
+        fetchedAtMs: nowMs,
+      };
+    }
+
+    const releases = [];
+    const seen = new Set();
+    for (const rel of res.data) {
+      if (!rel || rel.draft) continue;
+      const version = parseStrictSemver(rel.tag_name);
+      if (!version || seen.has(version)) continue;
+      seen.add(version);
+      const publishedAt = typeof rel.published_at === 'string' ? rel.published_at : '';
+      const date = publishedAt ? publishedAt.slice(0, 10) : '';
+      releases.push({
+        version,
+        tag: `v${version}`,
+        date,
+        title: typeof rel.name === 'string' ? rel.name.trim() : `v${version}`,
+        body: typeof rel.body === 'string' ? rel.body : '',
+        publishedAt,
+      });
+    }
+    releases.sort((a, b) => compareSemver(b.version, a.version));
+
+    const payload = {
+      ok: true,
+      currentVersion: local.currentVersion,
+      releases,
+      fetchedAtMs: nowMs,
+    };
+    releasesCache.set(cacheKey, payload);
+    return payload;
+  } catch {
+    return {
+      ok: false,
+      currentVersion: local.currentVersion,
+      releases: cached?.releases || [],
+      fetchedAtMs: nowMs,
+    };
+  }
+}
+
+/**
+ * Download official main archive OR a specific semver release tag (`targetVersion`) from GitHub,
+ * validate integrity, mirror into installed pluginRoot while preserving user configs & rules/AGENTS.md,
+ * and recompile Windows backdrop companion.
  */
 export async function applyPluginUpdate(
   paths,
   {
-    fetchImpl = globalThis.fetch,
+    targetVersion = '',
+    fetchImpl = proxyAwareFetch,
     execFileImpl = execFileAsync,
     ensureBackdropFn = ensureBackdropAssets,
     platform = process.platform,
     nowMs = Date.now(),
   } = {},
 ) {
+  const rawTarget = String(targetVersion || '').trim();
+  const cleanTarget = rawTarget ? parseStrictSemver(rawTarget) : '';
+  if (rawTarget && !cleanTarget) {
+    return { ok: false, status: 400, error: '无效的目标版本号格式（仅支持 X.Y.Z 语义化版本）' };
+  }
+
   if (updateInFlight) {
     return updateInFlight;
   }
@@ -368,22 +465,59 @@ export async function applyPluginUpdate(
       return { ok: false, status: 500, error: '当前运行环境不支持下载更新' };
     }
 
+    const beforeLocal = readLocalInstallState(paths);
+    const beforeVersion = beforeLocal.currentVersion;
+    const isTargetMode = Boolean(cleanTarget);
+    const action =
+      isTargetMode && compareSemver(cleanTarget, beforeVersion) < 0 ? 'rollback' : 'update';
+    const archiveUrl = isTargetMode ? buildTagArchiveZipUrl(cleanTarget) : GITHUB_ARCHIVE_ZIP_URL;
+
     const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'agy-monitor-update-'));
     try {
-      const latestCheck = await checkForUpdates(paths, { force: true, fetchImpl, nowMs });
+      const latestCheck = await checkForUpdates(paths, { force: true, fetchImpl, nowMs }).catch(() => ({
+        ok: false,
+      }));
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 45000);
       let zipBuf;
       try {
-        const dlRes = await fetchImpl(GITHUB_ARCHIVE_ZIP_URL, {
-          method: 'GET',
-          headers: { 'User-Agent': 'agy-monitor-updater' },
-          redirect: 'follow',
-          signal: controller.signal,
-        });
-        if (!dlRes.ok) {
-          return { ok: false, status: 502, error: `下载更新包失败 (HTTP ${dlRes.status})` };
+        let curUrl = archiveUrl;
+        let dlRes = null;
+        for (let hop = 0; hop < 4; hop += 1) {
+          dlRes = await fetchImpl(curUrl, {
+            method: 'GET',
+            headers: { 'User-Agent': 'agy-monitor-updater' },
+            redirect: 'follow',
+            signal: controller.signal,
+          });
+          if ([301, 302, 303, 307, 308].includes(dlRes.status)) {
+            const loc =
+              typeof dlRes.headers?.get === 'function'
+                ? dlRes.headers.get('location')
+                : dlRes.headers?.location || dlRes.headers?.Location;
+            if (!loc) break;
+            const nextUrl = new URL(String(loc), curUrl);
+            const allowedHost =
+              nextUrl.protocol === 'https:' &&
+              (nextUrl.hostname === 'codeload.github.com' ||
+                nextUrl.hostname === 'github.com' ||
+                nextUrl.hostname.endsWith('.githubusercontent.com'));
+            if (!allowedHost) {
+              return { ok: false, status: 502, error: '更新包重定向至非官方域名，已中止操作' };
+            }
+            curUrl = nextUrl.toString();
+            continue;
+          }
+          break;
+        }
+        if (!dlRes || !dlRes.ok) {
+          const code = dlRes?.status || 502;
+          const msg =
+            isTargetMode && code === 404
+              ? `GitHub 上未找到版本 v${cleanTarget} 的发布归档`
+              : `下载${action === 'rollback' ? '回退' : '更新'}包失败 (HTTP ${code})`;
+          return { ok: false, status: code === 404 ? 404 : 502, error: msg };
         }
         const ab = await dlRes.arrayBuffer();
         zipBuf = Buffer.from(ab);
@@ -476,9 +610,10 @@ export async function applyPluginUpdate(
 
       const updatedManifest = readJsonSyncSafe(path.join(pluginRoot, 'plugin.json'));
       const nextVersion =
-        typeof updatedManifest?.version === 'string' && updatedManifest.version.trim()
+        cleanTarget ||
+        (typeof updatedManifest?.version === 'string' && updatedManifest.version.trim()
           ? updatedManifest.version.trim().replace(/^v/i, '')
-          : latestCheck.remoteVersion || '1.0.0';
+          : latestCheck.remoteVersion || '1.0.0');
 
       let backdropCompiled = false;
       const shouldCompileBackdrop =
@@ -498,12 +633,21 @@ export async function applyPluginUpdate(
         typeof prevMeta?.shortSha === 'string' && prevMeta.shortSha.trim()
           ? prevMeta.shortSha.trim().toLowerCase()
           : prevFullSha.slice(0, 7);
-      const nextFullSha = latestCheck.ok && latestCheck.remoteFullSha ? latestCheck.remoteFullSha : prevFullSha;
-      const nextShortSha = latestCheck.ok && latestCheck.remoteSha ? latestCheck.remoteSha : prevShortSha;
+      const nextFullSha = isTargetMode
+        ? ''
+        : latestCheck.ok && latestCheck.remoteFullSha
+          ? latestCheck.remoteFullSha
+          : prevFullSha;
+      const nextShortSha = isTargetMode
+        ? ''
+        : latestCheck.ok && latestCheck.remoteSha
+          ? latestCheck.remoteSha
+          : prevShortSha;
 
       if (metaPath) {
         await atomicWriteJson(metaPath, {
           version: nextVersion,
+          ...(isTargetMode ? { tag: `v${cleanTarget}` } : {}),
           commitSha: nextFullSha,
           shortSha: nextShortSha,
           updatedAtMs: nowMs,
@@ -511,17 +655,20 @@ export async function applyPluginUpdate(
       }
 
       checkCache.delete(pluginRoot);
+      const remoteLatestVersion =
+        latestCheck.ok && latestCheck.remoteVersion ? latestCheck.remoteVersion : nextVersion;
+      const hasNewerAfter = compareSemver(remoteLatestVersion, nextVersion) > 0;
       const nextStatus = {
         ok: true,
         repoUrl: REPO_URL,
         currentVersion: nextVersion,
         localSha: nextShortSha,
-        remoteVersion: nextVersion,
-        remoteSha: nextShortSha,
-        remoteFullSha: nextFullSha,
+        remoteVersion: remoteLatestVersion,
+        remoteSha: latestCheck.remoteSha || nextShortSha,
+        remoteFullSha: latestCheck.remoteFullSha || nextFullSha,
         remoteDate: latestCheck.remoteDate || '',
         remoteMessage: latestCheck.remoteMessage || '',
-        hasUpdate: false,
+        hasUpdate: hasNewerAfter,
         checkedAtMs: nowMs,
       };
       checkCache.set(pluginRoot, nextStatus);
@@ -529,6 +676,9 @@ export async function applyPluginUpdate(
       return {
         ok: true,
         updated: true,
+        action,
+        previousVersion: beforeVersion,
+        targetVersion: nextVersion,
         needsReload: true,
         version: nextVersion,
         shortSha: nextShortSha,
@@ -592,4 +742,5 @@ export function openRepoInBrowser({ platform = process.platform, spawnImpl = spa
 
 export function resetUpdateCheckCache() {
   checkCache.clear();
+  releasesCache.clear();
 }
