@@ -75,6 +75,19 @@ export async function buildFrontendBundle(frontendDir) {
   });
 
   const appBody = stripAppImportsAndExports(appSrc);
+
+  // Optional pluggable extensions (gracefully skipped when extensions/ is absent or disabled)
+  let extChunk = '';
+  try {
+    const extLoader = await import('../extensions/loader.mjs');
+    extChunk = (await extLoader.buildFrontendExtensionsChunk?.()) || '';
+  } catch {
+    extChunk = '';
+  }
+  if (extChunk) {
+    chunks.push(extChunk);
+  }
+
   chunks.push(
     `  const {\n` +
       `    applyDomI18n,\n` +

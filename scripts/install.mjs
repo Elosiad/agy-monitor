@@ -122,6 +122,21 @@ export async function installPlugin({
     log('[4/4] 当前平台无需编译 Windows 壁纸伴侣，控制台面板已就绪');
   }
 
+  // Optional pluggable extension install hooks (never blocks core install)
+  if (!skipBackdropCompile) {
+    try {
+      const extLoader = await import('../sidecars/agy_monitor/extensions/loader.mjs');
+      const exts = await extLoader.loadInstalledExtensions();
+      for (const ext of exts) {
+        if (typeof ext?.onInstall === 'function') {
+          await ext.onInstall(paths).catch(() => {});
+        }
+      }
+    } catch {
+      // Extensions optional
+    }
+  }
+
   // Record installed version in install_meta.json so the update badge matches local ZIP installs accurately
   try {
     const manifest = JSON.parse(fs.readFileSync(path.join(syncRes.targetDir, 'plugin.json'), 'utf8'));

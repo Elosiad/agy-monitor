@@ -537,6 +537,11 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
         speedSource: isEmptySelectedConv
           ? null
           : activeRow.speed_source ?? (hasSelectedConv ? null : latestSpeedRow?.speed_source ?? null),
+        latestInputTokens: isEmptySelectedConv ? 0 : rowTotalIn,
+        latestUncachedInputTokens: isEmptySelectedConv ? 0 : rowIn,
+        latestCacheReadTokens: isEmptySelectedConv ? 0 : rowCache,
+        latestOutputTokens: isEmptySelectedConv ? 0 : Math.max(0, Number(activeRow.latest_output_tokens || 0)),
+        latestStepAtMs: isEmptySelectedConv ? 0 : Math.max(0, Number(activeRow.last_step_at_ms || 0)),
         upstreamModelId,
         upstreamModelStatus,
         upstreamModelSource,

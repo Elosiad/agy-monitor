@@ -87,25 +87,35 @@ function findSessionTitle(sessionsHub, convId) {
 }
 
 function initSubnavTabs(cleanups, onTabChange) {
-  const tabs = document.querySelectorAll(".monitor-subnav .subnav-tab");
-  const panels = document.querySelectorAll(".monitor-tab-panel[data-subnav-panel]");
+  const entries = [];
+  const activateTab = (targetKey) => {
+    entries.forEach(({ key, btn, panel }) => {
+      const isCurrent = key === targetKey;
+      btn.classList.toggle("is-active", isCurrent);
+      btn.setAttribute("aria-selected", String(isCurrent));
+      if (panel) panel.hidden = !isCurrent;
+    });
+    onTabChange?.(targetKey);
+    const matched = entries.find((e) => e.key === targetKey);
+    matched?.onActivate?.();
+  };
 
-  tabs.forEach((btn) => {
-    const onTabClick = () => {
-      const targetKey = btn.getAttribute("data-subnav");
-      tabs.forEach((tab) => {
-        const isCurrent = tab === btn;
-        tab.classList.toggle("is-active", isCurrent);
-        tab.setAttribute("aria-selected", String(isCurrent));
-      });
-      panels.forEach((panel) => {
-        panel.hidden = panel.getAttribute("data-subnav-panel") !== targetKey;
-      });
-      onTabChange?.(targetKey);
-    };
+  const registerSubnavTab = (key, btn, panel, onActivate) => {
+    if (!key || !btn) return;
+    entries.push({ key, btn, panel, onActivate });
+    const onTabClick = () => activateTab(key);
     btn.addEventListener("click", onTabClick);
     cleanups.push(() => btn.removeEventListener("click", onTabClick));
+  };
+
+  const tabs = document.querySelectorAll(".monitor-subnav .subnav-tab");
+  tabs.forEach((btn) => {
+    const key = btn.getAttribute("data-subnav");
+    const panel = document.querySelector(`.monitor-tab-panel[data-subnav-panel="${key}"]`);
+    registerSubnavTab(key, btn, panel, null);
   });
+
+  return { registerSubnavTab, activateTab };
 }
 
 let activeController = null;
@@ -215,8 +225,9 @@ export function mountMonitorApp() {
   }
 
   const components = {};
+  const mountedExtensions = [];
 
-  initSubnavTabs(cleanups, (tabKey) => {
+  const subnav = initSubnavTabs(cleanups, (tabKey) => {
     components.masteryHub?.setTabActive?.(tabKey === "mastery");
     components.accountsHub?.setTabActive?.(tabKey === "accounts");
     if (tabKey === "theme") {
@@ -237,6 +248,7 @@ export function mountMonitorApp() {
         comp.setTranslator(translator);
       }
     });
+    mountedExtensions.forEach((ext) => ext?.onLanguageChange?.(normalized));
     updateFollowModeUi();
     updateActiveConvBadge();
     renderUpdateButtonUi?.();
@@ -252,6 +264,7 @@ export function mountMonitorApp() {
       // AGY Console UI stays fixed in zh-CN; language setting exclusively controls Antigravity host UI via CDP.
       components.themeStudio?.update(prefs);
       components.modelAndPrompt?.update(prefs);
+      mountedExtensions.forEach((ext) => ext?.onPreferences?.(prefs));
       const dispId = state.displayConvId || state.snapshot?.activeConvId || state.lockedConvId || "";
       components.runtimeBar?.update(state.snapshot?.runtimeTelemetry, {
         activeConvId: dispId,
@@ -351,6 +364,7 @@ export function mountMonitorApp() {
           activeConvTitle: findSessionTitle(data.sessionsHub, nextConvId),
           followLatest: state.followLatest,
         });
+        mountedExtensions.forEach((ext) => ext?.onSnapshot?.(data));
         state.snapshot = data;
         state.etag = String(data.etag || "");
         // Keep Follow Latest unpinned across polls unless user explicitly locked a conversation
@@ -930,6 +944,25 @@ export function mountMonitorApp() {
     cleanups.push(() => auxPaneShell.removeEventListener("pointerenter", onPaneEnter));
   }
 
+  // Mount optional pluggable frontend extensions (zero effect when none registered)
+  if (typeof window !== "undefined" && Array.isArray(window.__agyExtensions)) {
+    window.__agyExtensions.forEach((extDef) => {
+      if (!extDef || typeof extDef.mount !== "function") return;
+      try {
+        const inst = extDef.mount({
+          apiFetch,
+          showToast,
+          getLanguage: () => state.language,
+          registerSubnavTab: subnav.registerSubnavTab,
+          activateTab: subnav.activateTab,
+        });
+        if (inst) mountedExtensions.push(inst);
+      } catch {
+        // Isolate extension errors from core dashboard
+      }
+    });
+  }
+
   // Initial load & start polling
   if (typeof window !== "undefined") {
     window.__agyMonitorMounted = true;
@@ -968,6 +1001,8 @@ export function mountMonitorApp() {
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
       Object.values(components).forEach((comp) => comp?.destroy?.());
+      mountedExtensions.forEach((ext) => ext?.destroy?.());
+      mountedExtensions.length = 0;
       activeController = null;
     },
   };
