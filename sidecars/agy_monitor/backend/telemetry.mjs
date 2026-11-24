@@ -37,8 +37,30 @@ export function estimateTokensFromText(text) {
   return estimateTokens(text);
 }
 
+function extractModelVersion(modelStr) {
+  const cleaned = String(modelStr || '')
+    .toLowerCase()
+    .replace(/(?:^|[-_\s/])20\d{6}(?=$|[-_\s/])/g, ' ')
+    .replace(/(?:^|[-_\s/])\d+(?:k|m|b)(?=$|[-_\s/])/g, ' ');
+  const m = cleaned.match(/(?:^|[-_\s/])(\d+)(?:[.-](\d{1,2}))?(?=$|[-_\s/])/);
+  if (!m) return null;
+  const major = Number(m[1]);
+  const hasMinor = m[2] !== undefined;
+  const minor = hasMinor ? Number(m[2]) : 0;
+  if (!Number.isFinite(major)) return null;
+  return { major, minor, hasMinor };
+}
+
+function hasExplicitAbMarker(modelStr) {
+  return /(?:^|[-_\s/])(exp|experiment|control|trial|canary|shadow|ab)(?=$|[-_\s/])/i.test(
+    String(modelStr || '')
+  );
+}
+
 function modelFamilyAndRank(modelStr, tierStr = '') {
-  const s = `${modelStr || ''} ${tierStr || ''}`.toLowerCase();
+  const s = `${modelStr || ''} ${tierStr || ''}`
+    .toLowerCase()
+    .replace(/[()[\]]/g, ' ');
   let family = 'other';
   if (s.includes('hydrogen')) family = 'hydrogen';
   else if (s.includes('neon')) family = 'neon';
@@ -46,20 +68,24 @@ function modelFamilyAndRank(modelStr, tierStr = '') {
   else if (s.includes('flash')) family = 'flash';
   else if (s.includes('opus')) family = 'opus';
   else if (s.includes('sonnet')) family = 'sonnet';
+  else if (s.includes('haiku')) family = 'haiku';
   else if (s.includes('carbon')) family = 'carbon';
+  else if (/\bultra\b/.test(s)) family = 'ultra';
+  else if (/\bpro\b/.test(s)) family = 'pro';
+  else if (/\bgpt\b/.test(s)) family = 'gpt';
 
   let rank = 2;
   let hasTier = false;
-  if (s.includes('xhigh') || s.includes('extra') || s.includes('max')) {
+  if (/(?:^|[-_\s/])(xhigh|extra|max)(?=$|[-_\s/])/.test(s) || s.includes('xhigh')) {
     rank = 4;
     hasTier = true;
-  } else if (s.includes('high')) {
+  } else if (/(?:^|[-_\s/])high(?=$|[-_\s/])/.test(s)) {
     rank = 3;
     hasTier = true;
-  } else if (s.includes('medium') || s.includes('med')) {
+  } else if (/(?:^|[-_\s/])(medium|med)(?=$|[-_\s/])/.test(s)) {
     rank = 2;
     hasTier = true;
-  } else if (s.includes('low') || s.includes('lite')) {
+  } else if (/(?:^|[-_\s/])(low|lite)(?=$|[-_\s/])/.test(s)) {
     rank = 1;
     hasTier = true;
   }
@@ -87,16 +113,57 @@ export function classifyUpstreamModelStatus(expectedDefaultModel, upstreamModelI
   const exp = modelFamilyAndRank(expectedId, expTierOnly);
   const act = modelFamilyAndRank(upstreamModelId, '');
 
-  const familyOrder = { flash: 1, argon: 2, sonnet: 3, hydrogen: 4, neon: 4, opus: 5, other: 2, carbon: 2 };
+  const familyOrder = {
+    haiku: 1,
+    flash: 1,
+    argon: 2,
+    carbon: 2,
+    other: 2,
+    sonnet: 3,
+    pro: 3,
+    gpt: 3,
+    hydrogen: 4,
+    neon: 4,
+    ultra: 5,
+    opus: 5,
+  };
   if (exp.family !== act.family) {
     if ((familyOrder[act.family] ?? 2) < (familyOrder[exp.family] ?? 2)) {
       return 'downgrade_suspected';
     }
     return 'ab_or_alias';
   }
-  if (!exp.hasTier) return 'match';
-  if (act.rank < exp.rank) return 'downgrade_suspected';
-  if (act.rank > exp.rank) return 'ab_or_alias';
+
+  // Same family: check version downgrade/upgrade first (e.g. 2.5-flash < 3.8-flash)
+  const expVer = extractModelVersion(normExp);
+  const actVer = extractModelVersion(normAct);
+  if (expVer && actVer) {
+    if (
+      actVer.major < expVer.major ||
+      (actVer.major === expVer.major && expVer.hasMinor && actVer.hasMinor && actVer.minor < expVer.minor)
+    ) {
+      return 'downgrade_suspected';
+    }
+    if (
+      actVer.major > expVer.major ||
+      (actVer.major === expVer.major && expVer.hasMinor && actVer.hasMinor && actVer.minor > expVer.minor)
+    ) {
+      return 'ab_or_alias';
+    }
+  }
+
+  // Upstream responseModel (e.g. gemini-3.8-flash-n, gemini-4-neon, gemini-4-hydrogen) normally omits
+  // request effort tiers (low/medium/high/xhigh). Only compare tier ranks when BOTH sides explicitly carry a tier.
+  if (exp.hasTier && act.hasTier) {
+    if (act.rank < exp.rank) return 'downgrade_suspected';
+    if (act.rank > exp.rank) return 'ab_or_alias';
+  }
+
+  // Explicit A/B experiment / control / trial suffixes on upstream responseModel (e.g. -exp-a, -control, -trial)
+  if (hasExplicitAbMarker(normAct) && !hasExplicitAbMarker(normExp)) {
+    return 'ab_or_alias';
+  }
+
   return 'match';
 }
 
@@ -205,6 +272,20 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
           }
         }
 
+        const latestCols = new Set(
+          db
+            .prepare(`PRAGMA table_info(conv_latest_metrics)`)
+            .all()
+            .map((c) => String(c.name || '').toLowerCase())
+        );
+        const hasUpstreamModelCols = latestCols.has('latest_upstream_model');
+        const latestModelSelect = hasUpstreamModelCols
+          ? `latest_model, latest_upstream_model, latest_requested_model, latest_requested_label`
+          : `latest_model, NULL AS latest_upstream_model, NULL AS latest_requested_model, NULL AS latest_requested_label`;
+        const latestModelWhere = hasUpstreamModelCols
+          ? `((latest_upstream_model IS NOT NULL AND TRIM(latest_upstream_model) != '') OR (latest_model IS NOT NULL AND TRIM(latest_model) != ''))`
+          : `(latest_model IS NOT NULL AND TRIM(latest_model) != '')`;
+
         if (topLevelConvIds !== null && topLevelConvIds.length > 0) {
           const placeholders = topLevelConvIds.map(() => '?').join(', ');
           latestSpeedRow = db
@@ -219,9 +300,9 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
 
           latestModelRow = db
             .prepare(
-              `SELECT latest_model
+              `SELECT ${latestModelSelect}
                FROM conv_latest_metrics
-               WHERE latest_model IS NOT NULL AND TRIM(latest_model) != '' AND conv_id IN (${placeholders})
+               WHERE ${latestModelWhere} AND conv_id IN (${placeholders})
                ORDER BY latest_model_at_ms DESC
                LIMIT 1`
             )
@@ -239,9 +320,9 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
 
           latestModelRow = db
             .prepare(
-              `SELECT latest_model
+              `SELECT ${latestModelSelect}
                FROM conv_latest_metrics
-               WHERE latest_model IS NOT NULL AND TRIM(latest_model) != ''
+               WHERE ${latestModelWhere}
                ORDER BY latest_model_at_ms DESC
                LIMIT 1`
             )
@@ -377,16 +458,54 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
           ? 0
           : globalTodayHit;
 
-    // Never borrow another conversation's model or speed when a specific conversation is active
+    // Never borrow another conversation's model or speed when a specific conversation is active.
+    // Prefer authoritative upstream `responseModel` (`gen_metadata.#1.#19`) over transcript's requested slug.
+    const modelSourceRow = isEmptySelectedConv
+      ? null
+      : activeRow.latest_upstream_model || activeRow.latest_model
+        ? activeRow
+        : hasSelectedConv
+          ? null
+          : latestModelRow || null;
+    const rawUpstreamFromGen =
+      typeof modelSourceRow?.latest_upstream_model === 'string' && modelSourceRow.latest_upstream_model.trim()
+        ? modelSourceRow.latest_upstream_model.trim()
+        : null;
+    const rawTranscriptModel =
+      typeof modelSourceRow?.latest_model === 'string' && modelSourceRow.latest_model.trim()
+        ? modelSourceRow.latest_model.trim()
+        : null;
+    const requestedModelId = rawUpstreamFromGen
+      ? (typeof modelSourceRow?.latest_requested_model === 'string' && modelSourceRow.latest_requested_model.trim()
+          ? modelSourceRow.latest_requested_model.trim()
+          : rawTranscriptModel)
+      : null;
+    const requestedModelLabel =
+      typeof modelSourceRow?.latest_requested_label === 'string' && modelSourceRow.latest_requested_label.trim()
+        ? modelSourceRow.latest_requested_label.trim()
+        : null;
+
     const upstreamModelId = isEmptySelectedConv
       ? null
-      : activeRow.latest_model || (hasSelectedConv ? null : latestModelRow?.latest_model || null);
+      : rawUpstreamFromGen || rawTranscriptModel || null;
+    const upstreamModelSource = !upstreamModelId
+      ? null
+      : rawUpstreamFromGen
+        ? 'conv_db_gen_metadata'
+        : 'transcript_log';
+
+    // When we have the exact step's requested model alongside upstream responseModel from conv DB,
+    // compare against THAT step's actual requested model (never a stale plugin defaultModel preference).
+    const comparisonBaseline =
+      rawUpstreamFromGen && (requestedModelId || requestedModelLabel)
+        ? { id: requestedModelId || requestedModelLabel, label: requestedModelLabel || undefined }
+        : prefs.defaultModel;
     const upstreamModelStatus = classifyUpstreamModelStatus(
-      prefs.defaultModel,
+      comparisonBaseline,
       upstreamModelId
     );
 
-    const etagSeed = `${scanEtag}|${targetConvId}|${isExplicitConvId ? 1 : 0}|${scope}|${range}|${windowCap}|${rulesAddonTokens}|${prefs.activePromptId || ''}|${prefs.defaultModel?.id || ''}`;
+    const etagSeed = `${scanEtag}|${targetConvId}|${isExplicitConvId ? 1 : 0}|${scope}|${range}|${windowCap}|${rulesAddonTokens}|${prefs.activePromptId || ''}|${prefs.defaultModel?.id || ''}|${upstreamModelId || ''}|${upstreamModelStatus}`;
     const etag = crypto.createHash('sha1').update(etagSeed).digest('hex').slice(0, 12);
 
     return {
@@ -420,6 +539,9 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
           : activeRow.speed_source ?? (hasSelectedConv ? null : latestSpeedRow?.speed_source ?? null),
         upstreamModelId,
         upstreamModelStatus,
+        upstreamModelSource,
+        requestedModelId,
+        requestedModelLabel,
         cacheHitPct,
       },
       availableModelsFromLogs,
@@ -449,11 +571,20 @@ export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap =
   const byId = new Map();
   if (db) {
     try {
+      const latestCols = new Set(
+        db
+          .prepare(`PRAGMA table_info(conv_latest_metrics)`)
+          .all()
+          .map((c) => String(c.name || '').toLowerCase())
+      );
+      const upstreamSelect = latestCols.has('latest_upstream_model')
+        ? 'latest_upstream_model'
+        : 'NULL AS latest_upstream_model';
       const ids = top.map((s) => String(s.id));
       const placeholders = ids.map(() => '?').join(', ');
       const rows = db
         .prepare(
-          `SELECT conv_id, latest_model, latest_context_tokens, latest_speed_tok_s,
+          `SELECT conv_id, latest_model, ${upstreamSelect}, latest_context_tokens, latest_speed_tok_s,
                   latest_uncached_input, latest_cache_read
            FROM conv_latest_metrics
            WHERE conv_id IN (${placeholders})`,
@@ -492,7 +623,9 @@ export function queryBatchConvHudMetrics(cacheDbPath, sessions = [], windowCap =
       windowCap: cap,
       tokPerSec,
       cacheHitPct,
-      upstreamModelId: typeof row?.latest_model === 'string' ? row.latest_model.trim() : '',
+      upstreamModelId:
+        (typeof row?.latest_upstream_model === 'string' && row.latest_upstream_model.trim()) ||
+        (typeof row?.latest_model === 'string' ? row.latest_model.trim() : ''),
     };
   });
 }
@@ -591,10 +724,16 @@ export function queryRequestLogs(cacheDbPath, opts = {}) {
     const hasStatus = cols.has('status');
     const hasErrorText = cols.has('error_text');
     const hasTtft = cols.has('ttft_ms');
+    const hasUpstreamModel = cols.has('upstream_model');
+    const hasRequestedLabel = cols.has('requested_model_label');
 
     const statusSelect = hasStatus ? 'status' : 'NULL AS status';
     const errorSelect = hasErrorText ? 'error_text' : 'NULL AS error_text';
     const ttftSelect = hasTtft ? 'ttft_ms' : 'NULL AS ttft_ms';
+    const upstreamSelect = hasUpstreamModel ? 'upstream_model' : 'NULL AS upstream_model';
+    const requestedLabelSelect = hasRequestedLabel
+      ? 'requested_model_label'
+      : 'NULL AS requested_model_label';
     const isErrorExpr = hasStatus
       ? `(step_type = 'ERROR_MESSAGE' OR UPPER(COALESCE(status, '')) = 'ERROR')`
       : `(step_type = 'ERROR_MESSAGE')`;
@@ -709,6 +848,7 @@ export function queryRequestLogs(cacheDbPath, opts = {}) {
     const pageRows = db
       .prepare(
         `SELECT conv_id, step_index, step_type, created_at_ms, model,
+                ${upstreamSelect}, ${requestedLabelSelect},
                 input_tokens, cache_read_tokens, output_tokens, tool_calls_count,
                 duration_ms, ${statusSelect}, ${errorSelect}, ${ttftSelect}
          FROM step_ledger
@@ -720,6 +860,12 @@ export function queryRequestLogs(cacheDbPath, opts = {}) {
 
     const items = pageRows.map((r) => {
       const rawModel = typeof r.model === 'string' && r.model.trim() ? r.model.trim() : '';
+      const rawUpstream =
+        typeof r.upstream_model === 'string' && r.upstream_model.trim() ? r.upstream_model.trim() : '';
+      const rawReqLabel =
+        typeof r.requested_model_label === 'string' && r.requested_model_label.trim()
+          ? r.requested_model_label.trim()
+          : '';
       const isPlanner = r.step_type === 'PLANNER_RESPONSE';
       const modelDisplayKey = rawModel || (isPlanner ? '__unrecorded__' : '');
       const uIn = Math.max(0, Number(r.input_tokens || 0));
@@ -760,6 +906,8 @@ export function queryRequestLogs(cacheDbPath, opts = {}) {
         stepIndex: Number(r.step_index || 0),
         createdAtMs: Number(r.created_at_ms || 0),
         model: modelDisplayKey,
+        upstreamModel: rawUpstream || null,
+        requestedModelLabel: rawReqLabel || null,
         uncachedInput: uIn,
         cacheRead: cRead,
         totalInput: totalIn,

@@ -8,6 +8,7 @@ export const DICT = Object.freeze({
     'nav.general': '通用',
     'nav.mastery': '掌握',
     'nav.theme': '美化',
+    'nav.accounts': '账号',
     'nav.refreshTitle': '立即刷新（触发增量重扫）',
     'nav.repoTitle': '打开项目 GitHub 主页 (aishadiaodeqishui/agy-monitor)',
     'nav.updateCheck': '检查更新',
@@ -218,6 +219,8 @@ export const DICT = Object.freeze({
     'runtime.cacheHitSub': '缓存命中 {pct}%',
     'runtime.noBaselineHint': '未设发起偏好 · 仅读当前日志',
     'runtime.downgradeHint': '与默认选定模型不一致',
+    'runtime.downgradeRequestedHint': '与本次请求模型不一致',
+    'runtime.requestedModelTag': '请求 {model}',
     'runtime.aliasHint': '检测到上游别名或灰测',
 
     // Mastery Tab (Placeholder)
@@ -337,6 +340,7 @@ export const DICT = Object.freeze({
     'nav.general': 'General',
     'nav.mastery': 'Mastery',
     'nav.theme': 'Studio',
+    'nav.accounts': 'Accounts',
     'nav.refreshTitle': 'Refresh Now (Triggers Incremental Rescan)',
     'nav.repoTitle': 'Open GitHub Repository (aishadiaodeqishui/agy-monitor)',
     'nav.updateCheck': 'Check Update',
@@ -546,6 +550,8 @@ export const DICT = Object.freeze({
     'runtime.cacheHitSub': 'Cache hit {pct}%',
     'runtime.noBaselineHint': 'No launch baseline · logs only',
     'runtime.downgradeHint': 'Differs from selected default',
+    'runtime.downgradeRequestedHint': 'Differs from requested model',
+    'runtime.requestedModelTag': 'Requested {model}',
     'runtime.aliasHint': 'Upstream alias / A/B detected',
 
     // Mastery Tab (Placeholder)

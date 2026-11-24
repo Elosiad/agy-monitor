@@ -13,7 +13,7 @@
 
     <div class="right-pane-canvas" id="rightPaneCanvas">
       <main class="monitor-dashboard" id="monitorDashboard" aria-label="Antigravity 上下文监控面板">
-        <!-- 顶部三级功能导航：通用 / 掌握 / 美化 -->
+        <!-- 顶部四级功能导航：通用 / 掌握 / 美化 / 账号 -->
         <nav class="monitor-subnav" aria-label="插件功能导航" data-i18n-aria="nav.ariaLabel">
           <div class="subnav-tabs-group" role="tablist">
             <button class="subnav-tab is-active" type="button" role="tab" data-subnav="general" aria-selected="true">
@@ -24,6 +24,9 @@
             </button>
             <button class="subnav-tab" type="button" role="tab" data-subnav="theme" aria-selected="false">
               <span data-i18n="nav.theme">美化</span>
+            </button>
+            <button class="subnav-tab" type="button" role="tab" data-subnav="accounts" aria-selected="false">
+              <span data-i18n="nav.accounts">账号</span>
             </button>
           </div>
 
@@ -548,6 +551,67 @@
             </div>
 
             <div class="mad-timeline" id="madTimeline" role="log" aria-label="Agent 执行内容历程"></div>
+
+            <!-- 主 Agent 底部毛玻璃输入框（仅主 Agent 详情页显示：提示词 + 粘图 + /swarm 命令补全 + 官方接口直发） -->
+            <div class="mad-composer-dock" id="madComposerDock" aria-label="向主 Agent 发送指令" hidden>
+              <div class="mad-slash-menu" id="madSlashMenu" role="listbox" aria-label="斜杠命令候选列表" hidden></div>
+              <div class="mad-composer-glass" id="madComposerGlass">
+                <div class="mad-attach-strip" id="madAttachStrip" aria-label="已粘贴图片附件" hidden></div>
+                <textarea
+                  class="mad-composer-input"
+                  id="madComposerInput"
+                  rows="2"
+                  maxlength="32000"
+                  placeholder="输入提示词发送给主 Agent，输入 / 唤起 /swarm 等命令，支持 Ctrl+V 粘贴图片…"
+                  aria-label="主 Agent 提示词输入框"
+                ></textarea>
+                <div class="mad-composer-toolbar">
+                  <div class="mad-composer-tools-left">
+                    <input
+                      type="file"
+                      id="madComposerFileInput"
+                      accept="image/png,image/jpeg,image/webp,image/gif"
+                      multiple
+                      hidden
+                    />
+                    <button
+                      type="button"
+                      class="mad-composer-tool-btn"
+                      id="madComposerAttachBtn"
+                      title="添加或粘贴图片（Ctrl+V / 拖拽，最多 6 张，单张 <= 8 MB）"
+                      aria-label="添加图片附件"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="mad-composer-tool-btn is-slash"
+                      id="madComposerSlashBtn"
+                      title="唤起 /swarm 等斜杠命令列表"
+                      aria-label="插入斜杠命令"
+                    >/</button>
+                    <span class="mad-composer-cmd-chip" id="madComposerCmdChip" hidden></span>
+                    <span class="mad-composer-hint" id="madComposerHint">Enter 发送 · Shift+Enter 换行</span>
+                  </div>
+                  <div class="mad-composer-tools-right">
+                    <button
+                      type="button"
+                      class="mad-composer-send-btn"
+                      id="madComposerSendBtn"
+                      title="发送给主 Agent (Enter)"
+                      aria-label="发送消息"
+                      disabled
+                    >
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M3.2 8h9.2M8.8 4.2L12.6 8l-3.8 3.8" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -819,6 +883,113 @@
             </div>
           </section>
         </div>
+
+        <!-- 账号面板：多账号 OAuth 授权 / 导入 / 额度监控 / 安全无感切换 -->
+        <div class="monitor-tab-panel monitor-accounts-panel" id="panelAccounts" data-subnav-panel="accounts" hidden>
+          <section class="acc-toolbar-card" aria-label="账号管理顶部操作">
+            <div class="acc-toolbar-actions">
+              <button class="acc-top-btn is-primary" id="accOauthBtn" type="button" title="捕获当前已登录账号或通过官方 OAuth 授权新增账号">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M9.6 2.6a3.8 3.8 0 1 1-3.15 5.92L2.5 12.5v1.3h1.8v-1.2h1.3v-1.3h1.2l.95-.95A3.8 3.8 0 0 1 9.6 2.6Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+                  <circle cx="10.4" cy="5.6" r="1" fill="currentColor"/>
+                </svg>
+                <span>OAuth 授权</span>
+              </button>
+              <button class="acc-top-btn" id="accImportBtn" type="button" title="粘贴 JSON 或 refresh_token 导入账号">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M8 2.4v7.4M5.2 7.2 8 10l2.8-2.8M2.8 11.4v1.4a1 1 0 0 0 1 1h8.4a1 1 0 0 0 1-1v-1.4" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>Token/Json 导入</span>
+              </button>
+              <button class="acc-top-btn" id="accSettingsBtn" type="button" title="账号管理设置">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.3"/>
+                  <path d="M8 2.1v1.4M8 12.5v1.4M2.1 8h1.4M12.5 8h1.4M3.8 3.8l1 1M11.2 11.2l1 1M12.2 3.8l-1 1M4.8 11.2l-1 1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                </svg>
+                <span>设置</span>
+              </button>
+              <div class="acc-sort-wrap" id="accSortWrap">
+                <button
+                  class="acc-top-btn acc-sort-btn"
+                  id="accSortBtn"
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-expanded="false"
+                  title="点击切换下一个排序方式；鼠标移入可选择升降序和具体排序方式"
+                >
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M2.6 4.4h7.2M2.6 8h5.2M2.6 11.6h3.2M12 3.2v9.6M10 10.6l2 2.2 2-2.2" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span id="accSortBtnLabel">排序: 上次使用 ↓</span>
+                </button>
+                <div class="acc-sort-menu" id="accSortMenu" role="menu" aria-label="账号排序选项">
+                  <div class="acc-sort-order-row" role="group" aria-label="排序方向">
+                    <button class="acc-sort-order-btn is-active" type="button" data-sort-order="desc" aria-pressed="true">降序 ↓</button>
+                    <button class="acc-sort-order-btn" type="button" data-sort-order="asc" aria-pressed="false">升序 ↑</button>
+                  </div>
+                  <div class="acc-sort-divider" aria-hidden="true"></div>
+                  <div class="acc-sort-fields">
+                    <button class="acc-sort-option" type="button" role="menuitemradio" data-sort-by="email" aria-checked="false">
+                      <span>a-z（邮箱首字母）</span>
+                      <span class="acc-sort-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="acc-sort-option" type="button" role="menuitemradio" data-sort-by="gemini" aria-checked="false">
+                      <span>Gemini 额度</span>
+                      <span class="acc-sort-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="acc-sort-option" type="button" role="menuitemradio" data-sort-by="gpt_claude" aria-checked="false">
+                      <span>GPTClaude 额度</span>
+                      <span class="acc-sort-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="acc-sort-option" type="button" role="menuitemradio" data-sort-by="argon" aria-checked="false">
+                      <span>Argon</span>
+                      <span class="acc-sort-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="acc-sort-option is-active" type="button" role="menuitemradio" data-sort-by="lastUsed" aria-checked="true">
+                      <span>上一次使用时间</span>
+                      <span class="acc-sort-check" aria-hidden="true">✓</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="acc-toolbar-meta">
+              <span class="acc-vault-pill" id="accVaultBadge" title="所有 OAuth 凭证均经 Windows DPAPI 本机当前用户加密保存，磁盘零明文">
+                <span class="acc-vault-dot" aria-hidden="true"></span>
+                <span id="accVaultText">DPAPI 加密保护</span>
+              </span>
+              <span class="acc-count-pill" id="accCountBadge">0 个账号</span>
+              <button class="acc-rollback-btn" id="accRollbackBtn" type="button" title="一键还原至最近一次切号前的加密备份快照" hidden>
+                <span>回滚备份</span>
+              </button>
+            </div>
+          </section>
+
+          <!-- 三类额度总余量汇总卡片（统计全部已启用账号的 5h / 周 余量与全部总量） -->
+          <section class="acc-summary-card" id="accSummaryCard" aria-label="三类额度总余量汇总" hidden>
+            <div class="acc-summary-head">
+              <div class="acc-summary-title-wrap">
+                <span class="acc-summary-title">三类额度总余量</span>
+                <span class="acc-summary-meta" id="accSummaryMeta">0 个账号</span>
+              </div>
+              <span class="acc-summary-hint" id="accSummaryHint">全部启用号累计余量 / 总量</span>
+            </div>
+            <div class="acc-quota-grid acc-summary-grid" id="accSummaryGrid"></div>
+          </section>
+
+          <!-- 切号 / OAuth 捕获 / 自动续跑动态状态横幅 -->
+          <div class="acc-status-banner" id="accStatusBanner" role="status" aria-live="polite" hidden>
+            <div class="acc-status-banner-left">
+              <span class="acc-status-dot" aria-hidden="true"></span>
+              <span class="acc-status-text" id="accStatusText"></span>
+            </div>
+            <button class="acc-status-action-btn" id="accStatusCancelBtn" type="button" hidden>取消续跑</button>
+          </div>
+
+          <!-- 账号列表 -->
+          <div class="acc-list" id="accList" role="list" aria-label="已保存账号列表"></div>
+        </div>
       </main>
     </div>
 
@@ -1050,6 +1221,247 @@
         <div class="mad-lightbox-actions">
           <button type="button" class="mad-lightbox-act-btn" id="madLightboxOpenFileBtn" title="使用系统默认程序打开图片文件">打开文件</button>
           <button type="button" class="mad-lightbox-act-btn is-primary" id="madLightboxOpenFolderBtn" title="在文件管理器中定位并选中该文件">打开所在位置 ↗</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 账号弹窗 1：OAuth 授权 -->
+    <div class="modal-overlay" id="accOauthModal" hidden role="dialog" aria-modal="true" aria-labelledby="accOauthModalTitle">
+      <div class="modal-backdrop" data-acc-modal-close="oauth"></div>
+      <div class="modal-dialog acc-modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title" id="accOauthModalTitle">OAuth 授权与收录账号</h3>
+          <button class="modal-close-btn" type="button" data-acc-modal-close="oauth" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body acc-modal-body">
+          <div class="acc-oauth-option">
+            <div class="acc-oauth-option-head">
+              <span class="acc-oauth-option-title">方式一：一键捕获当前已登录账号</span>
+              <span class="acc-oauth-tag is-fast">零重启 · 推荐</span>
+            </div>
+            <p class="acc-oauth-option-desc" id="accOauthCurrentHint">
+              自动读取当前 Antigravity 登录凭证与官方三类实时额度，使用本机 DPAPI 加密入库。
+            </p>
+            <div class="acc-field-inline">
+              <input class="acc-input" id="accCaptureRemarkInput" type="text" maxlength="120" placeholder="可选：给该账号写个备注（如 主力 Pro）…" />
+              <button class="acc-primary-btn" id="accCaptureCurrentBtn" type="button">立即捕获当前号</button>
+            </div>
+          </div>
+
+          <div class="acc-oauth-option">
+            <div class="acc-oauth-option-head">
+              <span class="acc-oauth-option-title">方式二：打开浏览器直接登录新号</span>
+              <span class="acc-oauth-tag is-fast">官方一键直连 · 不影响当前 AGY</span>
+            </div>
+            <p class="acc-oauth-option-desc">
+              点击直接唤起系统默认浏览器打开 Google 官方登录授权页，完成后本地安全端点自动捕获 Refresh Token 凭据并经 DPAPI 硬件级加密收录，全程无需注销当前 Antigravity 会话！
+            </p>
+            <div class="acc-oauth-action-row" id="accDirectOauthInitialRow">
+              <button class="acc-primary-btn" id="accStartDirectOauthBtn" type="button">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:5px;vertical-align:-1px" aria-hidden="true">
+                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                  <polyline points="15 3 21 3 21 9"></polyline>
+                  <line x1="10" y1="14" x2="21" y2="3"></line>
+                </svg>
+                打开浏览器授权新号
+              </button>
+            </div>
+            <div class="acc-direct-oauth-progress" id="accDirectOauthProgress" hidden>
+              <div class="acc-spinner-row">
+                <span class="acc-spinner" aria-hidden="true"></span>
+                <span class="acc-progress-text" id="accDirectOauthStatusText">已在浏览器中打开授权页，等待完成登录与许可…</span>
+              </div>
+              <div class="acc-direct-oauth-subactions">
+                <a class="acc-link-btn" id="accDirectOauthRetryLink" href="#" target="_blank" rel="noopener noreferrer">未自动打开？点此手动打开页面</a>
+                <button class="acc-link-btn is-danger" id="accDirectOauthCancelBtn" type="button">取消授权</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 账号弹窗 2：Token/Json 导入 -->
+    <div class="modal-overlay" id="accImportModal" hidden role="dialog" aria-modal="true" aria-labelledby="accImportModalTitle">
+      <div class="modal-backdrop" data-acc-modal-close="import"></div>
+      <div class="modal-dialog acc-modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title" id="accImportModalTitle">Token / JSON 导入</h3>
+          <button class="modal-close-btn" type="button" data-acc-modal-close="import" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body acc-modal-body">
+          <div class="acc-form-group">
+            <div class="acc-form-head">
+              <label class="acc-label" for="accImportTextarea">凭证内容（支持单个/批量 JSON、导出的 JSON 或纯 refresh_token）</label>
+              <button class="acc-inline-link-btn" id="accImportFileBtn" type="button">从 .json 文件载入</button>
+              <input type="file" id="accImportFileInput" accept=".json,.txt,application/json,text/plain" hidden />
+            </div>
+            <textarea
+              class="acc-textarea is-mono"
+              id="accImportTextarea"
+              rows="6"
+              placeholder='粘贴本插件导出的 JSON、Antigravity 凭据 JSON，或直接粘贴 1//0... 格式的 refresh_token（支持多行批量）'
+            ></textarea>
+          </div>
+          <div class="acc-form-grid-2">
+            <div class="acc-form-group">
+              <label class="acc-label" for="accImportEmailInput">账号邮箱（可选，JSON 内已有则自动识别）</label>
+              <input class="acc-input" id="accImportEmailInput" type="email" placeholder="example@gmail.com" autocomplete="off" />
+            </div>
+            <div class="acc-form-group">
+              <label class="acc-label" for="accImportRemarkInput">备注（可选）</label>
+              <input class="acc-input" id="accImportRemarkInput" type="text" maxlength="120" placeholder="例如：备用 Pro 号" autocomplete="off" />
+            </div>
+          </div>
+          <div class="acc-form-error" id="accImportError" role="alert" hidden></div>
+        </div>
+        <div class="modal-footer acc-modal-footer">
+          <button class="acc-cancel-btn" type="button" data-acc-modal-close="import">取消</button>
+          <button class="acc-primary-btn" id="accImportSubmitBtn" type="button">加密导入</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 账号弹窗 3：账号设置（定时刷新配额 + 5h 额度耗尽自动切号） -->
+    <div class="modal-overlay" id="accSettingsModal" hidden role="dialog" aria-modal="true" aria-labelledby="accSettingsModalTitle">
+      <div class="modal-backdrop" data-acc-modal-close="settings"></div>
+      <div class="modal-dialog acc-modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title" id="accSettingsModalTitle">账号设置</h3>
+          <button class="modal-close-btn" type="button" data-acc-modal-close="settings" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body acc-modal-body">
+          <div class="acc-setting-card">
+            <div class="acc-setting-row">
+              <label class="acc-setting-label" for="accSettingRefreshMinInput">配额自动刷新时间间隔：</label>
+              <div class="acc-setting-num-wrap">
+                <input
+                  class="acc-input acc-setting-num-input"
+                  id="accSettingRefreshMinInput"
+                  type="number"
+                  min="0"
+                  max="1440"
+                  step="1"
+                  value="5"
+                />
+                <span class="acc-setting-unit">min</span>
+              </div>
+            </div>
+            <p class="acc-setting-hint">按此间隔在后台自动同步当前账号实时三类额度，填 0 表示关闭定时自动刷新。</p>
+          </div>
+
+          <div class="acc-setting-card">
+            <div class="acc-setting-sentence">
+              <span>当</span>
+              <select class="acc-setting-select" id="accSettingAutoTargetSelect" aria-label="监控耗尽的额度类型">
+                <option value="gemini" selected>Gemini</option>
+                <option value="gpt_claude">Claude</option>
+                <option value="argon">Argon</option>
+              </select>
+              <span>的 5h/周额度耗尽或出现额度为空报错时，自动切号</span>
+              <button
+                class="acc-setting-toggle-btn is-off"
+                id="accSettingAutoToggleBtn"
+                type="button"
+                aria-pressed="false"
+              >
+                <span class="acc-toggle-dot" aria-hidden="true"></span>
+                <span id="accSettingAutoToggleText">已弃用</span>
+              </button>
+            </div>
+            <p class="acc-setting-hint">
+              自动优先切往该分类剩余额度最高的已启用账号，周额度为 0 或 5h 额度为 0 的账号均跳过；切号后自动续跑正在运行或因额度报错中断的会话。
+            </p>
+          </div>
+        </div>
+        <div class="modal-footer acc-modal-footer">
+          <button class="acc-cancel-btn" type="button" data-acc-modal-close="settings">取消</button>
+          <button class="acc-primary-btn" id="accSettingsSaveBtn" type="button">保存设置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 账号弹窗 4：写备注 -->
+    <div class="modal-overlay" id="accRemarkModal" hidden role="dialog" aria-modal="true" aria-labelledby="accRemarkModalTitle">
+      <div class="modal-backdrop" data-acc-modal-close="remark"></div>
+      <div class="modal-dialog acc-modal-dialog is-compact">
+        <div class="modal-header">
+          <h3 class="modal-title" id="accRemarkModalTitle">编辑账号备注</h3>
+          <button class="modal-close-btn" type="button" data-acc-modal-close="remark" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body acc-modal-body">
+          <div class="acc-form-group">
+            <label class="acc-label" id="accRemarkEmailLabel" for="accRemarkInput">账号备注</label>
+            <input class="acc-input" id="accRemarkInput" type="text" maxlength="120" placeholder="输入便于区分的备注名称（留空则清除备注）…" />
+          </div>
+        </div>
+        <div class="modal-footer acc-modal-footer">
+          <button class="acc-cancel-btn" type="button" data-acc-modal-close="remark">取消</button>
+          <button class="acc-primary-btn" id="accRemarkSaveBtn" type="button">保存备注</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 账号弹窗 6：导出 JSON -->
+    <div class="modal-overlay" id="accExportModal" hidden role="dialog" aria-modal="true" aria-labelledby="accExportModalTitle">
+      <div class="modal-backdrop" data-acc-modal-close="export"></div>
+      <div class="modal-dialog acc-modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title" id="accExportModalTitle">导出账号 JSON</h3>
+          <button class="modal-close-btn" type="button" data-acc-modal-close="export" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body acc-modal-body">
+          <p class="acc-export-warn">安全提醒：导出的 JSON 包含 OAuth 刷新凭证，请妥善保管，切勿公开分享或提交至代码仓库。</p>
+          <textarea class="acc-textarea is-mono" id="accExportTextarea" rows="8" readonly></textarea>
+        </div>
+        <div class="modal-footer acc-modal-footer">
+          <button class="acc-cancel-btn" type="button" data-acc-modal-close="export">关闭</button>
+          <button class="acc-secondary-btn" id="accExportCopyBtn" type="button">复制 JSON</button>
+          <button class="acc-primary-btn" id="accExportDownloadBtn" type="button">下载 .json</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 账号弹窗 7：删除确认 -->
+    <div class="modal-overlay" id="accDeleteModal" hidden role="dialog" aria-modal="true" aria-labelledby="accDeleteModalTitle">
+      <div class="modal-backdrop" data-acc-modal-close="delete"></div>
+      <div class="modal-dialog acc-modal-dialog is-compact">
+        <div class="modal-header">
+          <h3 class="modal-title" id="accDeleteModalTitle">确认删除账号</h3>
+          <button class="modal-close-btn" type="button" data-acc-modal-close="delete" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body acc-modal-body">
+          <p class="acc-delete-desc">
+            确定从加密保险库中移除 <strong id="accDeleteEmailText"></strong> 吗？移除后仅删除本插件保存的槽位，不会退出当前 Antigravity 登录。
+          </p>
+        </div>
+        <div class="modal-footer acc-modal-footer">
+          <button class="acc-cancel-btn" type="button" data-acc-modal-close="delete">取消</button>
+          <button class="acc-danger-btn" id="accDeleteConfirmBtn" type="button">确认删除</button>
         </div>
       </div>
     </div>

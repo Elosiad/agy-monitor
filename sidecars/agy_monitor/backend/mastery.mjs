@@ -202,16 +202,30 @@ export function sanitizeTimelineMarkdown(rawText, maxVisible = 3600) {
 }
 
 function extractUserUploadedImages(raw) {
-  if (typeof raw !== 'string' || !raw.includes('ADDITIONAL_METADATA')) return [];
-  const metaMatch = /<ADDITIONAL_METADATA>([\s\S]*?)<\/ADDITIONAL_METADATA>/i.exec(raw);
-  if (!metaMatch) return [];
+  if (typeof raw !== 'string') return [];
   const imgs = [];
-  const lines = metaMatch[1].split(/\r?\n/);
-  for (const line of lines) {
-    const m = /^\s*[-*]\s+((?:[a-zA-Z]:[\\/]|\/)[^\r\n]+\.(?:png|jpe?g|webp|gif|bmp|avif|ico))\s*$/i.exec(line);
-    if (m && m[1]) {
-      imgs.push(m[1].trim());
+  const seen = new Set();
+  const pushFromBlock = (block) => {
+    if (!block) return;
+    const lines = block.split(/\r?\n/);
+    for (const line of lines) {
+      const m = /^\s*[-*]\s+((?:[a-zA-Z]:[\\/]|\/)[^\r\n]+\.(?:png|jpe?g|webp|gif|bmp|avif|ico))\s*$/i.exec(line);
+      if (m && m[1]) {
+        const clean = m[1].trim();
+        if (!seen.has(clean)) {
+          seen.add(clean);
+          imgs.push(clean);
+        }
+      }
     }
+  };
+  if (raw.includes('ADDITIONAL_METADATA')) {
+    const metaMatch = /<ADDITIONAL_METADATA>([\s\S]*?)<\/ADDITIONAL_METADATA>/i.exec(raw);
+    if (metaMatch) pushFromBlock(metaMatch[1]);
+  }
+  if (raw.includes('[AGY_CONSOLE_IMAGES]')) {
+    const compMatch = /\[AGY_CONSOLE_IMAGES\]([\s\S]*?)\[\/AGY_CONSOLE_IMAGES\]/i.exec(raw);
+    if (compMatch) pushFromBlock(compMatch[1]);
   }
   return imgs.slice(0, 6);
 }
@@ -223,8 +237,29 @@ function stripUserRequestTags(raw) {
     .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
     .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, '')
     .replace(/<SYSTEM_MESSAGE>[\s\S]*?<\/SYSTEM_MESSAGE>/gi, '')
+    .replace(/\[AGY_CONSOLE_IMAGES\][\s\S]*?\[\/AGY_CONSOLE_IMAGES\]/gi, '')
+    .replace(/\[AGY_CONSOLE_CMD:[^\]]+\][^\r\n]*/gi, '')
     .trim();
   return body.replace(/\s+/g, ' ').slice(0, 260);
+}
+
+function extractSidecarDispatchedMessage(entry) {
+  if (!entry || entry.type === 'USER_INPUT' || typeof entry.content !== 'string') return null;
+  const raw = entry.content;
+  // Match messages delivered via `agentapi send-message --title="AGY 控制台"`
+  const hasMarker =
+    raw.includes('title="AGY 控制台"') ||
+    raw.includes('title=AGY 控制台') ||
+    raw.includes('AGY 控制台:') ||
+    raw.includes('[AGY_CONSOLE_IMAGES]') ||
+    raw.includes('[AGY_CONSOLE_CMD:');
+  if (!hasMarker) return null;
+  const contentMatch = /\bcontent=([\s\S]+)$/.exec(raw);
+  const payload = contentMatch ? contentMatch[1].trim() : raw;
+  const text = stripUserRequestTags(payload);
+  const images = extractUserUploadedImages(payload);
+  if (!text && images.length === 0) return null;
+  return { text, images };
 }
 
 function shortBasename(filePath) {
@@ -573,6 +608,22 @@ export async function parseAgentJourney(
         currentRunStepStartIdx = steps.length;
       }
       continue;
+    }
+
+    if (isMaster && entry.type === 'SYSTEM_MESSAGE') {
+      const dispatched = extractSidecarDispatchedMessage(entry);
+      if (dispatched) {
+        flushActions();
+        steps.push({
+          type: 'user',
+          text: dispatched.text,
+          ...(dispatched.images.length > 0 ? { images: dispatched.images } : {}),
+          isFollowup: true,
+          label: '来自 AGY 控制台',
+          stepIndex: Number(entry.step_index || i),
+        });
+        continue;
+      }
     }
 
     if (entry.type !== 'PLANNER_RESPONSE') continue;

@@ -152,4 +152,5 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   assert.match(src, /_consoleViewportPhysW\s*<\s*\(int\)Math\.Round\(winW\s*\*\s*0\.62\)/, 'IsConsoleCoveringAnchor must only trigger on true full-screen console (>=62% width)');
   assert.match(src, /idObject\s*!=\s*0\s*\|\|\s*idChild\s*!=\s*0/, 'OnWinEvent must require CHILDID_SELF (idChild == 0) so Chromium child hides never blink the backdrop');
   assert.match(src, /IsDirectlyBehindVisible\s*\(/, 'Z-order mismatch check must skip invisible helper windows to avoid EVENT_OBJECT_REORDER loops');
+  assert.match(src, /Antigravity_Original/, 'Host window finder must track both Antigravity and Antigravity_Original launcher wrapper processes');
 });

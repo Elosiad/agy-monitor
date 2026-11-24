@@ -17,6 +17,7 @@ import { createModelAndPrompt } from "./components/model_and_prompt.js";
 import { createSessionsHub } from "./components/sessions_hub.js";
 import { createRuntimeBar } from "./components/runtime_bar.js";
 import { createMasteryHub } from "./components/mastery_hub.js";
+import { createAccountsHub } from "./components/accounts_hub.js";
 import { createThemeStudio } from "./components/theme_studio.js";
 
 const POLL_ACTIVE_MS = 1200;
@@ -217,6 +218,7 @@ export function mountMonitorApp() {
 
   initSubnavTabs(cleanups, (tabKey) => {
     components.masteryHub?.setTabActive?.(tabKey === "mastery");
+    components.accountsHub?.setTabActive?.(tabKey === "accounts");
     if (tabKey === "theme") {
       components.themeStudio?.refreshBackdropStatus?.();
     }
@@ -487,6 +489,11 @@ export function mountMonitorApp() {
     onToast: showToast,
   });
 
+  components.accountsHub = createAccountsHub({
+    apiFetch,
+    onToast: showToast,
+  });
+
   components.themeStudio = createThemeStudio({
     apiFetch,
     t: translator,
@@ -685,6 +692,7 @@ export function mountMonitorApp() {
       refreshSnapshot({ force: true, syncHud: true });
       components.quotaCards?.refresh?.({ force: true });
       components.masteryHub?.refresh?.();
+      components.accountsHub?.refresh?.({ silent: true });
     };
     manualRefreshBtn.addEventListener("click", onManualRefresh);
     cleanups.push(() => manualRefreshBtn.removeEventListener("click", onManualRefresh));
@@ -936,6 +944,7 @@ export function mountMonitorApp() {
       updateCheckTimer = setTimeout(() => {
         if (!destroyed) {
           void checkPluginUpdate({ force: false, notify: false });
+          void components.accountsHub?.refresh?.({ silent: true });
         }
       }, 1200);
     }

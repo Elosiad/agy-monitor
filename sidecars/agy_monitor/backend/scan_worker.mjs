@@ -223,11 +223,229 @@ export function parseStepMetadataTiming(rawBuf) {
   };
 }
 
+function decodeProtoUtf8(buf, maxLen = 200) {
+  if (!buf || buf.length === 0 || buf.length > maxLen) return '';
+  const text = buf.toString('utf8').trim();
+  if (!text) return '';
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 32 || code === 127) return '';
+  }
+  return text;
+}
+
+function isAntigravityRoutingLabel(model) {
+  return String(model || '').trim().toLowerCase() === 'gemini-default';
+}
+
 /**
- * Reads exact per-step TTFT and total duration from Antigravity's per-conversation
- * SQLite database (`conversations/<convId>.db`) in strictly read-only mode.
+ * Extracts generation linkage keys from Antigravity `steps.metadata` protobuf:
+ * - field #20 -> field #3: 0-based `gen_metadata.idx`
+ * - field #9  -> field #11: `responseId` matching `gen_metadata.#1.#4.#11`
  */
-export function readConvDbStepTimings(convDbPath, stepIndices) {
+export function parseStepMetadataGenLink(rawBuf) {
+  if (!rawBuf) return { genIdx: null, responseId: null };
+  const buf = Buffer.isBuffer(rawBuf)
+    ? rawBuf
+    : rawBuf instanceof Uint8Array
+      ? Buffer.from(rawBuf.buffer, rawBuf.byteOffset, rawBuf.byteLength)
+      : null;
+  if (!buf || buf.length === 0) return { genIdx: null, responseId: null };
+
+  let genIdx = null;
+  let responseId = null;
+  try {
+    iterProtoFields(buf, (f, w, v) => {
+      if (w !== 2) return;
+      if (f === 20 && genIdx === null) {
+        iterProtoFields(v, (mf, mw, mv) => {
+          if (mf === 3 && mw === 0 && genIdx === null) {
+            const n = Number(mv);
+            if (Number.isSafeInteger(n) && n >= 0) genIdx = n;
+          }
+        });
+      } else if (f === 9 && responseId === null) {
+        iterProtoFields(v, (uf, uw, uv) => {
+          if (uf === 11 && uw === 2 && responseId === null) {
+            const id = decodeProtoUtf8(uv, 128);
+            if (id) responseId = id;
+          }
+        });
+      }
+    });
+  } catch {
+    return { genIdx: null, responseId: null };
+  }
+  return { genIdx, responseId };
+}
+
+/**
+ * Parses Antigravity `gen_metadata.data` (`GeneratorMetadata`) protobuf:
+ * - field #2: linked `steps.idx` (single varint or packed varints)
+ * - field #1 (`chatModel`):
+ *   - field #19: `responseModel` (authoritative upstream returned model ID, e.g. `gemini-3.8-flash-n`)
+ *   - field #21: `displayLabel` (requested UI model label, e.g. `Gemini 3.8 Flash (High)`)
+ *   - field #4 -> field #11: `responseId`
+ *   - field #20: key/value map (`model_enum`, etc.)
+ */
+export function parseGenMetadataRecord(rawBuf) {
+  if (!rawBuf) return null;
+  const buf = Buffer.isBuffer(rawBuf)
+    ? rawBuf
+    : rawBuf instanceof Uint8Array
+      ? Buffer.from(rawBuf.buffer, rawBuf.byteOffset, rawBuf.byteLength)
+      : null;
+  if (!buf || buf.length === 0) return null;
+
+  const stepIndices = [];
+  let responseModel = null;
+  let displayLabel = null;
+  let responseId = null;
+  let modelEnum = null;
+  let hasChatModel = false;
+
+  try {
+    iterProtoFields(buf, (f, w, v) => {
+      if (f === 2 && w === 0) {
+        const idx = Number(v);
+        if (Number.isSafeInteger(idx) && idx >= 0) stepIndices.push(idx);
+      } else if (f === 2 && w === 2) {
+        let pos = 0;
+        while (pos < v.length) {
+          const r = readProtoVarint(v, pos);
+          if (!r.ok) break;
+          const idx = Number(r.value);
+          if (Number.isSafeInteger(idx) && idx >= 0) stepIndices.push(idx);
+          pos = r.next;
+        }
+      } else if (f === 1 && w === 2 && !hasChatModel) {
+        hasChatModel = true;
+        iterProtoFields(v, (cf, cw, cv) => {
+          if (cf === 19 && cw === 2 && responseModel === null) {
+            const m = decodeProtoUtf8(cv, 160);
+            if (m) responseModel = m;
+          } else if (cf === 21 && cw === 2 && displayLabel === null) {
+            const lbl = decodeProtoUtf8(cv, 160);
+            if (lbl) displayLabel = lbl;
+          } else if (cf === 4 && cw === 2 && responseId === null) {
+            iterProtoFields(cv, (uf, uw, uv) => {
+              if (uf === 11 && uw === 2 && responseId === null) {
+                const id = decodeProtoUtf8(uv, 128);
+                if (id) responseId = id;
+              }
+            });
+          } else if (cf === 20 && cw === 2 && modelEnum === null) {
+            let key = '';
+            let val = '';
+            iterProtoFields(cv, (kf, kw, kv) => {
+              if (kf === 1 && kw === 2) key = decodeProtoUtf8(kv, 64);
+              else if (kf === 2 && kw === 2) val = decodeProtoUtf8(kv, 128);
+            });
+            if (key === 'model_enum' && val) modelEnum = val;
+          }
+        });
+      }
+    });
+  } catch {
+    return null;
+  }
+
+  if (!hasChatModel && stepIndices.length === 0) return null;
+  return {
+    stepIndices,
+    responseModel,
+    displayLabel,
+    responseId,
+    modelEnum,
+  };
+}
+
+function coarseModelFamilyKey(modelId) {
+  const s = String(modelId || '').toLowerCase();
+  if (s.includes('hydrogen')) return 'hydrogen';
+  if (s.includes('neon')) return 'neon';
+  if (s.includes('argon')) return 'argon';
+  if (s.includes('flash')) return 'flash';
+  if (s.includes('opus')) return 'opus';
+  if (s.includes('sonnet')) return 'sonnet';
+  if (s.includes('haiku')) return 'haiku';
+  if (s.includes('carbon')) return 'carbon';
+  if (s.includes('gpt')) return 'gpt';
+  if (s.includes('pro')) return 'pro';
+  return s;
+}
+
+/**
+ * Builds same-conversation `#21 displayLabel -> #19 responseModel` recovery map
+ * (mirroring tokscale's SessionModels recovery for continuation turns that omit `#19`).
+ */
+function buildSessionModelsResolver(records) {
+  const byDisplay = new Map();
+  const distinctModels = new Set();
+  const unresolvedLabels = new Set();
+
+  for (const rec of records) {
+    if (!rec) continue;
+    const label = rec.displayLabel || '';
+    const model = rec.responseModel && !isAntigravityRoutingLabel(rec.responseModel) ? rec.responseModel : '';
+    if (!model) {
+      if (label) unresolvedLabels.add(label);
+      continue;
+    }
+    distinctModels.add(model);
+    if (label) {
+      if (!byDisplay.has(label)) {
+        byDisplay.set(label, model);
+      } else {
+        const prev = byDisplay.get(label);
+        if (prev !== null && prev !== model) {
+          if (coarseModelFamilyKey(prev) === coarseModelFamilyKey(model)) {
+            // Keep the latest concrete variant within the same model family (e.g. flash-n / flash-control)
+            byDisplay.set(label, model);
+          } else {
+            // Genuinely conflicting families for the same display label -> mark ambiguous
+            byDisplay.set(label, null);
+          }
+        }
+      }
+    }
+  }
+
+  const resolvedByDisplay = new Map();
+  for (const [label, model] of byDisplay.entries()) {
+    if (model) resolvedByDisplay.set(label, model);
+  }
+
+  let everyLabelIdentified = true;
+  for (const label of unresolvedLabels) {
+    if (!resolvedByDisplay.has(label)) {
+      everyLabelIdentified = false;
+      break;
+    }
+  }
+  const soleModel =
+    distinctModels.size === 1 && everyLabelIdentified ? [...distinctModels][0] : null;
+
+  return {
+    recover(rec) {
+      if (!rec) return null;
+      if (rec.responseModel && !isAntigravityRoutingLabel(rec.responseModel)) {
+        return rec.responseModel;
+      }
+      if (rec.displayLabel) {
+        return resolvedByDisplay.get(rec.displayLabel) || null;
+      }
+      return soleModel;
+    },
+  };
+}
+
+/**
+ * Reads exact per-step timing (`steps.metadata`) AND authoritative upstream `responseModel`
+ * (`gen_metadata.#1.#19`) + requested UI `displayLabel` (`gen_metadata.#1.#21`) from
+ * Antigravity's per-conversation SQLite database (`conversations/<convId>.db`) in read-only mode.
+ */
+export function readConvDbStepTelemetry(convDbPath, stepIndices) {
   const result = new Map();
   if (!convDbPath || !Array.isArray(stepIndices) || stepIndices.length === 0) {
     return result;
@@ -239,7 +457,10 @@ export function readConvDbStepTimings(convDbPath, stepIndices) {
   let convDb = null;
   try {
     convDb = new DatabaseSync(convDbPath, { readOnly: true, timeout: 1000 });
+    const stepLinks = new Map();
+    const wantedGenIds = new Set();
     const CHUNK = 200;
+
     for (let start = 0; start < uniqueIds.length; start += CHUNK) {
       const slice = uniqueIds.slice(start, start + CHUNK);
       const placeholders = slice.map(() => '?').join(',');
@@ -250,14 +471,113 @@ export function readConvDbStepTimings(convDbPath, stepIndices) {
         .all(...slice);
       for (const row of rows) {
         const idx = Number(row.idx);
+        if (!Number.isInteger(idx)) continue;
         const timing = parseStepMetadataTiming(row.metadata);
-        if (timing && Number.isInteger(idx)) {
-          result.set(idx, timing);
+        const link = parseStepMetadataGenLink(row.metadata);
+        stepLinks.set(idx, link);
+        if (link.genIdx !== null) wantedGenIds.add(link.genIdx);
+        result.set(idx, {
+          timing,
+          upstreamModel: null,
+          requestedModelLabel: null,
+        });
+      }
+    }
+
+    const hasGenTable = Boolean(
+      convDb
+        .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gen_metadata'`)
+        .get()
+    );
+
+    if (hasGenTable) {
+      const genByIdx = new Map();
+      const wantedGenList = [...wantedGenIds];
+      for (let start = 0; start < wantedGenList.length; start += CHUNK) {
+        const slice = wantedGenList.slice(start, start + CHUNK);
+        const placeholders = slice.map(() => '?').join(',');
+        const genRows = convDb
+          .prepare(
+            `SELECT idx, data FROM gen_metadata WHERE idx IN (${placeholders}) AND data IS NOT NULL`
+          )
+          .all(...slice);
+        for (const gr of genRows) {
+          const gIdx = Number(gr.idx);
+          const parsed = parseGenMetadataRecord(gr.data);
+          if (parsed && Number.isInteger(gIdx)) {
+            genByIdx.set(gIdx, parsed);
+          }
+        }
+      }
+
+      // First pass: resolve directly linked gen_metadata rows (O(k) fast path)
+      let needsFullGenScan = false;
+      for (const idx of uniqueIds) {
+        const link = stepLinks.get(idx);
+        const gen = link && link.genIdx !== null ? genByIdx.get(link.genIdx) : null;
+        if (!gen) {
+          needsFullGenScan = true;
+          continue;
+        }
+        const entry = result.get(idx) || { timing: null, upstreamModel: null, requestedModelLabel: null };
+        if (gen.displayLabel) entry.requestedModelLabel = gen.displayLabel;
+        if (gen.responseModel && !isAntigravityRoutingLabel(gen.responseModel)) {
+          entry.upstreamModel = gen.responseModel;
+        } else {
+          needsFullGenScan = true;
+        }
+        result.set(idx, entry);
+      }
+
+      // Fallback / SessionModels recovery pass only when a step lacked direct genIdx or omitted #19
+      if (needsFullGenScan) {
+        const allGenRows = convDb
+          .prepare(
+            `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND length(data) < 262144 ORDER BY idx ASC`
+          )
+          .all();
+        const allParsed = [];
+        const byStepIdx = new Map();
+        const byResponseId = new Map();
+
+        for (const gr of allGenRows) {
+          const gIdx = Number(gr.idx);
+          const parsed = genByIdx.get(gIdx) || parseGenMetadataRecord(gr.data);
+          if (!parsed) continue;
+          if (Number.isInteger(gIdx)) genByIdx.set(gIdx, parsed);
+          allParsed.push(parsed);
+          for (const sIdx of parsed.stepIndices) {
+            byStepIdx.set(sIdx, parsed);
+          }
+          if (parsed.responseId) {
+            byResponseId.set(parsed.responseId, parsed);
+          }
+        }
+
+        const sessionModels = buildSessionModelsResolver(allParsed);
+        for (const idx of uniqueIds) {
+          const entry = result.get(idx) || { timing: null, upstreamModel: null, requestedModelLabel: null };
+          if (entry.upstreamModel) continue;
+          const link = stepLinks.get(idx);
+          const gen =
+            (link && link.genIdx !== null ? genByIdx.get(link.genIdx) : null) ||
+            (link && link.responseId ? byResponseId.get(link.responseId) : null) ||
+            byStepIdx.get(idx) ||
+            null;
+          if (!gen) continue;
+          if (!entry.requestedModelLabel && gen.displayLabel) {
+            entry.requestedModelLabel = gen.displayLabel;
+          }
+          const recovered = sessionModels.recover(gen);
+          if (recovered) {
+            entry.upstreamModel = recovered;
+          }
+          result.set(idx, entry);
         }
       }
     }
   } catch {
-    // Non-fatal: gracefully fall back to transcript timestamp heuristic if DB is busy/missing/legacy
+    // Non-fatal: gracefully fall back to transcript fields if DB is busy/missing/legacy
   } finally {
     if (convDb) {
       try {
@@ -268,6 +588,19 @@ export function readConvDbStepTimings(convDbPath, stepIndices) {
     }
   }
   return result;
+}
+
+/**
+ * Reads exact per-step TTFT and total duration from Antigravity's per-conversation
+ * SQLite database (`conversations/<convId>.db`) in strictly read-only mode.
+ */
+export function readConvDbStepTimings(convDbPath, stepIndices) {
+  const telemetryMap = readConvDbStepTelemetry(convDbPath, stepIndices);
+  const timings = new Map();
+  for (const [idx, info] of telemetryMap.entries()) {
+    if (info?.timing) timings.set(idx, info.timing);
+  }
+  return timings;
 }
 
 /**
@@ -305,6 +638,8 @@ export function ensureCacheSchema(db) {
       status TEXT,
       error_text TEXT,
       ttft_ms INTEGER,
+      upstream_model TEXT,
+      requested_model_label TEXT,
       PRIMARY KEY (conv_id, step_index)
     );
 
@@ -316,6 +651,9 @@ export function ensureCacheSchema(db) {
     CREATE TABLE IF NOT EXISTS conv_latest_metrics (
       conv_id TEXT PRIMARY KEY,
       latest_model TEXT,
+      latest_upstream_model TEXT,
+      latest_requested_model TEXT,
+      latest_requested_label TEXT,
       latest_model_at_ms INTEGER NOT NULL DEFAULT 0,
       latest_context_tokens INTEGER NOT NULL DEFAULT 0,
       latest_uncached_input INTEGER NOT NULL DEFAULT 0,
@@ -348,6 +686,25 @@ export function ensureCacheSchema(db) {
   }
   if (!existingCols.has('ttft_ms')) {
     db.exec(`ALTER TABLE step_ledger ADD COLUMN ttft_ms INTEGER`);
+  }
+  if (!existingCols.has('upstream_model')) {
+    db.exec(`ALTER TABLE step_ledger ADD COLUMN upstream_model TEXT`);
+  }
+  if (!existingCols.has('requested_model_label')) {
+    db.exec(`ALTER TABLE step_ledger ADD COLUMN requested_model_label TEXT`);
+  }
+
+  const latestCols = new Set(
+    db.prepare(`PRAGMA table_info(conv_latest_metrics)`).all().map((c) => String(c.name || '').toLowerCase())
+  );
+  if (!latestCols.has('latest_upstream_model')) {
+    db.exec(`ALTER TABLE conv_latest_metrics ADD COLUMN latest_upstream_model TEXT`);
+  }
+  if (!latestCols.has('latest_requested_model')) {
+    db.exec(`ALTER TABLE conv_latest_metrics ADD COLUMN latest_requested_model TEXT`);
+  }
+  if (!latestCols.has('latest_requested_label')) {
+    db.exec(`ALTER TABLE conv_latest_metrics ADD COLUMN latest_requested_label TEXT`);
   }
 }
 
@@ -574,8 +931,8 @@ async function readDeltaLines(
 function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
   const rows = db
     .prepare(
-      `SELECT step_index, step_type, created_at_ms, model, input_tokens,
-              cache_read_tokens, output_tokens, tool_calls_count, content_chars,
+      `SELECT step_index, step_type, created_at_ms, model, upstream_model, requested_model_label,
+              input_tokens, cache_read_tokens, output_tokens, tool_calls_count, content_chars,
               duration_ms, ttft_ms
        FROM step_ledger
        WHERE conv_id = ?
@@ -588,25 +945,31 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
     return;
   }
 
-  let exactTimings = null;
+  let convDbStepTelemetry = null;
   if (conversationsDir) {
-    const missingTimingIndices = [];
+    const missingConvDbIndices = [];
     for (let i = 0; i < rows.length; i += 1) {
       const r = rows[i];
-      if (r.step_type === 'PLANNER_RESPONSE' && (r.ttft_ms == null || r.duration_ms == null)) {
-        missingTimingIndices.push(r.step_index);
+      if (
+        r.step_type === 'PLANNER_RESPONSE' &&
+        (r.ttft_ms == null || r.duration_ms == null || r.upstream_model == null)
+      ) {
+        missingConvDbIndices.push(r.step_index);
       }
     }
-    if (missingTimingIndices.length > 0) {
+    if (missingConvDbIndices.length > 0) {
       const convDbPath = path.join(conversationsDir, `${convId}.db`);
-      const map = readConvDbStepTimings(convDbPath, missingTimingIndices);
+      const map = readConvDbStepTelemetry(convDbPath, missingConvDbIndices);
       if (map.size > 0) {
-        exactTimings = map;
+        convDbStepTelemetry = map;
       }
     }
   }
 
   let latestModel = null;
+  let latestUpstreamModel = null;
+  let latestRequestedModel = null;
+  let latestRequestedLabel = null;
   let latestModelAtMs = 0;
   let latestContextTokens = 0;
   let latestUncachedInput = 0;
@@ -624,10 +987,12 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
   const updateDurationStmt = db.prepare(
     `UPDATE step_ledger SET duration_ms = ? WHERE conv_id = ? AND step_index = ?`
   );
-  const updateExactTimingStmt = db.prepare(
+  const updateConvDbStepStmt = db.prepare(
     `UPDATE step_ledger
      SET ttft_ms = COALESCE(?, ttft_ms),
-         duration_ms = COALESCE(?, duration_ms)
+         duration_ms = COALESCE(?, duration_ms),
+         upstream_model = COALESCE(?, upstream_model),
+         requested_model_label = COALESCE(?, requested_model_label)
      WHERE conv_id = ? AND step_index = ?`
   );
 
@@ -635,10 +1000,6 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
     const row = rows[i];
     if (row.created_at_ms > lastStepAtMs) {
       lastStepAtMs = row.created_at_ms;
-    }
-    if (row.model) {
-      latestModel = row.model;
-      latestModelAtMs = row.created_at_ms;
     }
 
     if (row.step_type === 'CHECKPOINT') {
@@ -666,6 +1027,10 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
       userCharsTotal += row.content_chars;
     } else if (row.step_type === 'GENERIC' || row.step_type === 'ERROR_MESSAGE') {
       toolCharsTotal += row.content_chars;
+      if (row.model && !latestModel) {
+        latestModel = row.model;
+        latestModelAtMs = row.created_at_ms;
+      }
     }
 
     if (row.step_type === 'PLANNER_RESPONSE') {
@@ -680,16 +1045,46 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
         toolCharsTotal += row.tool_calls_count * 120;
       }
 
-      const dbTiming = exactTimings ? exactTimings.get(row.step_index) : null;
-      if (dbTiming && (dbTiming.ttftMs != null || dbTiming.durationMs != null)) {
-        updateExactTimingStmt.run(
-          dbTiming.ttftMs ?? null,
-          dbTiming.durationMs ?? null,
+      const dbStepInfo = convDbStepTelemetry ? convDbStepTelemetry.get(row.step_index) : null;
+      const dbTiming = dbStepInfo?.timing ?? null;
+      const dbUpstreamModel = dbStepInfo?.upstreamModel ?? null;
+      const dbRequestedLabel = dbStepInfo?.requestedModelLabel ?? null;
+      if (
+        (dbTiming && (dbTiming.ttftMs != null || dbTiming.durationMs != null)) ||
+        dbUpstreamModel != null ||
+        dbRequestedLabel != null
+      ) {
+        updateConvDbStepStmt.run(
+          dbTiming?.ttftMs ?? null,
+          dbTiming?.durationMs ?? null,
+          dbUpstreamModel,
+          dbRequestedLabel,
           convId,
           row.step_index
         );
-        if (dbTiming.ttftMs != null) row.ttft_ms = dbTiming.ttftMs;
-        if (dbTiming.durationMs != null) row.duration_ms = dbTiming.durationMs;
+        if (dbTiming?.ttftMs != null) row.ttft_ms = dbTiming.ttftMs;
+        if (dbTiming?.durationMs != null) row.duration_ms = dbTiming.durationMs;
+        if (dbUpstreamModel != null && !row.upstream_model) row.upstream_model = dbUpstreamModel;
+        if (dbRequestedLabel != null && !row.requested_model_label) {
+          row.requested_model_label = dbRequestedLabel;
+        }
+      }
+
+      if (row.model || row.upstream_model) {
+        if (row.model) {
+          latestModel = row.model;
+        }
+        latestModelAtMs = row.created_at_ms;
+        if (row.upstream_model) {
+          latestUpstreamModel = row.upstream_model;
+          latestRequestedModel = row.model || row.requested_model_label || null;
+          latestRequestedLabel = row.requested_model_label || null;
+        } else {
+          // Newer PLANNER_RESPONSE without conv DB gen_metadata: do not pair stale upstream model with a new turn
+          latestUpstreamModel = null;
+          latestRequestedModel = null;
+          latestRequestedLabel = null;
+        }
       }
 
       const hasExactDuration =
@@ -736,6 +1131,9 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
           }
         }
       }
+    } else if (row.model && row.step_type !== 'ERROR_MESSAGE') {
+      latestModel = row.model;
+      latestModelAtMs = row.created_at_ms;
     }
   }
 
@@ -744,13 +1142,16 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
 
   db.prepare(
     `INSERT INTO conv_latest_metrics (
-       conv_id, latest_model, latest_model_at_ms,
-       latest_context_tokens, latest_uncached_input, latest_cache_read, latest_output_tokens,
+       conv_id, latest_model, latest_upstream_model, latest_requested_model, latest_requested_label,
+       latest_model_at_ms, latest_context_tokens, latest_uncached_input, latest_cache_read, latest_output_tokens,
        user_chars_total, tool_chars_total,
        latest_speed_tok_s, avg_speed_tok_s, speed_source, speed_at_ms, last_step_at_ms
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(conv_id) DO UPDATE SET
        latest_model = excluded.latest_model,
+       latest_upstream_model = excluded.latest_upstream_model,
+       latest_requested_model = excluded.latest_requested_model,
+       latest_requested_label = excluded.latest_requested_label,
        latest_model_at_ms = excluded.latest_model_at_ms,
        latest_context_tokens = excluded.latest_context_tokens,
        latest_uncached_input = excluded.latest_uncached_input,
@@ -766,6 +1167,9 @@ function recomputeConvMetrics(db, convId, { conversationsDir = null } = {}) {
   ).run(
     convId,
     latestModel,
+    latestUpstreamModel,
+    latestRequestedModel,
+    latestRequestedLabel,
     latestModelAtMs,
     latestContextTokens,
     latestUncachedInput,
@@ -786,14 +1190,15 @@ function computeDbEtag(db) {
     .prepare(
       `SELECT COUNT(*) AS cnt, COALESCE(SUM(input_tokens + cache_read_tokens + output_tokens), 0) AS tokSum,
               COALESCE(MAX(created_at_ms), 0) AS maxTs,
-              COALESCE(SUM(COALESCE(ttft_ms, 0) + COALESCE(duration_ms, 0)), 0) AS timingSum
+              COALESCE(SUM(COALESCE(ttft_ms, 0) + COALESCE(duration_ms, 0)), 0) AS timingSum,
+              COALESCE(SUM(LENGTH(COALESCE(upstream_model, ''))), 0) AS upModelLenSum
        FROM step_ledger`
     )
     .get();
   const wm = db
     .prepare(`SELECT COUNT(*) AS files, COALESCE(SUM(byte_offset), 0) AS offsetSum FROM session_watermarks`)
     .get();
-  const raw = `${agg.cnt}:${agg.tokSum}:${agg.maxTs}:${agg.timingSum}:${wm.files}:${wm.offsetSum}`;
+  const raw = `${agg.cnt}:${agg.tokSum}:${agg.maxTs}:${agg.timingSum}:${agg.upModelLenSum}:${wm.files}:${wm.offsetSum}`;
   return crypto.createHash('sha1').update(raw).digest('hex').slice(0, 12);
 }
 
@@ -952,22 +1357,28 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
     }
 
     if (conversationsDir && fs.existsSync(conversationsDir)) {
-      const backfillRow = db
+      const timingBackfillRow = db
         .prepare(`SELECT value FROM scan_meta WHERE key = 'conv_db_timing_backfill_v1'`)
         .get();
-      const needsFullBackfill = !backfillRow || backfillRow.value !== '1';
+      const upstreamBackfillRow = db
+        .prepare(`SELECT value FROM scan_meta WHERE key = 'conv_db_upstream_model_backfill_v1'`)
+        .get();
+      const needsTimingBackfill = !timingBackfillRow || timingBackfillRow.value !== '1';
+      const needsUpstreamBackfill = !upstreamBackfillRow || upstreamBackfillRow.value !== '1';
+      const needsFullBackfill = needsTimingBackfill || needsUpstreamBackfill;
       const candidateRows = needsFullBackfill
         ? db
             .prepare(
               `SELECT DISTINCT conv_id FROM step_ledger
-               WHERE step_type = 'PLANNER_RESPONSE' AND (ttft_ms IS NULL OR duration_ms IS NULL)`
+               WHERE step_type = 'PLANNER_RESPONSE'
+                 AND (ttft_ms IS NULL OR duration_ms IS NULL OR upstream_model IS NULL)`
             )
             .all()
         : db
             .prepare(
               `SELECT DISTINCT conv_id FROM step_ledger
                WHERE step_type = 'PLANNER_RESPONSE'
-                 AND (ttft_ms IS NULL OR duration_ms IS NULL)
+                 AND (ttft_ms IS NULL OR duration_ms IS NULL OR upstream_model IS NULL)
                  AND created_at_ms >= ?
                LIMIT 5`
             )
@@ -995,8 +1406,11 @@ function scanDbWithConnection(db, transcripts, { flushPartial = false, conversat
         }
       }
 
-      if (needsFullBackfill && (candidateRows.length === 0 || backfilledAny)) {
+      if (needsTimingBackfill && (candidateRows.length === 0 || backfilledAny)) {
         upsertMeta.run('conv_db_timing_backfill_v1', '1');
+      }
+      if (needsUpstreamBackfill && (candidateRows.length === 0 || backfilledAny)) {
+        upsertMeta.run('conv_db_upstream_model_backfill_v1', '1');
       }
     }
 

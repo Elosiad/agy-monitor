@@ -1080,6 +1080,16 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
   const madSessionCrumbEl = document.getElementById("madSessionCrumb");
   const madDurationEl = document.getElementById("madDuration");
   const madTimelineEl = document.getElementById("madTimeline");
+  const madComposerDock = document.getElementById("madComposerDock");
+  const madSlashMenu = document.getElementById("madSlashMenu");
+  const madComposerGlass = document.getElementById("madComposerGlass");
+  const madAttachStrip = document.getElementById("madAttachStrip");
+  const madComposerInput = document.getElementById("madComposerInput");
+  const madComposerFileInput = document.getElementById("madComposerFileInput");
+  const madComposerAttachBtn = document.getElementById("madComposerAttachBtn");
+  const madComposerSlashBtn = document.getElementById("madComposerSlashBtn");
+  const madComposerCmdChip = document.getElementById("madComposerCmdChip");
+  const madComposerSendBtn = document.getElementById("madComposerSendBtn");
 
   const listEl = document.getElementById("masteryCliList");
   const totalCountEl = document.getElementById("masteryTotalCount");
@@ -1164,6 +1174,454 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
   const createdObjectUrls = new Set();
   let lastRenderedTimelineKey = "";
   let lastRenderedTimelineSig = "";
+
+  // ========== Main Agent Frosted-Glass Composer State ==========
+  const FALLBACK_SLASH_COMMANDS = [
+    {
+      name: "swarm",
+      category: "builtin",
+      badge: "Swarm",
+      description: "(Preview & Quota Heavy) 启动多 Agent 协作集群并行处理任务",
+    },
+    { name: "plan", category: "builtin", badge: "官方", description: "先勘查代码与上下文，制定分步实现计划" },
+    { name: "goal", category: "builtin", badge: "官方", description: "围绕单一目标持续深度推进并严格验收" },
+    { name: "boost", category: "builtin", badge: "官方", description: "开启深度思考、多视角审视与严格校验模式" },
+    { name: "grill-me", category: "builtin", badge: "官方", description: "通过交互式追问逐步对齐设计决策" },
+    { name: "teamwork", category: "builtin", badge: "官方", description: "将大型项目拆分为多角色协作团队并行推进" },
+    { name: "compact", category: "builtin", badge: "官方", description: "总结压缩上下文要点，释放窗口空间" },
+    { name: "schedule", category: "builtin", badge: "官方", description: "在当前会话中设置定时或倒计时任务" },
+    { name: "browser", category: "builtin", badge: "官方", description: "委派内置浏览器子 Agent 访问与交互网页" },
+    { name: "learn", category: "builtin", badge: "官方", description: "总结经验教训并沉淀为后续规则偏好" },
+  ];
+  const COMPOSER_ALLOWED_MIMES = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/gif",
+  ]);
+  const COMPOSER_EXT_MIMES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+  };
+  const COMPOSER_MAX_IMAGES = 6;
+  const COMPOSER_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+  let composerCommands = [...FALLBACK_SLASH_COMMANDS];
+  let composerCommandsLoaded = false;
+  let composerSending = false;
+  let composerCurrentSessionId = "";
+  let composerAttachments = [];
+  const composerDraftBySession = new Map();
+  let slashMatches = [];
+  let slashActiveIndex = 0;
+  let slashTokenRange = null; // { start, end }
+  let composerRefreshTimer = null;
+
+  const resolveComposerImageMime = (file) => {
+    const rawType = String(file?.type || "").trim().toLowerCase();
+    if (rawType === "image/jpg") return "image/jpeg";
+    if (COMPOSER_ALLOWED_MIMES.has(rawType)) return rawType;
+    if (!rawType) {
+      const name = String(file?.name || "").trim().toLowerCase();
+      const dot = name.lastIndexOf(".");
+      if (dot >= 0 && COMPOSER_EXT_MIMES[name.slice(dot)]) {
+        return COMPOSER_EXT_MIMES[name.slice(dot)];
+      }
+    }
+    return "";
+  };
+
+  const ensureComposerCommandsLoaded = async () => {
+    if (composerCommandsLoaded || typeof apiFetch !== "function") return;
+    composerCommandsLoaded = true;
+    try {
+      const res = await callJson(apiFetch, "/api/mastery/composer/commands");
+      if (!destroyed && Array.isArray(res?.commands) && res.commands.length > 0) {
+        composerCommands = res.commands;
+        if (madSlashMenu && !madSlashMenu.hidden) {
+          refreshSlashMenu();
+        }
+      }
+    } catch {
+      composerCommandsLoaded = false;
+    }
+  };
+
+  const autoResizeComposerInput = () => {
+    if (!madComposerInput) return;
+    try {
+      madComposerInput.style.height = "auto";
+      const sh = Number(madComposerInput.scrollHeight || 0);
+      if (sh > 0) {
+        madComposerInput.style.height = `${Math.max(40, Math.min(144, sh))}px`;
+      }
+    } catch {
+      // Ignore in miniDom test environment
+    }
+  };
+
+  const saveCurrentComposerDraft = () => {
+    if (!composerCurrentSessionId || !madComposerInput) return;
+    composerDraftBySession.set(composerCurrentSessionId, {
+      text: String(madComposerInput.value || ""),
+      attachments: [...composerAttachments],
+    });
+  };
+
+  const updateComposerCommandChip = () => {
+    if (!madComposerCmdChip || !madComposerInput) return;
+    const val = String(madComposerInput.value || "").trimStart();
+    const m = /^\/([a-zA-Z0-9_-]{1,48})(?=\s|$)/.exec(val);
+    if (!m) {
+      madComposerCmdChip.hidden = true;
+      madComposerCmdChip.textContent = "";
+      madComposerCmdChip.classList.remove("is-swarm");
+      return;
+    }
+    const cmdName = m[1].toLowerCase();
+    const known = composerCommands.find((c) => String(c.name || "").toLowerCase() === cmdName);
+    madComposerCmdChip.hidden = false;
+    madComposerCmdChip.classList.toggle("is-swarm", cmdName === "swarm");
+    madComposerCmdChip.textContent = cmdName === "swarm" ? "⚡ /swarm" : `/${known ? known.name : m[1]}`;
+    madComposerCmdChip.title = known?.description || `斜杠命令 /${m[1]}`;
+  };
+
+  const updateComposerSendState = () => {
+    if (!madComposerSendBtn) return;
+    const hasText = Boolean(madComposerInput && String(madComposerInput.value || "").trim());
+    const hasImgs = composerAttachments.length > 0;
+    const canSend =
+      !composerSending &&
+      detailAgentKey === "coord" &&
+      Boolean(activeDetailSession?.id) &&
+      (hasText || hasImgs);
+    madComposerSendBtn.disabled = !canSend;
+    madComposerSendBtn.classList.toggle("is-sending", composerSending);
+  };
+
+  const renderComposerAttachments = () => {
+    if (!madAttachStrip) return;
+    madAttachStrip.textContent = "";
+    if (composerAttachments.length === 0) {
+      madAttachStrip.hidden = true;
+      updateComposerSendState();
+      return;
+    }
+    madAttachStrip.hidden = false;
+    composerAttachments.forEach((att, idx) => {
+      const item = document.createElement("div");
+      item.className = "mad-attach-item";
+
+      const thumbBtn = document.createElement("button");
+      thumbBtn.type = "button";
+      thumbBtn.className = "mad-attach-thumb-btn";
+      thumbBtn.title = `点击大图预览：${att.name}`;
+      const img = document.createElement("img");
+      img.className = "mad-attach-thumb";
+      img.src = att.dataUrl;
+      img.alt = att.name || "附件图片";
+      thumbBtn.appendChild(img);
+      thumbBtn.addEventListener("click", () => {
+        openWebviewLightbox({ url: att.dataUrl, label: att.name || `图片 ${idx + 1}` });
+      });
+
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "mad-attach-remove";
+      removeBtn.setAttribute("aria-label", `移除图片 ${att.name || idx + 1}`);
+      removeBtn.title = "移除图片";
+      removeBtn.textContent = "×";
+      removeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        composerAttachments = composerAttachments.filter((entry) => entry.id !== att.id);
+        saveCurrentComposerDraft();
+        renderComposerAttachments();
+      });
+
+      item.appendChild(thumbBtn);
+      item.appendChild(removeBtn);
+      madAttachStrip.appendChild(item);
+    });
+    updateComposerSendState();
+  };
+
+  const closeSlashMenu = () => {
+    slashMatches = [];
+    slashTokenRange = null;
+    slashActiveIndex = 0;
+    if (madSlashMenu) {
+      madSlashMenu.hidden = true;
+      madSlashMenu.textContent = "";
+    }
+  };
+
+  const applySlashSelection = (cmd) => {
+    if (!cmd || !madComposerInput) return;
+    const raw = String(madComposerInput.value || "");
+    const range = slashTokenRange || { start: 0, end: raw.length };
+    const before = raw.slice(0, range.start);
+    const after = raw.slice(range.end);
+    const insertion = `/${cmd.name}${after.startsWith(" ") ? "" : " "}`;
+    madComposerInput.value = `${before}${insertion}${after}`;
+    const nextCaret = before.length + insertion.length;
+    try {
+      madComposerInput.focus();
+      madComposerInput.setSelectionRange?.(nextCaret, nextCaret);
+    } catch {
+      // Ignore selection API errors in test DOM
+    }
+    closeSlashMenu();
+    autoResizeComposerInput();
+    saveCurrentComposerDraft();
+    updateComposerCommandChip();
+    updateComposerSendState();
+  };
+
+  const renderSlashMenu = () => {
+    if (!madSlashMenu) return;
+    if (!slashMatches.length) {
+      closeSlashMenu();
+      return;
+    }
+    madSlashMenu.textContent = "";
+    slashMatches.forEach((cmd, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `mad-slash-item${idx === slashActiveIndex ? " is-active" : ""}`;
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", String(idx === slashActiveIndex));
+
+      const badge = document.createElement("span");
+      const badgeMod =
+        cmd.name === "swarm" ? " is-swarm" : cmd.category === "skill" ? " is-skill" : "";
+      badge.className = `mad-slash-badge${badgeMod}`;
+      badge.textContent = cmd.badge || (cmd.category === "skill" ? "技能" : "官方");
+
+      const name = document.createElement("span");
+      name.className = "mad-slash-name";
+      name.textContent = `/${cmd.name}`;
+
+      const desc = document.createElement("span");
+      desc.className = "mad-slash-desc";
+      desc.textContent = cmd.description || "";
+      desc.title = cmd.description || "";
+
+      btn.appendChild(badge);
+      btn.appendChild(name);
+      btn.appendChild(desc);
+
+      btn.addEventListener("mouseenter", () => {
+        if (slashActiveIndex === idx) return;
+        slashActiveIndex = idx;
+        Array.from(madSlashMenu.children).forEach((child, cIdx) => {
+          child.classList.toggle("is-active", cIdx === slashActiveIndex);
+          child.setAttribute("aria-selected", String(cIdx === slashActiveIndex));
+        });
+      });
+      btn.addEventListener("mousedown", (e) => {
+        // Prevent textarea blur before selection completes
+        e.preventDefault();
+      });
+      btn.addEventListener("click", () => applySlashSelection(cmd));
+
+      madSlashMenu.appendChild(btn);
+    });
+    madSlashMenu.hidden = false;
+  };
+
+  const refreshSlashMenu = ({ forceAll = false } = {}) => {
+    if (!madComposerInput || !madSlashMenu) return;
+    const val = String(madComposerInput.value || "");
+    const caret =
+      typeof madComposerInput.selectionStart === "number"
+        ? madComposerInput.selectionStart
+        : val.length;
+    const prefix = val.slice(0, caret);
+    const match = /(?:^|\s)(\/([a-zA-Z0-9_-]*))$/.exec(prefix);
+    if (!match && !forceAll) {
+      closeSlashMenu();
+      return;
+    }
+
+    const query = match ? String(match[2] || "").toLowerCase() : "";
+    const tokenLen = match ? match[1].length : 0;
+    slashTokenRange = match
+      ? { start: caret - tokenLen, end: caret }
+      : { start: caret, end: caret };
+
+    const filtered = !query
+      ? [...composerCommands]
+      : composerCommands
+          .filter(
+            (c) =>
+              String(c.name || "").toLowerCase().includes(query) ||
+              String(c.description || "").toLowerCase().includes(query)
+          )
+          .sort((a, b) => {
+            const an = String(a.name || "").toLowerCase();
+            const bn = String(b.name || "").toLowerCase();
+            const aStarts = an.startsWith(query) ? 0 : 1;
+            const bStarts = bn.startsWith(query) ? 0 : 1;
+            if (aStarts !== bStarts) return aStarts - bStarts;
+            return an.localeCompare(bn);
+          });
+
+    slashMatches = filtered.slice(0, 10);
+    slashActiveIndex = 0;
+    renderSlashMenu();
+  };
+
+  const addComposerImageFiles = (filesLike) => {
+    const files = Array.from(filesLike || []).filter(Boolean);
+    if (!files.length) return;
+
+    const remaining = COMPOSER_MAX_IMAGES - composerAttachments.length;
+    if (remaining <= 0) {
+      onToast?.(`单次最多附加 ${COMPOSER_MAX_IMAGES} 张图片`, "error");
+      return;
+    }
+    const accepted = files.slice(0, remaining);
+    if (files.length > remaining) {
+      onToast?.(`单次最多附加 ${COMPOSER_MAX_IMAGES} 张图片，已截取前 ${remaining} 张`, "info");
+    }
+
+    accepted.forEach((file, idx) => {
+      const mime = resolveComposerImageMime(file);
+      if (!mime) {
+        onToast?.("仅支持粘贴或上传 PNG / JPEG / WEBP / GIF 位图图片", "error");
+        return;
+      }
+      if (Number(file.size || 0) > COMPOSER_MAX_IMAGE_BYTES) {
+        onToast?.("单张图片请勿超过 8 MB", "error");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (destroyed) return;
+        const dataUrl = typeof reader.result === "string" ? reader.result : "";
+        const comma = dataUrl.indexOf(",");
+        const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+        if (!base64) return;
+        if (composerAttachments.length >= COMPOSER_MAX_IMAGES) return;
+        composerAttachments.push({
+          id: `att-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 7)}`,
+          name: file.name || `pasted-${composerAttachments.length + 1}.png`,
+          mime,
+          size: Number(file.size || 0),
+          base64,
+          dataUrl,
+        });
+        saveCurrentComposerDraft();
+        renderComposerAttachments();
+      };
+      reader.onerror = () => {
+        if (!destroyed) onToast?.("读取图片附件失败", "error");
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const syncComposerDockVisibility = (isMaster, session) => {
+    if (!madComposerDock) return;
+    const targetSessionId = isMaster && session?.id ? String(session.id) : "";
+    if (!targetSessionId) {
+      saveCurrentComposerDraft();
+      closeSlashMenu();
+      madComposerDock.hidden = true;
+      composerCurrentSessionId = "";
+      updateComposerSendState();
+      return;
+    }
+
+    if (composerCurrentSessionId !== targetSessionId) {
+      saveCurrentComposerDraft();
+      composerCurrentSessionId = targetSessionId;
+      const savedDraft = composerDraftBySession.get(targetSessionId);
+      if (madComposerInput) {
+        madComposerInput.value = savedDraft ? savedDraft.text : "";
+        autoResizeComposerInput();
+      }
+      composerAttachments = savedDraft ? [...savedDraft.attachments] : [];
+      closeSlashMenu();
+      renderComposerAttachments();
+      updateComposerCommandChip();
+    }
+
+    madComposerDock.hidden = false;
+    updateComposerSendState();
+    void ensureComposerCommandsLoaded();
+  };
+
+  const sendComposerMessage = async () => {
+    if (composerSending || detailAgentKey !== "coord" || !activeDetailSession?.id) return;
+    const convId = String(activeDetailSession.id).trim();
+    const prompt = madComposerInput ? String(madComposerInput.value || "").trim() : "";
+    if (!prompt && composerAttachments.length === 0) return;
+    if (typeof apiFetch !== "function") return;
+
+    composerSending = true;
+    closeSlashMenu();
+    updateComposerSendState();
+
+    const payloadImages = composerAttachments.map((att) => ({
+      name: att.name,
+      mime: att.mime,
+      base64: att.base64,
+    }));
+
+    try {
+      const res = await callJson(apiFetch, "/api/mastery/composer/send", {
+        method: "POST",
+        body: JSON.stringify({
+          conversationId: convId,
+          prompt,
+          images: payloadImages,
+        }),
+      });
+      if (destroyed) return;
+
+      if (madComposerInput) {
+        madComposerInput.value = "";
+        autoResizeComposerInput();
+      }
+      composerAttachments = [];
+      composerDraftBySession.delete(convId);
+      renderComposerAttachments();
+      updateComposerCommandChip();
+
+      const cmdTag = res?.matchedCommand ? `/${res.matchedCommand}` : "";
+      onToast?.(
+        cmdTag === "/swarm"
+          ? "已向主 Agent 发送 /swarm 协作指令"
+          : cmdTag
+            ? `已向主 Agent 发送 ${cmdTag} 指令`
+            : payloadImages.length > 0
+              ? `已发送消息与 ${payloadImages.length} 张图片给主 Agent`
+              : "已发送指令给主 Agent",
+        "success"
+      );
+
+      void refreshMastery({ force: true });
+      clearTimeout(composerRefreshTimer);
+      composerRefreshTimer = setTimeout(() => {
+        if (!destroyed && tabActive) {
+          void refreshMastery({ force: true });
+        }
+      }, 1200);
+    } catch (err) {
+      if (destroyed) return;
+      onToast?.(err?.message || "发送消息失败，请稍后重试", "error");
+    } finally {
+      composerSending = false;
+      if (!destroyed) {
+        updateComposerSendState();
+      }
+    }
+  };
 
   const jumpToSession = (session) => {
     const targetId = String(session?.id || selectedSessionId || "").trim();
@@ -1960,12 +2418,14 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
 
     overviewViewEl.hidden = true;
     detailViewEl.hidden = false;
+    syncComposerDockVisibility(isMaster, session);
     renderAgentTimeline(agent, isMaster, session, { preserveScroll: false });
   };
 
   const closeAgentDetail = () => {
     if (!overviewViewEl || !detailViewEl || detailViewEl.hidden) return;
     detailAgentKey = "";
+    syncComposerDockVisibility(false, null);
     detailViewEl.hidden = true;
     overviewViewEl.hidden = false;
     hoveredAgentId = null;
@@ -2384,6 +2844,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
           ? session.master
           : (session.subs || []).find((sub) => sub.id === detailAgentKey);
       if (targetAgent) {
+        syncComposerDockVisibility(detailAgentKey === "coord", session);
         renderAgentTimeline(targetAgent, detailAgentKey === "coord", session, {
           preserveScroll: true,
         });
@@ -2544,6 +3005,16 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
         return;
       }
       if (e.key !== "Escape") return;
+      if (madSlashMenu && !madSlashMenu.hidden) {
+        e.stopImmediatePropagation?.();
+        closeSlashMenu();
+        return;
+      }
+      if (typeof document !== "undefined" && document.activeElement === madComposerInput) {
+        e.stopImmediatePropagation?.();
+        madComposerInput?.blur?.();
+        return;
+      }
       if (modalBackdrop && !modalBackdrop.hidden) {
         e.stopImmediatePropagation?.();
         closeThirdPartyModal();
@@ -2553,6 +3024,156 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     },
     true
   );
+
+  // ========== Main Agent Frosted-Glass Composer Events ==========
+  on(madComposerInput, "input", () => {
+    autoResizeComposerInput();
+    saveCurrentComposerDraft();
+    updateComposerCommandChip();
+    updateComposerSendState();
+    refreshSlashMenu();
+  });
+
+  on(madComposerInput, "click", () => {
+    refreshSlashMenu();
+  });
+
+  on(madComposerInput, "keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    const menuOpen = Boolean(madSlashMenu && !madSlashMenu.hidden && slashMatches.length > 0);
+    if (menuOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        slashActiveIndex = (slashActiveIndex + 1) % slashMatches.length;
+        renderSlashMenu();
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        slashActiveIndex = (slashActiveIndex - 1 + slashMatches.length) % slashMatches.length;
+        renderSlashMenu();
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        applySlashSelection(slashMatches[slashActiveIndex] || slashMatches[0]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeSlashMenu();
+        return;
+      }
+    }
+
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      void sendComposerMessage();
+    }
+  });
+
+  on(madComposerInput, "paste", (e) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const pastedImages = [];
+    if (cd.items && cd.items.length > 0) {
+      for (let i = 0; i < cd.items.length; i += 1) {
+        const it = cd.items[i];
+        if (it && it.kind === "file" && String(it.type || "").toLowerCase().startsWith("image/")) {
+          const f = it.getAsFile?.();
+          if (f) pastedImages.push(f);
+        }
+      }
+    } else if (cd.files && cd.files.length > 0) {
+      for (let i = 0; i < cd.files.length; i += 1) {
+        const f = cd.files[i];
+        if (f && String(f.type || "").toLowerCase().startsWith("image/")) {
+          pastedImages.push(f);
+        }
+      }
+    }
+    if (pastedImages.length > 0) {
+      const plainText = typeof cd.getData === "function" ? cd.getData("text/plain") : "";
+      if (!plainText) {
+        e.preventDefault();
+      }
+      addComposerImageFiles(pastedImages);
+    }
+  });
+
+  on(madComposerAttachBtn, "click", () => {
+    madComposerFileInput?.click?.();
+  });
+
+  on(madComposerFileInput, "change", () => {
+    if (madComposerFileInput?.files?.length) {
+      addComposerImageFiles(madComposerFileInput.files);
+      madComposerFileInput.value = "";
+    }
+  });
+
+  on(madComposerSlashBtn, "click", () => {
+    if (!madComposerInput) return;
+    if (madSlashMenu && !madSlashMenu.hidden) {
+      closeSlashMenu();
+      madComposerInput.focus?.();
+      return;
+    }
+    void ensureComposerCommandsLoaded();
+    const cur = String(madComposerInput.value || "");
+    if (!cur.trimStart().startsWith("/")) {
+      madComposerInput.value = cur ? `/${cur}` : "/";
+      try {
+        madComposerInput.focus();
+        madComposerInput.setSelectionRange?.(1, 1);
+      } catch {}
+      autoResizeComposerInput();
+      saveCurrentComposerDraft();
+      updateComposerCommandChip();
+      updateComposerSendState();
+    } else {
+      madComposerInput.focus?.();
+    }
+    refreshSlashMenu({ forceAll: true });
+  });
+
+  on(madComposerSendBtn, "click", () => {
+    void sendComposerMessage();
+  });
+
+  on(madComposerGlass, "dragover", (e) => {
+    e.preventDefault();
+    madComposerGlass?.classList.add("is-dragover");
+  });
+
+  on(madComposerGlass, "dragleave", (e) => {
+    if (e.target === madComposerGlass) {
+      madComposerGlass?.classList.remove("is-dragover");
+    }
+  });
+
+  on(madComposerGlass, "drop", (e) => {
+    e.preventDefault();
+    madComposerGlass?.classList.remove("is-dragover");
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) {
+      addComposerImageFiles(files);
+    }
+  });
+
+  on(document, "click", (e) => {
+    if (!madSlashMenu || madSlashMenu.hidden) return;
+    const t = e.target;
+    if (
+      t &&
+      typeof t.closest === "function" &&
+      (t.closest("#madSlashMenu") || t.closest("#madComposerSlashBtn") || t.closest("#madComposerInput"))
+    ) {
+      return;
+    }
+    closeSlashMenu();
+  });
 
   // Lightbox zoom, pan, close, open-file & open-folder controls
   on(lightboxCloseBtn, "click", closeImageLightbox);
@@ -2848,6 +3469,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     setTranslator() {},
     destroy() {
       destroyed = true;
+      clearTimeout(composerRefreshTimer);
       stopPolling();
       resizeObserver?.disconnect?.();
       cleanups.forEach((fn) => fn());

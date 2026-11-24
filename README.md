@@ -31,14 +31,36 @@
 
 ### 3. 美化（Theme & Backdrop Studio）
 - **撞色主题引擎**：内置「极昼原版」等 5 套精选方案，支持 6 项核心色自定义、方案保存、随宿主明暗自动反色。
-- **图片壁纸 & Windows 整机壁纸**：内置 5 张高清壁纸（默认启用「星海夜行电车」），支持自定义上传图片、透明度/模糊度/暗度遮罩/圆角调节；Windows 下自动通过系统自带 `.NET` 编译轻量伴侣程序，提供 **方案一：贴背微透（默认 25%）**、**方案二：CDP 高清纯 CSS** 以及 **输入框上下文圆环 + 实时速度悬浮 HUD**（自动适配双屏多 DPI）。
+- **图片壁纸 & Windows 整机壁纸**：内置 5 张高清壁纸（默认启用「星海夜行电车」），支持自定义上传图片、透明度/模糊度/暗度遮罩/圆角调节；Windows 下自动通过系统自带 `.NET` 编译轻量伴侣程序，提供 **方案一：贴背微透（默认 25%）**、**方案二：CDP 高清纯 CSS** 以及 **输入框上下文圆环 + 实时速度悬浮 HUD**（自动适配双屏多 DPI，同时兼容 `Antigravity` 与 `Antigravity_Original` 启动器进程）。
 
 <img width="1920" height="1080" alt="ff9e0805cd6335cbb0a53afd3a58fc51" src="https://github.com/user-attachments/assets/d69f30ed-d0e4-417b-889b-2e02ed64dec6" />
+
+### 4. 账号（Multi-Account Hub）
+- **DPAPI 硬件级加密多账号保险库**：所有凭据均由 Windows 原生 DPAPI（CurrentUser）加密封装，磁盘零明文 Token、CLI 零敏感参数暴露。
+- **多种安全入库方式**：支持 **一键捕获当前已登录账号**、**浏览器官方 OAuth 一键直连授权新号**（PKCE S256 + 本地回环回调 + 系统代理隧道，不干扰当前运行中的 Antigravity），以及 **Token / JSON 批量导入导出**。
+- **全账号实时额度同步 & 总余量看板**：支持对当前与非当前所有账号直接通过官方 CloudCode 接口实时拉取 5 小时 / 周配额与重置倒计时；顶部展示三类额度总余量聚合卡片，宽屏自动适配 1/2/3 列卡片网格，并提供悬停下拉 + 点击轮切的多维度排序（邮箱 A-Z / Gemini / GPT&Claude / Argon / 最近使用）。
+- **无感一键切号与耗尽自动切号**：支持一键离线安全切号（自动备份与失败回滚）、自定义配额自动刷新间隔，以及开启指定模型组的 5h 耗尽 / 周额度归零 / `QUOTA_EXHAUSTED` 报错自动切号（优先选取最高可用额度且自动过滤 0 额度号，切号后仅自动续接真正运行中的会话）。
 
 
 ---
 
 ## 版本更新日志（Changelog）
+
+### `v1.1.0`（2026-11-24）— 多账号安全管理与自动切号（账号分页）、掌握页发消息输入框、真实上游模型校正 & 伴侣兼容加固
+
+- **全新「账号」分页（Multi-Account Hub）**：
+  - 新增基于 Windows 原生 DPAPI 硬件级加密的多账号保险库（[accounts.mjs](sidecars/agy_monitor/backend/accounts.mjs)、[AgyAccountTool.cs](sidecars/agy_monitor/accounts/AgyAccountTool.cs)、[accounts_hub.js](sidecars/agy_monitor/frontend/components/accounts_hub.js)），支持当前账号一键捕获、**浏览器官方 OAuth 一键直连授权新号**（PKCE S256 + 自动识别环境变量与 Windows 系统代理 HTTP/SOCKS5 隧道）、Token/JSON 批量导入导出、备注编辑、启/停用与删除。
+  - **全账号真实实时额度刷新**：参考 Cockpit Tools 接入官方 CloudCode 接口（`v1internal:loadCodeAssist` + `v1internal:retrieveUserQuotaSummary` 及 `v1internal:fetchAvailableModels` 兜底），支持任意非当前账号实时刷新 5 小时与周配额及重置倒计时，并支持定时自动同步。
+  - **三类额度总余量聚合卡片 & 多维排序 & 响应式多列布局**：顶部展示全部启用账号的 Gemini / GPT&Claude / Argon 5h 与周总余量进度条；提供悬停展开/点击轮切排序器与窄/宽屏 1～3 列卡片网格自适应。
+  - **一键安全切号 & 耗尽自动切号**：切号前自动 DPAPI 快照备份并支持一键回滚；设置中可配置配额自动刷新间隔与自动切号开关（支持 5h 耗尽、周额度归零及会话数据库 `step_type = 17` `QUOTA_EXHAUSTED` 报错触发，优先挑选最高余量账号且排除 0 额度号），重启后仅对切号前处于 `running` 状态的会话执行 At-Most-Once 自动续接。
+- **「掌握」页集成消息发送器**：
+  - 新增 [composer.mjs](sidecars/agy_monitor/backend/composer.mjs)，支持在掌握页直接向会话发送文本、附件图片及自动发现的 `/swarm` / 自定义技能指令。
+- **上游真实模型 ID 精准提取 & 消除误报「疑似降级」**：
+  - 从会话数据库 `gen_metadata.#1.#19` 提取权威上游返回模型（如 `gemini-3.8-flash-n`），并严格对比该轮实际请求模型，修复无降级却误标「疑似降级」的问题。
+- **桌面壁纸伴侣与切号助手进程识别兼容 & 测试路径隔离**：
+  - [AgyBackdrop.cs](sidecars/agy_monitor/backdrop/AgyBackdrop.cs) 与 [AgyAccountTool.cs](sidecars/agy_monitor/accounts/AgyAccountTool.cs) 同步兼容 `Antigravity` 与 `Antigravity_Original` 宿主进程，修复外壳启动器环境下整机美化与底部上下文圆环无法追踪主窗的问题；加固 [paths.mjs](sidecars/agy_monitor/backend/paths.mjs) 测试路径隔离，避免污染用户真实配置目录。
+
+---
 
 ### `v1.0.13`（2026-11-22）— 请求记录真实首字 (TTFT) 与全量精确耗时打通 & 伴侣冷启动探测优化
 

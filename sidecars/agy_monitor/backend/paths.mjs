@@ -63,16 +63,20 @@ export function resolvePaths(overrides = {}) {
 
   const pluginDataDir = path.resolve(
     overrides.pluginDataDir ||
-      process.env.AGY_MONITOR_PLUGIN_DATA_DIR ||
-      process.env.PLUGIN_DATA ||
-      path.join(appDataDir, 'plugin_data', PLUGIN_NAME),
+      (overrides.appDataDir
+        ? path.join(appDataDir, 'plugin_data', PLUGIN_NAME)
+        : process.env.AGY_MONITOR_PLUGIN_DATA_DIR ||
+          process.env.PLUGIN_DATA ||
+          path.join(appDataDir, 'plugin_data', PLUGIN_NAME)),
   );
 
   const sidecarDataDir = path.resolve(
     overrides.sidecarDataDir ||
-      process.env.AGY_MONITOR_SIDECAR_DATA_DIR ||
-      inferred.sidecarDataDir ||
-      path.join(appDataDir, 'sidecar_data', PLUGIN_NAME, SIDECAR_NAME, 'data'),
+      (overrides.appDataDir
+        ? path.join(appDataDir, 'sidecar_data', PLUGIN_NAME, SIDECAR_NAME, 'data')
+        : process.env.AGY_MONITOR_SIDECAR_DATA_DIR ||
+          inferred.sidecarDataDir ||
+          path.join(appDataDir, 'sidecar_data', PLUGIN_NAME, SIDECAR_NAME, 'data')),
   );
 
   const brainDir = path.resolve(
@@ -125,6 +129,10 @@ export function resolvePaths(overrides = {}) {
       overrides.backdropSourceFile ||
         path.join(pluginRoot, 'sidecars', SIDECAR_NAME, 'backdrop', 'AgyBackdrop.cs'),
     ),
+    accountToolSourceFile: path.resolve(
+      overrides.accountToolSourceFile ||
+        path.join(pluginRoot, 'sidecars', SIDECAR_NAME, 'accounts', 'AgyAccountTool.cs'),
+    ),
 
     appDataDir,
     geminiConfigDir,
@@ -133,6 +141,16 @@ export function resolvePaths(overrides = {}) {
 
     pluginDataDir,
     customWallpapersDir,
+    composerMediaDir: path.join(pluginDataDir, 'composer_media'),
+    accountsDir: path.join(pluginDataDir, 'accounts'),
+    accountsIndexFile: path.join(pluginDataDir, 'accounts', 'accounts_index.json'),
+    accountsVaultFile: path.join(pluginDataDir, 'accounts', 'accounts.vault.dat'),
+    accountsBackupsDir: path.join(pluginDataDir, 'accounts', 'backups'),
+    accountSwitchTxFile: path.join(pluginDataDir, 'accounts', 'switch_transaction.json'),
+    accountPendingResumeFile: path.join(pluginDataDir, 'accounts', 'pending_resume.json'),
+    accountPendingOauthFile: path.join(pluginDataDir, 'accounts', 'pending_oauth_capture.json'),
+    accountToolExeFile: path.join(pluginDataDir, 'bin', 'agy_account_tool.exe'),
+    accountToolHashFile: path.join(pluginDataDir, 'bin', 'agy_account_tool.sha1'),
     backdropBinDir: path.join(pluginDataDir, 'bin'),
     backdropExeFile: path.join(pluginDataDir, 'bin', 'agy_backdrop.exe'),
     backdropHashFile: path.join(pluginDataDir, 'bin', 'agy_backdrop.sha1'),

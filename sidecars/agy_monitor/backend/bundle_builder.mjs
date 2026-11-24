@@ -9,6 +9,7 @@ const COMPONENT_EXPORTS = [
   ['sessions_hub.js', 'createSessionsHub'],
   ['runtime_bar.js', 'createRuntimeBar'],
   ['mastery_hub.js', 'createMasteryHub'],
+  ['accounts_hub.js', 'createAccountsHub'],
   ['theme_studio.js', 'createThemeStudio'],
 ];
 
@@ -88,6 +89,7 @@ export async function buildFrontendBundle(frontendDir) {
       `  const { createSessionsHub } = __mods.sessions_hub;\n` +
       `  const { createRuntimeBar } = __mods.runtime_bar;\n` +
       `  const { createMasteryHub } = __mods.mastery_hub;\n` +
+      `  const { createAccountsHub } = __mods.accounts_hub;\n` +
       `  const { createThemeStudio } = __mods.theme_studio;\n` +
       `${appBody}\n` +
       `  if (typeof window !== "undefined") { window.__agyMonitorMount = mountMonitorApp; }\n` +

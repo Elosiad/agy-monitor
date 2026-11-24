@@ -114,13 +114,18 @@ export function createRuntimeBar({ t } = {}) {
   const renderUpstream = (telemetry) => {
     const modelId = telemetry?.upstreamModelId || "";
     const status = telemetry?.upstreamModelStatus || (modelId ? "no_baseline" : "unreported");
+    const source = telemetry?.upstreamModelSource || "";
+    const requestedDisplay = telemetry?.requestedModelLabel || telemetry?.requestedModelId || "";
     const cacheHitPct = telemetry?.cacheHitPct;
 
     if (upstreamModelEl) {
       const displayId =
         modelId || tr("runtime.upstreamNone", "尚无上游模型回传记录", "No upstream model logged yet");
       upstreamModelEl.textContent = displayId;
-      upstreamModelEl.title = displayId;
+      upstreamModelEl.title =
+        modelId && requestedDisplay && requestedDisplay.toLowerCase() !== modelId.toLowerCase()
+          ? `${displayId} · ${tr("runtime.requestedModelTag", "请求 {model}", "Requested {model}", { model: requestedDisplay })}`
+          : displayId;
       upstreamModelEl.classList.toggle(
         "is-alert",
         status === "downgrade_suspected" || status === "ab_or_alias"
@@ -164,7 +169,10 @@ export function createRuntimeBar({ t } = {}) {
       }
       if (status === "downgrade_suspected") {
         segments.push({
-          text: tr("runtime.downgradeHint", "与默认选定模型不一致", "Differs from selected default"),
+          text:
+            source === "conv_db_gen_metadata"
+              ? tr("runtime.downgradeRequestedHint", "与本次请求模型不一致", "Differs from requested model")
+              : tr("runtime.downgradeHint", "与默认选定模型不一致", "Differs from selected default"),
           highlight: false,
         });
       } else if (status === "ab_or_alias") {
@@ -175,6 +183,13 @@ export function createRuntimeBar({ t } = {}) {
       } else if (status === "no_baseline" && modelId) {
         segments.push({
           text: tr("runtime.noBaselineHint", "未设发起偏好 · 仅读当前日志", "No launch baseline · logs only"),
+          highlight: false,
+        });
+      } else if (status === "match" && requestedDisplay && requestedDisplay.toLowerCase() !== modelId.toLowerCase()) {
+        segments.push({
+          text: tr("runtime.requestedModelTag", "请求 {model}", "Requested {model}", {
+            model: requestedDisplay,
+          }),
           highlight: false,
         });
       }

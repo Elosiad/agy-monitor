@@ -34,6 +34,13 @@ import {
   resolveLocalTargetPath,
 } from './backend/mastery.mjs';
 import {
+  composeOutboundMessage,
+  listSlashCommands,
+  matchLeadingSlashCommand,
+  MAX_COMPOSER_PROMPT_CHARS,
+  saveComposerImages,
+} from './backend/composer.mjs';
+import {
   createMasterySummarizer,
   fetchThirdPartyModels,
   testThirdPartyConnection,
@@ -52,6 +59,7 @@ import {
   queryTelemetrySnapshot,
 } from './backend/telemetry.mjs';
 import { createQuotaClient } from './backend/quota.mjs';
+import { createAccountManager, ensureAccountTool } from './backend/accounts.mjs';
 import {
   applyPluginUpdate,
   checkForUpdates,
@@ -125,6 +133,10 @@ const STATIC_ASSETS = new Map([
   [
     '/components/mastery_hub.js',
     { relPath: 'components/mastery_hub.js', contentType: 'application/javascript; charset=utf-8' },
+  ],
+  [
+    '/components/accounts_hub.js',
+    { relPath: 'components/accounts_hub.js', contentType: 'application/javascript; charset=utf-8' },
   ],
   [
     '/components/theme_studio.js',
@@ -665,12 +677,29 @@ export function createMonitorHandlers({
   hudPublisher = null,
   cdpBridge = null,
   quotaClient = null,
+  accountManager = null,
+  accountDriver = null,
 } = {}) {
   const resolvedPaths = paths || resolvePaths();
   const store = storage || createStorage(resolvedPaths);
   const cdp = cdpBridge || createCdpThemeBridge(resolvedPaths);
   const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp);
   const quota = quotaClient || createQuotaClient();
+  const accounts =
+    accountManager ||
+    createAccountManager({
+      paths: resolvedPaths,
+      storage: store,
+      quotaClient: quota,
+      sidecarBridge,
+      getRunningConversations: async () => {
+        const hub = await querySessionsHub(resolvedPaths.summariesDbPath, store, {});
+        return Array.isArray(hub?.active)
+          ? hub.active.filter((s) => s && s.id && s.status === 'running')
+          : [];
+      },
+      driver: accountDriver,
+    });
   const masterySummarizer = createMasterySummarizer(resolvedPaths, store);
   const consoleViewports = new Map();
   let lastViewportDiskSig = '';
@@ -1004,7 +1033,11 @@ export function createMonitorHandlers({
 
   register('GET', '/api/quota', async (data = {}) => {
     const force = data.force === '1' || data.force === 'true' || data.force === true;
-    return quota.getQuotaSummary({ force });
+    const summary = await quota.getQuotaSummary({ force });
+    if (summary?.ok && Array.isArray(summary.groups) && summary.groups.length > 0) {
+      void accounts.syncActiveAccountQuotaFromLive(summary).catch(() => {});
+    }
+    return summary;
   });
 
   register('POST', '/api/rescan', async () => {
@@ -1445,6 +1478,85 @@ export function createMonitorHandlers({
     return { ok: true, mode: 'webview', path: resolved };
   });
 
+  register('GET', '/api/mastery/composer/commands', async () => {
+    const commands = await listSlashCommands(resolvedPaths);
+    return { ok: true, commands };
+  });
+
+  register('POST', '/api/mastery/composer/send', async (data = {}) => {
+    const conversationId =
+      typeof data.conversationId === 'string' ? data.conversationId.trim() : '';
+    if (!conversationId || !/^[a-zA-Z0-9_-]{4,128}$/.test(conversationId)) {
+      return errorResponse(ResponseCtor, 400, '目标会话 ID 无效');
+    }
+
+    const rawPrompt = typeof data.prompt === 'string' ? data.prompt : '';
+    const prompt = rawPrompt.replace(/\r\n?/g, '\n').trim();
+    if (prompt.length > MAX_COMPOSER_PROMPT_CHARS) {
+      return errorResponse(ResponseCtor, 400, `提示词过长，请控制在 ${MAX_COMPOSER_PROMPT_CHARS} 字符以内`);
+    }
+
+    const rawImages = Array.isArray(data.images) ? data.images : [];
+    if (!prompt && rawImages.length === 0) {
+      return errorResponse(ResponseCtor, 400, '请输入提示词或粘贴至少一张图片');
+    }
+
+    if (typeof sidecarBridge?.sendMessage !== 'function') {
+      return errorResponse(ResponseCtor, 503, '当前运行环境不支持通过 agentapi 向会话发送消息');
+    }
+
+    const savedImgRes = await saveComposerImages(resolvedPaths, rawImages);
+    if (!savedImgRes.ok) {
+      return errorResponse(ResponseCtor, savedImgRes.status || 400, savedImgRes.error || '保存粘贴图片失败');
+    }
+
+    const commands = await listSlashCommands(resolvedPaths);
+    const slashCommand = matchLeadingSlashCommand(prompt, commands);
+    const outboundMessage = composeOutboundMessage({
+      prompt,
+      savedImages: savedImgRes.saved,
+      slashCommand,
+    });
+
+    let projectId =
+      typeof data.projectId === 'string' && data.projectId.trim()
+        ? data.projectId.trim()
+        : sidecarBridge?.getConfig?.()?.projectId || '';
+    if (!projectId && typeof sidecarBridge?.getConversationMetadata === 'function') {
+      try {
+        const metaResp = await sidecarBridge.getConversationMetadata(conversationId);
+        const metaEvent =
+          metaResp?.response?.conversationMetadata || metaResp?.response?.conversation_metadata;
+        const resolvedProj =
+          metaEvent?.metadata?.projectId || metaEvent?.metadata?.project_id || '';
+        if (resolvedProj) projectId = resolvedProj;
+      } catch {
+        // Non-fatal: proceed without explicit projectId override
+      }
+    }
+
+    try {
+      const resp = await sidecarBridge.sendMessage(conversationId, outboundMessage, {
+        title: 'AGY 控制台',
+        ...(projectId ? { projectId } : {}),
+      });
+      triggerRescan?.();
+      return {
+        ok: true,
+        conversationId,
+        savedImages: savedImgRes.saved,
+        matchedCommand: slashCommand?.name || null,
+        response: resp && typeof resp === 'object' ? resp : {},
+      };
+    } catch (err) {
+      return errorResponse(
+        ResponseCtor,
+        502,
+        `发送消息失败：${sanitizeErrorMessage(err, 'agentapi send-message 调用失败')}`,
+      );
+    }
+  });
+
   register('POST', '/api/mastery/config', async (data = {}) => {
     try {
       const updated = await store.updateMasteryConfig(data);
@@ -1739,6 +1851,209 @@ export function createMonitorHandlers({
     return result;
   });
 
+  // ---- Multi-Account Management (DPAPI Vault + Detached Safe Switch + Auto-Resume) ----
+  register('GET', '/api/accounts', async () => {
+    try {
+      return await accounts.listAccounts();
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/settings', async (data = {}) => {
+    try {
+      const result = await accounts.updateAccountSettings(data);
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '保存账号设置失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/capture', async (data = {}) => {
+    try {
+      const result = await accounts.captureCurrentAccount({
+        remark: typeof data.remark === 'string' ? data.remark : '',
+        source: 'capture',
+      });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '捕获当前账号失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/oauth-add', async () => {
+    try {
+      const result = await accounts.startOauthWatch();
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '开启 OAuth 新号监听失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/oauth-watch/stop', async () => {
+    try {
+      return await accounts.stopOauthWatch();
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/oauth-direct/start', async (data = {}) => {
+    try {
+      const remark = typeof data.remark === 'string' ? data.remark : '';
+      const result = await accounts.startDirectBrowserOauth({ remark });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '开启浏览器 OAuth 授权失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('GET', '/api/accounts/oauth-direct/status', async () => {
+    try {
+      return accounts.getDirectBrowserOauthStatus();
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/oauth-direct/cancel', async () => {
+    try {
+      return await accounts.cancelDirectBrowserOauth();
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/import', async (data = {}) => {
+    try {
+      const result = await accounts.importAccounts({
+        rawInput: data.rawInput ?? data.text ?? data.payload ?? '',
+        email: typeof data.email === 'string' ? data.email : '',
+        remark: typeof data.remark === 'string' ? data.remark : '',
+      });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '导入账号失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/toggle', async (data = {}) => {
+    try {
+      const result = await accounts.toggleAccountEnabled(data.accountId, data.enabled);
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '切换账号启用状态失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/remark', async (data = {}) => {
+    try {
+      const result = await accounts.updateAccountRemark(data.accountId, data.remark ?? '');
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '保存备注失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/delete', async (data = {}) => {
+    try {
+      const result = await accounts.deleteAccount(data.accountId);
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '删除账号失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/export', async (data = {}) => {
+    try {
+      const result = await accounts.exportAccountJson(data.accountId);
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '导出账号 JSON 失败');
+      }
+      return makeResponse(ResponseCtor, result, {
+        status: 200,
+        contentType: 'application/json; charset=utf-8',
+        headers: { 'Cache-Control': 'no-store' },
+      });
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/refresh-quota', async (data = {}) => {
+    try {
+      const result = await accounts.refreshAccountQuota(data.accountId);
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '刷新账号额度失败', {
+          account: result.account || null,
+        });
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/switch', async (data = {}) => {
+    try {
+      const result = await accounts.switchAccount({
+        accountId: data.accountId,
+        autoResume: data.autoResume !== false,
+        resumePrompt: typeof data.resumePrompt === 'string' ? data.resumePrompt : undefined,
+      });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '切换账号失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/rollback', async () => {
+    try {
+      const result = await accounts.rollbackLatestBackup();
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '回滚备份失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/cancel-resume', async () => {
+    try {
+      return await accounts.cancelPendingResume();
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
   return routes;
 }
 
@@ -1898,17 +2213,36 @@ export async function startSidecarServer({
         },
       });
 
+  const sidecarBridgeObj = {
+    getConfig: () => app.config,
+    startConversation: (message, opts) => app.startConversation(message, opts),
+    sendMessage: (conversationId, message, opts) => app.sendMessage(conversationId, message, opts),
+    getConversationMetadata: (conversationId) => app.getConversationMetadata(conversationId),
+  };
+  const sharedQuotaClient = createQuotaClient();
+  const sharedAccountManager = createAccountManager({
+    paths,
+    storage,
+    quotaClient: sharedQuotaClient,
+    sidecarBridge: sidecarBridgeObj,
+    getRunningConversations: async () => {
+      const hub = await querySessionsHub(paths.summariesDbPath, storage, {});
+      return Array.isArray(hub?.active)
+        ? hub.active.filter((s) => s && s.id && s.status === 'running')
+        : [];
+    },
+  });
+
   const routes = createMonitorHandlers({
     paths,
     storage,
     ResponseCtor: Response,
-    sidecarBridge: {
-      getConfig: () => app.config,
-      startConversation: (message, opts) => app.startConversation(message, opts),
-    },
+    sidecarBridge: sidecarBridgeObj,
     triggerRescan: () => worker.rescan(),
     hudPublisher,
     cdpBridge,
+    quotaClient: sharedQuotaClient,
+    accountManager: sharedAccountManager,
   });
 
   for (const [key, handler] of routes.entries()) {
@@ -2000,6 +2334,7 @@ export async function startSidecarServer({
     void (async () => {
       try {
         await ensureBackdropAssets(paths);
+        await ensureAccountTool(paths).catch(() => {});
         const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
         await ensureCdpLauncher(paths, themes.cdpPort);
         await cdpBridge.sync(themes, { hostLanguage: prefs.language, probeForLang: true });
@@ -2010,6 +2345,8 @@ export async function startSidecarServer({
       }
     })();
 
+    sharedAccountManager.startLifecycleWatcher({ intervalMs: 2000 });
+
     companionWatchdogTimer = setInterval(() => {
       void ensureCompanionHealthy();
     }, 15_000);
@@ -2018,6 +2355,7 @@ export async function startSidecarServer({
 
   const shutdown = async () => {
     clearTimeout(activeViewTimer);
+    sharedAccountManager.stopLifecycleWatcher();
     if (companionWatchdogTimer) {
       clearInterval(companionWatchdogTimer);
       companionWatchdogTimer = null;

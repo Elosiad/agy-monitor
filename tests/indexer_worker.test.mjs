@@ -7,8 +7,18 @@ import { fork } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
-import { parseStepMetadataTiming, scanOnce } from '../sidecars/agy_monitor/backend/scan_worker.mjs';
-import { queryRequestLogs } from '../sidecars/agy_monitor/backend/telemetry.mjs';
+import {
+  parseGenMetadataRecord,
+  parseStepMetadataTiming,
+  scanOnce,
+} from '../sidecars/agy_monitor/backend/scan_worker.mjs';
+import {
+  queryBatchConvHudMetrics,
+  queryRequestLogs,
+  queryTelemetrySnapshot,
+} from '../sidecars/agy_monitor/backend/telemetry.mjs';
+import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
+import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.resolve(__dirname, '../sidecars/agy_monitor/backend/scan_worker.mjs');
@@ -353,4 +363,224 @@ test('extracts exact TTFT and total duration (including final text turn) from co
   cacheDb.close();
   assert.equal(latest.latest_speed_tok_s, 89.0);
   assert.equal(latest.speed_source, 'conv_db_exact');
+});
+
+function encodeStrField(fieldNum, str) {
+  return encodeLenField(fieldNum, Buffer.from(str, 'utf8'));
+}
+
+function encodeVarintField(fieldNum, val) {
+  return Buffer.concat([encodeVarint((fieldNum << 3) | 0), encodeVarint(val)]);
+}
+
+function encodeGenMetadataBlob({ stepIndices = [], responseModel = '', displayLabel = '', responseId = '' }) {
+  const chatParts = [];
+  if (responseId) {
+    chatParts.push(encodeLenField(4, encodeStrField(11, responseId)));
+  }
+  if (responseModel) {
+    chatParts.push(encodeStrField(19, responseModel));
+  }
+  if (displayLabel) {
+    chatParts.push(encodeStrField(21, displayLabel));
+  }
+  const topParts = [];
+  if (stepIndices.length > 0) {
+    topParts.push(encodeLenField(2, Buffer.concat(stepIndices.map((n) => encodeVarint(n)))));
+  }
+  topParts.push(encodeLenField(1, Buffer.concat(chatParts)));
+  return Buffer.concat(topParts);
+}
+
+function encodeStepMetaWithGenLink(sec, genIdx, responseId = '') {
+  const parts = [encodeLenField(1, encodeTimestamp(sec, 0))];
+  if (responseId) {
+    parts.push(encodeLenField(9, encodeStrField(11, responseId)));
+  }
+  if (genIdx != null) {
+    parts.push(encodeLenField(20, encodeVarintField(3, genIdx)));
+  }
+  return Buffer.concat(parts);
+}
+
+test('extracts authoritative upstream responseModel from gen_metadata.#1.#19 and avoids false downgrade against stale defaultModel', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-gen-model-'));
+  const pluginRoot = path.join(root, 'plugin');
+  const appDataDir = path.join(root, 'antigravity');
+  const geminiConfigDir = path.join(root, 'config');
+  const conversationsDir = path.join(appDataDir, 'conversations');
+  fs.mkdirSync(path.join(pluginRoot, 'rules'), { recursive: true });
+  fs.mkdirSync(path.join(appDataDir, 'brain'), { recursive: true });
+  fs.mkdirSync(conversationsDir, { recursive: true });
+  fs.mkdirSync(geminiConfigDir, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const paths = resolvePaths({ pluginRoot, appDataDir, geminiConfigDir });
+  const storage = createStorage(paths);
+  // User's plugin defaultModel is stale (Hydrogen XHigh), while user intentionally picked Gemini 3.8 Flash in Antigravity
+  await storage.updatePrefs({ defaultModel: { id: 'gemini-4-hydrogen-xhigh', tier: 'Extra' } });
+
+  const convFlash = 'conv-flash-real';
+  const convDowngraded = 'conv-true-downgrade';
+  const t0Sec = 1795423000;
+
+  // Verify direct protobuf record parser
+  const sampleBlob = encodeGenMetadataBlob({
+    stepIndices: [10, 11],
+    responseModel: 'gemini-3.8-flash-n',
+    displayLabel: 'Gemini 3.8 Flash (High)',
+    responseId: 'resp-10',
+  });
+  const parsedSample = parseGenMetadataRecord(sampleBlob);
+  assert.equal(parsedSample.responseModel, 'gemini-3.8-flash-n');
+  assert.equal(parsedSample.displayLabel, 'Gemini 3.8 Flash (High)');
+  assert.equal(parsedSample.responseId, 'resp-10');
+  assert.deepEqual(parsedSample.stepIndices, [10, 11]);
+
+  // 1. Normal Gemini 3.8 Flash conversation: step 10 has #19='gemini-3.8-flash-n', step 12 is a continuation turn omitting #19
+  writeConvLines(
+    paths.brainDir,
+    convFlash,
+    [
+      JSON.stringify({
+        step_index: 10,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(t0Sec * 1000).toISOString(),
+        model: 'gemini-3.8-flash-high',
+        input_tokens: 2200,
+        cache_read_tokens: 46000,
+        output_tokens: 1400,
+      }),
+      JSON.stringify({
+        step_index: 12,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date((t0Sec + 25) * 1000).toISOString(),
+        model: 'gemini-3.8-flash-high',
+        input_tokens: 1200,
+        cache_read_tokens: 48000,
+        output_tokens: 600,
+      }),
+    ].join('\n') + '\n',
+  );
+
+  const flashDb = new DatabaseSync(path.join(conversationsDir, `${convFlash}.db`));
+  flashDb.exec(`
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER);
+  `);
+  flashDb
+    .prepare(`INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)`)
+    .run(10, encodeStepMetaWithGenLink(t0Sec, 0, 'resp-10'));
+  flashDb
+    .prepare(`INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)`)
+    .run(12, encodeStepMetaWithGenLink(t0Sec + 25, 1, 'resp-12'));
+  flashDb
+    .prepare(`INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, 0)`)
+    .run(
+      0,
+      encodeGenMetadataBlob({
+        stepIndices: [10],
+        responseModel: 'gemini-3.8-flash-n',
+        displayLabel: 'Gemini 3.8 Flash (High)',
+        responseId: 'resp-10',
+      }),
+    );
+  // Continuation row omits #19 (or carries generic routing label 'gemini-default') while keeping #21 displayLabel
+  flashDb
+    .prepare(`INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, 0)`)
+    .run(
+      1,
+      encodeGenMetadataBlob({
+        stepIndices: [12],
+        responseModel: 'gemini-default',
+        displayLabel: 'Gemini 3.8 Flash (High)',
+        responseId: 'resp-12',
+      }),
+    );
+  flashDb.close();
+
+  // 2. Genuine server-side downgrade: requested Neon XHigh, upstream returned gemini-3.8-flash-n
+  writeConvLines(
+    paths.brainDir,
+    convDowngraded,
+    `${JSON.stringify({
+      step_index: 5,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date((t0Sec + 50) * 1000).toISOString(),
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 3000,
+      cache_read_tokens: 10000,
+      output_tokens: 400,
+    })}\n`,
+  );
+  const dgDb = new DatabaseSync(path.join(conversationsDir, `${convDowngraded}.db`));
+  dgDb.exec(`
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER);
+  `);
+  dgDb
+    .prepare(`INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)`)
+    .run(5, encodeStepMetaWithGenLink(t0Sec + 50, 0, 'resp-dg-5'));
+  dgDb
+    .prepare(`INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, 0)`)
+    .run(
+      0,
+      encodeGenMetadataBlob({
+        stepIndices: [5],
+        responseModel: 'gemini-3.8-flash-n',
+        displayLabel: 'Gemini 4 Neon (XHigh)',
+        responseId: 'resp-dg-5',
+      }),
+    );
+  dgDb.close();
+
+  await scanOnce(paths.brainDir, paths.telemetryCacheDb, { conversationsDir });
+
+  // Assert Gemini 3.8 Flash turn reports real upstream ID 'gemini-3.8-flash-n' and status 'match'
+  const snapFlash = await queryTelemetrySnapshot(paths.telemetryCacheDb, storage, paths, {
+    convId: convFlash,
+    isExplicitConvId: true,
+    scope: 'current',
+    range: '30d',
+    nowMs: (t0Sec + 120) * 1000,
+  });
+  assert.equal(snapFlash.runtimeTelemetry.upstreamModelId, 'gemini-3.8-flash-n');
+  assert.equal(snapFlash.runtimeTelemetry.upstreamModelStatus, 'match');
+  assert.equal(snapFlash.runtimeTelemetry.upstreamModelSource, 'conv_db_gen_metadata');
+  assert.equal(snapFlash.runtimeTelemetry.requestedModelId, 'gemini-3.8-flash-high');
+  assert.equal(snapFlash.runtimeTelemetry.requestedModelLabel, 'Gemini 3.8 Flash (High)');
+
+  // Request logs preserve requested model and expose upstreamModel on every step (including continuation turn)
+  const flashLogs = queryRequestLogs(paths.telemetryCacheDb, {
+    scope: 'current',
+    convId: convFlash,
+    range: '30d',
+    nowMs: (t0Sec + 120) * 1000,
+  });
+  assert.equal(flashLogs.items.length, 2);
+  assert.equal(flashLogs.items[0].stepIndex, 12);
+  assert.equal(flashLogs.items[0].upstreamModel, 'gemini-3.8-flash-n');
+  assert.equal(flashLogs.items[1].stepIndex, 10);
+  assert.equal(flashLogs.items[1].upstreamModel, 'gemini-3.8-flash-n');
+
+  // Batch HUD metrics also show real upstream model ID
+  const hudList = queryBatchConvHudMetrics(paths.telemetryCacheDb, [{ id: convFlash, title: 'Flash', workspace: '' }]);
+  assert.equal(hudList[0].upstreamModelId, 'gemini-3.8-flash-n');
+
+  // Assert genuine server downgrade IS flagged as 'downgrade_suspected'
+  const snapDg = await queryTelemetrySnapshot(paths.telemetryCacheDb, storage, paths, {
+    convId: convDowngraded,
+    isExplicitConvId: true,
+    scope: 'current',
+    range: '30d',
+    nowMs: (t0Sec + 120) * 1000,
+  });
+  assert.equal(snapDg.runtimeTelemetry.upstreamModelId, 'gemini-3.8-flash-n');
+  assert.equal(snapDg.runtimeTelemetry.upstreamModelStatus, 'downgrade_suspected');
 });

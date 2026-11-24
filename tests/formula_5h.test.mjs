@@ -111,6 +111,53 @@ test('classifyUpstreamModelStatus returns no_baseline when unset, matches neon/h
     classifyUpstreamModelStatus({ id: 'gemini-4-hydrogen-high', tier: 'High' }, 'gemini-4-hydrogen-xhigh'),
     'ab_or_alias',
   );
+  // Real Antigravity upstream responseModel IDs omit effort tiers (e.g. gemini-3.8-flash-n, gemini-4-neon)
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-3.8-flash-high', tier: 'High' }, 'gemini-3.8-flash-n'),
+    'match',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'Gemini 3.8 Flash (High)' }, 'gemini-3.8-flash-n'),
+    'match',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-4-neon-xhigh', tier: 'Extra' }, 'gemini-4-neon'),
+    'match',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-4-hydrogen-xhigh', tier: 'Extra' }, 'gemini-4-hydrogen'),
+    'match',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-4-hydrogen-high', tier: 'High' }, 'gemini-4-hydrogen-tiered-high'),
+    'match',
+  );
+  // Explicit A/B / control / trial variants are flagged as ab_or_alias, not downgrade
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-3.8-flash-high' }, 'gemini-3.8-flash-exp-a'),
+    'ab_or_alias',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-3.8-flash-high' }, 'gemini-3.8-flash-control'),
+    'ab_or_alias',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-4-argon-medium' }, 'gemini-4-argon-trial'),
+    'ab_or_alias',
+  );
+  // Genuine version / explicit-tier / cross-family downgrades are still caught
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-3.8-flash-high' }, 'gemini-2.5-flash'),
+    'downgrade_suspected',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-4-hydrogen-xhigh' }, 'gemini-4-hydrogen-low'),
+    'downgrade_suspected',
+  );
+  assert.equal(
+    classifyUpstreamModelStatus({ id: 'gemini-4-neon-xhigh' }, 'gemini-3.8-flash-n'),
+    'downgrade_suspected',
+  );
 });
 
 test('runtimeTelemetry detects upstream model mismatch, recovers legacy model=null as __unrecorded__, and prevents cross-conv / subagent hijacking', async (t) => {

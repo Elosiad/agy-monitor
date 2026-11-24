@@ -6963,6 +6963,13 @@ namespace AgyBackdropCompanion
             return FindAntigravityTopWindowsStatic();
         }
 
+        public static bool IsAntigravityHostProcessName(string procName)
+        {
+            if (string.IsNullOrEmpty(procName)) return false;
+            return string.Equals(procName, "Antigravity", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(procName, "Antigravity_Original", StringComparison.OrdinalIgnoreCase);
+        }
+
         public static List<IntPtr> FindAntigravityTopWindowsStatic()
         {
             var found = new List<IntPtr>();
@@ -6995,7 +7002,7 @@ namespace AgyBackdropCompanion
                     catch { procName = ""; }
                     pidCache[pid] = procName;
                 }
-                if (!string.Equals(procName, "Antigravity", StringComparison.OrdinalIgnoreCase)) return true;
+                if (!IsAntigravityHostProcessName(procName)) return true;
 
                 // Keep minimized Antigravity windows tracked (their rect is -32000x160x28 while iconic)
                 // so minimize/restore hides & reveals overlays cleanly without thrashing WPF windows.
