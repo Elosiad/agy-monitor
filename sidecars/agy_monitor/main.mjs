@@ -68,6 +68,15 @@ import {
 } from './backend/updater.mjs';
 import { detectWindowsHostEnv, toWindowsPath } from './backend/wsl_bridge.mjs';
 
+// Optional pluggable extensions (absent or disabled -> zero effect on core)
+let installedExtensions = [];
+try {
+  const extLoader = await import('./extensions/loader.mjs');
+  installedExtensions = await extLoader.loadInstalledExtensions();
+} catch {
+  installedExtensions = [];
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const WORKER_PATH = path.join(__dirname, 'backend', 'scan_worker.mjs');
@@ -534,7 +543,12 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
 
   let writeChain = Promise.resolve();
   let lastSessionsSnapshot = [];
-  const writePayload = (telemetry, { sessionsHudList = null, forceEmpty = false } = {}) => {
+  let lastActiveSessionCount = 0;
+  let lastUnreadSessionCount = 0;
+  const writePayload = (
+    telemetry,
+    { sessionsHudList = null, forceEmpty = false, activeSessionCount = null, unreadSessionCount = null } = {},
+  ) => {
     if (!paths?.hudTelemetryFile || (!telemetry && !forceEmpty)) return Promise.resolve();
     writeChain = writeChain.then(async () => {
       const pie = forceEmpty ? {} : (telemetry?.contextPie || {});
@@ -558,11 +572,24 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
           : null;
       const upstreamModelId = !forceEmpty && typeof rt.upstreamModelId === 'string' ? rt.upstreamModelId.trim() : '';
       const upstreamModelStatus = !forceEmpty && typeof rt.upstreamModelStatus === 'string' ? rt.upstreamModelStatus : 'unreported';
+      const latestInputTokens = !forceEmpty ? Math.max(0, Math.round(Number(rt.latestInputTokens) || 0)) : 0;
+      const latestUncachedInputTokens = !forceEmpty ? Math.max(0, Math.round(Number(rt.latestUncachedInputTokens) || 0)) : 0;
+      const latestCacheReadTokens = !forceEmpty ? Math.max(0, Math.round(Number(rt.latestCacheReadTokens) || 0)) : 0;
+      const latestOutputTokens = !forceEmpty ? Math.max(0, Math.round(Number(rt.latestOutputTokens) || 0)) : 0;
+      const latestStepAtMs = !forceEmpty ? Math.max(0, Math.round(Number(rt.latestStepAtMs) || 0)) : 0;
       const activeConvId = forceEmpty ? '' : (typeof telemetry?.activeConvId === 'string' ? telemetry.activeConvId : '');
 
       if (Array.isArray(sessionsHudList)) {
         lastSessionsSnapshot = sessionsHudList;
       }
+      if (typeof activeSessionCount === 'number' && Number.isFinite(activeSessionCount)) {
+        lastActiveSessionCount = Math.max(0, Math.round(activeSessionCount));
+      }
+      if (typeof unreadSessionCount === 'number' && Number.isFinite(unreadSessionCount)) {
+        lastUnreadSessionCount = Math.max(0, Math.round(unreadSessionCount));
+      }
+      const agentState =
+        lastActiveSessionCount > 0 ? 'running' : lastUnreadSessionCount > 0 ? 'unread' : 'idle';
 
       const payload = {
         activeConvId,
@@ -570,9 +597,17 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         totalUsed: used,
         windowCap: cap,
         tokPerSec,
+        latestInputTokens,
+        latestUncachedInputTokens,
+        latestCacheReadTokens,
+        latestOutputTokens,
+        latestStepAtMs,
         cacheHitPct,
         upstreamModelId,
         upstreamModelStatus,
+        activeSessionCount: lastActiveSessionCount,
+        unreadSessionCount: lastUnreadSessionCount,
+        agentState,
         cdpHudActive: false,
         sessions: lastSessionsSnapshot,
         updatedAtMs: Date.now(),
@@ -586,7 +621,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
       const sessionsSig = lastSessionsSnapshot
         .map((s) => `${s.id}:${s.percent}:${s.tokPerSec ?? ''}:${s.cacheHitPct ?? ''}:${s.upstreamModelId}`)
         .join(',');
-      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
       try {
@@ -635,12 +670,15 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
       const windowCap = Number(prefs?.windowCap) || 512000;
       const sessionsHudList = queryBatchConvHudMetrics(paths.cacheDbPath, allSelectable, windowCap);
 
+      const activeSessionCount = Array.isArray(sessionsHub?.active) ? sessionsHub.active.length : 0;
+      const unreadSessionCount = Array.isArray(sessionsHub?.unread) ? sessionsHub.unread.length : 0;
+
       const viewedInfo = await resolveViewedConvInfo(paths, sessionsHub);
       const viewedConvId = resolveActiveConv(topLevelIdSet, viewedInfo);
       if (viewedConvId === '__new_conversation__') {
         await writePayload(
           { contextPie: { windowCap, totalUsed: 0 }, runtimeTelemetry: {} },
-          { sessionsHudList, forceEmpty: true },
+          { sessionsHudList, forceEmpty: true, activeSessionCount, unreadSessionCount },
         );
         return;
       }
@@ -654,7 +692,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         scope: 'current',
         range: '30d',
       });
-      await writePayload(telemetry, { sessionsHudList });
+      await writePayload(telemetry, { sessionsHudList, activeSessionCount, unreadSessionCount });
     } catch {
       // Non-fatal HUD publish failure
     } finally {
@@ -944,7 +982,11 @@ export function createMonitorHandlers({
       !isExplicitConvId &&
       (syncHud || !rawHostConvId || Boolean(rawHostConvId && hud.isActiveHostConv?.(rawHostConvId)))
     ) {
-      void hud.writePayload(telemetry, { forceEmpty: isNewConv });
+      void hud.writePayload(telemetry, {
+        forceEmpty: isNewConv,
+        activeSessionCount: Array.isArray(sessionsHub?.active) ? sessionsHub.active.length : 0,
+        unreadSessionCount: Array.isArray(sessionsHub?.unread) ? sessionsHub.unread.length : 0,
+      });
     }
 
     const observedModels =
@@ -2065,6 +2107,24 @@ export function createMonitorHandlers({
     }
   });
 
+  // Mount optional pluggable extensions (each isolated in extensions/<name>/)
+  if (process.env.AGY_DISABLE_EXTENSIONS !== '1' && process.env.AGY_DISABLE_EXTENSIONS !== 'true') {
+    for (const ext of installedExtensions) {
+      if (typeof ext?.registerRoutes !== 'function') continue;
+      try {
+        ext.registerRoutes({
+          register,
+          paths: resolvedPaths,
+          storage: store,
+          makeResponse: (body, opts) => makeResponse(ResponseCtor, body, opts),
+          errorResponse: (status, err, extra) => errorResponse(ResponseCtor, status, err, extra),
+        });
+      } catch (err) {
+        console.warn(`[extensions] route registration failed for "${ext.id}": ${err?.message || err}`);
+      }
+    }
+  }
+
   return routes;
 }
 
@@ -2277,6 +2337,14 @@ export async function startSidecarServer({
     storage.getMasteryConfig(),
   ]).catch(() => {});
 
+  if (process.env.AGY_DISABLE_EXTENSIONS !== '1' && process.env.AGY_DISABLE_EXTENSIONS !== 'true') {
+    for (const ext of installedExtensions) {
+      if (typeof ext?.onStart === 'function') {
+        void Promise.resolve(ext.onStart({ paths, storage, skipWorker })).catch(() => {});
+      }
+    }
+  }
+
   void hudPublisher.refreshFromDb();
 
   let activeViewWatcher = null;
@@ -2377,6 +2445,13 @@ export async function startSidecarServer({
       // Ignore watcher close error
     }
     await cdpBridge.dispose().catch(() => {});
+    if (process.env.AGY_DISABLE_EXTENSIONS !== '1' && process.env.AGY_DISABLE_EXTENSIONS !== 'true') {
+      for (const ext of installedExtensions) {
+        if (typeof ext?.onShutdown === 'function') {
+          await Promise.resolve(ext.onShutdown({ paths, storage, skipWorker })).catch(() => {});
+        }
+      }
+    }
     if (!skipWorker && startupHostEnv.hasWindowsHost) {
       try {
         const themes = await storage.getThemes();

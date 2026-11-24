@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "desktop_pet_mcp": {
+      "command": "agy-node",
+      "args": [
+        "sidecars/agy_monitor/extensions/mcp_bridge.mjs"
+      ]
+    }
+  }
+}

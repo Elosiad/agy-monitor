@@ -38,8 +38,9 @@ const CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
 const MIN_ARCHIVE_BYTES = 10 * 1024;
 const MAX_ARCHIVE_BYTES = 30 * 1024 * 1024;
 
-const ROOT_FILES = ['plugin.json', 'package.json', 'hooks.json', 'README.md'];
-const MIRROR_DIRS = ['assets', 'sidecars', 'hooks'];
+const ROOT_FILES = ['plugin.json', 'package.json', 'hooks.json', 'mcp_config.json', 'README.md'];
+const OPTIONAL_ROOT_FILES = new Set(['mcp_config.json']);
+const MIRROR_DIRS = ['assets', 'sidecars', 'hooks', 'skills'];
 const REQUIRED_CORE_FILES = [
   'plugin.json',
   'hooks.json',
@@ -575,8 +576,11 @@ export async function applyPluginUpdate(
       try {
         for (const rel of ROOT_FILES) {
           const src = path.join(extractedRoot, rel);
+          const dest = path.join(pluginRoot, rel);
           if (fs.existsSync(src)) {
-            fs.copyFileSync(src, path.join(pluginRoot, rel));
+            fs.copyFileSync(src, dest);
+          } else if (OPTIONAL_ROOT_FILES.has(rel) && fs.existsSync(dest)) {
+            fs.rmSync(dest, { force: true });
           }
         }
         for (const rel of MIRROR_DIRS) {

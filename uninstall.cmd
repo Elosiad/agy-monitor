@@ -19,6 +19,10 @@ if !ERRORLEVEL! EQU 0 (
   if exist "!BACKDROP_EXE!" (
     "!BACKDROP_EXE!" --stop >nul 2>nul
   )
+  set "PET_EXE=%USERPROFILE%\.gemini\antigravity\plugin_data\agy-monitor\bin\agy_desktop_pet.exe"
+  if exist "!PET_EXE!" (
+    "!PET_EXE!" --stop >nul 2>nul
+  )
   set "TARGET=%USERPROFILE%\.gemini\config\plugins\agy-monitor"
   if exist "!TARGET!" (
     rmdir /s /q "!TARGET!"

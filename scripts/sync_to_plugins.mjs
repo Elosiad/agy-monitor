@@ -20,8 +20,8 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_SOURCE_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_TARGET_DIR = path.join(os.homedir(), '.gemini', 'config', 'plugins', 'agy-monitor');
 
-const ROOT_FILES = ['plugin.json', 'package.json', 'hooks.json', 'README.md'];
-const MIRROR_DIRS = ['assets', 'sidecars', 'hooks'];
+const ROOT_FILES = ['plugin.json', 'package.json', 'hooks.json', 'mcp_config.json', 'README.md'];
+const MIRROR_DIRS = ['assets', 'sidecars', 'hooks', 'skills'];
 
 function removeExistingSafely(targetDir) {
   const st = fs.lstatSync(targetDir, { throwIfNoEntry: false });

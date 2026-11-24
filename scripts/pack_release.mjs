@@ -20,6 +20,7 @@ const RELEASE_ROOT_FILES = [
   'plugin.json',
   'package.json',
   'hooks.json',
+  'mcp_config.json',
   'README.md',
   'LICENSE',
   'install.cmd',
@@ -33,6 +34,7 @@ const RELEASE_DIRS = [
   'hooks',
   'rules',
   'sidecars',
+  'skills',
 ];
 
 const RELEASE_SCRIPTS = [
