@@ -731,7 +731,7 @@ export function createMcpTools({ corePaths }) {
             bubble_template: {
               type: 'string',
               description:
-                'Custom popup bubble template supporting placeholders: {in}, {out}, {tps}, {pct}, {model}, {cache}, {unread}. Example: "入 {in} · 出 {out}" or "⚡ {tps} tok/s".',
+                'Custom popup bubble template supporting placeholders: {in}, {out}, {tps}, {pct}, {model}, {cache}, {unread}, {quota}. Example: "{model} · {quota}" or "入 {in} · 出 {out}".',
             },
             auto_wander: { type: 'boolean' },
             selectable: {

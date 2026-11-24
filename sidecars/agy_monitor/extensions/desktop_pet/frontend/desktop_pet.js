@@ -17,10 +17,11 @@ const BUBBLE_PRESETS = [
   { id: "tps", labelKey: "pet.bubblePresetTps", tpl: "⚡ {tps} tok/s" },
   { id: "tokens_tps", labelKey: "pet.bubblePresetTokensTps", tpl: "入 {in} · 出 {out} · {tps}t/s" },
   { id: "context", labelKey: "pet.bubblePresetContext", tpl: "{model} · 上下文 {pct}%" },
+  { id: "quota", labelKey: "pet.bubblePresetQuota", tpl: "{model} · {quota}" },
   { id: "full", labelKey: "pet.bubblePresetFull", tpl: "{model} · 入 {in} 出 {out} ({pct}%)" },
   { id: "cute", labelKey: "pet.bubblePresetCute", tpl: "摸摸头~ 能量满格 ✨ ({pct}%)" },
 ];
-const BUBBLE_VARS = ["{in}", "{out}", "{tps}", "{pct}", "{model}", "{cache}", "{unread}"];
+const BUBBLE_VARS = ["{in}", "{out}", "{tps}", "{pct}", "{model}", "{cache}", "{unread}", "{quota}"];
 
 const BUILTIN_PET_IDS = new Set(BUILTIN_PETS.map((p) => p.id));
 const ALLOWED_PET_MIME = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
@@ -739,8 +740,77 @@ export function mountDesktopPetExtension(ctx = {}) {
     posX: null,
     posY: null,
     petCompanion: null,
-    telemetry: { activeCount: 0, unreadCount: 0, inputTokens: 0, outputTokens: 0, tokPerSec: null, cacheHitPct: null, model: "", stepAtMs: 0, contextPct: 0 },
+    telemetry: {
+      activeCount: 0,
+      unreadCount: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      tokPerSec: null,
+      cacheHitPct: null,
+      model: "",
+      stepAtMs: 0,
+      contextPct: 0,
+      quota: null,
+    },
     panelPos: null,
+  };
+
+  const normalizeCompactQuota = (raw) => {
+    if (!raw || typeof raw !== "object") return null;
+    const clampPct = (v) =>
+      v !== null && v !== undefined && Number.isFinite(Number(v))
+        ? Math.max(0, Math.min(100, Math.round(Number(v))))
+        : null;
+    if (Array.isArray(raw.groups)) {
+      const pickBucket = (b) => (b && !b.disabled ? clampPct(b.remainingPct) : null);
+      const gem = raw.groups.find((g) => g?.key === "gemini") || null;
+      const claude = raw.groups.find((g) => g?.key === "gpt_claude") || null;
+      const out = {
+        gemini5h: pickBucket(gem?.fiveHour),
+        geminiWeekly: pickBucket(gem?.weekly),
+        claude5h: pickBucket(claude?.fiveHour),
+        claudeWeekly: pickBucket(claude?.weekly),
+      };
+      return out.gemini5h === null && out.geminiWeekly === null && out.claude5h === null && out.claudeWeekly === null
+        ? null
+        : out;
+    }
+    const out = {
+      gemini5h: clampPct(raw.gemini5h),
+      geminiWeekly: clampPct(raw.geminiWeekly),
+      claude5h: clampPct(raw.claude5h),
+      claudeWeekly: clampPct(raw.claudeWeekly),
+    };
+    return out.gemini5h === null && out.geminiWeekly === null && out.claude5h === null && out.claudeWeekly === null
+      ? null
+      : out;
+  };
+
+  const formatPoolQuota = (fiveH, weekly) => {
+    const has5h = typeof fiveH === "number" && Number.isFinite(fiveH);
+    const hasW = typeof weekly === "number" && Number.isFinite(weekly);
+    if (has5h && hasW) return `5h ${fiveH}%/周 ${weekly}%`;
+    if (has5h) return `5h ${fiveH}%`;
+    if (hasW) return `周 ${weekly}%`;
+    return "";
+  };
+
+  const formatQuotaValue = (q, model) => {
+    if (!q) return "--";
+    const gText = formatPoolQuota(q.gemini5h, q.geminiWeekly);
+    const cText = formatPoolQuota(q.claude5h, q.claudeWeekly);
+    if (!gText && !cText) return "--";
+    const m = String(model || "").toLowerCase();
+    const isClaudeOrGpt = /\b(claude|gpt|sonnet|opus|haiku|openai|o1|o3|o4)\b|claude|gpt-|sonnet|opus|haiku/.test(m);
+    const isGemini = /gemini|argon|flash|neon|hydrogen|carbon|ultra/.test(m);
+    if (isClaudeOrGpt) return cText || gText || "--";
+    if (isGemini) return gText || cText || "--";
+    const gMain = typeof q.gemini5h === "number" ? q.gemini5h : q.geminiWeekly;
+    const cMain = typeof q.claude5h === "number" ? q.claude5h : q.claudeWeekly;
+    if (typeof gMain === "number" && typeof cMain === "number") {
+      return `G ${gMain}% · C ${cMain}%`;
+    }
+    return gText || cText || "--";
   };
 
   const renderBubbleTemplate = (tpl = state.bubbleTemplate) => {
@@ -758,6 +828,7 @@ export function mountDesktopPetExtension(ctx = {}) {
         ? String(Math.round(state.telemetry.cacheHitPct))
         : "--";
     const unreadStr = String(Math.max(0, state.telemetry.unreadCount || 0));
+    const quotaStr = formatQuotaValue(state.telemetry.quota, state.telemetry.model);
     return raw
       .replaceAll("{in}", inStr)
       .replaceAll("{out}", outStr)
@@ -765,7 +836,8 @@ export function mountDesktopPetExtension(ctx = {}) {
       .replaceAll("{pct}", pctStr)
       .replaceAll("{model}", modelStr)
       .replaceAll("{cache}", cacheStr)
-      .replaceAll("{unread}", unreadStr);
+      .replaceAll("{unread}", unreadStr)
+      .replaceAll("{quota}", quotaStr);
   };
 
   const editorState = {
@@ -1962,6 +2034,7 @@ export function mountDesktopPetExtension(ctx = {}) {
     id: "desktop_pet",
     onSnapshot(snapshot) {
       if (!snapshot || typeof snapshot !== "object") return;
+      const nextQuota = normalizeCompactQuota(snapshot.quota) || state.telemetry.quota;
       state.telemetry = {
         activeCount: Array.isArray(snapshot.sessionsHub?.active) ? snapshot.sessionsHub.active.length : 0,
         unreadCount: Array.isArray(snapshot.sessionsHub?.unread) ? snapshot.sessionsHub.unread.length : 0,
@@ -1981,6 +2054,7 @@ export function mountDesktopPetExtension(ctx = {}) {
           typeof snapshot.contextPie?.percent === "number" && Number.isFinite(snapshot.contextPie.percent)
             ? snapshot.contextPie.percent
             : 0,
+        quota: nextQuota,
       };
       const nextMood = resolveMood();
       if (!dom.panelPet.hidden) renderPreviewStage();
@@ -2011,6 +2085,12 @@ export function mountDesktopPetExtension(ctx = {}) {
         }
       }
     },
+    onQuota(quotaData) {
+      const compact = normalizeCompactQuota(quotaData);
+      if (compact) {
+        state.telemetry.quota = compact;
+      }
+    },
     onPreferences() {
       if (Date.now() - lastServerPollMs > 1200) {
         void refreshFromServer();
@@ -2021,6 +2101,15 @@ export function mountDesktopPetExtension(ctx = {}) {
         renderPreviewStage();
         if (!persistInFlight && Date.now() - lastServerPollMs > 1200) {
           void refreshFromServer({ fromPoll: true });
+        }
+        if (!state.telemetry.quota) {
+          void fetchExtPetApi(apiFetch, "/api/quota")
+            .then((qData) => {
+              if (destroyed) return;
+              const compact = normalizeCompactQuota(qData);
+              if (compact) state.telemetry.quota = compact;
+            })
+            .catch(() => {});
         }
       } else {
         syncStageFramePlayback();

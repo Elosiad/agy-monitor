@@ -479,3 +479,61 @@ test('desktop_pet security hardening: PNG bomb guard, output_dir confinement, cu
   assert.match(String(htmlRes.headers?.['Content-Security-Policy'] || ''), /default-src 'none'/);
   assert.equal(htmlRes.headers?.['X-Content-Type-Options'], 'nosniff');
 });
+
+test('desktop_pet bubble template supports {quota} across backend HUD telemetry, frontend bundle, and C# companion', async (t) => {
+  const paths = makeTempPaths(t);
+  const store = createStorage(paths);
+  const fakeQuota = {
+    async getQuotaSummary() {
+      return {
+        ok: true,
+        available: true,
+        stale: false,
+        fetchedAtMs: Date.now(),
+        groups: [
+          {
+            key: 'gemini',
+            label: 'Gemini',
+            fiveHour: { remainingPct: 97, disabled: false },
+            weekly: { remainingPct: 99, disabled: false },
+          },
+          {
+            key: 'gpt_claude',
+            label: 'GPT&Claude',
+            fiveHour: { remainingPct: 80, disabled: false },
+            weekly: { remainingPct: 92, disabled: false },
+          },
+        ],
+      };
+    },
+  };
+
+  const routes = createMonitorHandlers({ paths, storage: store, quotaClient: fakeQuota });
+  const qRes = await routes.get('GET /api/quota')({});
+  assert.equal(qRes.ok, true);
+
+  const snap = await routes.get('GET /api/snapshot')({ scope: 'global', range: 'today' });
+  assert.deepEqual(snap.quota, {
+    gemini5h: 97,
+    geminiWeekly: 99,
+    claude5h: 80,
+    claudeWeekly: 92,
+  });
+
+  // Wait briefly for serialized hud_telemetry.json write
+  await new Promise((r) => setTimeout(r, 40));
+  const hudDoc = JSON.parse(fs.readFileSync(paths.hudTelemetryFile, 'utf8'));
+  assert.equal(hudDoc.quotaGemini5h, 97);
+  assert.equal(hudDoc.quotaGeminiWeekly, 99);
+  assert.equal(hudDoc.quotaClaude5h, 80);
+  assert.equal(hudDoc.quotaClaudeWeekly, 92);
+
+  const bundle = await buildFrontendBundle(FRONTEND_DIR);
+  assert.equal(bundle.includes('"{quota}"'), true);
+  assert.equal(bundle.includes('pet.bubblePresetQuota'), true);
+
+  const cs = fs.readFileSync(PET_CS, 'utf8');
+  assert.match(cs, /Replace\("\{quota\}",\s*quotaStr\)/);
+  assert.match(cs, /quotaGemini5h/);
+  assert.match(cs, /quotaClaudeWeekly/);
+});

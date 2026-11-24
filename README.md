@@ -43,7 +43,7 @@
 
 ### 5. 桌宠（Desktop Pet Studio · 可插拔扩展）
 - **完全低耦合插件化设计**：全部桌宠前后端、独立配置存储、Windows 透明悬浮进程、帧动画工作室与 MCP 工具集中收拢于 [sidecars/agy_monitor/extensions/desktop_pet/](sidecars/agy_monitor/extensions/desktop_pet/README.md)；删除该目录或设置 `AGY_DISABLE_EXTENSIONS=1` 即可完全移除，不影响主分支核心逻辑。
-- **6 轨道自定义帧动画 & 物理动效**：内置 3 款主题色矢量萌宠，支持单图/GIF 及 `1~30 FPS` 六轨道序列帧（`idle` 待机 / `running` 思考 / `unread` 完成 / `interact` 互动 / `walk` 自主漫步 / `drag` 拖拽），自带横向精灵图切帧、拖拽钟摆悬垂与落地回弹、自主桌面漫步与左右镜像、互动粒子，以及支持自定义文案模板/预设（`{in}/{out}/{tps}/{pct}/{model}/{cache}/{unread}`）的 **60fps 硬件加速弹出气泡**。
+- **6 轨道自定义帧动画 & 物理动效**：内置 3 款主题色矢量萌宠，支持单图/GIF 及 `1~30 FPS` 六轨道序列帧（`idle` 待机 / `running` 思考 / `unread` 完成 / `interact` 互动 / `walk` 自主漫步 / `drag` 拖拽），自带横向精灵图切帧、拖拽钟摆悬垂与落地回弹、自主桌面漫步与左右镜像、互动粒子，以及支持自定义文案模板/预设（`{in}/{out}/{tps}/{pct}/{model}/{cache}/{unread}/{quota}`）的 **60fps 硬件加速弹出气泡**。
 - **主题联动右键二级菜单 & 500% 缩放 & 游戏防误触穿透**：独立自定义 WPF 主题右键菜单（自动适配深浅色与强调色），顶部以二级菜单「🐾 切换桌宠 ›」收纳造型选择，支持 `60%~500%` 实时大小调节、带流畅过渡且不关闭菜单的胶囊开关、以及「可选中 / 不可选中（穿透）」双状态（锁定穿透时悬停头顶浮现不抢焦点 🔒 锁图标一键解锁）。
 - **Antigravity MCP API & Gemini 自动生图做动画**：内置 [`agy-monitor_desktop_pet_mcp`](mcp_config.json)（6 个 MCP 工具 + 零依赖精灵表切帧与绿幕/纯色抠图引擎）及 [`desktop-pet-animator`](skills/desktop-pet-animator/SKILL.md) 技能，可直接让 Gemini 调用生图制作多轨道桌宠动画并在控制台舞台与离线交互 HTML 中实时预览。详细接口与使用说明见 [桌宠扩展文档](sidecars/agy_monitor/extensions/desktop_pet/README.md)。
 
@@ -51,12 +51,23 @@
 
 ## 版本更新日志（Changelog）
 
-### `v1.1.1`（2026-11-24）— 顶栏更新公告与单版本更新/回退、OAuth 自动续签防 401、移除 Argon 双列适配、对话回退秒刷 & 可插拔桌宠工作室（PR #3）
+### `v1.1.2`（2026-11-24）— 可插拔 AI 桌宠工作室（PR #3）、桌宠气泡实时额度 `{quota}` & 安全/DPI/生命周期加固
 
 - **可插拔桌宠工作室扩展（来自 PR #3 `@GreenNa717` + 安全加固）**：
   - 新增低耦合扩展加载器 [loader.mjs](sidecars/agy_monitor/extensions/loader.mjs) 与 MCP 扩展桥 [mcp_bridge.mjs](sidecars/agy_monitor/extensions/mcp_bridge.mjs)，支持通过 `AGY_DISABLE_EXTENSIONS=1` 或移除扩展目录实现零侵入插拔（默认关闭、零常驻进程）。
-  - 新增独立「桌宠」分页、顶栏快捷开关、6 轨道帧动画工作室与 Windows 透明桌宠伴侣 `agy_desktop_pet.exe`（支持宿主进程防孤儿监控、休眠/锁屏自动暂停、60fps 硬件加速气泡、主题联动右键菜单、`60%~500%` 缩放与游戏防误触穿透/解锁）。
-  - 通过 [mcp_config.json](mcp_config.json) 暴露 6 大 MCP 工具与纯 Node.js 精灵表自动切帧抠图引擎（含路径沙箱与防 PNG 解压炸弹加固），搭配内置 [desktop-pet-animator](skills/desktop-pet-animator/SKILL.md) 技能支持全自动 AI 生图、抠图、导入与双通道实时预览。
+  - 新增独立「桌宠」分页、顶栏快捷开关、6 轨道帧动画工作室与 Windows 透明桌宠伴侣 `agy_desktop_pet.exe`（支持父进程 + Antigravity 宿主防孤儿守卫、休眠/锁屏自动暂停与恢复、Per-Monitor DPI 多屏坐标换算、60fps 硬件加速气泡、主题联动右键菜单、`60%~500%` 缩放与游戏防误触穿透/解锁）。
+  - 通过 [mcp_config.json](mcp_config.json) 暴露 6 大 MCP 工具与纯 Node.js 精灵表自动切帧抠图引擎（含路径沙箱、符号链接校验与防 PNG 解压炸弹加固），搭配内置 [desktop-pet-animator](skills/desktop-pet-animator/SKILL.md) 技能支持全自动 AI 生图、抠图、导入与双通道实时预览。
+- **桌宠弹出气泡新增实时额度变量 `{quota}` 与「模型 + 额度」预设**：
+  - 点击插入变量栏新增 `{quota}`，预设栏新增「模型 + 额度」（`{model} · {quota}`）；自动识别当前模型所属配额池（Gemini / GPT&Claude）展示 `5h XX%/周 YY%`，待机未知模型时展示总览 `G XX% · C YY%`。
+  - 后端实时额度同步写入 `hud_telemetry.json` 与 `/api/snapshot`，面板预览与 Windows 桌面悬浮宠双端即时刷新。
+- **打包 / 更新 / 卸载与前端布局兼容加固**：
+  - [pack_release.mjs](scripts/pack_release.mjs) 与 [updater.mjs](sidecars/agy_monitor/backend/updater.mjs) 纳入 `mcp_config.json` 与 `skills/`（回退旧版自动清理）；[uninstall.mjs](scripts/uninstall.mjs) / [uninstall.cmd](uninstall.cmd) 补齐退出桌宠伴侣进程。
+  - 修复窄屏挤出公告按钮、桌宠浮窗遮挡更新公告弹窗、重复动画定义导致预览气泡抖动及隐藏标签页时帧动画定时器空跑问题。
+
+---
+
+### `v1.1.1`（2026-11-24）— 顶栏更新公告与单版本更新/回退、OAuth 自动续签防 401、移除 Argon 双列适配 & 对话回退秒刷
+
 - **顶部导航栏「更新公告」按钮与全版本更新/回退弹窗**：
   - 顶栏右侧新增更新公告入口图标，点击弹窗即可浏览自 `v1.0.0` 起的全部版本更新历史，并自动同步 GitHub 最新 Release。
   - 每个版本条目右侧均带有交互按钮：高于本地版本显示 **`更新`**，等于本地版本显示 **`当前版本`**，低于本地版本显示 **`回退`**，一键拉取官方对应 Tag 归档完成升级或安全回退（严格保留个人配置与 `rules/AGENTS.md`，并自动走系统代理）。

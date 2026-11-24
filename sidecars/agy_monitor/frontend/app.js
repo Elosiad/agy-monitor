@@ -149,7 +149,7 @@ export function mountMonitorApp() {
 
   const updateState = {
     phase: "idle", // idle | checking | latest | available | updating | updated | error
-    currentVersion: "1.1.1",
+    currentVersion: "1.1.2",
     remoteVersion: "",
     remoteSha: "",
     remoteMessage: "",
@@ -431,6 +431,9 @@ export function mountMonitorApp() {
   components.quotaCards = createQuotaCards({
     apiFetch,
     t: translator,
+    onQuotaUpdate: (quotaData) => {
+      mountedExtensions.forEach((ext) => ext?.onQuota?.(quotaData));
+    },
   });
 
   components.modelAndPrompt = createModelAndPrompt({
@@ -617,7 +620,7 @@ export function mountMonitorApp() {
       const data = await fetchJson(`/api/update/status${force ? "?force=1" : ""}`);
       if (destroyed) return;
       if (data && data.ok) {
-        updateState.currentVersion = String(data.currentVersion || "1.1.1");
+        updateState.currentVersion = String(data.currentVersion || "1.1.2");
         components.changelogModal?.setCurrentVersion?.(updateState.currentVersion);
         updateState.remoteVersion = String(data.remoteVersion || updateState.currentVersion);
         updateState.remoteSha = String(data.remoteSha || "");

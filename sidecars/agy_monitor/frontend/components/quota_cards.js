@@ -152,7 +152,7 @@ async function requestQuotaJson(apiFetch, url) {
 /**
  * Mounts the 3-column official quota strip onto #quotaCardsStrip.
  */
-export function createQuotaCards({ apiFetch, t } = {}) {
+export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
   const container = document.getElementById("quotaCardsStrip");
 
   let translator = t;
@@ -348,6 +348,7 @@ export function createQuotaCards({ apiFetch, t } = {}) {
           fetchedAtMs: Number(data.fetchedAtMs) || Date.now(),
           groups: data.groups,
         };
+        onQuotaUpdate?.(data);
       } else if (state.phase === "ready" && state.groups.length > 0) {
         state = {
           ...state,

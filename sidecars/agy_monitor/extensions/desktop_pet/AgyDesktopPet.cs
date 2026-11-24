@@ -73,6 +73,10 @@ namespace AgyDesktopPetExtension
         public int activeSessionCount = 0;
         public int unreadSessionCount = 0;
         public string agentState = "idle";
+        public int? quotaGemini5h = null;
+        public int? quotaGeminiWeekly = null;
+        public int? quotaClaude5h = null;
+        public int? quotaClaudeWeekly = null;
     }
 
     internal sealed class PetThemePalette
@@ -748,6 +752,7 @@ namespace AgyDesktopPetExtension
                 ? _telemetry.cacheHitPct.Value.ToString(CultureInfo.InvariantCulture)
                 : "--";
             string unreadStr = _telemetry != null ? Math.Max(0, _telemetry.unreadSessionCount).ToString(CultureInfo.InvariantCulture) : "0";
+            string quotaStr = FormatQuotaText(_telemetry);
 
             return tpl
                 .Replace("{in}", inStr)
@@ -756,7 +761,61 @@ namespace AgyDesktopPetExtension
                 .Replace("{pct}", pctStr)
                 .Replace("{model}", modelStr)
                 .Replace("{cache}", cacheStr)
-                .Replace("{unread}", unreadStr);
+                .Replace("{unread}", unreadStr)
+                .Replace("{quota}", quotaStr);
+        }
+
+        private static string FormatPoolQuota(int? fiveH, int? weekly)
+        {
+            if (fiveH.HasValue && weekly.HasValue)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "5h {0}%/周 {1}%", fiveH.Value, weekly.Value);
+            }
+            if (fiveH.HasValue)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "5h {0}%", fiveH.Value);
+            }
+            if (weekly.HasValue)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "周 {0}%", weekly.Value);
+            }
+            return "";
+        }
+
+        private static string FormatQuotaText(PetTelemetry t)
+        {
+            if (t == null) return "--";
+            string gText = FormatPoolQuota(t.quotaGemini5h, t.quotaGeminiWeekly);
+            string cText = FormatPoolQuota(t.quotaClaude5h, t.quotaClaudeWeekly);
+            if (string.IsNullOrEmpty(gText) && string.IsNullOrEmpty(cText)) return "--";
+
+            string m = string.IsNullOrEmpty(t.upstreamModelId) ? "" : t.upstreamModelId.ToLowerInvariant();
+            bool isClaudeOrGpt =
+                m.IndexOf("claude", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("gpt", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("sonnet", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("opus", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("haiku", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("openai", StringComparison.Ordinal) >= 0;
+            bool isGemini =
+                m.IndexOf("gemini", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("argon", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("flash", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("neon", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("hydrogen", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("carbon", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("ultra", StringComparison.Ordinal) >= 0;
+
+            if (isClaudeOrGpt) return !string.IsNullOrEmpty(cText) ? cText : (!string.IsNullOrEmpty(gText) ? gText : "--");
+            if (isGemini) return !string.IsNullOrEmpty(gText) ? gText : (!string.IsNullOrEmpty(cText) ? cText : "--");
+
+            int? gMain = t.quotaGemini5h.HasValue ? t.quotaGemini5h : t.quotaGeminiWeekly;
+            int? cMain = t.quotaClaude5h.HasValue ? t.quotaClaude5h : t.quotaClaudeWeekly;
+            if (gMain.HasValue && cMain.HasValue)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "G {0}% · C {1}%", gMain.Value, cMain.Value);
+            }
+            return !string.IsNullOrEmpty(gText) ? gText : (!string.IsNullOrEmpty(cText) ? cText : "--");
         }
 
         private static string FormatTokenCount(long count)
@@ -3931,7 +3990,11 @@ namespace AgyDesktopPetExtension
                     upstreamModelId = ReadString(doc, "upstreamModelId", ""),
                     activeSessionCount = ClampInt(ReadInt(doc, "activeSessionCount", 0), 0, 999),
                     unreadSessionCount = ClampInt(ReadInt(doc, "unreadSessionCount", 0), 0, 999),
-                    agentState = ReadString(doc, "agentState", "idle")
+                    agentState = ReadString(doc, "agentState", "idle"),
+                    quotaGemini5h = ReadNullableInt(doc, "quotaGemini5h"),
+                    quotaGeminiWeekly = ReadNullableInt(doc, "quotaGeminiWeekly"),
+                    quotaClaude5h = ReadNullableInt(doc, "quotaClaude5h"),
+                    quotaClaudeWeekly = ReadNullableInt(doc, "quotaClaudeWeekly")
                 };
             }
             catch { }

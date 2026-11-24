@@ -522,12 +522,42 @@ async function readSafeCustomAssetFile(customWallpapersDir, filename) {
   }
 }
 
-function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
+function extractCompactQuota(summary) {
+  if (!summary || !summary.ok || !Array.isArray(summary.groups) || summary.groups.length === 0) {
+    return null;
+  }
+  const pickPct = (bucket) =>
+    bucket && !bucket.disabled && Number.isFinite(Number(bucket.remainingPct))
+      ? Math.max(0, Math.min(100, Math.round(Number(bucket.remainingPct))))
+      : null;
+  const gem = summary.groups.find((g) => g?.key === 'gemini') || null;
+  const claude = summary.groups.find((g) => g?.key === 'gpt_claude') || null;
+  const out = {
+    gemini5h: pickPct(gem?.fiveHour),
+    geminiWeekly: pickPct(gem?.weekly),
+    claude5h: pickPct(claude?.fiveHour),
+    claudeWeekly: pickPct(claude?.weekly),
+  };
+  if (
+    out.gemini5h === null &&
+    out.geminiWeekly === null &&
+    out.claude5h === null &&
+    out.claudeWeekly === null
+  ) {
+    return null;
+  }
+  return out;
+}
+
+function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient = null) {
   let lastSig = '';
   let inFlight = false;
   let queued = false;
   let lastHostConvId = '';
   let lastHostConvAtMs = 0;
+  let lastQuotaSnapshot = null;
+  let lastWrittenTelemetry = null;
+  let lastWrittenOpts = null;
 
   const setActiveHostConv = (convId) => {
     const id = typeof convId === 'string' ? convId.trim() : '';
@@ -541,6 +571,8 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     return Boolean(id && lastHostConvId && id === lastHostConvId);
   };
 
+  const getQuotaSnapshot = () => (lastQuotaSnapshot ? { ...lastQuotaSnapshot } : null);
+
   let writeChain = Promise.resolve();
   let lastSessionsSnapshot = [];
   let lastActiveSessionCount = 0;
@@ -550,6 +582,8 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     { sessionsHudList = null, forceEmpty = false, activeSessionCount = null, unreadSessionCount = null } = {},
   ) => {
     if (!paths?.hudTelemetryFile || (!telemetry && !forceEmpty)) return Promise.resolve();
+    lastWrittenTelemetry = telemetry;
+    lastWrittenOpts = { sessionsHudList, forceEmpty, activeSessionCount, unreadSessionCount };
     writeChain = writeChain.then(async () => {
       const pie = forceEmpty ? {} : (telemetry?.contextPie || {});
       const rt = forceEmpty ? {} : (telemetry?.runtimeTelemetry || {});
@@ -590,6 +624,11 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
       }
       const agentState =
         lastActiveSessionCount > 0 ? 'running' : lastUnreadSessionCount > 0 ? 'unread' : 'idle';
+      const q = lastQuotaSnapshot;
+      const quotaGemini5h = q ? q.gemini5h : null;
+      const quotaGeminiWeekly = q ? q.geminiWeekly : null;
+      const quotaClaude5h = q ? q.claude5h : null;
+      const quotaClaudeWeekly = q ? q.claudeWeekly : null;
 
       const payload = {
         activeConvId,
@@ -608,6 +647,10 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
         activeSessionCount: lastActiveSessionCount,
         unreadSessionCount: lastUnreadSessionCount,
         agentState,
+        quotaGemini5h,
+        quotaGeminiWeekly,
+        quotaClaude5h,
+        quotaClaudeWeekly,
         cdpHudActive: false,
         sessions: lastSessionsSnapshot,
         updatedAtMs: Date.now(),
@@ -621,7 +664,8 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
       const sessionsSig = lastSessionsSnapshot
         .map((s) => `${s.id}:${s.percent}:${s.tokPerSec ?? ''}:${s.cacheHitPct ?? ''}:${s.upstreamModelId}`)
         .join(',');
-      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
+      const quotaSig = `${quotaGemini5h ?? ''}:${quotaGeminiWeekly ?? ''}:${quotaClaude5h ?? ''}:${quotaClaudeWeekly ?? ''}`;
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
       try {
@@ -632,6 +676,21 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
       }
     });
     return writeChain;
+  };
+
+  const setQuotaSummary = (summary) => {
+    const compact = extractCompactQuota(summary);
+    if (!compact) return;
+    const changed =
+      !lastQuotaSnapshot ||
+      lastQuotaSnapshot.gemini5h !== compact.gemini5h ||
+      lastQuotaSnapshot.geminiWeekly !== compact.geminiWeekly ||
+      lastQuotaSnapshot.claude5h !== compact.claude5h ||
+      lastQuotaSnapshot.claudeWeekly !== compact.claudeWeekly;
+    lastQuotaSnapshot = compact;
+    if (changed && lastWrittenTelemetry) {
+      void writePayload(lastWrittenTelemetry, lastWrittenOpts || {});
+    }
   };
 
   const resolveActiveConv = (topLevelIdSet, viewedInfo) => {
@@ -660,10 +719,17 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     }
     inFlight = true;
     try {
-      const [sessionsHub, prefs] = await Promise.all([
+      const [sessionsHub, prefs, liveQuota] = await Promise.all([
         querySessionsHub(paths.summariesDbPath, store, {}),
         store.getPrefs(),
+        quotaClient && typeof quotaClient.getQuotaSummary === 'function'
+          ? quotaClient.getQuotaSummary({ force: false }).catch(() => null)
+          : Promise.resolve(null),
       ]);
+      const compactQuota = extractCompactQuota(liveQuota);
+      if (compactQuota) {
+        lastQuotaSnapshot = compactQuota;
+      }
       const allSelectable = Array.isArray(sessionsHub?.allSelectable) ? sessionsHub.allSelectable : [];
       const topLevelConvIds = allSelectable.map((s) => s.id).filter(Boolean);
       const topLevelIdSet = new Set(topLevelConvIds);
@@ -704,7 +770,15 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null) {
     }
   };
 
-  return { writePayload, refreshFromDb, setActiveHostConv, isActiveHostConv, resolveActiveConv };
+  return {
+    writePayload,
+    refreshFromDb,
+    setActiveHostConv,
+    isActiveHostConv,
+    resolveActiveConv,
+    setQuotaSummary,
+    getQuotaSnapshot,
+  };
 }
 
 /**
@@ -726,8 +800,8 @@ export function createMonitorHandlers({
   const resolvedPaths = paths || resolvePaths();
   const store = storage || createStorage(resolvedPaths);
   const cdp = cdpBridge || createCdpThemeBridge(resolvedPaths);
-  const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp);
   const quota = quotaClient || createQuotaClient();
+  const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp, quota);
   const accounts =
     accountManager ||
     createAccountManager({
@@ -1010,6 +1084,7 @@ export function createMonitorHandlers({
       tokenUsage: telemetry.tokenUsage,
       sessionsHub,
       runtimeTelemetry: telemetry.runtimeTelemetry,
+      quota: hud.getQuotaSnapshot?.() || null,
       availableModels,
     };
   });
@@ -1082,6 +1157,7 @@ export function createMonitorHandlers({
     const force = data.force === '1' || data.force === 'true' || data.force === true;
     const summary = await quota.getQuotaSummary({ force });
     if (summary?.ok && Array.isArray(summary.groups) && summary.groups.length > 0) {
+      hud.setQuotaSummary?.(summary);
       void accounts.syncActiveAccountQuotaFromLive(summary).catch(() => {});
     }
     return summary;
@@ -2265,13 +2341,14 @@ export async function startSidecarServer({
   const app = new SidecarApp();
   const paths = resolvePaths(pathsOverrides);
   const storage = createStorage(paths);
+  const sharedQuotaClient = createQuotaClient();
   let hudPublisher = null;
   const cdpBridge = createCdpThemeBridge(paths, {
     onHudStateChange() {
       void hudPublisher?.refreshFromDb?.();
     },
   });
-  hudPublisher = createHudTelemetryPublisher(paths, storage, cdpBridge);
+  hudPublisher = createHudTelemetryPublisher(paths, storage, cdpBridge, sharedQuotaClient);
 
   let latestWorkerEtag = '';
   const worker = skipWorker
@@ -2290,7 +2367,6 @@ export async function startSidecarServer({
     sendMessage: (conversationId, message, opts) => app.sendMessage(conversationId, message, opts),
     getConversationMetadata: (conversationId) => app.getConversationMetadata(conversationId),
   };
-  const sharedQuotaClient = createQuotaClient();
   const sharedAccountManager = createAccountManager({
     paths,
     storage,

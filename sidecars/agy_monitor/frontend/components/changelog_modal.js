@@ -13,6 +13,17 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.1.2",
+    date: "2026-11-24",
+    title: "可插拔 AI 桌宠工作室（PR #3）、桌宠气泡实时额度变量 {quota} & 安全/DPI/生命周期全面加固",
+    items: [
+      "合入来自 @GreenNa717 的可插拔桌面宠物扩展（PR #3）：独立「桌宠」分页、顶栏快捷开关、6 轨道自定义帧动画工作室、MCP 工具链与 AI 生图制帧技能（默认关闭、零后台常驻进程，支持 AGY_DISABLE_EXTENSIONS=1 完全隔离）。",
+      "桌宠弹出气泡新增实时额度变量 {quota} 与「模型 + 额度」快捷预设：自动按当前模型匹配对应池（Gemini / GPT&Claude）展示 5h/周剩余额度，面板预览与 Windows 桌面悬浮宠全链路实时同步。",
+      "全面安全与资源加固：为 PNG 解码补齐尺寸与解压上限防炸弹、收紧精灵表与离线预览 HTML 输出路径并校验符号链接、为预览页增加严格 CSP 与 nosniff、拦截原始 customPets 覆写；打包/更新/卸载脚本全面同步 mcp_config.json、skills/ 与桌宠伴侣进程清理。",
+      "加固 Windows 桌宠伴侣与前端兼容性：新增父进程 + Antigravity 宿主防孤儿退出守卫、休眠/锁屏/分辨率切换恢复、Per-Monitor 高分屏 DPI 坐标换算与配置合并写入；修复窄屏挤出公告按钮、浮窗遮挡弹窗、重复动画定义与隐藏时定时器空跑问题。",
+    ],
+  },
+  {
     version: "1.1.1",
     date: "2026-11-24",
     title: "更新公告弹窗（支持单版本更新/回退）、OAuth 自动续签防 401、移除 Argon 双列适配 & 回退切模型秒级响应",
@@ -234,7 +245,7 @@ async function requestChangelogJson(apiFetch, url, options = {}) {
 export function createChangelogModal({
   apiFetch,
   t,
-  initialVersion = "1.1.1",
+  initialVersion = "1.1.2",
   onVersionApplied,
   onToast,
 } = {}) {
