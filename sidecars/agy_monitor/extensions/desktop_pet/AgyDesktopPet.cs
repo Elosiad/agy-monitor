@@ -7,6 +7,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows;
@@ -61,6 +62,16 @@ namespace AgyDesktopPetExtension
         public List<CustomPetEntry> customPets = new List<CustomPetEntry>();
     }
 
+    internal sealed class SessionProgressItem
+    {
+        public string id = "";
+        public string name = "";
+        public string status = "done";
+        public int progress = 0;
+        public string tag = "";
+        public string content = "";
+    }
+
     internal sealed class PetTelemetry
     {
         public int percent = 0;
@@ -77,6 +88,7 @@ namespace AgyDesktopPetExtension
         public int? quotaGeminiWeekly = null;
         public int? quotaClaude5h = null;
         public int? quotaClaudeWeekly = null;
+        public List<SessionProgressItem> sessionProgress = new List<SessionProgressItem>();
     }
 
     internal sealed class PetThemePalette
@@ -136,6 +148,30 @@ namespace AgyDesktopPetExtension
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+
+        [DllImport("psapi.dll")]
+        private static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        public static void TrimWorkingSet()
+        {
+            try
+            {
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, false);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, false);
+                using (Process cur = Process.GetCurrentProcess())
+                {
+                    if (!EmptyWorkingSet(cur.Handle))
+                    {
+                        SetProcessWorkingSetSize(cur.Handle, new IntPtr(-1), new IntPtr(-1));
+                    }
+                }
+            }
+            catch { }
+        }
 
         public static void EnablePerMonitorDpi()
         {
@@ -197,9 +233,11 @@ namespace AgyDesktopPetExtension
     {
         private const double BaseStageSize = 112.0;
         private const double BubbleHeightReserve = 44.0;
-        private const double BaseWinWidth = 248.0;
+        private const double BaseWinWidth = 264.0;
         private const double BaseWinHeight = 162.0;
 
+        private readonly Grid _rootGrid;
+        private double _bubbleExtraHeight = 0.0;
         private readonly Border _bubbleBorder;
         private readonly TextBlock _bubbleText;
         private readonly ScaleTransform _bubbleScale;
@@ -344,7 +382,7 @@ namespace AgyDesktopPetExtension
             sparkleTransformGroup.Children.Add(_sparkleScale);
             sparkleTransformGroup.Children.Add(_sparkleTranslate);
 
-            var rootGrid = new Grid
+            _rootGrid = new Grid
             {
                 Width = BaseWinWidth,
                 Height = BaseWinHeight,
@@ -358,8 +396,9 @@ namespace AgyDesktopPetExtension
                 Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(242, 244, 250)),
                 FontSize = 11.2,
                 FontWeight = FontWeights.Medium,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                MaxWidth = 228,
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 15.5,
+                MaxWidth = 244,
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
                 TextAlignment = TextAlignment.Center
             };
@@ -444,10 +483,10 @@ namespace AgyDesktopPetExtension
             _petHost.MouseRightButtonDown += OnPetMouseRightButtonDown;
             _petHost.MouseRightButtonUp += OnPetMouseRightButtonUp;
 
-            rootGrid.Children.Add(_petHost);
-            rootGrid.Children.Add(_sparkleText);
-            rootGrid.Children.Add(_bubbleBorder);
-            Content = rootGrid;
+            _rootGrid.Children.Add(_petHost);
+            _rootGrid.Children.Add(_sparkleText);
+            _rootGrid.Children.Add(_bubbleBorder);
+            Content = _rootGrid;
 
             LocationChanged += delegate
             {
@@ -614,7 +653,7 @@ namespace AgyDesktopPetExtension
             _rootScale.ScaleX = scale;
             _rootScale.ScaleY = scale;
             Width = Math.Round(BaseWinWidth * scale);
-            Height = Math.Round(BaseWinHeight * scale);
+            Height = Math.Round((BaseWinHeight + _bubbleExtraHeight) * scale);
             Opacity = Math.Max(0.4, Math.Min(1.0, _petConfig.opacity / 100.0));
             Topmost = _petConfig.alwaysOnTop;
             ApplyWindowSelectability(_petConfig.selectable);
@@ -736,6 +775,120 @@ namespace AgyDesktopPetExtension
             }
         }
 
+        private static readonly Regex ListBlockRegex = new Regex(@"\[([^\[\]]+)\](?:\(([^()]*)\))?", RegexOptions.Compiled);
+        private static readonly Regex SessionVarRegex = new Regex(@"\{(schedule|content)(?::([a-zA-Z0-9_-]+))?\}", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        private string ResolveSessionField(string kind, string convId)
+        {
+            List<SessionProgressItem> list = (_telemetry != null && _telemetry.sessionProgress != null)
+                ? _telemetry.sessionProgress
+                : null;
+            SessionProgressItem target = null;
+            if (list != null && list.Count > 0)
+            {
+                if (!string.IsNullOrEmpty(convId))
+                {
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        if (string.Equals(list[i].id, convId, StringComparison.Ordinal))
+                        {
+                            target = list[i];
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        if (string.Equals(list[i].status, "active", StringComparison.OrdinalIgnoreCase)) { target = list[i]; break; }
+                    }
+                    if (target == null)
+                    {
+                        for (int i = 0; i < list.Count; i++)
+                        {
+                            if (string.Equals(list[i].status, "unread", StringComparison.OrdinalIgnoreCase)) { target = list[i]; break; }
+                        }
+                    }
+                    if (target == null) target = list[0];
+                }
+            }
+
+            if (string.Equals(kind, "schedule", StringComparison.OrdinalIgnoreCase))
+            {
+                if (target == null)
+                {
+                    if (!string.IsNullOrEmpty(convId))
+                    {
+                        string shortId = convId.Length > 8 ? convId.Substring(0, 8) : convId;
+                        return shortId + " · 待机";
+                    }
+                    return "待机";
+                }
+                string rawName = !string.IsNullOrEmpty(target.name) ? target.name : (target.id.Length > 8 ? target.id.Substring(0, 8) : target.id);
+                string shortName = rawName.Length > 20 ? rawName.Substring(0, 20) : rawName;
+                if (string.Equals(target.status, "active", StringComparison.OrdinalIgnoreCase))
+                {
+                    return string.Format(CultureInfo.InvariantCulture, "⚡ {0} · {1}%", shortName, target.progress);
+                }
+                if (string.Equals(target.status, "unread", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "★ " + shortName + " · 未读";
+                }
+                return "✓ " + shortName + " · 已完成";
+            }
+
+            if (target == null) return "暂无进展";
+            string txt = !string.IsNullOrEmpty(target.content)
+                ? target.content
+                : (!string.IsNullOrEmpty(target.tag) ? target.tag : (!string.IsNullOrEmpty(target.name) ? target.name : "推进中"));
+            return txt.Length > 38 ? txt.Substring(0, 38) : txt;
+        }
+
+        private string RenderSessionVars(string text, string overrideId)
+        {
+            return SessionVarRegex.Replace(text, delegate(Match m)
+            {
+                string kind = m.Groups[1].Value;
+                string cid = !string.IsNullOrEmpty(overrideId) ? overrideId : (m.Groups[2].Success ? m.Groups[2].Value : "");
+                return ResolveSessionField(kind, cid);
+            });
+        }
+
+        private string RenderListItems(List<string> items, string overrideId)
+        {
+            var lines = new List<string>();
+            for (int i = 0; i < items.Count; i++)
+            {
+                string resolved = RenderSessionVars(items[i], overrideId).Trim();
+                if (!string.IsNullOrEmpty(resolved)) lines.Add(resolved);
+            }
+            return string.Join("\n", lines.ToArray());
+        }
+
+        private static void ResolveQuotaPair(PetTelemetry t, out string fiveH, out string weekly)
+        {
+            fiveH = "--";
+            weekly = "--";
+            if (t == null) return;
+            string m = string.IsNullOrEmpty(t.upstreamModelId) ? "" : t.upstreamModelId.ToLowerInvariant();
+            bool isClaudeOrGpt =
+                m.IndexOf("claude", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("gpt", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("sonnet", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("opus", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("haiku", StringComparison.Ordinal) >= 0 ||
+                m.IndexOf("openai", StringComparison.Ordinal) >= 0;
+            int? raw5 = isClaudeOrGpt
+                ? (t.quotaClaude5h.HasValue ? t.quotaClaude5h : t.quotaGemini5h)
+                : (t.quotaGemini5h.HasValue ? t.quotaGemini5h : t.quotaClaude5h);
+            int? rawW = isClaudeOrGpt
+                ? (t.quotaClaudeWeekly.HasValue ? t.quotaClaudeWeekly : t.quotaGeminiWeekly)
+                : (t.quotaGeminiWeekly.HasValue ? t.quotaGeminiWeekly : t.quotaClaudeWeekly);
+            if (raw5.HasValue) fiveH = raw5.Value.ToString(CultureInfo.InvariantCulture);
+            if (rawW.HasValue) weekly = rawW.Value.ToString(CultureInfo.InvariantCulture);
+        }
+
         private string RenderBubbleTemplate(string template)
         {
             string tpl = string.IsNullOrEmpty(template) ? "入 {in} · 出 {out}" : template;
@@ -752,9 +905,12 @@ namespace AgyDesktopPetExtension
                 ? _telemetry.cacheHitPct.Value.ToString(CultureInfo.InvariantCulture)
                 : "--";
             string unreadStr = _telemetry != null ? Math.Max(0, _telemetry.unreadSessionCount).ToString(CultureInfo.InvariantCulture) : "0";
+            string q5Str;
+            string q7Str;
+            ResolveQuotaPair(_telemetry, out q5Str, out q7Str);
             string quotaStr = FormatQuotaText(_telemetry);
 
-            return tpl
+            string scalarExpanded = tpl
                 .Replace("{in}", inStr)
                 .Replace("{out}", outStr)
                 .Replace("{tps}", tpsStr)
@@ -762,7 +918,152 @@ namespace AgyDesktopPetExtension
                 .Replace("{model}", modelStr)
                 .Replace("{cache}", cacheStr)
                 .Replace("{unread}", unreadStr)
+                .Replace("{quota5h}", q5Str)
+                .Replace("{quota7d}", q7Str)
                 .Replace("{quota}", quotaStr);
+
+            MatchCollection matches = ListBlockRegex.Matches(scalarExpanded);
+            if (matches.Count == 0)
+            {
+                return RenderSessionVars(scalarExpanded, "");
+            }
+
+            var renderedIds = new HashSet<string>(StringComparer.Ordinal);
+            int totalBlocks = 0;
+            const int maxListBlocks = 6;
+            var sb = new StringBuilder();
+            int cursor = 0;
+            bool prevEndedWithList = false;
+
+            for (int mi = 0; mi < matches.Count; mi++)
+            {
+                Match m = matches[mi];
+                string between = scalarExpanded.Substring(cursor, m.Index - cursor);
+                string inner = m.Groups[1].Value;
+                string modsRaw = m.Groups[2].Success ? m.Groups[2].Value : "";
+
+                var items = new List<string>();
+                string[] rawParts = inner.Split(',');
+                for (int i = 0; i < rawParts.Length; i++)
+                {
+                    string part = rawParts[i].Trim();
+                    if (!string.IsNullOrEmpty(part)) items.Add(part);
+                }
+
+                bool wantActive = false;
+                bool wantUnread = false;
+                if (!string.IsNullOrEmpty(modsRaw))
+                {
+                    string[] modParts = modsRaw.ToLowerInvariant().Split(',');
+                    for (int i = 0; i < modParts.Length; i++)
+                    {
+                        string mp = modParts[i].Trim();
+                        if (mp == "active") wantActive = true;
+                        else if (mp == "unread") wantUnread = true;
+                    }
+                }
+
+                var explicitIds = new List<string>();
+                for (int i = 0; i < items.Count; i++)
+                {
+                    MatchCollection idMatches = SessionVarRegex.Matches(items[i]);
+                    for (int j = 0; j < idMatches.Count; j++)
+                    {
+                        if (idMatches[j].Groups[2].Success)
+                        {
+                            string cid = idMatches[j].Groups[2].Value;
+                            if (!string.IsNullOrEmpty(cid) && !explicitIds.Contains(cid)) explicitIds.Add(cid);
+                        }
+                    }
+                }
+
+                var blocks = new List<string>();
+                if (explicitIds.Count > 0)
+                {
+                    if (totalBlocks < maxListBlocks)
+                    {
+                        string bt = RenderListItems(items, "");
+                        if (!string.IsNullOrEmpty(bt))
+                        {
+                            blocks.Add(bt);
+                            totalBlocks++;
+                        }
+                    }
+                    for (int i = 0; i < explicitIds.Count; i++) renderedIds.Add(explicitIds[i]);
+                }
+                else if (!wantActive && !wantUnread)
+                {
+                    if (totalBlocks < maxListBlocks)
+                    {
+                        string bt = RenderListItems(items, "");
+                        if (!string.IsNullOrEmpty(bt))
+                        {
+                            blocks.Add(bt);
+                            totalBlocks++;
+                        }
+                    }
+                }
+
+                if ((wantActive || wantUnread) && _telemetry != null && _telemetry.sessionProgress != null)
+                {
+                    for (int i = 0; i < _telemetry.sessionProgress.Count && totalBlocks < maxListBlocks; i++)
+                    {
+                        SessionProgressItem sp = _telemetry.sessionProgress[i];
+                        if (sp == null || string.IsNullOrEmpty(sp.id) || renderedIds.Contains(sp.id)) continue;
+                        bool match = (wantActive && string.Equals(sp.status, "active", StringComparison.OrdinalIgnoreCase)) ||
+                            (wantUnread && string.Equals(sp.status, "unread", StringComparison.OrdinalIgnoreCase));
+                        if (!match) continue;
+                        renderedIds.Add(sp.id);
+                        string bt = RenderListItems(items, sp.id);
+                        if (!string.IsNullOrEmpty(bt))
+                        {
+                            blocks.Add(bt);
+                            totalBlocks++;
+                        }
+                    }
+                }
+
+                string combined = string.Join("\n\n", blocks.ToArray());
+                if (!string.IsNullOrEmpty(between.Trim()))
+                {
+                    sb.Append(between);
+                    if (!string.IsNullOrEmpty(combined))
+                    {
+                        if (sb.Length > 0 && sb[sb.Length - 1] != '\n') sb.Append('\n');
+                        sb.Append(combined);
+                        prevEndedWithList = true;
+                    }
+                    else
+                    {
+                        prevEndedWithList = false;
+                    }
+                }
+                else if (!string.IsNullOrEmpty(combined))
+                {
+                    if (sb.Length > 0 && prevEndedWithList) sb.Append("\n\n");
+                    else if (sb.Length > 0 && sb[sb.Length - 1] != '\n') sb.Append('\n');
+                    sb.Append(combined);
+                    prevEndedWithList = true;
+                }
+
+                cursor = m.Index + m.Length;
+            }
+
+            if (cursor < scalarExpanded.Length)
+            {
+                string tail = scalarExpanded.Substring(cursor);
+                if (!string.IsNullOrEmpty(tail.Trim()))
+                {
+                    if (sb.Length > 0 && sb[sb.Length - 1] != '\n' && !tail.StartsWith("\n", StringComparison.Ordinal))
+                    {
+                        sb.Append('\n');
+                    }
+                    sb.Append(RenderSessionVars(tail, ""));
+                }
+            }
+
+            string finalStr = sb.ToString().Trim();
+            return string.IsNullOrEmpty(finalStr) ? "暂无活动/未读会话" : finalStr;
         }
 
         private static string FormatPoolQuota(int? fiveH, int? weekly)
@@ -1396,7 +1697,7 @@ namespace AgyDesktopPetExtension
             double stageW = BaseStageSize * scale;
             double stageH = BaseStageSize * scale;
             double petLeft = Left + (Width - stageW) * 0.5;
-            double petTop = Top + BubbleHeightReserve * scale;
+            double petTop = Top + (BubbleHeightReserve + _bubbleExtraHeight) * scale;
             double petRight = petLeft + stageW;
             double petBottom = petTop + stageH;
 
@@ -1648,6 +1949,20 @@ namespace AgyDesktopPetExtension
             }
         }
 
+        private void SetBubbleExtraHeight(double extra)
+        {
+            double clamped = Math.Max(0.0, Math.Min(210.0, Math.Round(extra)));
+            double delta = clamped - _bubbleExtraHeight;
+            if (Math.Abs(delta) < 0.5) return;
+            _bubbleExtraHeight = clamped;
+            double scale = Math.Max(0.6, Math.Min(5.0, _petConfig.size / 100.0));
+            _rootGrid.Height = BaseWinHeight + clamped;
+            _petHost.Margin = new Thickness(0, BubbleHeightReserve + clamped, 0, 4);
+            _sparkleText.Margin = new Thickness(68, 42 + clamped, 0, 0);
+            Height = Math.Round((BaseWinHeight + clamped) * scale);
+            Top = Math.Round(Top - delta * scale);
+        }
+
         private void HideBubbleImmediate()
         {
             _bubbleAnimGen++;
@@ -1657,6 +1972,7 @@ namespace AgyDesktopPetExtension
             _bubbleScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
             _bubbleTranslate.BeginAnimation(TranslateTransform.YProperty, null);
             _bubbleBorder.Visibility = Visibility.Collapsed;
+            SetBubbleExtraHeight(0.0);
         }
 
         private void HideBubbleAnimated()
@@ -1672,6 +1988,7 @@ namespace AgyDesktopPetExtension
                 if (_bubbleAnimGen == gen)
                 {
                     _bubbleBorder.Visibility = Visibility.Collapsed;
+                    SetBubbleExtraHeight(0.0);
                 }
             };
             _bubbleBorder.BeginAnimation(UIElement.OpacityProperty, fadeOut);
@@ -1691,8 +2008,26 @@ namespace AgyDesktopPetExtension
             _bubbleAnimGen++;
             _bubbleHideTimer.Stop();
 
+            bool multiline = text.IndexOf('\n') >= 0;
+            _bubbleText.TextAlignment = multiline ? TextAlignment.Left : TextAlignment.Center;
             _bubbleText.Text = text;
             _bubbleBorder.Visibility = Visibility.Visible;
+
+            if (multiline)
+            {
+                try
+                {
+                    _bubbleBorder.Measure(new System.Windows.Size(BaseWinWidth - 8.0, 260.0));
+                    double needed = Math.Max(0.0, Math.Ceiling(_bubbleBorder.DesiredSize.Height) - BubbleHeightReserve + 8.0);
+                    SetBubbleExtraHeight(needed);
+                }
+                catch { }
+                if (durationSec < 6.5) durationSec = 6.5;
+            }
+            else
+            {
+                SetBubbleExtraHeight(0.0);
+            }
 
             var popEase = new BackEase { Amplitude = 0.34, EasingMode = EasingMode.EaseOut };
             var fadeEase = new CubicEase { EasingMode = EasingMode.EaseOut };
@@ -3499,6 +3834,9 @@ namespace AgyDesktopPetExtension
         private int _hudReloadPending = 0;
         private int _themeReloadPending = 0;
         private volatile bool _disposed = false;
+        private const string TrimEventName = @"Local\AgyDesktopPetTrim";
+        private EventWaitHandle _trimEvent;
+        private Thread _trimThread;
 
         public PetHostController(string dataDir, Dispatcher dispatcher, int parentPid)
         {
@@ -3522,13 +3860,25 @@ namespace AgyDesktopPetExtension
             StartStopListener();
             HookSystemEvents();
 
+            int pollTick = 0;
+            bool startupTrimmed = false;
             _pollTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher);
             _pollTimer.Interval = TimeSpan.FromMilliseconds(1000);
             _pollTimer.Tick += delegate
             {
                 if (_disposed) return;
+                pollTick++;
                 if (!CheckHostLiveness()) return;
                 CheckFiles();
+                if (!startupTrimmed && pollTick >= 5)
+                {
+                    startupTrimmed = true;
+                    PetNative.TrimWorkingSet();
+                }
+                else if ((pollTick % 600) == 0)
+                {
+                    PetNative.TrimWorkingSet();
+                }
                 if ((DateTime.UtcNow - _lastStatusWriteUtc).TotalSeconds >= 3.0)
                 {
                     WriteStatusFile(true);
@@ -3700,6 +4050,27 @@ namespace AgyDesktopPetExtension
             });
             _stopThread.IsBackground = true;
             _stopThread.Start();
+
+            try
+            {
+                _trimEvent = new EventWaitHandle(false, EventResetMode.AutoReset, TrimEventName);
+                _trimThread = new Thread(delegate()
+                {
+                    while (!_disposed)
+                    {
+                        try
+                        {
+                            if (!_trimEvent.WaitOne(5000)) continue;
+                            if (_disposed) break;
+                            PetNative.TrimWorkingSet();
+                        }
+                        catch { break; }
+                    }
+                });
+                _trimThread.IsBackground = true;
+                _trimThread.Start();
+            }
+            catch { }
         }
 
         private void InstallWatcher()
@@ -3979,6 +4350,27 @@ namespace AgyDesktopPetExtension
                 _lastHudLen = fi.Length;
                 var doc = _json.DeserializeObject(raw) as Dictionary<string, object>;
                 if (doc == null) return;
+                var spList = new List<SessionProgressItem>();
+                object rawSpObj;
+                if (doc.TryGetValue("sessionProgress", out rawSpObj) && rawSpObj is System.Collections.IEnumerable && !(rawSpObj is string))
+                {
+                    foreach (object spObj in (System.Collections.IEnumerable)rawSpObj)
+                    {
+                        var spd = spObj as Dictionary<string, object>;
+                        if (spd == null) continue;
+                        string spId = ReadString(spd, "id", "");
+                        if (string.IsNullOrEmpty(spId)) continue;
+                        spList.Add(new SessionProgressItem
+                        {
+                            id = spId,
+                            name = ReadString(spd, "name", spId),
+                            status = ReadString(spd, "status", "done"),
+                            progress = ClampInt(ReadInt(spd, "progress", 0), 0, 100),
+                            tag = ReadString(spd, "tag", ""),
+                            content = ReadString(spd, "content", "")
+                        });
+                    }
+                }
                 _telemetry = new PetTelemetry
                 {
                     percent = ClampInt(ReadInt(doc, "percent", 0), 0, 999),
@@ -3994,7 +4386,8 @@ namespace AgyDesktopPetExtension
                     quotaGemini5h = ReadNullableInt(doc, "quotaGemini5h"),
                     quotaGeminiWeekly = ReadNullableInt(doc, "quotaGeminiWeekly"),
                     quotaClaude5h = ReadNullableInt(doc, "quotaClaude5h"),
-                    quotaClaudeWeekly = ReadNullableInt(doc, "quotaClaudeWeekly")
+                    quotaClaudeWeekly = ReadNullableInt(doc, "quotaClaudeWeekly"),
+                    sessionProgress = spList
                 };
             }
             catch { }
@@ -4374,6 +4767,16 @@ namespace AgyDesktopPetExtension
                     try { _stopEvent.Set(); } catch { }
                     _stopEvent.Dispose();
                     _stopEvent = null;
+                }
+            }
+            catch { }
+            try
+            {
+                if (_trimEvent != null)
+                {
+                    try { _trimEvent.Set(); } catch { }
+                    _trimEvent.Dispose();
+                    _trimEvent = null;
                 }
             }
             catch { }

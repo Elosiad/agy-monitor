@@ -480,7 +480,7 @@ test('desktop_pet security hardening: PNG bomb guard, output_dir confinement, cu
   assert.equal(htmlRes.headers?.['X-Content-Type-Options'], 'nosniff');
 });
 
-test('desktop_pet bubble template supports {quota} across backend HUD telemetry, frontend bundle, and C# companion', async (t) => {
+test('desktop_pet bubble template supports {quota5h}/{quota7d} & session progress list DSL across backend, frontend, and C#', async (t) => {
   const paths = makeTempPaths(t);
   const store = createStorage(paths);
   const fakeQuota = {
@@ -519,6 +519,14 @@ test('desktop_pet bubble template supports {quota} across backend HUD telemetry,
     claude5h: 80,
     claudeWeekly: 92,
   });
+  assert.equal(Array.isArray(snap.sessionProgress), true);
+
+  // Long multi-session bubble templates (>160 chars) must persist without truncation
+  const longTpl =
+    '[{schedule:609c9cb9-f607-4832-a0e2-a2e23f302301},{content:609c9cb9-f607-4832-a0e2-a2e23f302301}][{schedule:11111111-2222-3333-4444-555555555555},{content:11111111-2222-3333-4444-555555555555}](active,unread)';
+  const petStore = createPetStorage(resolvePetPaths(paths));
+  const savedCfg = await petStore.savePetConfig({ bubbleTemplate: longTpl });
+  assert.equal(savedCfg.bubbleTemplate, longTpl);
 
   // Wait briefly for serialized hud_telemetry.json write
   await new Promise((r) => setTimeout(r, 40));
@@ -527,13 +535,19 @@ test('desktop_pet bubble template supports {quota} across backend HUD telemetry,
   assert.equal(hudDoc.quotaGeminiWeekly, 99);
   assert.equal(hudDoc.quotaClaude5h, 80);
   assert.equal(hudDoc.quotaClaudeWeekly, 92);
+  assert.equal(Array.isArray(hudDoc.sessionProgress), true);
 
   const bundle = await buildFrontendBundle(FRONTEND_DIR);
-  assert.equal(bundle.includes('"{quota}"'), true);
-  assert.equal(bundle.includes('pet.bubblePresetQuota'), true);
+  assert.equal(bundle.includes('"{quota5h}"'), true);
+  assert.equal(bundle.includes('"{quota7d}"'), true);
+  assert.equal(bundle.includes('5h {quota5h}% · 周 {quota7d}%'), true);
+  assert.equal(bundle.includes('pet.bubblePresetSessions'), true);
+  assert.equal(bundle.includes('buildSessionsPresetTemplate'), true);
 
   const cs = fs.readFileSync(PET_CS, 'utf8');
-  assert.match(cs, /Replace\("\{quota\}",\s*quotaStr\)/);
-  assert.match(cs, /quotaGemini5h/);
-  assert.match(cs, /quotaClaudeWeekly/);
+  assert.match(cs, /Replace\("\{quota5h\}",\s*q5Str\)/);
+  assert.match(cs, /Replace\("\{quota7d\}",\s*q7Str\)/);
+  assert.match(cs, /ListBlockRegex/);
+  assert.match(cs, /SessionProgressItem/);
+  assert.match(cs, /SetBubbleExtraHeight/);
 });

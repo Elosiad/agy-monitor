@@ -20,6 +20,7 @@ import { createMasteryHub } from "./components/mastery_hub.js";
 import { createAccountsHub } from "./components/accounts_hub.js";
 import { createThemeStudio } from "./components/theme_studio.js";
 import { createChangelogModal } from "./components/changelog_modal.js";
+import { createMemoryModal } from "./components/memory_modal.js";
 
 const POLL_ACTIVE_MS = 1200;
 const POLL_IDLE_MS = 2500;
@@ -149,7 +150,7 @@ export function mountMonitorApp() {
 
   const updateState = {
     phase: "idle", // idle | checking | latest | available | updating | updated | error
-    currentVersion: "1.1.2",
+    currentVersion: "1.1.3",
     remoteVersion: "",
     remoteSha: "",
     remoteMessage: "",
@@ -546,6 +547,12 @@ export function mountMonitorApp() {
     },
   });
 
+  components.memoryModal = createMemoryModal({
+    apiFetch,
+    t: translator,
+    onToast: showToast,
+  });
+
   // Sync initial filter state from tokenUsage DOM
   const initialFilter = components.tokenUsage.getFilter?.();
   if (initialFilter) {
@@ -620,7 +627,7 @@ export function mountMonitorApp() {
       const data = await fetchJson(`/api/update/status${force ? "?force=1" : ""}`);
       if (destroyed) return;
       if (data && data.ok) {
-        updateState.currentVersion = String(data.currentVersion || "1.1.2");
+        updateState.currentVersion = String(data.currentVersion || "1.1.3");
         components.changelogModal?.setCurrentVersion?.(updateState.currentVersion);
         updateState.remoteVersion = String(data.remoteVersion || updateState.currentVersion);
         updateState.remoteSha = String(data.remoteSha || "");
@@ -733,6 +740,7 @@ export function mountMonitorApp() {
       components.quotaCards?.refresh?.({ force: true });
       components.masteryHub?.refresh?.();
       components.accountsHub?.refresh?.({ silent: true });
+      components.memoryModal?.refresh?.({ force: true });
     };
     manualRefreshBtn.addEventListener("click", onManualRefresh);
     cleanups.push(() => manualRefreshBtn.removeEventListener("click", onManualRefresh));

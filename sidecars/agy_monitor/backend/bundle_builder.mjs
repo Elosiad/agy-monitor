@@ -12,6 +12,7 @@ const COMPONENT_EXPORTS = [
   ['accounts_hub.js', 'createAccountsHub'],
   ['theme_studio.js', 'createThemeStudio'],
   ['changelog_modal.js', 'createChangelogModal'],
+  ['memory_modal.js', 'createMemoryModal'],
 ];
 
 const I18N_EXPORTS = [
@@ -106,6 +107,7 @@ export async function buildFrontendBundle(frontendDir) {
       `  const { createAccountsHub } = __mods.accounts_hub;\n` +
       `  const { createThemeStudio } = __mods.theme_studio;\n` +
       `  const { createChangelogModal } = __mods.changelog_modal;\n` +
+      `  const { createMemoryModal } = __mods.memory_modal;\n` +
       `${appBody}\n` +
       `  if (typeof window !== "undefined") { window.__agyMonitorMount = mountMonitorApp; }\n` +
       `})();`,

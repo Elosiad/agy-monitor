@@ -8781,3 +8781,598 @@ body.host-backdrop-shared .mad-lightbox-img {
   color: var(--text-muted);
   font-family: var(--font-mono);
 }
+
+/* ========== 顶栏实时内存胶囊与 AGY 内存管理弹窗 ========== */
+.subnav-memory-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-hairline);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.subnav-memory-btn:hover {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+  border-color: var(--border-subtle);
+}
+
+.subnav-memory-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-teal);
+  flex-shrink: 0;
+}
+
+.subnav-memory-btn.is-healthy {
+  color: var(--accent-teal);
+  border-color: color-mix(in srgb, var(--accent-teal) 32%, transparent);
+  background: color-mix(in srgb, var(--accent-teal) 8%, transparent);
+}
+
+.subnav-memory-btn.is-elevated {
+  color: var(--accent-amber);
+  border-color: color-mix(in srgb, var(--accent-amber) 38%, transparent);
+  background: color-mix(in srgb, var(--accent-amber) 10%, transparent);
+}
+
+.subnav-memory-btn.is-elevated .subnav-memory-dot {
+  background: var(--accent-amber);
+}
+
+.subnav-memory-btn.is-high {
+  color: var(--accent-danger);
+  border-color: color-mix(in srgb, var(--accent-danger) 46%, transparent);
+  background: var(--accent-danger-bg);
+}
+
+.subnav-memory-btn.is-high .subnav-memory-dot {
+  background: var(--accent-danger);
+}
+
+.memory-modal-dialog {
+  max-width: min(600px, calc(100vw - 24px));
+  max-height: min(700px, calc(100vh - 28px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg-elevated) 96%, var(--bg-canvas));
+  backdrop-filter: blur(16px);
+}
+
+.memory-modal-header {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.memory-modal-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.memory-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.memory-refresh-btn.is-spinning svg {
+  animation: agy-spin 0.8s linear infinite;
+}
+
+.memory-health-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.memory-health-badge.is-healthy {
+  color: var(--accent-teal);
+  background: var(--accent-teal-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-teal) 36%, transparent);
+}
+
+.memory-health-badge.is-elevated {
+  color: var(--accent-amber);
+  background: var(--accent-amber-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 38%, transparent);
+}
+
+.memory-health-badge.is-high {
+  color: var(--accent-danger);
+  background: var(--accent-danger-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 42%, transparent);
+}
+
+.memory-modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.mem-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+@container aux-pane (max-width: 520px) {
+  .mem-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.mem-kpi-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  background: color-mix(in srgb, var(--bg-surface) 82%, transparent);
+  border: 1px solid var(--border-hairline);
+}
+
+.mem-kpi-label {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mem-kpi-val {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.mem-kpi-val.is-primary {
+  color: var(--accent-blue);
+}
+
+.mem-kpi-val.is-teal {
+  color: var(--accent-teal);
+}
+
+.mem-actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mem-primary-btn,
+.mem-secondary-btn {
+  flex: 1 1 170px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background 0.14s ease, border-color 0.14s ease, opacity 0.14s ease, transform 0.1s ease;
+}
+
+.mem-primary-btn {
+  background: var(--accent-blue);
+  color: var(--text-on-accent);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 84%, var(--text-on-accent) 16%);
+}
+
+.mem-primary-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue) 88%, var(--text-on-accent) 12%);
+}
+
+.mem-secondary-btn {
+  background: var(--bg-control);
+  color: var(--text-strong);
+  border: 1px solid var(--border-subtle);
+}
+
+.mem-secondary-btn:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+  border-color: var(--border-focus);
+}
+
+.mem-primary-btn:disabled,
+.mem-secondary-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.mem-diagnostics-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mem-diagnostics-list[hidden] {
+  display: none;
+}
+
+.mem-diag-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  background: color-mix(in srgb, var(--bg-surface) 84%, transparent);
+  border: 1px solid var(--border-hairline);
+  border-left: 3px solid var(--accent-blue);
+}
+
+.mem-diag-card.is-warn {
+  border-left-color: var(--accent-amber);
+  background: color-mix(in srgb, var(--accent-amber) 7%, var(--bg-surface));
+}
+
+.mem-diag-card.is-danger {
+  border-left-color: var(--accent-danger);
+  background: color-mix(in srgb, var(--accent-danger) 9%, var(--bg-surface));
+}
+
+.mem-diag-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mem-diag-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.mem-diag-detail {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.mem-diag-action-btn {
+  flex-shrink: 0;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  background: var(--accent-blue-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 36%, transparent);
+}
+
+.mem-diag-action-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue) 24%, transparent);
+}
+
+.mem-section-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: calc(var(--ui-radius) - 1px);
+  background: color-mix(in srgb, var(--bg-surface) 78%, transparent);
+  border: 1px solid var(--border-hairline);
+}
+
+.mem-section-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.mem-groups-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mem-group-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mem-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mem-group-name-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mem-group-name {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.mem-group-count {
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bg-control);
+}
+
+.mem-uia-tag {
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--accent-amber);
+  background: var(--accent-amber-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+}
+
+.mem-uia-tag.is-mini {
+  padding: 0 5px;
+  font-size: 9px;
+}
+
+.mem-group-vals {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.mem-group-ws {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.mem-group-commit {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.mem-bar-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-track);
+  overflow: hidden;
+}
+
+.mem-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.mem-bar-fill.is-blue {
+  background: var(--accent-blue);
+}
+
+.mem-bar-fill.is-purple {
+  background: var(--accent-purple);
+}
+
+.mem-bar-fill.is-amber {
+  background: var(--accent-amber);
+}
+
+.mem-bar-fill.is-teal {
+  background: var(--accent-teal);
+}
+
+.mem-bar-fill.is-muted {
+  background: var(--text-muted);
+}
+
+.mem-procs-details {
+  border-radius: calc(var(--ui-radius) - 1px);
+  background: color-mix(in srgb, var(--bg-surface) 74%, transparent);
+  border: 1px solid var(--border-hairline);
+  padding: 8px 12px;
+}
+
+.mem-procs-summary {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.mem-procs-summary:hover {
+  color: var(--text-strong);
+}
+
+.mem-top-procs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.mem-proc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: var(--bg-control);
+  font-size: 11px;
+}
+
+.mem-proc-left,
+.mem-proc-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mem-proc-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mem-proc-pid,
+.mem-proc-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.mem-proc-ws {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.mem-empty-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.mem-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.mem-toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mem-toggle-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.mem-toggle-desc {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.mem-toggle-input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent-blue);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.mem-toggle-divider {
+  height: 1px;
+  background: var(--border-hairline);
+}
+
+.mem-threshold-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.mem-threshold-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.mem-threshold-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.mem-threshold-chip {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-control);
+  border: 1px solid var(--border-hairline);
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.mem-threshold-chip:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+}
+
+.mem-threshold-chip.is-active {
+  background: var(--accent-blue-bg);
+  color: var(--accent-blue);
+  border-color: color-mix(in srgb, var(--accent-blue) 42%, transparent);
+}
+
+.mem-threshold-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.memory-modal-footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.memory-footer-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}

@@ -153,4 +153,9 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   assert.match(src, /idObject\s*!=\s*0\s*\|\|\s*idChild\s*!=\s*0/, 'OnWinEvent must require CHILDID_SELF (idChild == 0) so Chromium child hides never blink the backdrop');
   assert.match(src, /IsDirectlyBehindVisible\s*\(/, 'Z-order mismatch check must skip invisible helper windows to avoid EVENT_OBJECT_REORDER loops');
   assert.match(src, /Antigravity_Original/, 'Host window finder must track both Antigravity and Antigravity_Original launcher wrapper processes');
+
+  // 13. v1.1.3 anti-HUD-drift guards: exclude AGY Console Document from UIA matching and keep tight bottom band
+  assert.match(src, /IsInsideAgyConsoleDocument\s*\(/, 'ProbeComposerAnchor must skip buttons inside the AGY Console sidecar Document');
+  assert.match(src, /int\s+bandTop\s*=\s*winRect\.Bottom\s*-\s*\(int\)Math\.Round\(108\s*\*\s*dpiScale\)/, 'ProbeComposerAnchor must keep tight 108 DIP bottom band to avoid latching onto chat/sidecar buttons');
+  assert.match(src, /ComputePureWin32ComposerAnchor\s*\(/, 'Strict Zero-UIA mode must cleanly disable guessed Mode-1 HUD coordinates');
 });

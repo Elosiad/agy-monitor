@@ -154,6 +154,11 @@ function defaultPrefs() {
     defaultModel: null,
     activePromptId: 'official',
     followLatestSession: true,
+    memoryGuard: {
+      autoTrimEnabled: true,
+      thresholdMb: 1800,
+      intervalMin: 10,
+    },
   };
 }
 
@@ -179,6 +184,7 @@ function defaultThemesState() {
     syncGlobal: true,
     backdropEnabled: true,
     hudEnabled: true,
+    zeroUiaMode: false,
     hostThemeMode: 'backdrop',
     cdpPort: 9229,
     hostBlendPct: 25,
@@ -515,6 +521,16 @@ export function createStorage(paths) {
       };
     }
 
+    const rawGuard = raw.memoryGuard && typeof raw.memoryGuard === 'object' ? raw.memoryGuard : {};
+    const memoryGuard = {
+      autoTrimEnabled:
+        typeof rawGuard.autoTrimEnabled === 'boolean'
+          ? rawGuard.autoTrimEnabled
+          : base.memoryGuard.autoTrimEnabled,
+      thresholdMb: clampInt(rawGuard.thresholdMb, 800, 16384, base.memoryGuard.thresholdMb),
+      intervalMin: clampInt(rawGuard.intervalMin, 5, 180, base.memoryGuard.intervalMin),
+    };
+
     return {
       version: 1,
       language: VALID_LANGUAGES.has(raw.language) ? raw.language : base.language,
@@ -529,6 +545,7 @@ export function createStorage(paths) {
         typeof raw.followLatestSession === 'boolean'
           ? raw.followLatestSession
           : base.followLatestSession,
+      memoryGuard,
     };
   }
 
@@ -678,6 +695,11 @@ export function createStorage(paths) {
         ? safeRaw.hudEnabled
         : base.hudEnabled;
 
+    const zeroUiaMode =
+      typeof safeRaw.zeroUiaMode === 'boolean'
+        ? safeRaw.zeroUiaMode
+        : base.zeroUiaMode;
+
     const hostThemeMode = safeRaw.hostThemeMode === 'cdp' ? 'cdp' : 'backdrop';
     const cdpPort = clampInt(safeRaw.cdpPort, 1024, 65535, base.cdpPort);
 
@@ -692,6 +714,7 @@ export function createStorage(paths) {
       syncGlobal: followHostTheme,
       backdropEnabled,
       hudEnabled,
+      zeroUiaMode,
       hostThemeMode,
       cdpPort,
       hostBlendPct: clampInt(safeRaw.hostBlendPct, 5, 42, base.hostBlendPct),
@@ -715,6 +738,7 @@ export function createStorage(paths) {
       syncGlobal: Boolean(state.followHostTheme ?? state.syncGlobal),
       backdropEnabled: Boolean(state.backdropEnabled),
       hudEnabled: state.hudEnabled !== false,
+      zeroUiaMode: Boolean(state.zeroUiaMode),
       hostThemeMode: state.hostThemeMode === 'cdp' ? 'cdp' : 'backdrop',
       cdpPort: clampInt(state.cdpPort, 1024, 65535, 9229),
       hostBlendPct: clampInt(state.hostBlendPct, 5, 42, 25),
@@ -784,11 +808,16 @@ export function createStorage(paths) {
         const { data } = await readJsonSafe(paths.userPrefsFile, { throwOnIoError: true });
         const current = normalizePrefs(data);
         const resolvedCap = patch.windowCap ?? patch.contextWindowCap ?? current.windowCap;
+        const mergedGuard =
+          patch.memoryGuard && typeof patch.memoryGuard === 'object'
+            ? { ...current.memoryGuard, ...patch.memoryGuard }
+            : current.memoryGuard;
         const next = normalizePrefs({
           ...current,
           ...patch,
           windowCap: resolvedCap,
           contextWindowCap: resolvedCap,
+          memoryGuard: mergedGuard,
         });
         await atomicWriteJson(paths.userPrefsFile, next);
         return next;

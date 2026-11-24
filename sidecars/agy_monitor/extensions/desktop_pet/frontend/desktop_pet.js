@@ -12,16 +12,18 @@ const BUILTIN_PETS = [
 ];
 
 const DEFAULT_BUBBLE_TEMPLATE = "入 {in} · 出 {out}";
+const MAX_BUBBLE_TEMPLATE_LEN = 2000;
 const BUBBLE_PRESETS = [
   { id: "tokens", labelKey: "pet.bubblePresetTokens", tpl: "入 {in} · 出 {out}" },
   { id: "tps", labelKey: "pet.bubblePresetTps", tpl: "⚡ {tps} tok/s" },
   { id: "tokens_tps", labelKey: "pet.bubblePresetTokensTps", tpl: "入 {in} · 出 {out} · {tps}t/s" },
   { id: "context", labelKey: "pet.bubblePresetContext", tpl: "{model} · 上下文 {pct}%" },
-  { id: "quota", labelKey: "pet.bubblePresetQuota", tpl: "{model} · {quota}" },
+  { id: "quota", labelKey: "pet.bubblePresetQuota", tpl: "5h {quota5h}% · 周 {quota7d}%" },
+  { id: "sessions", labelKey: "pet.bubblePresetSessions", tpl: "__SESSIONS_PROGRESS__", dynamic: true },
   { id: "full", labelKey: "pet.bubblePresetFull", tpl: "{model} · 入 {in} 出 {out} ({pct}%)" },
   { id: "cute", labelKey: "pet.bubblePresetCute", tpl: "摸摸头~ 能量满格 ✨ ({pct}%)" },
 ];
-const BUBBLE_VARS = ["{in}", "{out}", "{tps}", "{pct}", "{model}", "{cache}", "{unread}", "{quota}"];
+const BUBBLE_VARS = ["{in}", "{out}", "{tps}", "{pct}", "{model}", "{cache}", "{unread}", "{quota5h}", "{quota7d}"];
 
 const BUILTIN_PET_IDS = new Set(BUILTIN_PETS.map((p) => p.id));
 const ALLOWED_PET_MIME = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
@@ -430,6 +432,7 @@ function buildExtensionDom(tr) {
     el("button", {
       class: p.tpl === DEFAULT_BUBBLE_TEMPLATE ? "pet-bubble-preset-chip is-active" : "pet-bubble-preset-chip",
       type: "button",
+      "data-bubble-preset-id": p.id,
       "data-bubble-tpl": p.tpl,
       text: tr(p.labelKey),
     })
@@ -438,7 +441,7 @@ function buildExtensionDom(tr) {
     class: "custom-palette-input",
     id: "petBubbleTemplateInput",
     type: "text",
-    maxlength: "160",
+    maxlength: String(MAX_BUBBLE_TEMPLATE_LEN),
     value: DEFAULT_BUBBLE_TEMPLATE,
     placeholder: tr("pet.bubbleTplPlaceholder"),
   });
@@ -751,6 +754,7 @@ export function mountDesktopPetExtension(ctx = {}) {
       stepAtMs: 0,
       contextPct: 0,
       quota: null,
+      sessions: [],
     },
     panelPos: null,
   };
@@ -795,6 +799,22 @@ export function mountDesktopPetExtension(ctx = {}) {
     return "";
   };
 
+  const resolveQuotaPair = (q, model) => {
+    if (!q) return { fiveH: "--", weekly: "--" };
+    const m = String(model || "").toLowerCase();
+    const isClaudeOrGpt = /\b(claude|gpt|sonnet|opus|haiku|openai|o1|o3|o4)\b|claude|gpt-|sonnet|opus|haiku/.test(m);
+    const raw5h = isClaudeOrGpt
+      ? (typeof q.claude5h === "number" ? q.claude5h : q.gemini5h)
+      : (typeof q.gemini5h === "number" ? q.gemini5h : q.claude5h);
+    const rawW = isClaudeOrGpt
+      ? (typeof q.claudeWeekly === "number" ? q.claudeWeekly : q.geminiWeekly)
+      : (typeof q.geminiWeekly === "number" ? q.geminiWeekly : q.claudeWeekly);
+    return {
+      fiveH: typeof raw5h === "number" && Number.isFinite(raw5h) ? String(raw5h) : "--",
+      weekly: typeof rawW === "number" && Number.isFinite(rawW) ? String(rawW) : "--",
+    };
+  };
+
   const formatQuotaValue = (q, model) => {
     if (!q) return "--";
     const gText = formatPoolQuota(q.gemini5h, q.geminiWeekly);
@@ -813,6 +833,69 @@ export function mountDesktopPetExtension(ctx = {}) {
     return gText || cText || "--";
   };
 
+  const normalizeSessionProgressList = (snapshot) => {
+    const out = [];
+    const seen = new Set();
+    const sp = Array.isArray(snapshot?.sessionProgress) ? snapshot.sessionProgress : [];
+    for (const item of sp) {
+      const id = typeof item?.id === "string" ? item.id.trim() : "";
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        name: String(item.name || id.slice(0, 8)),
+        status: item.status === "active" || item.status === "unread" ? item.status : "done",
+        progress: Number.isFinite(Number(item.progress)) ? Math.max(0, Math.min(100, Math.round(Number(item.progress)))) : 0,
+        tag: String(item.tag || ""),
+        content: String(item.content || ""),
+      });
+    }
+    const pushFallback = (arr, status) => {
+      if (!Array.isArray(arr)) return;
+      for (const s of arr) {
+        const id = typeof s?.id === "string" ? s.id.trim() : "";
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push({
+          id,
+          name: String(s.title || id.slice(0, 8)),
+          status,
+          progress: status === "active" ? 15 : 100,
+          tag: status === "active" ? "进行中" : status === "unread" ? "结束未读" : "任务结束",
+          content: String(s.title || ""),
+        });
+      }
+    };
+    pushFallback(snapshot?.sessionsHub?.active, "active");
+    pushFallback(snapshot?.sessionsHub?.waiting, "active");
+    pushFallback(snapshot?.sessionsHub?.unread, "unread");
+    return out;
+  };
+
+  const buildSessionsPresetTemplate = () => {
+    const actives = (state.telemetry.sessions || []).filter((s) => s && s.status === "active" && s.id);
+    if (actives.length === 0) {
+      return "[{schedule},{content}](active,unread)";
+    }
+    return `${actives.map((s) => `[{schedule:${s.id}},{content:${s.id}}]`).join("")}(active,unread)`;
+  };
+
+  const resolveSessionField = (kind, convId) => {
+    const list = Array.isArray(state.telemetry.sessions) ? state.telemetry.sessions : [];
+    const target = convId
+      ? list.find((s) => s.id === convId)
+      : list.find((s) => s.status === "active") || list.find((s) => s.status === "unread") || list[0] || null;
+    if (kind === "schedule") {
+      if (!target) return convId ? `${convId.slice(0, 8)} · 待机` : "待机";
+      const shortName = (target.name || target.id.slice(0, 8)).slice(0, 20);
+      if (target.status === "active") return `⚡ ${shortName} · ${target.progress}%`;
+      if (target.status === "unread") return `★ ${shortName} · 未读`;
+      return `✓ ${shortName} · 已完成`;
+    }
+    if (!target) return "暂无进展";
+    return String(target.content || target.tag || target.name || "推进中").slice(0, 38);
+  };
+
   const renderBubbleTemplate = (tpl = state.bubbleTemplate) => {
     const raw = typeof tpl === "string" && tpl.trim() ? tpl.trim() : DEFAULT_BUBBLE_TEMPLATE;
     const inStr = formatTokenCount(state.telemetry.inputTokens);
@@ -828,16 +911,154 @@ export function mountDesktopPetExtension(ctx = {}) {
         ? String(Math.round(state.telemetry.cacheHitPct))
         : "--";
     const unreadStr = String(Math.max(0, state.telemetry.unreadCount || 0));
+    const quotaPair = resolveQuotaPair(state.telemetry.quota, state.telemetry.model);
     const quotaStr = formatQuotaValue(state.telemetry.quota, state.telemetry.model);
-    return raw
-      .replaceAll("{in}", inStr)
-      .replaceAll("{out}", outStr)
-      .replaceAll("{tps}", tpsStr)
-      .replaceAll("{pct}", pctStr)
-      .replaceAll("{model}", modelStr)
-      .replaceAll("{cache}", cacheStr)
-      .replaceAll("{unread}", unreadStr)
-      .replaceAll("{quota}", quotaStr);
+
+    const replaceScalars = (text) =>
+      text
+        .replaceAll("{in}", inStr)
+        .replaceAll("{out}", outStr)
+        .replaceAll("{tps}", tpsStr)
+        .replaceAll("{pct}", pctStr)
+        .replaceAll("{model}", modelStr)
+        .replaceAll("{cache}", cacheStr)
+        .replaceAll("{unread}", unreadStr)
+        .replaceAll("{quota5h}", quotaPair.fiveH)
+        .replaceAll("{quota7d}", quotaPair.weekly)
+        .replaceAll("{quota}", quotaStr);
+
+    const scalarExpanded = replaceScalars(raw);
+
+    // Parse list syntax: [{schedule:ID},{content:ID}](active,unread)
+    const listRe = /\[([^\[\]]+)\](?:\(([^()]*)\))?/g;
+    const matches = [...scalarExpanded.matchAll(listRe)];
+    if (matches.length === 0) {
+      return scalarExpanded
+        .replace(/\{schedule(?::([a-zA-Z0-9_-]+))?\}/gi, (_, cid) => resolveSessionField("schedule", cid || ""))
+        .replace(/\{content(?::([a-zA-Z0-9_-]+))?\}/gi, (_, cid) => resolveSessionField("content", cid || ""));
+    }
+
+    const renderedIds = new Set();
+    let totalBlocks = 0;
+    const MAX_LIST_BLOCKS = 6;
+    const renderItems = (items, overrideId) =>
+      items
+        .map((item) =>
+          item
+            .replace(/\{schedule(?::([a-zA-Z0-9_-]+))?\}/gi, (_, cid) =>
+              resolveSessionField("schedule", overrideId || cid || "")
+            )
+            .replace(/\{content(?::([a-zA-Z0-9_-]+))?\}/gi, (_, cid) =>
+              resolveSessionField("content", overrideId || cid || "")
+            )
+            .trim()
+        )
+        .filter(Boolean)
+        .join("\n");
+
+    let out = "";
+    let cursor = 0;
+    let prevEndedWithList = false;
+
+    for (const m of matches) {
+      const start = m.index;
+      const between = scalarExpanded.slice(cursor, start);
+      const betweenTrim = between.trim();
+      const inner = m[1] || "";
+      const modsRaw = m[2] || "";
+
+      const items = inner
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const mods = modsRaw
+        .toLowerCase()
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const wantActive = mods.includes("active");
+      const wantUnread = mods.includes("unread");
+
+      const explicitIds = [];
+      for (const it of items) {
+        for (const idm of it.matchAll(/\{(?:schedule|content):([a-zA-Z0-9_-]+)\}/gi)) {
+          if (idm[1] && !explicitIds.includes(idm[1])) explicitIds.push(idm[1]);
+        }
+      }
+
+      const blocks = [];
+      if (explicitIds.length > 0) {
+        if (totalBlocks < MAX_LIST_BLOCKS) {
+          const blockText = renderItems(items, "");
+          if (blockText) {
+            blocks.push(blockText);
+            totalBlocks += 1;
+          }
+        }
+        explicitIds.forEach((cid) => renderedIds.add(cid));
+      } else if (!wantActive && !wantUnread) {
+        if (totalBlocks < MAX_LIST_BLOCKS) {
+          const blockText = renderItems(items, "");
+          if (blockText) {
+            blocks.push(blockText);
+            totalBlocks += 1;
+          }
+        }
+      }
+
+      if (wantActive || wantUnread) {
+        const allSessions = Array.isArray(state.telemetry.sessions) ? state.telemetry.sessions : [];
+        const dynamicSessions = allSessions.filter((s) => {
+          if (!s?.id || renderedIds.has(s.id)) return false;
+          if (wantActive && s.status === "active") return true;
+          if (wantUnread && s.status === "unread") return true;
+          return false;
+        });
+        for (const ds of dynamicSessions) {
+          if (totalBlocks >= MAX_LIST_BLOCKS) break;
+          renderedIds.add(ds.id);
+          const blockText = renderItems(items, ds.id);
+          if (blockText) {
+            blocks.push(blockText);
+            totalBlocks += 1;
+          }
+        }
+      }
+
+      const blockCombined = blocks.join("\n\n");
+      if (betweenTrim) {
+        out += between;
+        if (blockCombined) {
+          if (!out.endsWith("\n")) out += "\n";
+          out += blockCombined;
+          prevEndedWithList = true;
+        } else {
+          prevEndedWithList = false;
+        }
+      } else {
+        if (blockCombined) {
+          if (out && prevEndedWithList) {
+            out += "\n\n";
+          } else if (out && !out.endsWith("\n")) {
+            out += "\n";
+          }
+          out += blockCombined;
+          prevEndedWithList = true;
+        }
+      }
+      cursor = start + m[0].length;
+    }
+
+    const tail = scalarExpanded.slice(cursor);
+    if (tail.trim()) {
+      if (out && !out.endsWith("\n") && !tail.startsWith("\n")) out += "\n";
+      out += tail
+        .replace(/\{schedule(?::([a-zA-Z0-9_-]+))?\}/gi, (_, cid) => resolveSessionField("schedule", cid || ""))
+        .replace(/\{content(?::([a-zA-Z0-9_-]+))?\}/gi, (_, cid) => resolveSessionField("content", cid || ""));
+    }
+
+    const finalStr = out.trim();
+    return finalStr || "暂无活动/未读会话";
   };
 
   const editorState = {
@@ -968,21 +1189,27 @@ export function mountDesktopPetExtension(ctx = {}) {
   const showPanelBubble = (text, durationMs = 3400) => {
     if (!state.showSpeechBubble || !text) return;
     clearTimeout(bubbleTimer);
-    dom.panelBubble.textContent = String(text);
+    const str = String(text);
+    const isMultiline = str.includes("\n");
+    dom.panelBubble.textContent = str;
+    dom.panelBubble.classList.toggle("is-multiline", isMultiline);
     dom.panelBubble.hidden = false;
     bubbleTimer = setTimeout(() => {
       if (!destroyed) dom.panelBubble.hidden = true;
-    }, durationMs);
+    }, isMultiline ? Math.max(durationMs, 6500) : durationMs);
   };
 
   const showPreviewBubble = (text, durationMs = 3200) => {
     if (!text) return;
     clearTimeout(previewBubbleTimer);
-    dom.previewBubble.textContent = String(text);
+    const str = String(text);
+    const isMultiline = str.includes("\n");
+    dom.previewBubble.textContent = str;
+    dom.previewBubble.classList.toggle("is-multiline", isMultiline);
     dom.previewBubble.hidden = false;
     previewBubbleTimer = setTimeout(() => {
       if (!destroyed) dom.previewBubble.hidden = true;
-    }, durationMs);
+    }, isMultiline ? Math.max(durationMs, 6500) : durationMs);
   };
 
   const renderPreviewStage = () => {
@@ -1298,8 +1525,14 @@ export function mountDesktopPetExtension(ctx = {}) {
       dom.bubbleTplInput.value = state.bubbleTemplate || DEFAULT_BUBBLE_TEMPLATE;
     }
     dom.bubblePresetBtns.forEach((btn) => {
+      const presetId = btn.getAttribute("data-bubble-preset-id") || "";
       const tpl = btn.getAttribute("data-bubble-tpl") || "";
-      btn.classList.toggle("is-active", tpl === (state.bubbleTemplate || DEFAULT_BUBBLE_TEMPLATE));
+      const curTpl = state.bubbleTemplate || DEFAULT_BUBBLE_TEMPLATE;
+      const isActive =
+        presetId === "sessions"
+          ? /\[[^\]]*\{(?:schedule|content)/i.test(curTpl)
+          : tpl === curTpl;
+      btn.classList.toggle("is-active", isActive);
     });
   };
 
@@ -1880,21 +2113,25 @@ export function mountDesktopPetExtension(ctx = {}) {
   });
   dom.bubblePresetBtns.forEach((btn) =>
     listen(btn, "click", () => {
-      const tpl = btn.getAttribute("data-bubble-tpl") || DEFAULT_BUBBLE_TEMPLATE;
-      state.bubbleTemplate = tpl;
-      dom.bubbleTplInput.value = tpl;
+      const presetId = btn.getAttribute("data-bubble-preset-id") || "";
+      const tpl =
+        presetId === "sessions"
+          ? buildSessionsPresetTemplate()
+          : btn.getAttribute("data-bubble-tpl") || DEFAULT_BUBBLE_TEMPLATE;
+      state.bubbleTemplate = tpl.slice(0, MAX_BUBBLE_TEMPLATE_LEN);
+      dom.bubbleTplInput.value = state.bubbleTemplate;
       renderControls();
       triggerInteract(false, true);
       schedulePersist(true);
     })
   );
   listen(dom.bubbleTplInput, "input", () => {
-    state.bubbleTemplate = String(dom.bubbleTplInput.value || "").slice(0, 160) || DEFAULT_BUBBLE_TEMPLATE;
+    state.bubbleTemplate = String(dom.bubbleTplInput.value || "").slice(0, MAX_BUBBLE_TEMPLATE_LEN) || DEFAULT_BUBBLE_TEMPLATE;
     renderControls();
     schedulePersist(false);
   });
   listen(dom.bubbleTestBtn, "click", () => {
-    state.bubbleTemplate = String(dom.bubbleTplInput.value || "").trim().slice(0, 160) || DEFAULT_BUBBLE_TEMPLATE;
+    state.bubbleTemplate = String(dom.bubbleTplInput.value || "").trim().slice(0, MAX_BUBBLE_TEMPLATE_LEN) || DEFAULT_BUBBLE_TEMPLATE;
     renderControls();
     triggerInteract(false, true);
     schedulePersist(true);
@@ -1905,7 +2142,7 @@ export function mountDesktopPetExtension(ctx = {}) {
       if (!token) return;
       const cur = String(dom.bubbleTplInput.value || "");
       const sep = cur && !cur.endsWith(" ") ? " " : "";
-      const next = (cur + sep + token).slice(0, 160);
+      const next = (cur + sep + token).slice(0, MAX_BUBBLE_TEMPLATE_LEN);
       dom.bubbleTplInput.value = next;
       state.bubbleTemplate = next;
       renderControls();
@@ -2055,6 +2292,7 @@ export function mountDesktopPetExtension(ctx = {}) {
             ? snapshot.contextPie.percent
             : 0,
         quota: nextQuota,
+        sessions: normalizeSessionProgressList(snapshot),
       };
       const nextMood = resolveMood();
       if (!dom.panelPet.hidden) renderPreviewStage();

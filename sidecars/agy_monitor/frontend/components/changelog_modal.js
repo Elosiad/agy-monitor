@@ -13,6 +13,18 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.1.3",
+    date: "2026-11-24",
+    title: "全量 AGY 内存管理与零 UIA 省内存模式、桌宠独立 5h/周额度变量与多行「会话进展」气泡",
+    items: [
+      "新增全量 AGY 内存管理体系：顶栏新增三态颜色实时 RAM 胶囊与「AGY 内存管理」弹窗，实时拆解主进程、渲染与 GPU、语言服务、本插件伴侣及其他扩展的专用物理内存与提交内存，提供智能根因诊断、一键安全释放全量内存、重启伴侣进程及超阈值自动后台瘦身（默认 1.8G / 10 分钟冷却）。",
+      "根治伴侣内存膨胀并提供可选零 UIA 省内存模式：壁纸与桌宠伴侣新增 Gen-2 定时自瘦身与外部触发瘦身，后台 SQLite 限制页缓存并定时执行 PRAGMA shrink_memory；在内存管理弹窗可选开启「极致零 UIA 省内存模式」（推荐搭配方案二 CDP 兼得零 UIA 与原生输入框圆环）。",
+      "彻底修复底部上下文圆环（HUD）频繁乱串：通过校验元素所属 Document 直接隔离右侧 AGY 控制台，收紧底部 108px 搜索带并移除「自动/取消/审查」等误匹配词，无论开关控制台、切换会话或打开原生 Review 面板均稳稳贴合输入框 Turbo 左侧。",
+      "桌宠气泡模板升级：将 {quota} 拆分为纯数值变量 {quota5h}（5 小时余量）与 {quota7d}（周额度余量），快捷预设「模型 + 额度」精简为「额度」（5h {quota5h}% · 周 {quota7d}%）。",
+      "桌宠新增「会话进展」快捷预设与列表模板语法：支持 [{schedule:<id>},{content:<id>}](active,unread) 导入当前全部活动/未读会话并自动多行换行排版，WPF 桌面气泡随行数自动向上扩展展示。",
+    ],
+  },
+  {
     version: "1.1.2",
     date: "2026-11-24",
     title: "可插拔 AI 桌宠工作室（PR #3）、桌宠气泡实时额度变量 {quota} & 安全/DPI/生命周期全面加固",
@@ -245,7 +257,7 @@ async function requestChangelogJson(apiFetch, url, options = {}) {
 export function createChangelogModal({
   apiFetch,
   t,
-  initialVersion = "1.1.2",
+  initialVersion = "1.1.3",
   onVersionApplied,
   onToast,
 } = {}) {

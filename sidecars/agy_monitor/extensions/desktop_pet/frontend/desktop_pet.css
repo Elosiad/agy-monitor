@@ -299,12 +299,25 @@
   border: 1px solid color-mix(in srgb, var(--accent-blue) 45%, var(--border-subtle));
   color: var(--text-strong);
   font-size: 11px;
-  white-space: nowrap;
+  line-height: 1.4;
+  white-space: pre-line;
   overflow: hidden;
   text-overflow: ellipsis;
   box-shadow: var(--shadow-soft);
   pointer-events: none;
+  z-index: 4;
   animation: petBubblePop 0.2s ease-out;
+}
+
+.pet-preview-bubble.is-multiline {
+  border-radius: 11px;
+  padding: 6px 10px;
+  text-align: left;
+  max-height: 116px;
+  overflow-y: auto;
+  white-space: pre-line;
+  word-break: break-word;
+  pointer-events: auto;
 }
 
 .pet-preview-actor {
@@ -389,18 +402,27 @@
 }
 
 .panel-pet-bubble {
-  max-width: 178px;
+  max-width: 248px;
   padding: 5px 10px;
   border-radius: 12px;
   background: color-mix(in srgb, var(--bg-elevated) 95%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent-blue) 45%, var(--border-subtle));
   color: var(--text-strong);
   font-size: 11px;
-  line-height: 1.35;
+  line-height: 1.38;
+  white-space: pre-line;
+  word-break: break-word;
   text-align: center;
   box-shadow: var(--shadow-soft);
   pointer-events: none;
   animation: petBubblePop 0.2s ease-out;
+}
+
+.panel-pet-bubble.is-multiline {
+  text-align: left;
+  padding: 6px 10px;
+  max-height: 180px;
+  overflow-y: auto;
 }
 
 .panel-pet-body {

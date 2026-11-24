@@ -1411,6 +1411,7 @@ export async function buildMasterySnapshot(
         isRecentFallback: Boolean(s.isRecentFallback),
         modifiedMs: Number(s.modifiedMs || 0),
         tag: isActive ? masterJourney.shortStatus : masterIsRead ? '任务结束' : '结束未读',
+        content: masterJourney.taskLine || masterJourney.shortStatus || '',
         subAgentCount: runningSubCount,
         progress: masterProgress,
         timeLabel: s.agoText || '',
@@ -1471,6 +1472,7 @@ export async function buildMasterySnapshot(
         isRecentFallback: Boolean(s.isRecentFallback),
         modifiedMs: Number(s.modifiedMs || 0),
         tag: isActive ? quickJourney.shortStatus : sessionMarkedRead ? '任务结束' : '结束未读',
+        content: quickJourney.taskLine || quickJourney.shortStatus || '',
         subAgentCount: quickSubCount,
         progress: isActive ? quickJourney.progress : 100,
         timeLabel: s.agoText || '',
@@ -1488,6 +1490,94 @@ export async function buildMasterySnapshot(
     unreadCount: unreadList.length,
     detailSession,
   };
+}
+
+/**
+ * Lightweight session progress summary for HUD telemetry & Desktop Pet bubbles.
+ * Hydrates active, unread, and any explicitly pinned conversation IDs.
+ */
+export async function queryCompactSessionProgress(
+  paths,
+  sessionsHub,
+  { extraIds = [], maxItems = 16, nowMs = Date.now() } = {},
+) {
+  const brainDir = paths?.brainDir;
+  if (!brainDir) return [];
+
+  const activeRaw = [
+    ...(Array.isArray(sessionsHub?.active) ? sessionsHub.active : []),
+    ...(Array.isArray(sessionsHub?.waiting) ? sessionsHub.waiting : []),
+  ];
+  const unreadRaw = Array.isArray(sessionsHub?.unread) ? sessionsHub.unread : [];
+  const allRaw = [
+    ...(Array.isArray(sessionsHub?.allSelectable) ? sessionsHub.allSelectable : []),
+    ...(Array.isArray(sessionsHub?.recent) ? sessionsHub.recent : []),
+    ...(Array.isArray(sessionsHub?.favorites) ? sessionsHub.favorites : []),
+    ...unreadRaw,
+    ...activeRaw,
+  ];
+  const knownById = new Map();
+  for (const item of allRaw) {
+    if (!item?.id) continue;
+    const prev = knownById.get(item.id);
+    if (!prev || (item.title && item.title !== item.id.slice(0, 8))) {
+      knownById.set(item.id, { ...(prev || {}), ...item });
+    }
+  }
+
+  const ordered = [];
+  const seen = new Set();
+  const pushCandidate = (id, status) => {
+    const clean = typeof id === 'string' ? id.trim() : '';
+    if (!clean || seen.has(clean) || ordered.length >= maxItems) return;
+    seen.add(clean);
+    const meta = knownById.get(clean) || { id: clean, title: clean.slice(0, 8) };
+    ordered.push({ id: clean, title: meta.title || clean.slice(0, 8), status });
+  };
+
+  for (const s of activeRaw) pushCandidate(s?.id, 'active');
+  for (const s of unreadRaw) pushCandidate(s?.id, 'unread');
+  for (const cid of Array.isArray(extraIds) ? extraIds : []) pushCandidate(cid, 'done');
+
+  if (ordered.length === 0) return [];
+
+  const hydrated = await Promise.all(
+    ordered.map(async (item) => {
+      const isActive = item.status === 'active';
+      try {
+        const j = await parseAgentJourney(brainDir, item.id, {
+          isMaster: true,
+          isCompleted: !isActive,
+          isSleep: false,
+          fallbackBrief: item.title,
+          nowMs,
+        });
+        return {
+          id: item.id,
+          name: String(item.title || item.id.slice(0, 8)).slice(0, 48),
+          status: item.status,
+          progress: isActive ? Math.max(0, Math.min(100, Math.round(Number(j?.progress) || 0))) : 100,
+          tag: isActive
+            ? String(j?.shortStatus || '进行中').slice(0, 24)
+            : item.status === 'unread'
+              ? '结束未读'
+              : '任务结束',
+          content: String(j?.taskLine || j?.shortStatus || item.title || '').slice(0, 80),
+        };
+      } catch {
+        return {
+          id: item.id,
+          name: String(item.title || item.id.slice(0, 8)).slice(0, 48),
+          status: item.status,
+          progress: isActive ? 15 : 100,
+          tag: isActive ? '进行中' : item.status === 'unread' ? '结束未读' : '任务结束',
+          content: String(item.title || '').slice(0, 80),
+        };
+      }
+    }),
+  );
+
+  return hydrated;
 }
 
 /**

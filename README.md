@@ -43,13 +43,29 @@
 
 ### 5. 桌宠（Desktop Pet Studio · 可插拔扩展）
 - **完全低耦合插件化设计**：全部桌宠前后端、独立配置存储、Windows 透明悬浮进程、帧动画工作室与 MCP 工具集中收拢于 [sidecars/agy_monitor/extensions/desktop_pet/](sidecars/agy_monitor/extensions/desktop_pet/README.md)；删除该目录或设置 `AGY_DISABLE_EXTENSIONS=1` 即可完全移除，不影响主分支核心逻辑。
-- **6 轨道自定义帧动画 & 物理动效**：内置 3 款主题色矢量萌宠，支持单图/GIF 及 `1~30 FPS` 六轨道序列帧（`idle` 待机 / `running` 思考 / `unread` 完成 / `interact` 互动 / `walk` 自主漫步 / `drag` 拖拽），自带横向精灵图切帧、拖拽钟摆悬垂与落地回弹、自主桌面漫步与左右镜像、互动粒子，以及支持自定义文案模板/预设（`{in}/{out}/{tps}/{pct}/{model}/{cache}/{unread}/{quota}`）的 **60fps 硬件加速弹出气泡**。
+- **6 轨道自定义帧动画 & 物理动效**：内置 3 款主题色矢量萌宠，支持单图/GIF 及 `1~30 FPS` 六轨道序列帧（`idle` 待机 / `running` 思考 / `unread` 完成 / `interact` 互动 / `walk` 自主漫步 / `drag` 拖拽），自带横向精灵图切帧、拖拽钟摆悬垂与落地回弹、自主桌面漫步与左右镜像、互动粒子，以及支持自定义文案模板/预设（`{in}/{out}/{tps}/{pct}/{model}/{cache}/{unread}/{quota5h}/{quota7d}` 与多行「会话进展」列表）的 **60fps 硬件加速弹出气泡**。
 - **主题联动右键二级菜单 & 500% 缩放 & 游戏防误触穿透**：独立自定义 WPF 主题右键菜单（自动适配深浅色与强调色），顶部以二级菜单「🐾 切换桌宠 ›」收纳造型选择，支持 `60%~500%` 实时大小调节、带流畅过渡且不关闭菜单的胶囊开关、以及「可选中 / 不可选中（穿透）」双状态（锁定穿透时悬停头顶浮现不抢焦点 🔒 锁图标一键解锁）。
 - **Antigravity MCP API & Gemini 自动生图做动画**：内置 [`agy-monitor_desktop_pet_mcp`](mcp_config.json)（6 个 MCP 工具 + 零依赖精灵表切帧与绿幕/纯色抠图引擎）及 [`desktop-pet-animator`](skills/desktop-pet-animator/SKILL.md) 技能，可直接让 Gemini 调用生图制作多轨道桌宠动画并在控制台舞台与离线交互 HTML 中实时预览。详细接口与使用说明见 [桌宠扩展文档](sidecars/agy_monitor/extensions/desktop_pet/README.md)。
 
 ---
 
 ## 版本更新日志（Changelog）
+
+### `v1.1.3`（2026-11-24）— 全量 AGY 内存管理与零 UIA 省内存模式、桌宠独立 `{quota5h}` / `{quota7d}` 变量与多行「会话进展」气泡
+
+- **全量 AGY 内存监控、智能诊断与安全瘦身引擎**：
+  - 顶栏新增三态颜色实时 `RAM` 胶囊，点击打开「AGY 内存管理」弹窗，通过原生 Win32 PSAPI / Toolhelp 高速扫描（约 250ms、零 PowerShell 开销）精准拆解 **Antigravity 主进程 / 渲染与 GPU / `language_server` / 本插件伴侣 / 其他扩展** 五大分类的专用物理内存与提交内存，并支持展开 Top 8 高占用进程明细。
+  - 内置智能根因诊断（检测主进程 `uiautomationcore.dll` 无障碍树驻留、伴侣内存膨胀、单会话超大 DB、多渲染子进程堆积与整机高压），支持 **一键安全释放全量内存**（不关窗、不中断会话）、**一键重启伴侣进程** 及 **超阈值自动后台瘦身**（默认 `1.8G`、10 分钟冷却，可自由调整阈值与开关）。
+- **根治插件自身内存膨胀并提供可选零 UIA 模式**：
+  - 壁纸伴侣 [AgyBackdrop.cs](sidecars/agy_monitor/backdrop/AgyBackdrop.cs) 与桌宠伴侣 [AgyDesktopPet.cs](sidecars/agy_monitor/extensions/desktop_pet/AgyDesktopPet.cs) 新增定时 Gen-2 GC + 工作集压缩与跨进程即时瘦身事件，同时可在内存管理弹窗按需开启「极致零 UIA 省内存模式」（搭配方案二 CDP 可兼得零 UIA 与像素级原生输入框圆环）。
+  - [scan_worker.mjs](sidecars/agy_monitor/backend/scan_worker.mjs) 与 [telemetry.mjs](sidecars/agy_monitor/backend/telemetry.mjs) 限制 SQLite 页缓存上限（`cache_size = -2000/-1000`）并周期性执行 `PRAGMA shrink_memory`。
+- **彻底修复底部上下文圆环（HUD）高频乱串**：
+  - [AgyBackdrop.cs](sidecars/agy_monitor/backdrop/AgyBackdrop.cs) 新增 `IsInsideAgyConsoleDocument` 直接隔离右侧控制台 Document、收紧底部搜索带（`280px → 108px`）并移除会误吸掌握/账号/桌宠面板按钮的宽泛关键词，无论开关控制台、切换会话或打开原生 `Review` 面板均精准紧贴输入框 `Turbo` 左侧。
+- **桌宠气泡模板升级（拆分 5h/周纯数值变量 + 多行「会话进展」预设）**：
+  - 将 `{quota}` 拆分为纯数值变量 `{quota5h}`（5 小时剩余额度）与 `{quota7d}`（周剩余额度），快捷预设「模型 + 额度」精简为 **「额度」**（`5h {quota5h}% · 周 {quota7d}%`）。
+  - 新增 **「会话进展」** 预设与多行列表语法 `[{schedule:<id>},{content:<id>}](active,unread)`，自动导入当前所有活动/未读会话并按项换行、列表间空行排版，WPF 桌面气泡随内容行数自动向上平滑扩展。
+
+---
 
 ### `v1.1.2`（2026-11-24）— 可插拔 AI 桌宠工作室（PR #3）、桌宠气泡实时额度 `{quota}` & 安全/DPI/生命周期加固
 

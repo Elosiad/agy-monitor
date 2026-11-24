@@ -31,6 +31,7 @@ import { buildFrontendBundle } from './backend/bundle_builder.mjs';
 import {
   buildMasterySnapshot,
   openLocalPathTarget,
+  queryCompactSessionProgress,
   resolveLocalTargetPath,
 } from './backend/mastery.mjs';
 import {
@@ -54,10 +55,12 @@ import {
   sanitizePublicMasteryConfig,
 } from './backend/storage.mjs';
 import {
+  clearTelemetryTransientCaches,
   queryBatchConvHudMetrics,
   queryRequestLogs,
   queryTelemetrySnapshot,
 } from './backend/telemetry.mjs';
+import { createMemoryManager } from './backend/memory_manager.mjs';
 import { createQuotaClient } from './backend/quota.mjs';
 import { createAccountManager, ensureAccountTool } from './backend/accounts.mjs';
 import {
@@ -155,6 +158,10 @@ const STATIC_ASSETS = new Map([
   [
     '/components/changelog_modal.js',
     { relPath: 'components/changelog_modal.js', contentType: 'application/javascript; charset=utf-8' },
+  ],
+  [
+    '/components/memory_modal.js',
+    { relPath: 'components/memory_modal.js', contentType: 'application/javascript; charset=utf-8' },
   ],
 ]);
 
@@ -347,7 +354,10 @@ function deriveMarkdownTitle(content, filename) {
   return base.replace(/\.(md|markdown)$/i, '').trim().slice(0, 80) || '自定义规则';
 }
 
-function buildCombinedEtag(telemetryEtag, sessionsHub, activeConvId = '') {
+function buildCombinedEtag(telemetryEtag, sessionsHub, activeConvId = '', sessionProgress = null) {
+  const spSig = Array.isArray(sessionProgress)
+    ? sessionProgress.map((s) => `${s.id}:${s.status}:${s.progress}:${s.content}`).join('|')
+    : '';
   const digestSeed = JSON.stringify({
     c: activeConvId || '',
     t: telemetryEtag || 'empty',
@@ -356,6 +366,7 @@ function buildCombinedEtag(telemetryEtag, sessionsHub, activeConvId = '') {
     u: (sessionsHub?.unread || []).map((s) => `${s.id}:${s.modifiedMs}`),
     r: (sessionsHub?.recent || []).slice(0, 8).map((s) => `${s.id}:${s.status}:${s.modifiedMs}`),
     f: (sessionsHub?.favorites || []).map((s) => `${s.id}:${s.title}`),
+    sp: spSig,
   });
   return crypto.createHash('sha1').update(digestSeed).digest('hex').slice(0, 14);
 }
@@ -549,6 +560,23 @@ function extractCompactQuota(summary) {
   return out;
 }
 
+async function readPinnedBubbleSessionIds(paths) {
+  if (!paths?.pluginDataDir) return [];
+  try {
+    const raw = (await fs.readFile(path.join(paths.pluginDataDir, 'pet_config.json'), 'utf8')).replace(/^\uFEFF/, '');
+    const doc = JSON.parse(raw);
+    const tpl = typeof doc?.bubbleTemplate === 'string' ? doc.bubbleTemplate : '';
+    if (!tpl) return [];
+    const ids = new Set();
+    for (const m of tpl.matchAll(/\{(?:schedule|content):([a-zA-Z0-9_-]{6,64})\}/gi)) {
+      if (m[1]) ids.add(m[1]);
+    }
+    return [...ids].slice(0, 8);
+  } catch {
+    return [];
+  }
+}
+
 function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient = null) {
   let lastSig = '';
   let inFlight = false;
@@ -556,6 +584,9 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
   let lastHostConvId = '';
   let lastHostConvAtMs = 0;
   let lastQuotaSnapshot = null;
+  let lastSessionProgress = [];
+  let lastProgressCacheKey = '';
+  let lastProgressAtMs = 0;
   let lastWrittenTelemetry = null;
   let lastWrittenOpts = null;
 
@@ -572,6 +603,29 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
   };
 
   const getQuotaSnapshot = () => (lastQuotaSnapshot ? { ...lastQuotaSnapshot } : null);
+  const getSessionProgressSnapshot = () => lastSessionProgress.map((s) => ({ ...s }));
+
+  const resolveSessionProgress = async (sessionsHub) => {
+    const extraIds = await readPinnedBubbleSessionIds(paths);
+    const keyParts = [
+      ...(sessionsHub?.active || []).map((s) => `a:${s.id}:${s.modifiedMs || 0}`),
+      ...(sessionsHub?.waiting || []).map((s) => `w:${s.id}:${s.modifiedMs || 0}`),
+      ...(sessionsHub?.unread || []).map((s) => `u:${s.id}:${s.modifiedMs || 0}`),
+      ...extraIds.map((id) => `p:${id}`),
+    ];
+    const cacheKey = keyParts.join('|');
+    const now = Date.now();
+    if (cacheKey === lastProgressCacheKey && now - lastProgressAtMs < 1500) {
+      return lastSessionProgress;
+    }
+    const next = await queryCompactSessionProgress(paths, sessionsHub, { extraIds, maxItems: 16, nowMs: now }).catch(
+      () => lastSessionProgress,
+    );
+    lastSessionProgress = Array.isArray(next) ? next : [];
+    lastProgressCacheKey = cacheKey;
+    lastProgressAtMs = now;
+    return lastSessionProgress;
+  };
 
   let writeChain = Promise.resolve();
   let lastSessionsSnapshot = [];
@@ -579,11 +633,20 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
   let lastUnreadSessionCount = 0;
   const writePayload = (
     telemetry,
-    { sessionsHudList = null, forceEmpty = false, activeSessionCount = null, unreadSessionCount = null } = {},
+    {
+      sessionsHudList = null,
+      sessionProgress = null,
+      forceEmpty = false,
+      activeSessionCount = null,
+      unreadSessionCount = null,
+    } = {},
   ) => {
     if (!paths?.hudTelemetryFile || (!telemetry && !forceEmpty)) return Promise.resolve();
+    if (Array.isArray(sessionProgress)) {
+      lastSessionProgress = sessionProgress;
+    }
     lastWrittenTelemetry = telemetry;
-    lastWrittenOpts = { sessionsHudList, forceEmpty, activeSessionCount, unreadSessionCount };
+    lastWrittenOpts = { sessionsHudList, sessionProgress: lastSessionProgress, forceEmpty, activeSessionCount, unreadSessionCount };
     writeChain = writeChain.then(async () => {
       const pie = forceEmpty ? {} : (telemetry?.contextPie || {});
       const rt = forceEmpty ? {} : (telemetry?.runtimeTelemetry || {});
@@ -651,6 +714,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
         quotaGeminiWeekly,
         quotaClaude5h,
         quotaClaudeWeekly,
+        sessionProgress: lastSessionProgress,
         cdpHudActive: false,
         sessions: lastSessionsSnapshot,
         updatedAtMs: Date.now(),
@@ -664,8 +728,11 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       const sessionsSig = lastSessionsSnapshot
         .map((s) => `${s.id}:${s.percent}:${s.tokPerSec ?? ''}:${s.cacheHitPct ?? ''}:${s.upstreamModelId}`)
         .join(',');
+      const spSig = lastSessionProgress
+        .map((s) => `${s.id}:${s.status}:${s.progress}:${s.content}`)
+        .join(',');
       const quotaSig = `${quotaGemini5h ?? ''}:${quotaGeminiWeekly ?? ''}:${quotaClaude5h ?? ''}:${quotaClaudeWeekly ?? ''}`;
-      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${spSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
       try {
@@ -738,13 +805,14 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
 
       const activeSessionCount = Array.isArray(sessionsHub?.active) ? sessionsHub.active.length : 0;
       const unreadSessionCount = Array.isArray(sessionsHub?.unread) ? sessionsHub.unread.length : 0;
+      const sessionProgress = await resolveSessionProgress(sessionsHub);
 
       const viewedInfo = await resolveViewedConvInfo(paths, sessionsHub);
       const viewedConvId = resolveActiveConv(topLevelIdSet, viewedInfo);
       if (viewedConvId === '__new_conversation__') {
         await writePayload(
           { contextPie: { windowCap, totalUsed: 0 }, runtimeTelemetry: {} },
-          { sessionsHudList, forceEmpty: true, activeSessionCount, unreadSessionCount },
+          { sessionsHudList, sessionProgress, forceEmpty: true, activeSessionCount, unreadSessionCount },
         );
         return;
       }
@@ -758,7 +826,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
         scope: 'current',
         range: '30d',
       });
-      await writePayload(telemetry, { sessionsHudList, activeSessionCount, unreadSessionCount });
+      await writePayload(telemetry, { sessionsHudList, sessionProgress, activeSessionCount, unreadSessionCount });
     } catch {
       // Non-fatal HUD publish failure
     } finally {
@@ -778,6 +846,8 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     resolveActiveConv,
     setQuotaSummary,
     getQuotaSnapshot,
+    resolveSessionProgress,
+    getSessionProgressSnapshot,
   };
 }
 
@@ -796,12 +866,31 @@ export function createMonitorHandlers({
   quotaClient = null,
   accountManager = null,
   accountDriver = null,
+  memoryManager = null,
+  memoryDriver = null,
+  getWorkerPid = null,
+  shrinkWorkerMemory = null,
 } = {}) {
   const resolvedPaths = paths || resolvePaths();
   const store = storage || createStorage(resolvedPaths);
   const cdp = cdpBridge || createCdpThemeBridge(resolvedPaths);
   const quota = quotaClient || createQuotaClient();
   const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp, quota);
+  const memory =
+    memoryManager ||
+    createMemoryManager({
+      paths: resolvedPaths,
+      storage: store,
+      getExtraPids: () => {
+        const wPid = typeof getWorkerPid === 'function' ? getWorkerPid() : 0;
+        return wPid > 0 ? [process.pid, wPid] : [process.pid];
+      },
+      onShrinkInternal: () => {
+        clearTelemetryTransientCaches();
+        shrinkWorkerMemory?.();
+      },
+      driver: memoryDriver,
+    });
   const accounts =
     accountManager ||
     createAccountManager({
@@ -1052,12 +1141,18 @@ export function createMonitorHandlers({
       windowCap,
     });
 
+    const sessionProgress =
+      typeof hud.resolveSessionProgress === 'function'
+        ? await hud.resolveSessionProgress(sessionsHub)
+        : [];
+
     if (
       !isExplicitConvId &&
       (syncHud || !rawHostConvId || Boolean(rawHostConvId && hud.isActiveHostConv?.(rawHostConvId)))
     ) {
       void hud.writePayload(telemetry, {
         forceEmpty: isNewConv,
+        sessionProgress,
         activeSessionCount: Array.isArray(sessionsHub?.active) ? sessionsHub.active.length : 0,
         unreadSessionCount: Array.isArray(sessionsHub?.unread) ? sessionsHub.unread.length : 0,
       });
@@ -1069,7 +1164,7 @@ export function createMonitorHandlers({
         : telemetry.tokenUsage?.models || [];
     const availableModels = await listKnownModels(resolvedPaths, observedModels);
 
-    const etag = buildCombinedEtag(telemetry.etag, sessionsHub, telemetry.activeConvId);
+    const etag = buildCombinedEtag(telemetry.etag, sessionsHub, telemetry.activeConvId, sessionProgress);
 
     if (data.etag && String(data.etag) === etag) {
       return { unchanged: true, etag };
@@ -1083,6 +1178,7 @@ export function createMonitorHandlers({
       contextPie: telemetry.contextPie,
       tokenUsage: telemetry.tokenUsage,
       sessionsHub,
+      sessionProgress,
       runtimeTelemetry: telemetry.runtimeTelemetry,
       quota: hud.getQuotaSnapshot?.() || null,
       availableModels,
@@ -1791,6 +1887,9 @@ export function createMonitorHandlers({
     if (typeof data.hudEnabled === 'boolean') {
       patch.hudEnabled = data.hudEnabled;
     }
+    if (typeof data.zeroUiaMode === 'boolean') {
+      patch.zeroUiaMode = data.zeroUiaMode;
+    }
     if (data.hostThemeMode === 'cdp' || data.hostThemeMode === 'backdrop') {
       patch.hostThemeMode = data.hostThemeMode;
     }
@@ -2183,6 +2282,48 @@ export function createMonitorHandlers({
     }
   });
 
+  // ---- Whole-AGY Memory Telemetry, Safe Working-Set Trim & Zero-UIA Guard ----
+  register('GET', '/api/memory/status', async (data = {}) => {
+    try {
+      const force = data.force === '1' || data.force === 'true' || data.force === true;
+      return await memory.getStatus({ force });
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/memory/optimize', async () => {
+    try {
+      const result = await memory.optimizeNow({ reason: 'manual' });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, 500, result.error || '内存释放失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/memory/restart-companions', async () => {
+    try {
+      return await memory.restartCompanions();
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/memory/settings', async (data = {}) => {
+    try {
+      const result = await memory.updateSettings(data);
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, 400, result.error || '保存内存设置失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
   // Mount optional pluggable extensions (each isolated in extensions/<name>/)
   if (process.env.AGY_DISABLE_EXTENSIONS !== '1' && process.env.AGY_DISABLE_EXTENSIONS !== 'true') {
     for (const ext of installedExtensions) {
@@ -2258,6 +2399,18 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {})
   launch();
 
   return {
+    getPid() {
+      return child && Number.isInteger(child.pid) ? child.pid : 0;
+    },
+    shrinkMemory() {
+      if (child && child.connected) {
+        try {
+          child.send({ type: 'shrink' });
+        } catch {
+          // Ignore transient IPC disconnect while worker restarts
+        }
+      }
+    },
     rescan() {
       if (child && child.connected) {
         try {
@@ -2352,7 +2505,7 @@ export async function startSidecarServer({
 
   let latestWorkerEtag = '';
   const worker = skipWorker
-    ? { rescan() {}, async stop() {} }
+    ? { getPid() { return 0; }, shrinkMemory() {}, rescan() {}, async stop() {} }
     : spawnWorkerSupervisor(paths, {
         scanIntervalMs,
         onUpdated(msg) {
@@ -2380,6 +2533,19 @@ export async function startSidecarServer({
     },
   });
 
+  const sharedMemoryManager = createMemoryManager({
+    paths,
+    storage,
+    getExtraPids: () => {
+      const wPid = worker.getPid?.() || 0;
+      return wPid > 0 ? [process.pid, wPid] : [process.pid];
+    },
+    onShrinkInternal: () => {
+      clearTelemetryTransientCaches();
+      worker.shrinkMemory?.();
+    },
+  });
+
   const routes = createMonitorHandlers({
     paths,
     storage,
@@ -2390,6 +2556,9 @@ export async function startSidecarServer({
     cdpBridge,
     quotaClient: sharedQuotaClient,
     accountManager: sharedAccountManager,
+    memoryManager: sharedMemoryManager,
+    getWorkerPid: () => worker.getPid?.() || 0,
+    shrinkWorkerMemory: () => worker.shrinkMemory?.(),
   });
 
   for (const [key, handler] of routes.entries()) {
@@ -2501,6 +2670,7 @@ export async function startSidecarServer({
     })();
 
     sharedAccountManager.startLifecycleWatcher({ intervalMs: 2000 });
+    sharedMemoryManager.startAutoGuard();
 
     companionWatchdogTimer = setInterval(() => {
       void ensureCompanionHealthy();
@@ -2511,6 +2681,7 @@ export async function startSidecarServer({
   const shutdown = async () => {
     clearTimeout(activeViewTimer);
     sharedAccountManager.stopLifecycleWatcher();
+    sharedMemoryManager.stopAutoGuard();
     if (companionWatchdogTimer) {
       clearInterval(companionWatchdogTimer);
       companionWatchdogTimer = null;

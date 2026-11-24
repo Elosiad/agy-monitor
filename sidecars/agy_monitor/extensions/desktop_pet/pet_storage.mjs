@@ -220,7 +220,7 @@ export const DEFAULT_BUBBLE_TEMPLATE = '入 {in} · 出 {out}';
 
 function sanitizeBubbleTemplate(raw, fallback = DEFAULT_BUBBLE_TEMPLATE) {
   if (typeof raw !== 'string') return fallback;
-  const cleaned = raw.replace(/[\r\n\t\x00-\x1f]/g, ' ').trim().slice(0, 160);
+  const cleaned = raw.replace(/[\r\n\t\x00-\x1f]/g, ' ').trim().slice(0, 2000);
   return cleaned || fallback;
 }
 

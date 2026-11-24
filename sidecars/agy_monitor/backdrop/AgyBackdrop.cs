@@ -39,6 +39,7 @@ namespace AgyBackdropCompanion
         public string canvasColor = "#14161D";
         public string accentColor = "#5B8CFF";
         public string wallpaperPath = "";
+        public bool zeroUiaMode = false;
     }
 
     internal sealed class HudDisplayConfig
@@ -663,12 +664,43 @@ namespace AgyBackdropCompanion
             catch { }
         }
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW")]
+        private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        public static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        public static string GetWindowTitleText(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return "";
+            try
+            {
+                var sb = new StringBuilder(256);
+                int len = GetWindowTextW(hwnd, sb, sb.Capacity);
+                if (len > 0) return sb.ToString(0, Math.Min(len, sb.Length)).Trim();
+            }
+            catch { }
+            return "";
+        }
+
         public static void TrimWorkingSet()
         {
             try
             {
-                GC.Collect(2, GCCollectionMode.Optimized, false);
-                SetProcessWorkingSetSize(GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1));
+                GC.Collect(2, GCCollectionMode.Forced, true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(2, GCCollectionMode.Forced, true);
+                IntPtr cur = GetCurrentProcess();
+                if (!EmptyWorkingSet(cur))
+                {
+                    SetProcessWorkingSetSize(cur, new IntPtr(-1), new IntPtr(-1));
+                }
             }
             catch { }
         }
@@ -3154,8 +3186,8 @@ namespace AgyBackdropCompanion
     {
         private static readonly string[] ModeKeywords = new string[]
         {
-            "turbo", "planning", "fast", "auto", "strict", "review", "proceed", "sandbox", "permission", "ask",
-            "极速", "规划", "快速", "自动", "严格", "审查", "权限"
+            "turbo", "planning", "fast",
+            "极速", "规划", "快速"
         };
 
         private static readonly string[] MicKeywords = new string[]
@@ -3165,7 +3197,7 @@ namespace AgyBackdropCompanion
 
         private static readonly string[] SendStopKeywords = new string[]
         {
-            "send", "stop", "submit", "cancel", "发送", "停止"
+            "send", "stop", "发送", "停止"
         };
 
         private static bool ContainsAny(string haystack, string[] needles)
@@ -3363,6 +3395,37 @@ namespace AgyBackdropCompanion
             catch { }
         }
 
+        private static bool IsInsideAgyConsoleDocument(AutomationElement el)
+        {
+            if (el == null) return false;
+            try
+            {
+                AutomationElement cur = el;
+                for (int hop = 0; hop < 32 && cur != null; hop++)
+                {
+                    ControlType ct = null;
+                    try { ct = cur.Current.ControlType; } catch { }
+                    if (ct == ControlType.Document)
+                    {
+                        string docName = "";
+                        try { docName = cur.Current.Name ?? ""; } catch { docName = ""; }
+                        if (!string.IsNullOrEmpty(docName) &&
+                            (docName.IndexOf("Antigravity Monitor", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             docName.IndexOf("AGY 控制台", StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (ct == ControlType.Window) return false;
+                    try { cur = TreeWalker.ControlViewWalker.GetParent(cur); }
+                    catch { return false; }
+                }
+            }
+            catch { }
+            return false;
+        }
+
         public static HudAnchorInfo ProbeComposerAnchor(
             IntPtr hwnd,
             Native.RECT winRect,
@@ -3389,10 +3452,11 @@ namespace AgyBackdropCompanion
             double dpiScale = Native.GetWindowDpiScale(hwnd);
             int winW = Math.Max(1, winRect.Right - winRect.Left);
             int winH = Math.Max(1, winRect.Bottom - winRect.Top);
-            // Expand upward band so tall pasted multiline prompts never drop the composer toolbar anchor
-            int bandTop = winRect.Bottom - Math.Min((int)Math.Round(280 * dpiScale), Math.Max((int)Math.Round(140 * dpiScale), winH / 2));
+            // Composer bottom toolbar stays pinned within the bottom ~108 DIP (multiline textarea expands upward).
+            int bandTop = winRect.Bottom - (int)Math.Round(108 * dpiScale);
             int bandBottom = winRect.Bottom - (int)Math.Round(4 * dpiScale);
-            int minBtnLeft = winRect.Left + (int)Math.Round(140 * dpiScale);
+            int minBtnLeft = winRect.Left + (int)Math.Round(120 * dpiScale);
+            int maxBtnRight = winRect.Right - 4;
             int defaultLeftGuard = winRect.Left + (int)Math.Round(220 * dpiScale);
             int rowAlignTol = (int)Math.Round(16 * dpiScale);
 
@@ -3402,7 +3466,7 @@ namespace AgyBackdropCompanion
                 System.Windows.Rect cr;
                 if (TryGetValidRect(cachedAnchor, out cr) &&
                     cr.Top >= bandTop && cr.Bottom <= bandBottom &&
-                    cr.Left >= minBtnLeft && cr.Right <= winRect.Right - 4)
+                    cr.Left >= minBtnLeft && cr.Right <= maxBtnRight)
                 {
                     int baseShift = cachedKind == 1 ? 5 : (cachedKind == 2 ? 36 : 86);
                     int extraShift = (int)Math.Round(baseShift * dpiScale);
@@ -3496,7 +3560,7 @@ namespace AgyBackdropCompanion
                     if (!TryGetValidRect(btn, out r)) continue;
                     if (r.Top < bandTop || r.Bottom > bandBottom) continue;
                     if (r.Height < minBtnH || r.Height > maxBtnH) continue;
-                    if (r.Left < minBtnLeft) continue;
+                    if (r.Left < minBtnLeft || r.Right > maxBtnRight) continue;
 
                     bottomButtonCount++;
                     rowButtons.Add(new KeyValuePair<AutomationElement, System.Windows.Rect>(btn, r));
@@ -3504,20 +3568,29 @@ namespace AgyBackdropCompanion
                     try { name = btn.Current.Name ?? ""; } catch { name = ""; }
                     if (string.IsNullOrEmpty(name)) continue;
 
-                    if (modeMatch == null && ContainsAny(name, ModeKeywords) && r.Width >= minModeW && r.Width <= maxModeW)
+                    if (ContainsAny(name, ModeKeywords) && r.Width >= minModeW && r.Width <= maxModeW)
                     {
-                        modeMatch = btn;
-                        modeRect = r;
+                        if ((modeMatch == null || r.Bottom > modeRect.Bottom) && !IsInsideAgyConsoleDocument(btn))
+                        {
+                            modeMatch = btn;
+                            modeRect = r;
+                        }
                     }
-                    else if (micMatch == null && ContainsAny(name, MicKeywords) && r.Width <= maxIconW)
+                    else if (ContainsAny(name, MicKeywords) && r.Width <= maxIconW)
                     {
-                        micMatch = btn;
-                        micRect = r;
+                        if ((micMatch == null || r.Bottom > micRect.Bottom) && !IsInsideAgyConsoleDocument(btn))
+                        {
+                            micMatch = btn;
+                            micRect = r;
+                        }
                     }
-                    else if (sendMatch == null && ContainsAny(name, SendStopKeywords) && r.Width <= maxIconW)
+                    else if (ContainsAny(name, SendStopKeywords) && r.Width <= maxIconW)
                     {
-                        sendMatch = btn;
-                        sendRect = r;
+                        if ((sendMatch == null || r.Bottom > sendRect.Bottom) && !IsInsideAgyConsoleDocument(btn))
+                        {
+                            sendMatch = btn;
+                            sendRect = r;
+                        }
                     }
                 }
 
@@ -4089,8 +4162,80 @@ namespace AgyBackdropCompanion
             return false;
         }
 
+        public static ActiveViewInfo ProbeActiveConversationTitlePureWin32(IntPtr hwnd)
+        {
+            var info = new ActiveViewInfo { Workspace = "", Title = "" };
+            try
+            {
+                string raw = Native.GetWindowTitleText(hwnd);
+                if (string.IsNullOrEmpty(raw)) return info;
+                string low = raw.ToLowerInvariant();
+                if (low == "antigravity" || low == "antigravity_original") return info;
+                // Strip trailing " - Antigravity" if present
+                int dashIdx = raw.LastIndexOf(" - Antigravity", StringComparison.OrdinalIgnoreCase);
+                if (dashIdx > 0) raw = raw.Substring(0, dashIdx).Trim();
+                if (string.IsNullOrEmpty(raw)) return info;
+                if (IsNewConversationTitle(raw))
+                {
+                    info.IsNewConversation = true;
+                    info.Title = raw;
+                    return info;
+                }
+                int slashIdx = raw.IndexOf(" / ", StringComparison.Ordinal);
+                if (slashIdx > 0 && slashIdx < raw.Length - 3)
+                {
+                    string ws = raw.Substring(0, slashIdx).Trim();
+                    string title = raw.Substring(slashIdx + 3).Trim();
+                    if (IsNewConversationTitle(title))
+                    {
+                        info.Workspace = ws;
+                        info.Title = title;
+                        info.IsNewConversation = true;
+                        return info;
+                    }
+                    if (!IsHeaderChromeText(title))
+                    {
+                        info.Workspace = ws;
+                        info.Title = title;
+                        return info;
+                    }
+                }
+                if (!IsHeaderChromeText(raw))
+                {
+                    info.Title = raw;
+                }
+            }
+            catch { }
+            return info;
+        }
+
+        public static HudAnchorInfo ComputePureWin32ComposerAnchor(IntPtr hwnd, Native.RECT winRect, bool consoleVisible, int consolePhysW)
+        {
+            // Strict Zero-UIA mode deliberately disables guessed Mode-1 WPF HUD coordinates so it never drifts
+            // across dynamic splits/sidebars/Review panes (Mode-2 CDP DOM HUD remains pixel-perfect with zero UIA).
+            return new HudAnchorInfo
+            {
+                HasAnchor = false,
+                ComposerVisible = false,
+                Occluded = false,
+                FromUia = false,
+                RightX = 0,
+                LeftGuardX = 0,
+                CenterY = 0,
+                AnchorWinLeft = winRect.Left,
+                AnchorWinTop = winRect.Top,
+                AnchorWinRight = winRect.Right,
+                AnchorWinBottom = winRect.Bottom
+            };
+        }
+
         public static ActiveViewInfo ProbeActiveConversationView(IntPtr hwnd, Native.RECT winRect)
         {
+            ActiveViewInfo fastTitle = ProbeActiveConversationTitlePureWin32(hwnd);
+            if (fastTitle.IsNewConversation || !string.IsNullOrEmpty(fastTitle.Title))
+            {
+                return fastTitle;
+            }
             var info = new ActiveViewInfo { Workspace = "", Title = "" };
             try
             {
@@ -4280,6 +4425,7 @@ namespace AgyBackdropCompanion
     internal sealed class CompanionController : IDisposable
     {
         private const string StopEventName = @"Local\AgyMonitorBackdropStop";
+        private const string TrimEventName = @"Local\AgyMonitorBackdropTrim";
         private readonly string _dataDir;
         private readonly string _assetsDir;
         private readonly string _themesPath;
@@ -4299,8 +4445,10 @@ namespace AgyBackdropCompanion
         private DispatcherTimer _debounceTimer;
         private DispatcherTimer _reconcileTimer;
         private Thread _stopListenerThread;
+        private Thread _trimListenerThread;
         private Thread _uiaWorkerThread;
         private EventWaitHandle _stopEvent;
+        private EventWaitHandle _trimEvent;
         private readonly AutoResetEvent _uiaWakeEvent = new AutoResetEvent(false);
         private NotifyIcon _trayIcon;
         private Icon _trayIconGlyph;
@@ -4434,6 +4582,10 @@ namespace AgyBackdropCompanion
                     startupTrimmed = true;
                     Native.TrimWorkingSet();
                 }
+                else if ((reconcileTick % 300) == 0)
+                {
+                    Native.TrimWorkingSet();
+                }
                 if ((DateTime.UtcNow - _lastStatusWriteUtc).TotalSeconds >= 3.0)
                 {
                     WriteStatusFile(true);
@@ -4510,6 +4662,16 @@ namespace AgyBackdropCompanion
             };
             menu.Items.Add(reloadItem);
 
+            var trimItem = new ToolStripMenuItem("立即释放内存");
+            trimItem.Click += delegate
+            {
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try { Native.TrimWorkingSet(); } catch { }
+                });
+            };
+            menu.Items.Add(trimItem);
+
             menu.Items.Add(new ToolStripSeparator());
             var exitItem = new ToolStripMenuItem("退出并还原主窗不透明");
             exitItem.Click += delegate
@@ -4530,6 +4692,7 @@ namespace AgyBackdropCompanion
         private void StartStopEventListener()
         {
             _stopEvent = new EventWaitHandle(false, EventResetMode.ManualReset, StopEventName);
+            try { _stopEvent.Reset(); } catch { }
             _stopListenerThread = new Thread(delegate()
             {
                 try
@@ -4544,6 +4707,27 @@ namespace AgyBackdropCompanion
             });
             _stopListenerThread.IsBackground = true;
             _stopListenerThread.Start();
+
+            try
+            {
+                _trimEvent = new EventWaitHandle(false, EventResetMode.AutoReset, TrimEventName);
+                _trimListenerThread = new Thread(delegate()
+                {
+                    while (!_disposed)
+                    {
+                        try
+                        {
+                            if (!_trimEvent.WaitOne(5000)) continue;
+                            if (_disposed) break;
+                            Native.TrimWorkingSet();
+                        }
+                        catch { break; }
+                    }
+                });
+                _trimListenerThread.IsBackground = true;
+                _trimListenerThread.Start();
+            }
+            catch { }
         }
 
         private void StartRenderFollow(IntPtr hwnd)
@@ -4765,21 +4949,36 @@ namespace AgyBackdropCompanion
                         var snapHudHwnd = new List<IntPtr>();
                         var snapBackdropHwnd = new List<IntPtr>();
                         bool cdpTakesHud = false;
+                        bool useZeroUia = true;
+                        bool snapConsoleVis = false;
+                        int snapConsolePhysW = 0;
 
                         // Single cross-thread UI snapshot per tick (eliminates N+1 blocking Dispatcher.Invoke calls!)
                         _dispatcher.Invoke(new Action(delegate
                         {
                             cdpTakesHud = _hudTelemetry != null && _hudTelemetry.cdpHudActive;
+                            useZeroUia = _config != null && _config.zeroUiaMode;
+                            long vpNowMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                            bool vpFresh = _consoleViewportVisible && _consoleViewportPhysW > 0 && _consoleViewportUpdatedMs > 0 && (vpNowMs - _consoleViewportUpdatedMs) <= 10000;
+                            snapConsoleVis = vpFresh;
+                            snapConsolePhysW = vpFresh ? _consoleViewportPhysW : 0;
                             if (cdpTakesHud) return;
                             foreach (TrackedHostWindow rec in _tracked.Values)
                             {
+                                if (useZeroUia && (rec.CachedUiaAnchor != null || rec.CachedLeftGuard != null || rec.CachedComposerBox != null))
+                                {
+                                    rec.CachedUiaAnchor = null;
+                                    rec.CachedUiaAnchorKind = 0;
+                                    rec.CachedLeftGuard = null;
+                                    rec.CachedComposerBox = null;
+                                }
                                 if (Native.IsWindow(rec.Hwnd) && Native.IsWindowVisible(rec.Hwnd) && !Native.IsIconic(rec.Hwnd))
                                 {
                                     snapHwnds.Add(rec.Hwnd);
-                                    snapCachedEl.Add(rec.CachedUiaAnchor);
-                                    snapCachedKind.Add(rec.CachedUiaAnchorKind);
-                                    snapCachedLeft.Add(rec.CachedLeftGuard);
-                                    snapCachedBox.Add(rec.CachedComposerBox);
+                                    snapCachedEl.Add(useZeroUia ? null : rec.CachedUiaAnchor);
+                                    snapCachedKind.Add(useZeroUia ? 0 : rec.CachedUiaAnchorKind);
+                                    snapCachedLeft.Add(useZeroUia ? null : rec.CachedLeftGuard);
+                                    snapCachedBox.Add(useZeroUia ? null : rec.CachedComposerBox);
                                     snapLastScan.Add(rec.LastFullUiaScanUtc);
                                     snapLastOcc.Add(rec.LastOcclusionCheckUtc);
                                     snapPrevAnchor.Add(rec.Anchor);
@@ -4886,11 +5085,13 @@ namespace AgyBackdropCompanion
                             IntPtr backdropHwnd = snapBackdropHwnd[idx];
 
                             double rescanCooldownMs = clickJustReleased ? 220.0 : (mouseDownOnHost ? 320.0 : (isFgTracked ? 1200.0 : 4000.0));
-                            bool canProbeAnchor = cachedEl != null || (loopNow - lastScan).TotalMilliseconds >= rescanCooldownMs;
+                            bool canProbeAnchor = useZeroUia || cachedEl != null || (loopNow - lastScan).TotalMilliseconds >= rescanCooldownMs;
                             if (canProbeAnchor)
                             {
                                 bool hadCached = cachedEl != null;
-                                HudAnchorInfo anchor = UiaHelper.ProbeComposerAnchor(h, winRect, ref cachedEl, ref cachedKind, ref cachedLeft, ref cachedBox);
+                                HudAnchorInfo anchor = useZeroUia
+                                    ? UiaHelper.ComputePureWin32ComposerAnchor(h, winRect, snapConsoleVis, snapConsolePhysW)
+                                    : UiaHelper.ProbeComposerAnchor(h, winRect, ref cachedEl, ref cachedKind, ref cachedLeft, ref cachedBox);
                                 DateTime scanTime = (!hadCached || cachedEl == null) ? DateTime.UtcNow : lastScan;
 
                                 HudAnchorInfo finalAnchor = anchor;
@@ -4910,14 +5111,11 @@ namespace AgyBackdropCompanion
                                     }
                                     else
                                     {
-                                        // Adaptive UIA occlusion interval:
-                                        // - Background window: pure-Win32 Z-order only (0 COM UIA RPCs!) unless verifying a freshly discovered anchor
-                                        // - Active foreground interaction: 160ms
-                                        // - Currently occluded (waiting for menu/fullscreen close): 240ms
-                                        // - Idle foreground: 750ms (instant wake on any mouse move/click!)
+                                        // Adaptive occlusion interval:
+                                        // Zero-UIA mode runs pure-Win32 Z-order ONLY (0 COM UIA RPCs, never triggers Electron AXTree!)
                                         double occIntervalMs = userActiveNow ? 160.0 : (prevAnchor.Occluded ? 240.0 : 750.0);
-                                        bool freshAnchorVerify = !hadCached && cachedEl != null;
-                                        bool runUiaChecks = freshAnchorVerify || (isFgTracked && (clickJustReleased || typingNewlineKey || (loopNow - lastOccCheck).TotalMilliseconds >= occIntervalMs));
+                                        bool freshAnchorVerify = !useZeroUia && !hadCached && cachedEl != null;
+                                        bool runUiaChecks = !useZeroUia && (freshAnchorVerify || (isFgTracked && (clickJustReleased || typingNewlineKey || (loopNow - lastOccCheck).TotalMilliseconds >= occIntervalMs)));
                                         if (runUiaChecks)
                                         {
                                             nextOccCheck = loopNow;
@@ -5013,11 +5211,13 @@ namespace AgyBackdropCompanion
                                 }
                             }
 
-                            // Probe active conversation breadcrumb for each visible window (dual-window support + foreground view file)
+                            // Probe active conversation breadcrumb for each visible window (pure Win32 title in Zero-UIA mode!)
                             if (wantViewProbe)
                             {
-                                uiaScanCycles += 4;
-                                ActiveViewInfo view = UiaHelper.ProbeActiveConversationView(h, winRect);
+                                ActiveViewInfo view = useZeroUia
+                                    ? UiaHelper.ProbeActiveConversationTitlePureWin32(h)
+                                    : UiaHelper.ProbeActiveConversationView(h, winRect);
+                                if (!useZeroUia) uiaScanCycles += 4;
                                 if (view.IsNewConversation || !string.IsNullOrEmpty(view.Title))
                                 {
                                     string vwWs = view.Workspace ?? "";
@@ -5079,21 +5279,21 @@ namespace AgyBackdropCompanion
                             _lastViewProbeUtc = DateTime.UtcNow;
                         }
 
-                        // Periodically reclaim transient UIA COM RCW wrappers to keep handle count & RAM flat
+                        // Periodically reclaim transient UIA COM RCW wrappers (Gen-2 + Finalizers + WorkingSet trim)
                         if (uiaScanCycles >= 45 && !mouseDownOnHost)
                         {
                             uiaScanCycles = 0;
-                            GC.Collect(1, GCCollectionMode.Optimized, false);
+                            Native.TrimWorkingSet();
                         }
                     }
                     catch { }
 
                     int waitMs;
-                    if (mouseDownOnHost || typingNewlineKey) waitMs = 16;
-                    else if (userActiveNow) waitMs = 32;
-                    else if (!isFgTracked) waitMs = 550;
-                    else if (anyOccluded) waitMs = 200;
-                    else waitMs = 360;
+                    if (mouseDownOnHost || typingNewlineKey) waitMs = 32;
+                    else if (userActiveNow) waitMs = 120;
+                    else if (!isFgTracked) waitMs = 600;
+                    else if (anyOccluded) waitMs = 240;
+                    else waitMs = 500;
                     try { _uiaWakeEvent.WaitOne(waitMs); } catch { Thread.Sleep(waitMs); }
                 }
             });
@@ -5448,6 +5648,7 @@ namespace AgyBackdropCompanion
                 {
                     if (_disposed) return;
                     ReloadConsoleViewport();
+                    TriggerFastUiaBurst(250, false);
                     SyncAllWindows(false);
                 }));
             }
@@ -5514,6 +5715,7 @@ namespace AgyBackdropCompanion
                     if (info.LastWriteTimeUtc != _lastConsoleViewportWriteUtc || info.Length != _lastConsoleViewportLength)
                     {
                         ReloadConsoleViewport();
+                        TriggerFastUiaBurst(250, false);
                     }
                 }
             }
@@ -6260,7 +6462,8 @@ namespace AgyBackdropCompanion
                     radius = ClampInt(ReadInt(doc, "radius", 12), 4, 18),
                     fit = ReadString(doc, "fit", "cover"),
                     canvasColor = "#070709",
-                    accentColor = "#5B8CFF"
+                    accentColor = "#5B8CFF",
+                    zeroUiaMode = ReadBool(doc, "zeroUiaMode", false)
                 };
 
                 var colors = doc.ContainsKey("colors") ? doc["colors"] as Dictionary<string, object> : null;
@@ -7181,6 +7384,7 @@ namespace AgyBackdropCompanion
                     { "hostBlendPct", _config.hostBlendPct },
                     { "activeWallpaperId", _config.activeWallpaperId ?? "" },
                     { "hudEnabled", _config.hudEnabled && _hudEnabledByTray },
+                    { "zeroUiaMode", _config.zeroUiaMode },
                     { "hudVisible", running && anyHudVisible },
                     { "hudAnchorFound", running && anyHudAnchor },
                     { "hudOccluded", running && anyHudOccluded },
@@ -7287,6 +7491,17 @@ namespace AgyBackdropCompanion
                     _stopEvent.Set();
                     _stopEvent.Dispose();
                     _stopEvent = null;
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (_trimEvent != null)
+                {
+                    _trimEvent.Set();
+                    _trimEvent.Dispose();
+                    _trimEvent = null;
                 }
             }
             catch { }
@@ -7430,6 +7645,538 @@ namespace AgyBackdropCompanion
         }
     }
 
+    internal static class MemoryHelper
+    {
+        private const uint TH32CS_SNAPPROCESS = 0x00000002;
+        private const uint TH32CS_SNAPMODULE = 0x00000008;
+        private const uint TH32CS_SNAPMODULE32 = 0x00000010;
+        private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        private const uint PROCESS_VM_READ = 0x0010;
+        private const uint PROCESS_SET_QUOTA = 0x0100;
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const int ERROR_BAD_LENGTH = 24;
+        private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32W
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct MODULEENTRY32W
+        {
+            public uint dwSize;
+            public uint th32ModuleID;
+            public uint th32ProcessID;
+            public uint GlblcntUsage;
+            public uint ProccntUsage;
+            public IntPtr modBaseAddr;
+            public uint modBaseSize;
+            public IntPtr hModule;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string szModule;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExePath;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_MEMORY_COUNTERS_EX
+        {
+            public uint cb;
+            public uint PageFaultCount;
+            public UIntPtr PeakWorkingSetSize;
+            public UIntPtr WorkingSetSize;
+            public UIntPtr QuotaPeakPagedPoolUsage;
+            public UIntPtr QuotaPagedPoolUsage;
+            public UIntPtr QuotaPeakNonPagedPoolUsage;
+            public UIntPtr QuotaNonPagedPoolUsage;
+            public UIntPtr PagefileUsage;
+            public UIntPtr PeakPagefileUsage;
+            public UIntPtr PrivateUsage;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MEMORYSTATUSEX
+        {
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+        }
+
+        private sealed class ProcEntry
+        {
+            public int Pid;
+            public int Ppid;
+            public string Name;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32FirstW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Module32FirstW(IntPtr hSnapshot, ref MODULEENTRY32W lpme);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Module32NextW(IntPtr hSnapshot, ref MODULEENTRY32W lpme);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool GetProcessMemoryInfo(IntPtr hProcess, out PROCESS_MEMORY_COUNTERS_EX ppsmemCounters, uint cb);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool QueryWorkingSet(IntPtr hProcess, IntPtr pv, uint cb);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        private static string StripExeSuffix(string exeName)
+        {
+            if (string.IsNullOrEmpty(exeName)) return "";
+            if (exeName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return exeName.Substring(0, exeName.Length - 4);
+            }
+            return exeName;
+        }
+
+        private static bool IsCoreAgyProcessName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (string.Equals(name, "Antigravity", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(name, "Antigravity_Original", StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith("language_server", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(name, "agy_backdrop", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(name, "agy_desktop_pet", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(name, "agy_account_tool", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static List<ProcEntry> EnumerateAllProcesses()
+        {
+            var list = new List<ProcEntry>();
+            IntPtr snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == IntPtr.Zero || snap == INVALID_HANDLE_VALUE) return list;
+            try
+            {
+                var pe = new PROCESSENTRY32W();
+                pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+                if (Process32FirstW(snap, ref pe))
+                {
+                    do
+                    {
+                        list.Add(new ProcEntry
+                        {
+                            Pid = (int)pe.th32ProcessID,
+                            Ppid = (int)pe.th32ParentProcessID,
+                            Name = StripExeSuffix(pe.szExeFile ?? "")
+                        });
+                    }
+                    while (Process32NextW(snap, ref pe));
+                }
+            }
+            finally
+            {
+                CloseHandle(snap);
+            }
+            return list;
+        }
+
+        private static bool HasAncestorInSet(int pid, Dictionary<int, ProcEntry> byPid, HashSet<int> roots)
+        {
+            int cur = pid;
+            for (int depth = 0; depth < 8; depth++)
+            {
+                ProcEntry e;
+                if (!byPid.TryGetValue(cur, out e)) return false;
+                if (e.Ppid <= 0 || e.Ppid == cur) return false;
+                if (roots.Contains(e.Ppid)) return true;
+                cur = e.Ppid;
+            }
+            return false;
+        }
+
+        private static long QueryPrivateWorkingSetBytes(IntPtr hProcess)
+        {
+            int pageSize = Environment.SystemPageSize;
+            if (pageSize <= 0) pageSize = 4096;
+            int ptrSize = IntPtr.Size;
+            uint bufBytes = 256 * 1024;
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                IntPtr buf = Marshal.AllocHGlobal((int)bufBytes);
+                try
+                {
+                    bool ok = QueryWorkingSet(hProcess, buf, bufBytes);
+                    if (!ok)
+                    {
+                        int err = Marshal.GetLastWin32Error();
+                        if (err == ERROR_BAD_LENGTH)
+                        {
+                            long neededEntries = Marshal.ReadIntPtr(buf, 0).ToInt64();
+                            if (neededEntries > 0 && neededEntries < 16 * 1024 * 1024)
+                            {
+                                long neededBytes = (neededEntries + 2048L) * ptrSize;
+                                if (neededBytes > (long)bufBytes && neededBytes <= 64L * 1024 * 1024)
+                                {
+                                    bufBytes = (uint)neededBytes;
+                                    continue;
+                                }
+                            }
+                            bufBytes = Math.Min(64u * 1024u * 1024u, bufBytes * 4u);
+                            continue;
+                        }
+                        return -1;
+                    }
+
+                    long count = Marshal.ReadIntPtr(buf, 0).ToInt64();
+                    long maxEntries = ((long)bufBytes / ptrSize) - 1;
+                    if (count < 0) return -1;
+                    if (count > maxEntries) count = maxEntries;
+
+                    long privatePages = 0;
+                    for (long i = 0; i < count; i++)
+                    {
+                        int offset = (int)((i + 1) * ptrSize);
+                        ulong entry = (ptrSize == 8)
+                            ? (ulong)Marshal.ReadInt64(buf, offset)
+                            : (ulong)(uint)Marshal.ReadInt32(buf, offset);
+                        // Bit 8 (0x100) is PSAPI_WORKING_SET_BLOCK.Shared
+                        if ((entry & 0x100UL) == 0UL)
+                        {
+                            privatePages++;
+                        }
+                    }
+                    return privatePages * (long)pageSize;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buf);
+                }
+            }
+            return -1;
+        }
+
+        private static bool IsModuleLoaded(int pid, string moduleFileName)
+        {
+            IntPtr snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, (uint)pid);
+            if (snap == IntPtr.Zero || snap == INVALID_HANDLE_VALUE) return false;
+            try
+            {
+                var me = new MODULEENTRY32W();
+                me.dwSize = (uint)Marshal.SizeOf(typeof(MODULEENTRY32W));
+                if (Module32FirstW(snap, ref me))
+                {
+                    do
+                    {
+                        if (string.Equals(me.szModule, moduleFileName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+                    }
+                    while (Module32NextW(snap, ref me));
+                }
+            }
+            catch { }
+            finally
+            {
+                CloseHandle(snap);
+            }
+            return false;
+        }
+
+        private static double BytesToMb(long bytes)
+        {
+            if (bytes <= 0) return 0.0;
+            return Math.Round(bytes / (1024.0 * 1024.0), 1);
+        }
+
+        private static List<ProcEntry> FilterTargetProcesses(List<ProcEntry> all, HashSet<int> extraPids, int selfPid)
+        {
+            var byPid = new Dictionary<int, ProcEntry>(all.Count);
+            var corePids = new HashSet<int>();
+            for (int i = 0; i < all.Count; i++)
+            {
+                ProcEntry e = all[i];
+                byPid[e.Pid] = e;
+                if (IsCoreAgyProcessName(e.Name))
+                {
+                    corePids.Add(e.Pid);
+                }
+            }
+
+            var matched = new List<ProcEntry>();
+            for (int i = 0; i < all.Count; i++)
+            {
+                ProcEntry e = all[i];
+                if (e.Pid == selfPid) continue;
+                bool isExtra = extraPids != null && extraPids.Contains(e.Pid);
+                bool isCore = corePids.Contains(e.Pid);
+                bool isAgyNodeChild = !isCore &&
+                    string.Equals(e.Name, "node", StringComparison.OrdinalIgnoreCase) &&
+                    HasAncestorInSet(e.Pid, byPid, corePids);
+                if (isCore || isExtra || isAgyNodeChild)
+                {
+                    matched.Add(e);
+                }
+            }
+            return matched;
+        }
+
+        private static HashSet<int> FindMainWindowPids()
+        {
+            var pids = new HashSet<int>();
+            try
+            {
+                List<IntPtr> hwnds = CompanionController.FindAntigravityTopWindowsStatic();
+                for (int i = 0; i < hwnds.Count; i++)
+                {
+                    uint p;
+                    Native.GetWindowThreadProcessId(hwnds[i], out p);
+                    if (p > 0) pids.Add((int)p);
+                }
+            }
+            catch { }
+            return pids;
+        }
+
+        private static Dictionary<string, object> CaptureSnapshotData(HashSet<int> extraPids, bool inspectUia)
+        {
+            int selfPid;
+            using (Process cur = Process.GetCurrentProcess()) selfPid = cur.Id;
+
+            var sys = new Dictionary<string, object>();
+            try
+            {
+                var ms = new MEMORYSTATUSEX();
+                ms.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+                if (GlobalMemoryStatusEx(ref ms))
+                {
+                    sys["totalMb"] = Math.Round(ms.ullTotalPhys / (1024.0 * 1024.0), 0);
+                    sys["availableMb"] = Math.Round(ms.ullAvailPhys / (1024.0 * 1024.0), 0);
+                    sys["loadPct"] = (int)ms.dwMemoryLoad;
+                }
+            }
+            catch { }
+
+            List<ProcEntry> all = EnumerateAllProcesses();
+            List<ProcEntry> targets = FilterTargetProcesses(all, extraPids, selfPid);
+            HashSet<int> mainWinPids = FindMainWindowPids();
+            DateTime nowUtc = DateTime.UtcNow;
+
+            var procsOut = new List<Dictionary<string, object>>(targets.Count);
+            long totalPrivWsBytes = 0;
+            long totalWsBytes = 0;
+            long totalCommitBytes = 0;
+
+            for (int i = 0; i < targets.Count; i++)
+            {
+                ProcEntry e = targets[i];
+                long wsBytes = 0;
+                long commitBytes = 0;
+                long privWsBytes = -1;
+                IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, (uint)e.Pid);
+                if (hProc == IntPtr.Zero)
+                {
+                    hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)e.Pid);
+                }
+                if (hProc == IntPtr.Zero) continue;
+
+                try
+                {
+                    var pmc = new PROCESS_MEMORY_COUNTERS_EX();
+                    pmc.cb = (uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS_EX));
+                    if (GetProcessMemoryInfo(hProc, out pmc, pmc.cb))
+                    {
+                        wsBytes = (long)pmc.WorkingSetSize.ToUInt64();
+                        commitBytes = (long)pmc.PrivateUsage.ToUInt64();
+                    }
+                    privWsBytes = QueryPrivateWorkingSetBytes(hProc);
+                }
+                catch { }
+                finally
+                {
+                    CloseHandle(hProc);
+                }
+
+                if (privWsBytes < 0)
+                {
+                    privWsBytes = (commitBytes > 0 && wsBytes > 0) ? Math.Min(wsBytes, commitBytes) : wsBytes;
+                }
+
+                bool hasMainWin = mainWinPids.Contains(e.Pid);
+                bool uiaLoaded = false;
+                if (inspectUia && CompanionController.IsAntigravityHostProcessName(e.Name) && (hasMainWin || privWsBytes >= 120L * 1024 * 1024))
+                {
+                    uiaLoaded = IsModuleLoaded(e.Pid, "uiautomationcore.dll");
+                }
+
+                long uptimeSec = 0;
+                try
+                {
+                    using (Process p = Process.GetProcessById(e.Pid))
+                    {
+                        double sec = (nowUtc - p.StartTime.ToUniversalTime()).TotalSeconds;
+                        if (sec > 0) uptimeSec = (long)Math.Round(sec);
+                    }
+                }
+                catch { }
+
+                totalPrivWsBytes += Math.Max(0, privWsBytes);
+                totalWsBytes += Math.Max(0, wsBytes);
+                totalCommitBytes += Math.Max(0, commitBytes);
+
+                procsOut.Add(new Dictionary<string, object>
+                {
+                    { "pid", e.Pid },
+                    { "ppid", e.Ppid },
+                    { "name", e.Name },
+                    { "hasMainWindow", hasMainWin },
+                    { "uiaLoaded", uiaLoaded },
+                    { "privateWsMb", BytesToMb(privWsBytes) },
+                    { "workingSetMb", BytesToMb(wsBytes) },
+                    { "privateCommitMb", BytesToMb(commitBytes) },
+                    { "uptimeSec", uptimeSec }
+                });
+            }
+
+            long epochMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+            return new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "ts", epochMs },
+                { "system", sys },
+                { "totalPrivateWsMb", BytesToMb(totalPrivWsBytes) },
+                { "totalWorkingSetMb", BytesToMb(totalWsBytes) },
+                { "totalPrivateCommitMb", BytesToMb(totalCommitBytes) },
+                { "processCount", procsOut.Count },
+                { "processes", procsOut }
+            };
+        }
+
+        private static void SignalNamedEventSafe(string eventName)
+        {
+            try
+            {
+                using (var ev = EventWaitHandle.OpenExisting(eventName))
+                {
+                    ev.Set();
+                }
+            }
+            catch { }
+        }
+
+        public static string CaptureMemorySnapshotJson(HashSet<int> extraPids)
+        {
+            var json = new JavaScriptSerializer();
+            json.MaxJsonLength = 8 * 1024 * 1024;
+            Dictionary<string, object> snap = CaptureSnapshotData(extraPids, true);
+            return json.Serialize(snap);
+        }
+
+        public static string TrimAllAntigravityMemoryJson(HashSet<int> extraPids)
+        {
+            int selfPid;
+            using (Process cur = Process.GetCurrentProcess()) selfPid = cur.Id;
+
+            Dictionary<string, object> before = CaptureSnapshotData(extraPids, false);
+
+            // Trigger full managed Gen-2 GC + Finalizers inside our own running C# companions first
+            SignalNamedEventSafe(@"Local\AgyMonitorBackdropTrim");
+            SignalNamedEventSafe(@"Local\AgyDesktopPetTrim");
+
+            List<ProcEntry> all = EnumerateAllProcesses();
+            List<ProcEntry> targets = FilterTargetProcesses(all, extraPids, selfPid);
+            int trimmedCount = 0;
+            int failedCount = 0;
+
+            for (int i = 0; i < targets.Count; i++)
+            {
+                ProcEntry e = targets[i];
+                IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, false, (uint)e.Pid);
+                if (hProc == IntPtr.Zero)
+                {
+                    failedCount++;
+                    continue;
+                }
+                try
+                {
+                    bool ok = EmptyWorkingSet(hProc);
+                    if (!ok)
+                    {
+                        ok = SetProcessWorkingSetSize(hProc, new IntPtr(-1), new IntPtr(-1));
+                    }
+                    if (ok) trimmedCount++;
+                    else failedCount++;
+                }
+                catch
+                {
+                    failedCount++;
+                }
+                finally
+                {
+                    CloseHandle(hProc);
+                }
+            }
+
+            // Brief pause so companion GC + OS working set trim settle before reading after-snapshot
+            Thread.Sleep(220);
+
+            Dictionary<string, object> after = CaptureSnapshotData(extraPids, true);
+            double beforeMb = Convert.ToDouble(before["totalPrivateWsMb"], CultureInfo.InvariantCulture);
+            double afterMb = Convert.ToDouble(after["totalPrivateWsMb"], CultureInfo.InvariantCulture);
+            double freedMb = Math.Round(Math.Max(0.0, beforeMb - afterMb), 1);
+
+            var payload = new Dictionary<string, object>
+            {
+                { "ok", true },
+                { "trimmedCount", trimmedCount },
+                { "failedCount", failedCount },
+                { "beforeTotalPrivateWsMb", beforeMb },
+                { "afterTotalPrivateWsMb", afterMb },
+                { "freedMb", freedMb },
+                { "snapshot", after }
+            };
+
+            var json = new JavaScriptSerializer();
+            json.MaxJsonLength = 8 * 1024 * 1024;
+            return json.Serialize(payload);
+        }
+    }
+
     internal static class Program
     {
         [STAThread]
@@ -7443,12 +8190,30 @@ namespace AgyBackdropCompanion
             bool stopMode = false;
             bool probeDesktopMode = false;
             bool restoreOpacityMode = false;
+            bool memorySnapshotMode = false;
+            bool trimMemoryMode = false;
+            var extraPids = new HashSet<int>();
 
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--stop") stopMode = true;
                 else if (args[i] == "--probe-desktop") probeDesktopMode = true;
                 else if (args[i] == "--restore-opacity") restoreOpacityMode = true;
+                else if (args[i] == "--memory-snapshot") memorySnapshotMode = true;
+                else if (args[i] == "--trim-memory") trimMemoryMode = true;
+                else if (args[i] == "--extra-pids" && i + 1 < args.Length)
+                {
+                    string rawPids = args[++i] ?? "";
+                    string[] parts = rawPids.Split(new char[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    for (int pIdx = 0; pIdx < parts.Length; pIdx++)
+                    {
+                        int parsedPid;
+                        if (int.TryParse(parts[pIdx].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedPid) && parsedPid > 0)
+                        {
+                            extraPids.Add(parsedPid);
+                        }
+                    }
+                }
                 else if (args[i] == "--data-dir" && i + 1 < args.Length) dataDir = args[++i];
                 else if (args[i] == "--assets-dir" && i + 1 < args.Length) assetsDir = args[++i];
             }
@@ -7456,6 +8221,20 @@ namespace AgyBackdropCompanion
             if (probeDesktopMode)
             {
                 Console.WriteLine(Native.GetDesktopName());
+                return 0;
+            }
+
+            if (memorySnapshotMode)
+            {
+                try { Console.OutputEncoding = new UTF8Encoding(false); } catch { }
+                Console.WriteLine(MemoryHelper.CaptureMemorySnapshotJson(extraPids));
+                return 0;
+            }
+
+            if (trimMemoryMode)
+            {
+                try { Console.OutputEncoding = new UTF8Encoding(false); } catch { }
+                Console.WriteLine(MemoryHelper.TrimAllAntigravityMemoryJson(extraPids));
                 return 0;
             }
 

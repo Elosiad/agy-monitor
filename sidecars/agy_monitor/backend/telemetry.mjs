@@ -170,13 +170,23 @@ export function classifyUpstreamModelStatus(expectedDefaultModel, upstreamModelI
 function openReadOnlyCacheDb(cacheDbPath) {
   if (!cacheDbPath || !fs.existsSync(cacheDbPath)) return null;
   try {
-    return new DatabaseSync(cacheDbPath, { readOnly: true, timeout: 1500 });
+    const db = new DatabaseSync(cacheDbPath, { readOnly: true, timeout: 1500 });
+    try {
+      db.exec('PRAGMA cache_size = -1000; PRAGMA temp_store = FILE;');
+    } catch {
+      // Ignore pragma restriction on read-only DB
+    }
+    return db;
   } catch {
     return null;
   }
 }
 
 const rulesTokenCache = new Map();
+
+export function clearTelemetryTransientCaches() {
+  rulesTokenCache.clear();
+}
 
 async function readRulesAddonTokens(paths) {
   const candidates = [paths?.rulesFile, paths?.agentsMdPath].filter(Boolean);

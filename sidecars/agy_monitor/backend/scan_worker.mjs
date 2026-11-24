@@ -457,6 +457,11 @@ export function readConvDbStepTelemetry(convDbPath, stepIndices) {
   let convDb = null;
   try {
     convDb = new DatabaseSync(convDbPath, { readOnly: true, timeout: 1000 });
+    try {
+      convDb.exec('PRAGMA cache_size = -1000; PRAGMA temp_store = FILE;');
+    } catch {
+      // Ignore pragma restriction on read-only DB
+    }
     const stepLinks = new Map();
     const wantedGenIds = new Set();
     const CHUNK = 200;
@@ -612,6 +617,8 @@ export function ensureCacheSchema(db) {
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 3000;
+    PRAGMA cache_size = -2000;
+    PRAGMA temp_store = FILE;
 
     CREATE TABLE IF NOT EXISTS session_watermarks (
       conv_id TEXT PRIMARY KEY,
@@ -1566,6 +1573,13 @@ async function runWorkerMain() {
           fullSweep: Boolean(forceNotify) || scanTick === 1,
         });
         const res = await scanDbWithConnection(db, transcripts, { flushPartial: false, conversationsDir });
+        if (scanTick % 30 === 0) {
+          try {
+            db.exec('PRAGMA shrink_memory;');
+          } catch {
+            // Non-fatal SQLite shrink error
+          }
+        }
         if ((res.etagChanged || forceNotify) && process.connected && typeof process.send === 'function') {
           try {
             process.send({
@@ -1617,6 +1631,19 @@ async function runWorkerMain() {
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'rescan') {
       void triggerScan(Boolean(msg.forceNotify));
+    } else if (msg.type === 'shrink') {
+      try {
+        db.exec('PRAGMA shrink_memory;');
+      } catch {
+        // Ignore shrink error
+      }
+      if (typeof global.gc === 'function') {
+        try {
+          global.gc();
+        } catch {
+          // Ignore GC error
+        }
+      }
     } else if (msg.type === 'shutdown') {
       void shutdown();
     }

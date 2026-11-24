@@ -731,7 +731,7 @@ export function createMcpTools({ corePaths }) {
             bubble_template: {
               type: 'string',
               description:
-                'Custom popup bubble template supporting placeholders: {in}, {out}, {tps}, {pct}, {model}, {cache}, {unread}, {quota}. Example: "{model} · {quota}" or "入 {in} · 出 {out}".',
+                'Custom popup bubble template supporting placeholders: {in}, {out}, {tps}, {pct}, {model}, {cache}, {unread}, {quota5h}, {quota7d}, and session progress list syntax [{schedule:<id>},{content:<id>}](active,unread). Example: "5h {quota5h}% · 周 {quota7d}%" or "[{schedule},{content}](active,unread)".',
             },
             auto_wander: { type: 'boolean' },
             selectable: {

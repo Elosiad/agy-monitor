@@ -47,6 +47,18 @@
               <span class="active-conv-name" id="activeConvName" data-i18n="status.syncing">同步中…</span>
             </span>
             <button
+              class="subnav-memory-btn"
+              id="memoryStatusBtn"
+              type="button"
+              title="查看 AGY 内存占用与一键释放"
+              aria-label="查看 AGY 内存占用与一键释放"
+              data-i18n-title="nav.memoryTitle"
+              data-i18n-aria="nav.memoryTitle"
+            >
+              <span class="subnav-memory-dot" aria-hidden="true"></span>
+              <span class="subnav-memory-label" id="memoryStatusLabel" data-i18n="nav.memoryLoading">RAM --</span>
+            </button>
+            <button
               class="subnav-update-btn"
               id="updateStatusBtn"
               type="button"
@@ -1483,7 +1495,7 @@
         <div class="modal-header changelog-modal-header">
           <div class="changelog-modal-title-wrap">
             <h3 class="modal-title" id="changelogModalTitle" data-i18n="changelog.title">更新公告</h3>
-            <span class="changelog-current-ver" id="changelogCurrentVer">v1.1.2</span>
+            <span class="changelog-current-ver" id="changelogCurrentVer">v1.1.3</span>
           </div>
           <button class="modal-close-btn" type="button" data-changelog-close aria-label="关闭" data-i18n-aria="common.close">
             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -1493,8 +1505,105 @@
         </div>
         <div class="modal-body changelog-modal-body" id="changelogList"></div>
         <div class="modal-footer changelog-modal-footer">
-          <span class="changelog-footer-meta" id="changelogFooterMeta">共 17 个版本</span>
+          <span class="changelog-footer-meta" id="changelogFooterMeta">共 18 个版本</span>
           <button class="modal-confirm-btn" type="button" data-changelog-close data-i18n="common.gotIt">我知道了</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- AGY 全量内存监控与安全瘦身弹窗 -->
+    <div class="modal-overlay" id="memoryModal" hidden role="dialog" aria-modal="true" aria-labelledby="memoryModalTitle">
+      <div class="modal-backdrop" data-memory-close></div>
+      <div class="modal-dialog memory-modal-dialog">
+        <div class="modal-header memory-modal-header">
+          <div class="memory-modal-title-wrap">
+            <h3 class="modal-title" id="memoryModalTitle" data-i18n="memory.title">AGY 内存管理</h3>
+            <span class="memory-health-badge is-healthy" id="memoryHealthBadge" data-i18n="memory.levelHealthy">运行轻快</span>
+          </div>
+          <div class="memory-header-actions">
+            <button
+              class="modal-close-btn memory-refresh-btn"
+              id="memoryRefreshBtn"
+              type="button"
+              title="立即重新扫描内存"
+              aria-label="立即重新扫描内存"
+              data-i18n-title="memory.refreshTitle"
+              data-i18n-aria="memory.refreshTitle"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M13.3 8a5.3 5.3 0 1 1-1.45-3.65M13.3 2.8v2.7h-2.7" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button class="modal-close-btn" type="button" data-memory-close aria-label="关闭" data-i18n-aria="common.close">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="modal-body memory-modal-body">
+          <div class="mem-kpi-grid">
+            <div class="mem-kpi-card">
+              <span class="mem-kpi-label" data-i18n="memory.kpiPrivateWs">AGY 专用物理内存</span>
+              <span class="mem-kpi-val is-primary" id="memKpiPrivateWs">--</span>
+            </div>
+            <div class="mem-kpi-card">
+              <span class="mem-kpi-label" data-i18n="memory.kpiCommit">总提交内存</span>
+              <span class="mem-kpi-val" id="memKpiCommit">--</span>
+            </div>
+            <div class="mem-kpi-card">
+              <span class="mem-kpi-label" data-i18n="memory.kpiSystem">系统可用内存</span>
+              <span class="mem-kpi-val" id="memKpiSystem">--</span>
+            </div>
+            <div class="mem-kpi-card">
+              <span class="mem-kpi-label" data-i18n="memory.kpiFreed">最近已释放</span>
+              <span class="mem-kpi-val is-teal" id="memKpiFreed">--</span>
+            </div>
+          </div>
+
+          <div class="mem-actions-bar">
+            <button class="mem-primary-btn" id="memOptimizeBtn" type="button" data-i18n="memory.optimizeBtn">⚡ 一键释放全量内存</button>
+            <button class="mem-secondary-btn" id="memRestartCompanionsBtn" type="button" data-i18n="memory.restartCompanionsBtn">♻️ 重启伴侣进程</button>
+          </div>
+
+          <div class="mem-diagnostics-list" id="memDiagnosticsList" hidden></div>
+
+          <section class="mem-section-card" aria-label="分类内存占用">
+            <div class="mem-section-title" data-i18n="memory.breakdownTitle">进程分类占用明细</div>
+            <div class="mem-groups-list" id="memGroupsList"></div>
+          </section>
+
+          <details class="mem-procs-details">
+            <summary class="mem-procs-summary" data-i18n="memory.topProcsTitle">查看高占用进程明细 (Top 8)</summary>
+            <div class="mem-top-procs-list" id="memTopProcsList"></div>
+          </details>
+
+          <section class="mem-section-card mem-settings-card" aria-label="内存优化策略">
+            <div class="mem-section-title" data-i18n="memory.settingsTitle">自动防膨胀与根因防护</div>
+            <label class="mem-toggle-row">
+              <span class="mem-toggle-copy">
+                <span class="mem-toggle-name" data-i18n="memory.zeroUiaLabel">极致零 UIA 省内存模式</span>
+                <span class="mem-toggle-desc" data-i18n="memory.zeroUiaDesc">彻底停用壁纸伴侣 UIA（会暂停方案一桌面悬浮圆环；搭配方案二 CDP 可兼得零 UIA 与像素级原生圆环）</span>
+              </span>
+              <input class="mem-toggle-input" id="memZeroUiaToggle" type="checkbox" />
+            </label>
+            <div class="mem-toggle-divider"></div>
+            <label class="mem-toggle-row">
+              <span class="mem-toggle-copy">
+                <span class="mem-toggle-name" data-i18n="memory.autoTrimLabel">超阈值自动安全瘦身</span>
+                <span class="mem-toggle-desc" data-i18n="memory.autoTrimDesc">当 AGY 物理内存超过阈值时后台静默压缩空闲工作集与 SQLite 缓存（冷却 10 分钟）</span>
+              </span>
+              <input class="mem-toggle-input" id="memAutoTrimToggle" type="checkbox" checked />
+            </label>
+            <div class="mem-threshold-bar">
+              <span class="mem-threshold-label" data-i18n="memory.thresholdLabel">自动瘦身触发阈值</span>
+              <div class="mem-threshold-chips" id="memThresholdRow"></div>
+            </div>
+          </section>
+        </div>
+        <div class="modal-footer memory-modal-footer">
+          <span class="memory-footer-meta" id="memoryFooterMeta" data-i18n="memory.footerSafeNote">仅安全压缩空闲工作集与缓存，不关闭窗口、不中断运行中会话。</span>
+          <button class="modal-confirm-btn" type="button" data-memory-close data-i18n="common.close">关闭</button>
         </div>
       </div>
     </div>

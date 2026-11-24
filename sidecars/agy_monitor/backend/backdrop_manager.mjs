@@ -191,7 +191,7 @@ function buildLauncherCmdContent(vbsPath) {
   ].join('\r\n');
 }
 
-async function resolveBackdropRuntimePaths(paths, hostInfo = detectWindowsHostEnv()) {
+export async function resolveBackdropRuntimePaths(paths, hostInfo = detectWindowsHostEnv()) {
   if (hostInfo.isNativeWindows) {
     return {
       binDirPosix: paths?.backdropBinDir || '',
@@ -297,6 +297,8 @@ export async function ensureBackdropAssets(paths) {
       try {
         await execFileAsync(hostInfo.cscPath, [
           '/nologo',
+          '/codepage:65001',
+          '/utf8output',
           '/target:winexe',
           '/optimize+',
           `/out:${tmpExeWin}`,
@@ -431,6 +433,7 @@ export async function getBackdropStatus(paths, themes = {}) {
     appliedAlpha: running ? Number(raw?.appliedAlpha || 255) : 255,
     backdropEnabled: Boolean(themes?.backdropEnabled),
     hudEnabled: themes?.hudEnabled !== false,
+    zeroUiaMode: Boolean(themes?.zeroUiaMode),
     hostThemeMode: themes?.hostThemeMode === 'cdp' ? 'cdp' : 'backdrop',
     cdpPort: Number(themes?.cdpPort || 9229),
     hudVisible: running && Boolean(raw?.hudVisible),
