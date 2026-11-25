@@ -13,6 +13,14 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.1.5",
+    date: "2026-11-25",
+    title: "修复 Electron 运行时持久注入 app.asar 报 ENOENT 的热修复",
+    items: [
+      "修复 Windows 桌面端在宿主 Electron 运行时下启用持久化状态栏或方案三持久壁纸时，因 node:fs 将 app.asar 拦截为虚拟目录导致的「ENOENT, not found in ...\\resources\\app.asar」报错：自动改用 Electron 内置 original-fs 绕过拦截，一键注入与自动补注恢复正常。",
+    ],
+  },
+  {
     version: "1.1.4",
     date: "2026-11-25",
     title: "方案三持久纯 CSS 壁纸与全界面毛玻璃化、原生底栏双圆环额度帘幕动画 & Cockpit 同款保守切号",

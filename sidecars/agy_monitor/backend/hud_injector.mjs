@@ -1,10 +1,32 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
+import nodeFs from 'node:fs';
+import nodeFsp from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { atomicWriteJson, atomicWriteText } from './paths.mjs';
 import { detectWindowsHostEnv, resolveWindowsHostDirs } from './wsl_bridge.mjs';
+
+const _require = createRequire(import.meta.url);
+
+// Inside Electron's ELECTRON_RUN_AS_NODE sidecar runtime, standard `node:fs` intercepts
+// `.asar` paths as virtual directories and throws `ENOENT, not found in .../app.asar`.
+// Use Electron's built-in `original-fs` so real disk `.asar` reads/writes/renames bypass ASAR hooks cleanly.
+function loadRawFs() {
+  if (process.versions && process.versions.electron) {
+    try {
+      const ofs = _require('original-fs');
+      if (ofs && typeof ofs.readFileSync === 'function' && ofs.promises) {
+        return { fs: ofs, fsp: ofs.promises };
+      }
+    } catch {
+      // Fallback to standard node:fs
+    }
+  }
+  return { fs: nodeFs, fsp: nodeFsp };
+}
+
+const { fs, fsp } = loadRawFs();
 
 export const NATIVE_HUD_VERSION = '2.2.6';
 export const NATIVE_HUD_HEARTBEAT_TTL_MS = 14_000;

@@ -51,6 +51,13 @@
 
 ## 版本更新日志（Changelog）
 
+### `v1.1.5`（2026-11-25）— 修复 Electron 宿主环境下持久注入 `app.asar` 报 `ENOENT` 异常
+
+- **修复持久化注入 / 方案三壁纸在 Windows 桌面端报 `ENOENT, not found in ...\resources\app.asar`**：
+  - [hud_injector.mjs](sidecars/agy_monitor/backend/hud_injector.mjs) 在 Electron 运行时（`ELECTRON_RUN_AS_NODE=1`）下自动改用内置 `original-fs` 读写与原子替换磁盘 `app.asar`，彻底绕过 Electron ASAR 虚拟文件系统拦截，修复另一台设备更新后状态栏停在「待自动补注」且无法写入的问题。
+
+---
+
 ### `v1.1.4`（2026-11-25）— 持久纯 CSS 整机壁纸与毛玻璃化（方案三默认）、原生 Shadow DOM 底栏与双圆环额度帘幕动画 & Cockpit 同款保守切号
 
 - **方案三：持久纯 CSS 整机壁纸注入（默认选项，免快捷方式且文字 100% 锐利）**：
