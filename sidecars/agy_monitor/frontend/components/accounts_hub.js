@@ -134,6 +134,125 @@ function createSvgIcon(pathD, extra = "") {
   return svg;
 }
 
+function resolveAccountStatus(acc, nowMs = Date.now()) {
+  if (acc?.accountStatus && typeof acc.accountStatus === "object" && acc.accountStatus.code) {
+    return acc.accountStatus;
+  }
+  const rawCode = String(acc?.authErrorCode || "").trim().toUpperCase();
+  const msg = String(acc?.authError || "").trim();
+  const validationUrl = typeof acc?.authValidationUrl === "string" ? acc.authValidationUrl.trim() : "";
+  if (rawCode || msg) {
+    let code = rawCode === "INVALID_GRANT" ? "RT_EXPIRED" : rawCode;
+    if (!code) {
+      if (/validation_required|verify\s+(?:your\s+)?account|要求验证/i.test(msg)) {
+        code = "VALIDATION_REQUIRED";
+      } else if (/account_disabled|account_suspended|account_banned|tos_violation|封禁|停用/i.test(msg)) {
+        code = "ACCOUNT_BANNED";
+      } else if (validationUrl) {
+        code = "VALIDATION_REQUIRED";
+      } else if (/invalid_grant|refresh\s*token|rt\s*已过期/i.test(msg)) {
+        code = "RT_EXPIRED";
+      } else if (/missing_refresh_token|缺少\s*(?:refresh_token|rt)/i.test(msg)) {
+        code = "MISSING_REFRESH_TOKEN";
+      } else if (/access\s*token|at\s*已过期|unauthenticated/i.test(msg)) {
+        code = "AT_EXPIRED";
+      } else if (/subscription_required|订阅权限/i.test(msg)) {
+        code = "SUBSCRIPTION_REQUIRED";
+      } else if (/代理|网络|超时|timeout|econnrefused/i.test(msg)) {
+        code = "NETWORK_ERROR";
+      } else {
+        code = "API_ERROR";
+      }
+    }
+    const isErr =
+      code === "ACCOUNT_BANNED" ||
+      code === "RT_EXPIRED" ||
+      code === "MISSING_REFRESH_TOKEN" ||
+      code === "CLIENT_MISMATCH";
+    const badgeMap = {
+      VALIDATION_REQUIRED: "需验证",
+      ACCOUNT_BANNED: "已封禁",
+      RT_EXPIRED: "RT 过期",
+      MISSING_REFRESH_TOKEN: "缺少 RT",
+      AT_EXPIRED: "AT 过期",
+      SUBSCRIPTION_REQUIRED: "无订阅",
+      CLIENT_MISMATCH: "客户端异常",
+      NETWORK_ERROR: "网络异常",
+      API_ERROR: "接口异常",
+    };
+    return {
+      state: isErr ? "error" : "warning",
+      code,
+      badge: badgeMap[code] || "账号异常",
+      blocking:
+        code === "ACCOUNT_BANNED" ||
+        code === "VALIDATION_REQUIRED" ||
+        code === "RT_EXPIRED" ||
+        code === "MISSING_REFRESH_TOKEN" ||
+        code === "SUBSCRIPTION_REQUIRED",
+      message: msg || "账号状态异常，请点击刷新查看详情",
+      validationUrl,
+      detectedAtMs: Number(acc?.authErrorAtMs) || 0,
+    };
+  }
+  const expMs = Number(acc?.tokenExpiryMs) || 0;
+  if (!acc?.isCurrent && expMs > 0 && expMs <= nowMs) {
+    const missingRt = acc?.hasRefreshToken === false;
+    return {
+      state: missingRt ? "error" : "warning",
+      code: "AT_EXPIRED",
+      badge: missingRt ? "AT 过期 · 无 RT" : "AT 过期",
+      blocking: missingRt,
+      message: missingRt
+        ? "Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入"
+        : "Access Token (AT) 已过期，点击「刷新额度」可自动续签",
+      detectedAtMs: expMs,
+    };
+  }
+  if (!acc?.isCurrent && acc?.hasRefreshToken === false) {
+    return {
+      state: "error",
+      code: "MISSING_REFRESH_TOKEN",
+      badge: "缺少 RT",
+      blocking: true,
+      message: "缺少 Refresh Token (RT)，AT 过期后将无法自动续签，建议重新授权",
+      detectedAtMs: Number(acc?.updatedAtMs) || 0,
+    };
+  }
+  return { state: "healthy", code: "OK", badge: "正常", blocking: false, message: "", detectedAtMs: 0 };
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall back to execCommand when async gesture activation expires inside iframe/Electron
+    }
+  }
+  if (typeof document === "undefined" || !document.body) return false;
+  const ta = document.createElement("textarea");
+  ta.value = value;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-9999px";
+  ta.style.left = "-9999px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  try {
+    ta.focus();
+    ta.select();
+    return Boolean(document.execCommand?.("copy"));
+  } catch {
+    return false;
+  } finally {
+    ta.remove();
+  }
+}
+
 export function createAccountsHub({
   apiFetch,
   onToast,
@@ -151,6 +270,15 @@ export function createAccountsHub({
   const statusBannerEl = document.getElementById("accStatusBanner");
   const statusTextEl = document.getElementById("accStatusText");
   const statusCancelBtn = document.getElementById("accStatusCancelBtn");
+  const filterBarEl = document.getElementById("accFilterBar");
+  const filterGroupEl = document.getElementById("accFilterGroup");
+  const filterCountAllEl = document.getElementById("accFilterCountAll");
+  const filterCountHealthyEl = document.getElementById("accFilterCountHealthy");
+  const filterCountAbnormalEl = document.getElementById("accFilterCountAbnormal");
+  const batchRefreshBtn = document.getElementById("accBatchRefreshBtn");
+  const batchRefreshLabelEl = document.getElementById("accBatchRefreshLabel");
+  const disableAbnormalBtn = document.getElementById("accDisableAbnormalBtn");
+  const disableAbnormalLabelEl = document.getElementById("accDisableAbnormalLabel");
 
   // Top action buttons
   const oauthBtn = document.getElementById("accOauthBtn");
@@ -229,8 +357,15 @@ export function createAccountsHub({
   let activeRemarkAccount = null;
   let activeDeleteAccount = null;
   let activeExportPayload = { filename: "agy-account.json", jsonText: "" };
+  let activeFilter = "all";
+  let batchRefreshing = false;
+  let batchProgressText = "";
   const refreshingIds = new Set();
   const togglingIds = new Set();
+  const openingValidationIds = new Set();
+  const openedValidationIds = new Set();
+  const copiedValidationIds = new Set();
+  const pulsingCardIds = new Set();
   const cleanups = [];
 
   const state = {
@@ -492,13 +627,47 @@ export function createAccountsHub({
       nowMs,
     );
 
-    sortedAccounts.forEach((acc) => {
+    const visibleAccounts = sortedAccounts.filter((acc) => {
+      if (activeFilter === "all") return true;
+      const st = resolveAccountStatus(acc, nowMs);
+      const isAbnormal = st.state !== "healthy";
+      return activeFilter === "abnormal" ? isAbnormal : !isAbnormal;
+    });
+
+    if (visibleAccounts.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "acc-empty-card";
+      const title = document.createElement("div");
+      title.className = "acc-empty-title";
+      title.textContent = activeFilter === "abnormal" ? "当前没有异常账号" : "当前筛选条件下无账号";
+      const desc = document.createElement("div");
+      desc.className = "acc-empty-desc";
+      desc.textContent =
+        activeFilter === "abnormal"
+          ? "所有已检测账号状态良好，如需重新核验可点击上方「一键检测全部」。"
+          : "点击「全部」查看所有已保存账号。";
+      empty.appendChild(title);
+      empty.appendChild(desc);
+      listEl.appendChild(empty);
+      return;
+    }
+
+    visibleAccounts.forEach((acc) => {
+      const accStatus = resolveAccountStatus(acc, nowMs);
+      const isAbnormal = accStatus.state !== "healthy";
+
       const card = document.createElement("article");
       card.className = "acc-item-card";
       card.setAttribute("role", "listitem");
       card.setAttribute("data-account-id", acc.id);
+      if (accStatus.code && accStatus.code !== "OK") {
+        card.setAttribute("data-account-status", accStatus.code);
+      }
       if (acc.isCurrent) card.classList.add("is-current");
       if (!acc.enabled) card.classList.add("is-disabled");
+      if (accStatus.state === "error") card.classList.add("is-abnormal-error");
+      else if (accStatus.state === "warning") card.classList.add("is-abnormal-warn");
+      if (pulsingCardIds.has(acc.id)) card.classList.add("is-trigger-pulse");
 
       // Row 1: Identity (Email + Status badges + Remark)
       const topRow = document.createElement("div");
@@ -508,7 +677,17 @@ export function createAccountsHub({
       idLeft.className = "acc-item-identity";
 
       const statusDot = document.createElement("span");
-      statusDot.className = `acc-item-dot ${acc.isCurrent ? "is-current" : acc.enabled ? "is-enabled" : "is-disabled"}`;
+      const dotClass =
+        accStatus.state === "error"
+          ? "is-error"
+          : accStatus.state === "warning"
+            ? "is-warn"
+            : acc.isCurrent
+              ? "is-current"
+              : acc.enabled
+                ? "is-enabled"
+                : "is-disabled";
+      statusDot.className = `acc-item-dot ${dotClass}`;
       statusDot.setAttribute("aria-hidden", "true");
 
       const emailEl = document.createElement("span");
@@ -524,6 +703,13 @@ export function createAccountsHub({
         curBadge.className = "acc-badge is-current";
         curBadge.textContent = "当前使用";
         idLeft.appendChild(curBadge);
+      }
+      if (isAbnormal) {
+        const errBadge = document.createElement("span");
+        errBadge.className = `acc-badge ${accStatus.state === "error" ? "is-error" : "is-warn"}`;
+        errBadge.textContent = accStatus.badge || "异常";
+        errBadge.title = accStatus.message || accStatus.badge;
+        idLeft.appendChild(errBadge);
       }
       if (!acc.enabled) {
         const disBadge = document.createElement("span");
@@ -552,7 +738,7 @@ export function createAccountsHub({
       topRow.appendChild(idRight);
       card.appendChild(topRow);
 
-      // Row 2: Three quota categories (Gemini / GPT&Claude / Argon)
+      // Row 2: Two quota categories (Gemini / GPT&Claude)
       const quotaRow = document.createElement("div");
       quotaRow.className = "acc-quota-grid";
       const groupsByKey = new Map();
@@ -566,16 +752,132 @@ export function createAccountsHub({
       });
       card.appendChild(quotaRow);
 
+      // Row 2.5: Abnormal error detail banner with contextual recovery action
+      if (isAbnormal && accStatus.message) {
+        const alertBar = document.createElement("div");
+        alertBar.className = `acc-item-alert ${accStatus.state === "error" ? "is-error" : "is-warn"}`;
+        alertBar.setAttribute("role", "alert");
+        if (accStatus.detectedAtMs) {
+          alertBar.title = `检测时间：${formatClock(accStatus.detectedAtMs)}`;
+        }
+
+        const alertMain = document.createElement("div");
+        alertMain.className = "acc-item-alert-main";
+        const iconPath =
+          accStatus.state === "error"
+            ? "M8 2.2a5.8 5.8 0 1 0 0 11.6A5.8 5.8 0 0 0 8 2.2ZM8 5v3.5M8 10.9h.01"
+            : "M8 2.4 13.8 12.8H2.2L8 2.4ZM8 6.3v3M8 11.1h.01";
+        alertMain.appendChild(createSvgIcon(iconPath, "acc-item-alert-icon"));
+
+        const alertText = document.createElement("span");
+        alertText.className = "acc-item-alert-text";
+        alertText.textContent = accStatus.message;
+        alertMain.appendChild(alertText);
+        alertBar.appendChild(alertMain);
+
+        if (accStatus.code === "VALIDATION_REQUIRED" && accStatus.validationUrl) {
+          const actionGroup = document.createElement("div");
+          actionGroup.className = "acc-item-alert-actions";
+
+          const isOpening = openingValidationIds.has(acc.id);
+          const isOpened = openedValidationIds.has(acc.id);
+          const verifyBtn = document.createElement("button");
+          verifyBtn.type = "button";
+          verifyBtn.className = `acc-item-alert-btn${isOpening ? " is-launching" : isOpened ? " is-done" : ""}`;
+          verifyBtn.disabled = isOpening;
+          if (isOpening) {
+            verifyBtn.appendChild(createSvgIcon("M13.3 8a5.3 5.3 0 1 1-1.45-3.65", "acc-alert-spin-icon"));
+            const lbl = document.createElement("span");
+            lbl.textContent = "打开中…";
+            verifyBtn.appendChild(lbl);
+          } else if (isOpened) {
+            verifyBtn.appendChild(createSvgIcon("M3.2 8.4 6.6 11.6 12.8 4.6", "acc-alert-check-icon"));
+            const lbl = document.createElement("span");
+            lbl.textContent = "已打开";
+            verifyBtn.appendChild(lbl);
+          } else {
+            const lbl = document.createElement("span");
+            lbl.textContent = "去验证";
+            verifyBtn.appendChild(lbl);
+            verifyBtn.appendChild(createSvgIcon("M5 11 11 5M6.2 5H11v4.8", "acc-alert-arrow-icon"));
+          }
+          verifyBtn.title = "刷新验证链接并跳转至对应邮箱的 Google 登录与验证页";
+          verifyBtn.addEventListener("click", () => void handleOpenValidationUrl(acc, accStatus.validationUrl));
+          actionGroup.appendChild(verifyBtn);
+
+          const isCopied = copiedValidationIds.has(acc.id);
+          const copyBtn = document.createElement("button");
+          copyBtn.type = "button";
+          copyBtn.className = `acc-item-alert-btn is-icon-only${isCopied ? " is-done" : ""}`;
+          copyBtn.disabled = isOpening;
+          copyBtn.appendChild(
+            createSvgIcon(
+              isCopied
+                ? "M3.2 8.4 6.6 11.6 12.8 4.6"
+                : "M5.5 5.5h6.8a1 1 0 0 1 1 1v6.8a1 1 0 0 1-1 1H5.5a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1ZM3.7 10.5H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h6.5a1 1 0 0 1 1 1v.7",
+              isCopied ? "acc-alert-check-icon" : "",
+            ),
+          );
+          copyBtn.title = "复制验证链接（方便粘贴到无痕窗口或对应账号的浏览器配置中验证）";
+          copyBtn.setAttribute("aria-label", "复制验证链接");
+          copyBtn.addEventListener("click", () => void handleCopyValidationUrl(acc, accStatus.validationUrl));
+          actionGroup.appendChild(copyBtn);
+
+          alertBar.appendChild(actionGroup);
+        } else if (
+          accStatus.code === "RT_EXPIRED" ||
+          accStatus.code === "MISSING_REFRESH_TOKEN" ||
+          (accStatus.code === "AT_EXPIRED" && accStatus.blocking)
+        ) {
+          const reauthBtn = document.createElement("button");
+          reauthBtn.type = "button";
+          reauthBtn.className = "acc-item-alert-btn";
+          reauthBtn.textContent = "重新授权";
+          reauthBtn.title = "打开 OAuth 授权窗口重新获取有效凭证";
+          reauthBtn.addEventListener("click", () => {
+            triggerCardPulse(acc.id);
+            openOauthModal();
+          });
+          alertBar.appendChild(reauthBtn);
+        } else if (accStatus.code === "AT_EXPIRED" && !accStatus.blocking) {
+          const isRenewing = refreshingIds.has(acc.id);
+          const renewBtn = document.createElement("button");
+          renewBtn.type = "button";
+          renewBtn.className = `acc-item-alert-btn${isRenewing ? " is-launching" : ""}`;
+          renewBtn.disabled = isRenewing;
+          if (isRenewing) {
+            renewBtn.appendChild(createSvgIcon("M13.3 8a5.3 5.3 0 1 1-1.45-3.65", "acc-alert-spin-icon"));
+          }
+          const lbl = document.createElement("span");
+          lbl.textContent = isRenewing ? "续签中…" : "立即续签";
+          renewBtn.appendChild(lbl);
+          renewBtn.title = "使用保存的 RT 立即续签 AT 并同步最新额度";
+          renewBtn.addEventListener("click", () => {
+            triggerCardPulse(acc.id);
+            void handleRefreshQuota(acc);
+          });
+          alertBar.appendChild(renewBtn);
+        }
+
+        card.appendChild(alertBar);
+      }
+
       // Row 3: Action buttons (Switch, Refresh Quota, Enable/Disable, Remark, Export JSON, Delete)
       const actionsRow = document.createElement("div");
       actionsRow.className = "acc-item-actions";
 
       // 1. Switch button (immediate direct switch without confirmation modal)
       const isSwitchingThis = switchingAccountId === acc.id;
+      const isSwitchBlocked =
+        accStatus.code === "ACCOUNT_BANNED" ||
+        accStatus.code === "RT_EXPIRED" ||
+        accStatus.code === "MISSING_REFRESH_TOKEN" ||
+        (accStatus.code === "AT_EXPIRED" && accStatus.blocking);
       const switchBtn = document.createElement("button");
       switchBtn.type = "button";
       switchBtn.className = `acc-act-btn is-switch${acc.isCurrent ? " is-active-now" : ""}${isSwitchingThis ? " is-spinning" : ""}`;
-      switchBtn.disabled = acc.isCurrent || !acc.enabled || !state.supported || Boolean(switchingAccountId);
+      switchBtn.disabled =
+        acc.isCurrent || !acc.enabled || isSwitchBlocked || !state.supported || Boolean(switchingAccountId);
       switchBtn.appendChild(createSvgIcon("M3 6h9.5M9.5 3.2L12.5 6l-3 2.8M13 10H3.5M6.5 7.2L3.5 10l3 2.8"));
       const switchLabel = document.createElement("span");
       switchLabel.textContent = acc.isCurrent ? "使用中" : isSwitchingThis ? "切换中…" : "切换账号";
@@ -584,7 +886,11 @@ export function createAccountsHub({
         ? "当前正使用该账号"
         : !acc.enabled
           ? "已禁用账号不可切换，请先启用"
-          : "点击直接切换至该账号并自动重启（仅续跑真正运行中的活动会话）";
+          : isSwitchBlocked
+            ? accStatus.code === "ACCOUNT_BANNED"
+              ? "该账号已被 Google 封禁或停用，不可切换"
+              : "该账号凭据已过期或缺少 RT，请先重新授权后再切换"
+            : "点击直接切换至该账号并自动重启（仅续跑真正运行中的活动会话）";
       switchBtn.addEventListener("click", () => void handleSwitchAccountDirect(acc));
       actionsRow.appendChild(switchBtn);
 
@@ -694,17 +1000,19 @@ export function createAccountsHub({
 
     const nowMs = Date.now();
     const enabledAccounts = allAccounts.filter((acc) => acc && acc.enabled !== false);
-    const pool = enabledAccounts;
+    const abnormalCount = allAccounts.filter((acc) => resolveAccountStatus(acc, nowMs).state !== "healthy").length;
+    const pool = enabledAccounts.filter((acc) => !resolveAccountStatus(acc, nowMs).blocking);
     summaryCardEl.hidden = false;
 
     if (summaryMetaEl) {
-      summaryMetaEl.textContent =
+      const baseText =
         enabledAccounts.length === allAccounts.length
           ? `共 ${allAccounts.length} 个账号`
           : `已启用 ${enabledAccounts.length} / ${allAccounts.length} 个账号`;
+      summaryMetaEl.textContent = abnormalCount > 0 ? `${baseText} · 异常 ${abnormalCount} 个` : baseText;
     }
     if (summaryHintEl) {
-      summaryHintEl.textContent = `总容量 ${pool.length * 100}%`;
+      summaryHintEl.textContent = `可用总容量 ${pool.length * 100}%`;
     }
 
     const aggregateBucket = (groupKey, field) => {
@@ -838,11 +1146,66 @@ export function createAccountsHub({
     });
   }
 
+  function renderFilterBar() {
+    if (!filterBarEl) return;
+    const allAccounts = Array.isArray(state.accounts) ? state.accounts : [];
+    if (allAccounts.length === 0) {
+      filterBarEl.hidden = true;
+      return;
+    }
+    filterBarEl.hidden = false;
+    const nowMs = Date.now();
+    let healthyCount = 0;
+    let abnormalCount = 0;
+    let enabledBlockingCount = 0;
+    for (const acc of allAccounts) {
+      const st = resolveAccountStatus(acc, nowMs);
+      if (st.state === "healthy") {
+        healthyCount += 1;
+      } else {
+        abnormalCount += 1;
+        if (acc.enabled !== false && !acc.isCurrent && st.blocking) {
+          enabledBlockingCount += 1;
+        }
+      }
+    }
+    if (filterCountAllEl) filterCountAllEl.textContent = String(allAccounts.length);
+    if (filterCountHealthyEl) filterCountHealthyEl.textContent = String(healthyCount);
+    if (filterCountAbnormalEl) filterCountAbnormalEl.textContent = String(abnormalCount);
+
+    if (filterGroupEl) {
+      filterGroupEl.querySelectorAll("[data-acc-filter]").forEach((btn) => {
+        const key = btn.getAttribute("data-acc-filter") || "all";
+        const active = key === activeFilter;
+        btn.classList.toggle("is-active", active);
+        btn.setAttribute("aria-selected", String(active));
+        if (key === "abnormal") {
+          btn.classList.toggle("has-abnormal", abnormalCount > 0);
+        }
+      });
+    }
+    if (batchRefreshBtn) {
+      batchRefreshBtn.disabled = batchRefreshing;
+      batchRefreshBtn.classList.toggle("is-spinning", batchRefreshing);
+    }
+    if (batchRefreshLabelEl) {
+      batchRefreshLabelEl.textContent = batchRefreshing ? batchProgressText || "检测中…" : "一键检测全部";
+    }
+    if (disableAbnormalBtn) {
+      disableAbnormalBtn.hidden = enabledBlockingCount === 0;
+      disableAbnormalBtn.disabled = batchRefreshing;
+    }
+    if (disableAbnormalLabelEl) {
+      disableAbnormalLabelEl.textContent = `禁用异常 (${enabledBlockingCount})`;
+    }
+  }
+
   function renderAll() {
     renderHeaderMeta();
     renderSortControls();
     renderQuotaSummaryCard();
     renderStatusBanner();
+    renderFilterBar();
     renderAccountList();
   }
 
@@ -1147,6 +1510,7 @@ export function createAccountsHub({
     } finally {
       togglingIds.delete(acc.id);
       renderQuotaSummaryCard();
+      renderFilterBar();
       renderAccountList();
     }
   }
@@ -1200,8 +1564,8 @@ export function createAccountsHub({
     }
   }
 
-  async function handleRefreshQuota(acc) {
-    if (refreshingIds.has(acc.id)) return;
+  async function handleRefreshQuota(acc, { silentToast = false } = {}) {
+    if (refreshingIds.has(acc.id)) return { ok: false, skipped: true };
     refreshingIds.add(acc.id);
     renderAccountList();
     try {
@@ -1213,13 +1577,225 @@ export function createAccountsHub({
       if (idx >= 0 && res.account) {
         state.accounts[idx] = res.account;
       }
-      onToast?.(res.message || "已刷新账号额度", res.mode === "live" ? "success" : "info");
+      if (!silentToast) {
+        onToast?.(res.message || "已刷新账号额度", res.mode === "live" ? "success" : "info");
+      }
+      return { ok: true, account: res.account || null };
     } catch (err) {
-      onToast?.(err?.message || "刷新额度失败", "error");
+      const idx = state.accounts.findIndex((a) => a.id === acc.id);
+      if (idx >= 0 && err?.data?.account) {
+        state.accounts[idx] = err.data.account;
+      }
+      if (!silentToast) {
+        onToast?.(err?.message || "刷新额度失败", "error");
+      }
+      return { ok: false, error: err?.message || "刷新额度失败", code: err?.data?.code || "" };
     } finally {
       refreshingIds.delete(acc.id);
       renderQuotaSummaryCard();
+      renderFilterBar();
       renderAccountList();
+    }
+  }
+
+  function triggerCardPulse(accountId) {
+    if (!accountId) return;
+    pulsingCardIds.add(accountId);
+    renderAccountList();
+    setTimeout(() => {
+      if (destroyed) return;
+      pulsingCardIds.delete(accountId);
+      const cardEl = listEl?.querySelector?.(`[data-account-id="${accountId}"]`);
+      if (cardEl) cardEl.classList.remove("is-trigger-pulse");
+    }, 560);
+  }
+
+  async function handleOpenValidationUrl(acc, fallbackUrl = "") {
+    if (!acc || !acc.id || openingValidationIds.has(acc.id)) return;
+    openingValidationIds.add(acc.id);
+    openedValidationIds.delete(acc.id);
+    pulsingCardIds.add(acc.id);
+    renderAccountList();
+    setTimeout(() => {
+      if (destroyed) return;
+      pulsingCardIds.delete(acc.id);
+      const cardEl = listEl?.querySelector?.(`[data-account-id="${acc.id}"]`);
+      if (cardEl) cardEl.classList.remove("is-trigger-pulse");
+    }, 560);
+
+    try {
+      const res = await requestJson("/api/accounts/open-validation-url", {
+        method: "POST",
+        body: JSON.stringify({
+          accountId: acc.id,
+          fallbackUrl: fallbackUrl || acc.accountStatus?.validationUrl || "",
+        }),
+      });
+      if (res?.alreadyVerified && res.account) {
+        const idx = state.accounts.findIndex((a) => a.id === acc.id);
+        if (idx >= 0) state.accounts[idx] = res.account;
+        onToast?.(res.message || `${acc.email} 已完成验证，额度已恢复正常`, "success");
+        return;
+      }
+      const targetUrl = res?.validationUrl || fallbackUrl || "";
+      if (res?.opened === false && targetUrl) {
+        try {
+          window.open(targetUrl, "_blank", "noopener,noreferrer");
+        } catch {}
+        const copied = await copyTextToClipboard(targetUrl);
+        onToast?.(
+          copied
+            ? `已复制 ${acc.email} 的验证链接并尝试打开浏览器`
+            : `已尝试打开 ${acc.email} 的 Google 验证页面`,
+          "info",
+        );
+      } else {
+        onToast?.(
+          `已打开 ${acc.email} 的验证页（如浏览器未登录该邮箱，请先登录对应邮箱后将自动进入验证）`,
+          "success",
+        );
+      }
+      openedValidationIds.add(acc.id);
+      setTimeout(() => {
+        if (destroyed) return;
+        openedValidationIds.delete(acc.id);
+        renderAccountList();
+      }, 1800);
+    } catch (err) {
+      const urlToTry = err?.data?.validationUrl || fallbackUrl || acc.accountStatus?.validationUrl || "";
+      if (urlToTry) {
+        try {
+          window.open(urlToTry, "_blank", "noopener,noreferrer");
+          const copied = await copyTextToClipboard(urlToTry);
+          openedValidationIds.add(acc.id);
+          setTimeout(() => {
+            if (destroyed) return;
+            openedValidationIds.delete(acc.id);
+            renderAccountList();
+          }, 1800);
+          onToast?.(
+            copied
+              ? `已尝试直接打开并复制 ${acc.email} 的验证链接`
+              : `已尝试直接打开 ${acc.email} 的验证链接`,
+            "info",
+          );
+          return;
+        } catch {}
+      }
+      onToast?.(err?.message || "打开验证页面失败", "error");
+    } finally {
+      openingValidationIds.delete(acc.id);
+      pulsingCardIds.delete(acc.id);
+      renderQuotaSummaryCard();
+      renderFilterBar();
+      renderAccountList();
+    }
+  }
+
+  async function handleCopyValidationUrl(acc, fallbackUrl = "") {
+    if (!acc || !acc.id) return;
+    triggerCardPulse(acc.id);
+    try {
+      const res = await requestJson("/api/accounts/open-validation-url", {
+        method: "POST",
+        body: JSON.stringify({
+          accountId: acc.id,
+          fallbackUrl: fallbackUrl || acc.accountStatus?.validationUrl || "",
+          copyOnly: true,
+        }),
+      });
+      if (res?.alreadyVerified && res.account) {
+        const idx = state.accounts.findIndex((a) => a.id === acc.id);
+        if (idx >= 0) state.accounts[idx] = res.account;
+        renderAll();
+        onToast?.(res.message || `${acc.email} 已完成验证，额度已恢复正常`, "success");
+        return;
+      }
+      const targetUrl = res?.validationUrl || fallbackUrl || "";
+      if (!targetUrl) {
+        onToast?.("暂无可复制的验证链接", "error");
+        return;
+      }
+      const copied = await copyTextToClipboard(targetUrl);
+      if (!copied) {
+        onToast?.("复制失败，请点击「去验证」直接打开或手动复制", "error");
+        return;
+      }
+      pulsingCardIds.delete(acc.id);
+      copiedValidationIds.add(acc.id);
+      renderAccountList();
+      setTimeout(() => {
+        if (destroyed) return;
+        copiedValidationIds.delete(acc.id);
+        renderAccountList();
+      }, 1800);
+      onToast?.(`已复制 ${acc.email} 的验证链接，可粘贴到无痕窗口登录该邮箱完成验证`, "success");
+    } catch (err) {
+      onToast?.(err?.message || "复制验证链接失败", "error");
+    }
+  }
+
+  async function handleBatchRefreshAll() {
+    if (batchRefreshing) return;
+    const nowMs = Date.now();
+    // Skip blocking abnormal accounts (banned / verification / RT expired) to avoid triggering Google risk control
+    const targets = state.accounts.filter(
+      (a) => a && a.enabled !== false && !resolveAccountStatus(a, nowMs).blocking,
+    );
+    if (targets.length === 0) {
+      onToast?.("暂无可安全检测的已启用账号（异常账号请单独处理）", "info");
+      return;
+    }
+    batchRefreshing = true;
+    let done = 0;
+    let okCount = 0;
+    let failCount = 0;
+    batchProgressText = `检测中 0/${targets.length}`;
+    renderFilterBar();
+
+    try {
+      // Strictly sequential with 1.2s pacing between accounts to prevent burst risk-control triggers
+      for (let i = 0; i < targets.length && !destroyed; i += 1) {
+        const acc = targets[i];
+        const r = await handleRefreshQuota(acc, { silentToast: true });
+        done += 1;
+        if (r?.ok) okCount += 1;
+        else if (!r?.skipped) failCount += 1;
+        batchProgressText = `检测中 ${done}/${targets.length}`;
+        renderFilterBar();
+        if (i < targets.length - 1 && !destroyed) {
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+        }
+      }
+      onToast?.(
+        failCount > 0
+          ? `检测完成：${okCount} 个正常，${failCount} 个异常（已标出具体原因）`
+          : `检测完成：全部 ${okCount} 个账号状态正常`,
+        failCount > 0 ? "info" : "success",
+      );
+    } finally {
+      batchRefreshing = false;
+      batchProgressText = "";
+      renderAll();
+    }
+  }
+
+  async function handleDisableAbnormal() {
+    try {
+      const res = await requestJson("/api/accounts/disable-abnormal", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (Array.isArray(res.accounts)) {
+        state.accounts = res.accounts;
+      }
+      renderAll();
+      onToast?.(
+        res.disabledCount > 0 ? `已一键禁用 ${res.disabledCount} 个异常账号` : "当前没有需要禁用的异常账号",
+        res.disabledCount > 0 ? "success" : "info",
+      );
+    } catch (err) {
+      onToast?.(err?.message || "禁用异常账号失败", "error");
     }
   }
 
@@ -1393,6 +1969,22 @@ export function createAccountsHub({
   bindClick(settingsSaveBtn, () => void handleSaveSettings());
   bindClick(rollbackBtn, () => void handleRollbackBackup());
   bindClick(statusCancelBtn, () => void handleStatusBannerAction());
+  bindClick(batchRefreshBtn, () => void handleBatchRefreshAll());
+  bindClick(disableAbnormalBtn, () => void handleDisableAbnormal());
+
+  if (filterGroupEl) {
+    const onFilterClick = (e) => {
+      const pill = e.target?.closest?.("[data-acc-filter]");
+      if (!pill) return;
+      const nextFilter = pill.getAttribute("data-acc-filter") || "all";
+      if (nextFilter === activeFilter) return;
+      activeFilter = nextFilter;
+      renderFilterBar();
+      renderAccountList();
+    };
+    filterGroupEl.addEventListener("click", onFilterClick);
+    cleanups.push(() => filterGroupEl.removeEventListener("click", onFilterClick));
+  }
 
   if (sortMenu) {
     const onSortMenuClick = (e) => {
@@ -1460,15 +2052,10 @@ export function createAccountsHub({
   }
 
   bindClick(exportCopyBtn, async () => {
-    try {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-        await navigator.clipboard.writeText(activeExportPayload.jsonText);
-      } else if (exportTextarea) {
-        exportTextarea.select();
-        document.execCommand("copy");
-      }
+    const copied = await copyTextToClipboard(activeExportPayload.jsonText);
+    if (copied) {
       onToast?.("已复制账号 JSON 到剪贴板", "success");
-    } catch {
+    } else {
       onToast?.("复制失败，请手动选中文本复制", "error");
     }
   });

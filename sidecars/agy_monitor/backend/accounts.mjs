@@ -1151,6 +1151,228 @@ export function buildCockpitCredentialPayload(
   };
 }
 
+export const ACCOUNT_ABNORMAL_BACKOFF_CODES = Object.freeze(
+  new Set([
+    'INVALID_GRANT',
+    'RT_EXPIRED',
+    'MISSING_REFRESH_TOKEN',
+    'ACCOUNT_BANNED',
+    'VALIDATION_REQUIRED',
+    'SUBSCRIPTION_REQUIRED',
+  ]),
+);
+
+export const ACCOUNT_AUTO_SWITCH_BLOCKED_CODES = Object.freeze(
+  new Set([
+    'INVALID_GRANT',
+    'RT_EXPIRED',
+    'MISSING_REFRESH_TOKEN',
+    'ACCOUNT_BANNED',
+    'VALIDATION_REQUIRED',
+    'SUBSCRIPTION_REQUIRED',
+  ]),
+);
+
+const ACCOUNT_STATUS_META = Object.freeze({
+  OK: { state: 'healthy', badge: '正常', blocking: false },
+  VALIDATION_REQUIRED: { state: 'warning', badge: '需验证', blocking: true },
+  ACCOUNT_BANNED: { state: 'error', badge: '已封禁', blocking: true },
+  RT_EXPIRED: { state: 'error', badge: 'RT 过期', blocking: true },
+  INVALID_GRANT: { state: 'error', badge: 'RT 过期', blocking: true },
+  MISSING_REFRESH_TOKEN: { state: 'error', badge: '缺少 RT', blocking: true },
+  AT_EXPIRED: { state: 'warning', badge: 'AT 过期', blocking: false },
+  SUBSCRIPTION_REQUIRED: { state: 'warning', badge: '无订阅', blocking: true },
+  CLIENT_MISMATCH: { state: 'error', badge: '客户端异常', blocking: false },
+  NETWORK_ERROR: { state: 'warning', badge: '网络异常', blocking: false },
+  API_ERROR: { state: 'warning', badge: '接口异常', blocking: false },
+});
+
+export function sanitizeValidationUrl(rawUrl) {
+  const s = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (!s) return '';
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'https:') return '';
+    const host = u.hostname.toLowerCase();
+    const allowed =
+      host === 'google.com' ||
+      host.endsWith('.google.com') ||
+      host === 'g.co' ||
+      host.endsWith('.g.co');
+    return allowed ? u.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Wrap raw `accounts.google.com/v3/signin/continue?plt=...` verification URLs with
+ * Google's official `AccountChooser?Email=<email>&continue=<url>` so browsers that are
+ * not signed in (or signed into a different Google account) show a clean pre-filled
+ * sign-in prompt for the exact target account instead of an unauthenticated error page.
+ */
+export function buildVerificationLaunchUrl(rawUrl, email = '') {
+  const safe = sanitizeValidationUrl(rawUrl);
+  if (!safe) return '';
+  const cleanEmail = sanitizeEmail(email);
+  if (!cleanEmail) return safe;
+  try {
+    const parsed = new URL(safe);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'accounts.google.com') {
+      if (/^\/AccountChooser/i.test(parsed.pathname)) {
+        if (!parsed.searchParams.get('Email')) {
+          parsed.searchParams.set('Email', cleanEmail);
+        }
+        return parsed.toString();
+      }
+      if (parsed.searchParams.has('authuser') && !parsed.searchParams.get('authuser')) {
+        parsed.searchParams.set('authuser', cleanEmail);
+      }
+      const chooser = new URL('https://accounts.google.com/AccountChooser');
+      chooser.searchParams.set('Email', cleanEmail);
+      chooser.searchParams.set('continue', parsed.toString());
+      return chooser.toString();
+    }
+    return safe;
+  } catch {
+    return safe;
+  }
+}
+
+function normalizeAbnormalCode(rawCode) {
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!code || code === 'OK') return '';
+  if (code === 'INVALID_GRANT') return 'RT_EXPIRED';
+  return Object.prototype.hasOwnProperty.call(ACCOUNT_STATUS_META, code) ? code : 'API_ERROR';
+}
+
+export function classifyAccountError(err) {
+  const rawMsg = String(err?.message || err || '').trim();
+  const rawCode = String(err?.code || err?.reason || '').trim().toUpperCase();
+  const status = Number(err?.status) || 0;
+  const validationUrl = sanitizeValidationUrl(err?.validationUrl || '');
+
+  let code = normalizeAbnormalCode(rawCode);
+  if (!code) {
+    if (/validation_required|verify\s+(?:your\s+)?account|要求验证/i.test(rawMsg)) {
+      code = 'VALIDATION_REQUIRED';
+    } else if (
+      /account_disabled|account_suspended|account_banned|user_suspended|tos_violation|abuse_detected|封禁|停用|disabled\s+by\s+administrator|account\s+(?:has\s+been\s+)?(?:disabled|suspended|banned|terminated)/i.test(
+        rawMsg,
+      )
+    ) {
+      code = 'ACCOUNT_BANNED';
+    } else if (validationUrl) {
+      code = 'VALIDATION_REQUIRED';
+    } else if (/invalid_grant|refresh\s*token.*(?:过期|失效|撤销|expired|revoked)|rt\s*已过期/i.test(rawMsg)) {
+      code = 'RT_EXPIRED';
+    } else if (/missing_refresh_token|缺少\s*(?:refresh_token|rt)/i.test(rawMsg)) {
+      code = 'MISSING_REFRESH_TOKEN';
+    } else if (/access\s*token.*(?:过期|失效|expired)|at\s*已过期|unauthenticated/i.test(rawMsg)) {
+      code = 'AT_EXPIRED';
+    } else if (/subscription_required|subscription\s+required|订阅权限/i.test(rawMsg)) {
+      code = 'SUBSCRIPTION_REQUIRED';
+    } else if (/invalid_client|unauthorized_client|客户端校验失败/i.test(rawMsg)) {
+      code = 'CLIENT_MISMATCH';
+    } else if (
+      /连接\s*Google|代理|fetch\s+failed|econnrefused|etimedout|enotfound|network|timeout|超时/i.test(rawMsg)
+    ) {
+      code = 'NETWORK_ERROR';
+    } else if (status === 401) {
+      code = 'AT_EXPIRED';
+    } else {
+      code = 'API_ERROR';
+    }
+  }
+
+  const meta = ACCOUNT_STATUS_META[code] || ACCOUNT_STATUS_META.API_ERROR;
+  const fallbackMessages = {
+    VALIDATION_REQUIRED: 'Google 要求验证该账号，请完成验证后再刷新',
+    ACCOUNT_BANNED: '该账号已被 Google 封禁或停用，无法继续使用',
+    RT_EXPIRED: 'Refresh Token (RT) 已过期或被撤销，请重新通过 OAuth 授权',
+    MISSING_REFRESH_TOKEN: '缺少 Refresh Token (RT)，无法续签，请重新授权或导入',
+    AT_EXPIRED: 'Access Token (AT) 已过期或失效，请刷新续签或重新授权',
+    SUBSCRIPTION_REQUIRED: '该账号暂无有效 Antigravity 订阅权限',
+    CLIENT_MISMATCH: 'Google OAuth 客户端校验失败 (HTTP 401)',
+    NETWORK_ERROR: '连接 Google 服务失败，请检查代理或网络设置',
+    API_ERROR: status ? `Google 配额接口错误 (HTTP ${status})` : '同步账号官方额度失败',
+  };
+
+  return {
+    code,
+    state: meta.state,
+    badge: meta.badge,
+    blocking: meta.blocking,
+    message: rawMsg || fallbackMessages[code] || '账号状态异常',
+    validationUrl,
+  };
+}
+
+export function buildAccountStatus(acc, nowMs = Date.now(), isCurrent = false) {
+  const persistedCode = normalizeAbnormalCode(acc?.authErrorCode || '');
+  const persistedMsg = typeof acc?.authError === 'string' ? acc.authError.trim() : '';
+  const validationUrl = sanitizeValidationUrl(acc?.authValidationUrl || '');
+  const detectedAtMs = Number(acc?.authErrorAtMs) || 0;
+
+  if (persistedCode || persistedMsg) {
+    const code = persistedCode || classifyAccountError({ message: persistedMsg, validationUrl }).code;
+    const meta = ACCOUNT_STATUS_META[code] || ACCOUNT_STATUS_META.API_ERROR;
+    return {
+      state: meta.state,
+      code,
+      badge: meta.badge,
+      blocking: meta.blocking,
+      message: persistedMsg || classifyAccountError({ code, validationUrl }).message,
+      ...(validationUrl ? { validationUrl } : {}),
+      detectedAtMs,
+    };
+  }
+
+  // Proactive passive check: if AT expiry is already in the past on an inactive account, surface AT_EXPIRED
+  const expMs = Number(acc?.tokenExpiryMs) || 0;
+  if (!isCurrent && expMs > 0 && expMs <= nowMs) {
+    const missingRt = acc?.hasRefreshToken === false;
+    return {
+      state: missingRt ? 'error' : 'warning',
+      code: 'AT_EXPIRED',
+      badge: missingRt ? 'AT 过期 · 无 RT' : 'AT 过期',
+      blocking: missingRt,
+      message: missingRt
+        ? 'Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入'
+        : 'Access Token (AT) 已过期，点击「立即续签」或「一键刷新 AT」可自动续签',
+      detectedAtMs: expMs,
+    };
+  }
+
+  if (acc?.hasRefreshToken === false && !isCurrent) {
+    return {
+      state: 'error',
+      code: 'MISSING_REFRESH_TOKEN',
+      badge: '缺少 RT',
+      blocking: true,
+      message: '缺少 Refresh Token (RT)，AT 过期后将无法自动续签，建议重新授权',
+      detectedAtMs: Number(acc?.updatedAtMs) || 0,
+    };
+  }
+
+  return {
+    state: 'healthy',
+    code: 'OK',
+    badge: '正常',
+    blocking: false,
+    message: '',
+    detectedAtMs: 0,
+  };
+}
+
+function clearAccountErrorFields(acc) {
+  if (!acc || typeof acc !== 'object') return;
+  acc.authError = '';
+  acc.authErrorCode = '';
+  acc.authErrorAtMs = 0;
+  acc.authValidationUrl = '';
+}
 function formatOAuthErrorDetail(rawText = '') {
   const s = String(rawText || '').trim();
   if (!s) return '';
@@ -1186,38 +1408,95 @@ function extractCloudCodeProjectId(val) {
   return '';
 }
 
-function parseGoogleCloudCodeError(status, rawText = '') {
+export function parseGoogleCloudCodeError(status, rawText = '') {
   let message = String(rawText || '').trim() || `HTTP ${status}`;
   let reason = '';
   let validationUrl = '';
+  let errStatusText = '';
   try {
     const parsed = JSON.parse(rawText);
     const errObj = parsed?.error && typeof parsed.error === 'object' ? parsed.error : null;
     if (errObj?.message) message = String(errObj.message);
+    if (typeof errObj?.status === 'string') errStatusText = errObj.status.trim().toUpperCase();
     const details = Array.isArray(errObj?.details) ? errObj.details : [];
     for (const d of details) {
-      if (!reason && typeof d?.reason === 'string') reason = d.reason;
-      if (!validationUrl && typeof d?.metadata?.validation_url === 'string') {
-        validationUrl = d.metadata.validation_url;
+      if (!reason && typeof d?.reason === 'string') reason = d.reason.trim().toUpperCase();
+      if (!validationUrl) {
+        const metaUrl =
+          d?.metadata?.validation_url ||
+          d?.metadata?.appeal_url ||
+          d?.metadata?.verification_url ||
+          '';
+        const linkUrl = Array.isArray(d?.links)
+          ? (
+              d.links.find(
+                (l) =>
+                  typeof l?.url === 'string' &&
+                  /accounts\.google\.com|myaccount\.google\.com|verify|appeal|challenge/i.test(l.url) &&
+                  !/\/docs\/|request-license/i.test(l.url),
+              )?.url || ''
+            )
+          : '';
+        const candidateUrl = metaUrl || linkUrl;
+        if (typeof candidateUrl === 'string' && candidateUrl.trim()) {
+          validationUrl = sanitizeValidationUrl(candidateUrl);
+        }
       }
     }
   } catch {
     // non-JSON body
   }
-  if (!reason) {
-    if (/verify\s+(?:your\s+)?account/i.test(message)) reason = 'VALIDATION_REQUIRED';
-    else if (/subscription\s+required/i.test(message)) reason = 'SUBSCRIPTION_REQUIRED';
+
+  const BANNED_REASONS = new Set([
+    'ACCOUNT_DISABLED',
+    'ACCOUNT_SUSPENDED',
+    'ACCOUNT_BANNED',
+    'USER_SUSPENDED',
+    'ACCESS_REVOKED',
+    'TOS_VIOLATION',
+    'ABUSE_DETECTED',
+    'INELIGIBLE_ACCOUNT',
+  ]);
+  const BANNED_MSG_RE =
+    /account\s+(?:has\s+been\s+)?(?:disabled|suspended|banned|terminated|restricted)|user\s+(?:is\s+)?(?:disabled|suspended|banned)|disabled_account|tos\s+violation|terms\s+of\s+service|violat(?:ed|ing)\s+.*(?:policy|terms)|permanently\s+banned|access\s+(?:has\s+been\s+)?revoked|forbidden.*abuse/i;
+  const VERIFY_MSG_RE =
+    /verify\s+(?:your\s+)?account|validation_required|verification\s+required|account\s+verification/i;
+  const SUB_MSG_RE = /subscription\s+required|no\s+active\s+subscription|request-license|license\s+required|not\s+licensed/i;
+
+  let code = '';
+  if (reason === 'VALIDATION_REQUIRED') {
+    reason = 'VALIDATION_REQUIRED';
+    code = 'VALIDATION_REQUIRED';
+  } else if (BANNED_REASONS.has(reason) || BANNED_MSG_RE.test(message)) {
+    reason = 'ACCOUNT_BANNED';
+    code = 'ACCOUNT_BANNED';
+  } else if (validationUrl || VERIFY_MSG_RE.test(message)) {
+    reason = 'VALIDATION_REQUIRED';
+    code = 'VALIDATION_REQUIRED';
+  } else if (reason === 'SUBSCRIPTION_REQUIRED' || SUB_MSG_RE.test(message) || /request-license/i.test(rawText)) {
+    reason = 'SUBSCRIPTION_REQUIRED';
+    code = 'SUBSCRIPTION_REQUIRED';
+  } else if (status === 401 || errStatusText === 'UNAUTHENTICATED') {
+    reason = 'AT_EXPIRED';
+    code = 'AT_EXPIRED';
+  } else {
+    code = 'API_ERROR';
   }
+
+  const compactMsg = message.replace(/\s+/g, ' ').slice(0, 160);
   const err = new Error(
-    reason === 'VALIDATION_REQUIRED' || validationUrl
-      ? 'Google 要求验证该账号，请切换登录完成验证后再刷新'
-      : reason === 'SUBSCRIPTION_REQUIRED'
-        ? '该账号暂无有效 Antigravity 订阅权限'
-        : status === 401
-          ? '该账号 OAuth 凭据已失效，请重新授权'
-          : `Google 配额接口错误 (HTTP ${status}): ${message.slice(0, 180)}`,
+    code === 'VALIDATION_REQUIRED'
+      ? 'Google 要求验证该账号，请完成验证后再刷新'
+      : code === 'ACCOUNT_BANNED'
+        ? `该账号已被 Google 封禁或停用${compactMsg && !/^HTTP\s+\d+$/i.test(compactMsg) ? `（${compactMsg.slice(0, 100)}）` : ''}`
+        : code === 'SUBSCRIPTION_REQUIRED'
+          ? '该账号暂无有效 Antigravity 订阅权限'
+          : code === 'AT_EXPIRED'
+            ? 'Access Token (AT) 已过期或失效，请刷新续签或重新授权'
+            : `Google 配额接口错误 (HTTP ${status}): ${compactMsg}`,
   );
   err.status = status;
+  err.code = code;
   err.reason = reason;
   err.validationUrl = validationUrl;
   return err;
@@ -1260,9 +1539,15 @@ export async function refreshAccessTokenForCredential(
   }
 
   if (!refreshToken) {
-    const err = new Error('该账号缺少 refresh_token，请重新通过 OAuth 授权');
+    const hasExplicitExpiry = Boolean(existingToken.expiry || credObj.expiry);
+    const isAtExpired = Boolean(existingAccess && ((expiryMs > 0 && expiryMs <= nowMs) || (hasExplicitExpiry && expiryMs <= nowMs)));
+    const err = new Error(
+      isAtExpired
+        ? 'Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新通过 OAuth 授权或导入'
+        : '该账号缺少 Refresh Token (RT)，无法续签，请重新通过 OAuth 授权或导入',
+    );
     err.status = 401;
-    err.code = 'MISSING_REFRESH_TOKEN';
+    err.code = isAtExpired ? 'AT_EXPIRED' : 'MISSING_REFRESH_TOKEN';
     throw err;
   }
 
@@ -1329,8 +1614,10 @@ export async function refreshAccessTokenForCredential(
   let matchedClientId = '';
   let lastClientErr = null;
   let invalidGrantErr = null;
+  const invalidGrantClientIds = new Set();
 
   for (const attempt of attempts) {
+    if (invalidGrantClientIds.has(attempt.clientId)) continue;
     let invalidGrantRetriesLeft = 1;
     while (true) {
       const res = await fetchImpl('https://oauth2.googleapis.com/token', {
@@ -1365,6 +1652,18 @@ export async function refreshAccessTokenForCredential(
 
       const errText = await res.text().catch(() => '');
       const errDetail = formatOAuthErrorDetail(errText);
+      if (
+        /account_disabled|account_deleted|user_disabled|account\s+has\s+been\s+disabled|disabled\s+by\s+administrator/i.test(
+          errText,
+        )
+      ) {
+        const bannedErr = new Error(
+          `该账号已被 Google 封禁或停用，无法刷新令牌${errDetail ? ` (${errDetail})` : ''}`,
+        );
+        bannedErr.status = 403;
+        bannedErr.code = 'ACCOUNT_BANNED';
+        throw bannedErr;
+      }
       if (res.status === 401 && /invalid_client|unauthorized_client/i.test(errText)) {
         lastClientErr = new Error(
           `Google OAuth 客户端校验失败 (HTTP 401)${errDetail ? `: ${errDetail}` : ''}`,
@@ -1382,21 +1681,25 @@ export async function refreshAccessTokenForCredential(
           }
           continue;
         }
-        invalidGrantErr = new Error('该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权');
+        invalidGrantErr = new Error(
+          `Refresh Token (RT) 已过期或被撤销，请重新通过 OAuth 授权${errDetail ? ` (${errDetail})` : ''}`,
+        );
         invalidGrantErr.status = 401;
-        invalidGrantErr.code = 'INVALID_GRANT';
-        if (preferredCid && attempt.clientId === preferredCid) {
+        invalidGrantErr.code = 'RT_EXPIRED';
+        invalidGrantClientIds.add(attempt.clientId);
+        // Stop immediately on primary/preferred client so we never spam Google with repeated failed grants
+        if (attempt.clientId === preferredCid || attempt.clientId === client.clientId) {
           throw invalidGrantErr;
         }
-        // Keep checking remaining distinct client_ids if we weren't sure which client minted the token
         break;
       }
       const err = new Error(
         res.status === 400 || res.status === 401
-          ? `该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权${errDetail ? ` (${errDetail})` : ''}`
+          ? `Refresh Token (RT) 校验失败或已失效，请重新通过 OAuth 授权${errDetail ? ` (${errDetail})` : ''}`
           : `刷新 Google OAuth 令牌失败 (HTTP ${res.status})${errDetail ? `: ${errDetail}` : ''}`,
       );
       err.status = res.status === 400 || res.status === 401 ? 401 : res.status || 502;
+      err.code = res.status === 400 || res.status === 401 ? 'RT_EXPIRED' : 'API_ERROR';
       throw err;
     }
     if (payload) break;
@@ -1531,6 +1834,11 @@ function hasUsableQuotaGroups(summary) {
 
 async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl, baseUrl = CLOUD_CODE_DAILY_BASE_URL) {
   const validCached = validCloudCodeProjectId(cachedProjectId);
+  // Skip `v1internal:loadCodeAssist` (FULL_ELIGIBILITY_CHECK) whenever projectId is already cached
+  // to avoid repeatedly triggering Google's high-sensitivity eligibility / anti-abuse pipeline.
+  if (validCached) {
+    return { projectId: validCached, subscriptionTier: '' };
+  }
   const clientProfile = getCloudCodeClientProfile();
   const metadata = {
     ideName: 'antigravity',
@@ -1564,12 +1872,24 @@ async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl, 
   });
 
   if (res.status === 401) {
-    const err = new Error('loadCodeAssist 401 Unauthorized');
+    const err = new Error('Access Token (AT) 已过期或失效 (loadCodeAssist HTTP 401)');
     err.status = 401;
+    err.code = 'AT_EXPIRED';
     throw err;
   }
 
-  if (res.ok) {
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    const parsedErr = parseGoogleCloudCodeError(res.status, errText);
+    if (
+      parsedErr.code === 'VALIDATION_REQUIRED' ||
+      parsedErr.code === 'ACCOUNT_BANNED' ||
+      parsedErr.code === 'SUBSCRIPTION_REQUIRED' ||
+      parsedErr.validationUrl
+    ) {
+      throw parsedErr;
+    }
+  } else {
     const data = await res.json().catch(() => null);
     if (data && typeof data === 'object') {
       const fromResp = extractCloudCodeProjectId(data.cloudaicompanionProject);
@@ -1672,8 +1992,9 @@ export async function fetchCloudCodeQuotaForCredential(
         body: reqBody,
       });
       if (res.status === 401) {
-        const err = new Error('retrieveUserQuotaSummary 401');
+        const err = new Error('Access Token (AT) 已过期或失效 (HTTP 401)');
         err.status = 401;
+        err.code = 'AT_EXPIRED';
         throw err;
       }
       if (res.ok) {
@@ -1692,7 +2013,12 @@ export async function fetchCloudCodeQuotaForCredential(
       } else {
         const errText = await res.text().catch(() => '');
         const parsedErr = parseGoogleCloudCodeError(res.status, errText);
-        if (parsedErr.reason === 'VALIDATION_REQUIRED' || parsedErr.validationUrl) {
+        if (
+          parsedErr.code === 'VALIDATION_REQUIRED' ||
+          parsedErr.code === 'ACCOUNT_BANNED' ||
+          parsedErr.code === 'SUBSCRIPTION_REQUIRED' ||
+          parsedErr.validationUrl
+        ) {
           lastDenialError = parsedErr;
         } else {
           lastHttpError = parsedErr;
@@ -1713,8 +2039,9 @@ export async function fetchCloudCodeQuotaForCredential(
         body: reqBody,
       });
       if (res.status === 401) {
-        const err = new Error('fetchAvailableModels 401');
+        const err = new Error('Access Token (AT) 已过期或失效 (HTTP 401)');
         err.status = 401;
+        err.code = 'AT_EXPIRED';
         throw err;
       }
       if (res.ok) {
@@ -1732,8 +2059,9 @@ export async function fetchCloudCodeQuotaForCredential(
         const errText = await res.text().catch(() => '');
         const parsedErr = parseGoogleCloudCodeError(res.status, errText);
         if (
-          parsedErr.reason === 'VALIDATION_REQUIRED' ||
-          parsedErr.reason === 'SUBSCRIPTION_REQUIRED' ||
+          parsedErr.code === 'VALIDATION_REQUIRED' ||
+          parsedErr.code === 'ACCOUNT_BANNED' ||
+          parsedErr.code === 'SUBSCRIPTION_REQUIRED' ||
           parsedErr.validationUrl
         ) {
           throw parsedErr;
@@ -1760,13 +2088,23 @@ export async function fetchCloudCodeQuotaForCredential(
     };
   } catch (err) {
     if (err?.status === 401 && !tokenState.renewed) {
-      tokenState = await refreshAccessTokenForCredential(credObj, {
-        fetchImpl,
-        nowMs,
-        forceRefresh: true,
-        oauthClient,
-        preferredClientId,
-      });
+      try {
+        tokenState = await refreshAccessTokenForCredential(credObj, {
+          fetchImpl,
+          nowMs,
+          forceRefresh: true,
+          oauthClient,
+          preferredClientId,
+        });
+      } catch (refreshErr) {
+        if (refreshErr?.code === 'MISSING_REFRESH_TOKEN') {
+          const atErr = new Error('Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新通过 OAuth 授权或导入');
+          atErr.status = 401;
+          atErr.code = 'AT_EXPIRED';
+          throw atErr;
+        }
+        throw refreshErr;
+      }
       const fetched = await runWithToken(tokenState.accessToken);
       return {
         ok: true,
@@ -1776,6 +2114,10 @@ export async function fetchCloudCodeQuotaForCredential(
         matchedClientId: tokenState.matchedClientId || '',
         tokenExpiryMs: tokenState.expiryMs || extractTokenExpiryMs(tokenState.credObj),
       };
+    }
+    if (err?.status === 401 && tokenState.renewed && !err.code) {
+      err.code = 'AT_EXPIRED';
+      err.message = 'Access Token (AT) 已过期或被 Google 拒绝 (HTTP 401)，请重新授权';
     }
     throw err;
   }
@@ -1788,25 +2130,96 @@ export function openExternalUrl(rawUrl) {
   }
   try {
     if (process.platform === 'win32') {
-      const child = spawn(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process $env:TARGET_URL'],
-        {
-          env: { ...process.env, TARGET_URL: url },
-          stdio: 'ignore',
-          windowsHide: true,
-        },
-      );
-      child.unref();
-      return true;
+      const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+      const psExe = path.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const psBin = fs.existsSync(psExe) ? psExe : 'powershell.exe';
+      const cleanEnv = { ...buildCleanLaunchEnv(process.env), TARGET_URL: url };
+      try {
+        const child = spawn(
+          psBin,
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            '$psi = New-Object System.Diagnostics.ProcessStartInfo; $psi.FileName = $env:TARGET_URL; $psi.UseShellExecute = $true; [System.Diagnostics.Process]::Start($psi) | Out-Null',
+          ],
+          {
+            env: cleanEnv,
+            stdio: 'ignore',
+            windowsHide: true,
+          },
+        );
+        child.on('error', () => {});
+        child.unref();
+        return true;
+      } catch {
+        const rundllExe = path.join(sysRoot, 'System32', 'rundll32.exe');
+        const child = spawn(
+          fs.existsSync(rundllExe) ? rundllExe : 'rundll32.exe',
+          ['url.dll,FileProtocolHandler', url],
+          {
+            env: cleanEnv,
+            stdio: 'ignore',
+            windowsHide: true,
+          },
+        );
+        child.on('error', () => {});
+        child.unref();
+        return true;
+      }
     }
     const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
-    const child = spawn(cmd, [url], { stdio: 'ignore' });
+    const child = spawn(cmd, [url], { detached: true, stdio: 'ignore' });
+    child.on('error', () => {});
     child.unref();
     return true;
   } catch {
     return false;
   }
+}
+
+async function openExternalUrlVerified(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  if (!url || (!url.startsWith('https://') && !url.startsWith('http://'))) {
+    return false;
+  }
+  if (process.platform !== 'win32') {
+    return openExternalUrl(url);
+  }
+  const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+  const psExe = path.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const psBin = fs.existsSync(psExe) ? psExe : 'powershell.exe';
+  const cleanEnv = { ...buildCleanLaunchEnv(process.env), TARGET_URL: url };
+
+  const runExec = (bin, args, env) =>
+    new Promise((resolve) => {
+      try {
+        execFile(bin, args, { env, windowsHide: true, timeout: 6000 }, (err) => {
+          resolve(!err);
+        });
+      } catch {
+        resolve(false);
+      }
+    });
+
+  const psOk = await runExec(
+    psBin,
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      '$psi = New-Object System.Diagnostics.ProcessStartInfo; $psi.FileName = $env:TARGET_URL; $psi.UseShellExecute = $true; [System.Diagnostics.Process]::Start($psi) | Out-Null',
+    ],
+    cleanEnv,
+  );
+  if (psOk) return true;
+
+  const rundllExe = path.join(sysRoot, 'System32', 'rundll32.exe');
+  return runExec(
+    fs.existsSync(rundllExe) ? rundllExe : 'rundll32.exe',
+    ['url.dll,FileProtocolHandler', url],
+    cleanEnv,
+  );
 }
 
 function escapeHtmlText(str) {
@@ -2475,6 +2888,12 @@ export function selectBestAutoSwitchCandidate(
     if (!acc || !acc.id) continue;
     if (acc.enabled === false) continue;
     if (curEmailNorm && sanitizeEmail(acc.email) === curEmailNorm) continue;
+    // Exclude accounts in blocking abnormal states (banned / needs verification / RT expired / missing RT / no subscription)
+    const errCode = String(acc.authErrorCode || acc.accountStatus?.code || '').trim().toUpperCase();
+    if (errCode && ACCOUNT_AUTO_SWITCH_BLOCKED_CODES.has(errCode)) continue;
+    if (acc.accountStatus?.blocking === true) continue;
+    const computedStatus = buildAccountStatus(acc, nowMs, false);
+    if (computedStatus.blocking) continue;
 
     const group = Array.isArray(acc.quota?.groups)
       ? acc.quota.groups.find((g) => g && g.key === targetGroupKey) || null
@@ -3612,9 +4031,8 @@ export function createAccountManager({
         credentialUserScope: liveInfo.live.credentialUserScope || existingSecret?.credentialUserScope || '',
         capturedAtMs: ts,
       };
-      acc.authError = '';
-      acc.authErrorCode = '';
-      acc.authErrorAtMs = 0;
+      clearAccountErrorFields(acc);
+      acc.hasRefreshToken = Boolean(liveRefresh);
       return true;
     }
     return false;
@@ -3642,6 +4060,7 @@ export function createAccountManager({
       if (!target) return false;
       target.quota = normalized;
       target.updatedAtMs = nowMs;
+      clearAccountErrorFields(target);
       index.activeAccountId = target.id;
       const vaultUpdated = syncLiveCredentialIntoVaultLocked(target, vault, liveInfo, nowMs);
       if (vaultUpdated) {
@@ -3675,6 +4094,7 @@ export function createAccountManager({
 
   function formatPublicAccount(acc, liveEmail, nowMs) {
     const isCurrent = Boolean(liveEmail && sanitizeEmail(acc.email) === liveEmail);
+    const accountStatus = buildAccountStatus(acc, nowMs, isCurrent);
     return {
       id: acc.id,
       email: acc.email,
@@ -3687,7 +4107,12 @@ export function createAccountManager({
       updatedAtMs: Number(acc.updatedAtMs) || 0,
       lastUsedAtMs: Number(acc.lastUsedAtMs) || 0,
       tokenExpiryMs: Number(acc.tokenExpiryMs) || 0,
+      ...(typeof acc.hasRefreshToken === 'boolean' ? { hasRefreshToken: acc.hasRefreshToken } : {}),
       ...(acc.authError ? { authError: String(acc.authError) } : {}),
+      ...(acc.authErrorCode ? { authErrorCode: normalizeAbnormalCode(acc.authErrorCode) } : {}),
+      ...(acc.authErrorAtMs ? { authErrorAtMs: Number(acc.authErrorAtMs) || 0 } : {}),
+      ...(acc.authValidationUrl ? { authValidationUrl: sanitizeValidationUrl(acc.authValidationUrl) } : {}),
+      accountStatus,
       quota: enrichQuotaWithResetStatus(acc.quota || null, nowMs),
     };
   }
@@ -3817,6 +4242,7 @@ export function createAccountManager({
           lastUsedAtMs: ts,
           tokenExpiryMs: credExpiryMs,
           ...(rtHash ? { refreshTokenHash: rtHash } : {}),
+          hasRefreshToken: Boolean(extractRefreshToken(norm.credObj)),
           ...(credClientId ? { oauthClientId: credClientId } : {}),
           quota: liveQuota,
         };
@@ -3828,9 +4254,8 @@ export function createAccountManager({
         if (credExpiryMs > 0) existing.tokenExpiryMs = credExpiryMs;
         if (rtHash) existing.refreshTokenHash = rtHash;
         if (credClientId) existing.oauthClientId = credClientId;
-        existing.authError = '';
-        existing.authErrorCode = '';
-        existing.authErrorAtMs = 0;
+        existing.hasRefreshToken = Boolean(extractRefreshToken(norm.credObj));
+        clearAccountErrorFields(existing);
         if (remark && sanitizeRemark(remark)) {
           existing.remark = sanitizeRemark(remark);
         }
@@ -3892,6 +4317,7 @@ export function createAccountManager({
         const itemExpiryMs = extractTokenExpiryMs(itemCredObj);
         const itemClientId = extractPreferredClientIdFromCred(itemCredObj);
         const itemRtHash = computeRefreshTokenHash(extractRefreshToken(itemCredObj));
+        const itemHasRt = Boolean(extractRefreshToken(itemCredObj));
         let existing = index.accounts.find((a) => sanitizeEmail(a.email) === sanitizeEmail(item.email));
         if (!existing) {
           existing = {
@@ -3906,6 +4332,7 @@ export function createAccountManager({
             lastUsedAtMs: 0,
             tokenExpiryMs: itemExpiryMs,
             ...(itemRtHash ? { refreshTokenHash: itemRtHash } : {}),
+            hasRefreshToken: itemHasRt,
             ...(itemClientId ? { oauthClientId: itemClientId } : {}),
             quota: item.quota || null,
           };
@@ -3916,9 +4343,8 @@ export function createAccountManager({
           if (itemExpiryMs > 0) existing.tokenExpiryMs = itemExpiryMs;
           if (itemRtHash) existing.refreshTokenHash = itemRtHash;
           if (itemClientId) existing.oauthClientId = itemClientId;
-          existing.authError = '';
-          existing.authErrorCode = '';
-          existing.authErrorAtMs = 0;
+          existing.hasRefreshToken = itemHasRt;
+          clearAccountErrorFields(existing);
           if (item.remark) existing.remark = item.remark;
           if (item.quota && !existing.quota) existing.quota = item.quota;
           updatedCount += 1;
@@ -4084,9 +4510,7 @@ export function createAccountManager({
           if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
           acc.quota = freshQuota;
           acc.updatedAtMs = nowMs;
-          acc.authError = '';
-          acc.authErrorCode = '';
-          acc.authErrorAtMs = 0;
+          clearAccountErrorFields(acc);
           index.activeAccountId = acc.id;
           const vaultUpdated = syncLiveCredentialIntoVaultLocked(acc, vault, liveInfo, nowMs);
           if (vaultUpdated) {
@@ -4120,16 +4544,42 @@ export function createAccountManager({
       }
     }
     if (!parsedCred || !extractRefreshToken(parsedCred)) {
-      return withStoreLock(async () => {
-        const index = await readIndex();
-        const acc = index.accounts.find((a) => a.id === id);
-        return {
-          ok: false,
-          status: 422,
-          error: '该账号缺少有效的 OAuth 凭据，请重新授权或导入后再刷新额度',
-          account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
-        };
-      });
+      const existingAccess =
+        (typeof parsedCred?.token?.access_token === 'string' && parsedCred.token.access_token.trim()) ||
+        (typeof parsedCred?.access_token === 'string' && parsedCred.access_token.trim()) ||
+        '';
+      const credExpMs = extractTokenExpiryMs(parsedCred);
+      const isAtOnlyValid = Boolean(existingAccess && credExpMs > nowMs + OAUTH_REFRESH_SAFETY_MS);
+      if (!isAtOnlyValid) {
+        const hasExplicitExpiry = Boolean(parsedCred?.token?.expiry || parsedCred?.expiry);
+        const isAtExpired = Boolean(
+          existingAccess && ((credExpMs > 0 && credExpMs <= nowMs) || (hasExplicitExpiry && credExpMs <= nowMs)),
+        );
+        const code = isAtExpired ? 'AT_EXPIRED' : 'MISSING_REFRESH_TOKEN';
+        const errMsg = isAtExpired
+          ? 'Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入'
+          : '该账号缺少 Refresh Token (RT)，无法续签，请重新授权或导入';
+        return withStoreLock(async () => {
+          const index = await readIndex();
+          const acc = index.accounts.find((a) => a.id === id);
+          if (acc) {
+            acc.hasRefreshToken = false;
+            if (credExpMs > 0) acc.tokenExpiryMs = credExpMs;
+            acc.authError = errMsg;
+            acc.authErrorCode = code;
+            acc.authErrorAtMs = nowMs;
+            acc.authValidationUrl = '';
+            await writeIndex(index);
+          }
+          return {
+            ok: false,
+            status: 422,
+            code,
+            error: errMsg,
+            account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
+          };
+        });
+      }
     }
 
     let remote;
@@ -4140,20 +4590,23 @@ export function createAccountManager({
         nowMs,
       });
     } catch (err) {
+      const classified = classifyAccountError(err);
       return withStoreLock(async () => {
         const index = await readIndex();
         const acc = index.accounts.find((a) => a.id === id);
-        if (acc && err?.code === 'INVALID_GRANT') {
-          acc.authError = err?.message || 'OAuth 凭据已失效或被撤销';
-          acc.authErrorCode = 'INVALID_GRANT';
+        if (acc) {
+          acc.hasRefreshToken = Boolean(extractRefreshToken(parsedCred));
+          acc.authError = classified.message;
+          acc.authErrorCode = classified.code;
           acc.authErrorAtMs = nowMs;
+          acc.authValidationUrl = classified.validationUrl || '';
           await writeIndex(index);
         }
         return {
           ok: false,
           status: Number(err?.status) || 502,
-          code: err?.code || '',
-          error: err?.message || `同步 ${snap.email} 官方额度失败`,
+          code: classified.code,
+          error: classified.message,
           account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
         };
       });
@@ -4163,10 +4616,19 @@ export function createAccountManager({
       return withStoreLock(async () => {
         const index = await readIndex();
         const acc = index.accounts.find((a) => a.id === id);
+        const errMsg = `未能获取 ${snap.email} 的有效官方配额数据`;
+        if (acc) {
+          acc.authError = errMsg;
+          acc.authErrorCode = 'API_ERROR';
+          acc.authErrorAtMs = nowMs;
+          acc.authValidationUrl = '';
+          await writeIndex(index);
+        }
         return {
           ok: false,
           status: 502,
-          error: `未能获取 ${snap.email} 的有效官方配额数据`,
+          code: 'API_ERROR',
+          error: errMsg,
           account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
         };
       });
@@ -4190,9 +4652,8 @@ export function createAccountManager({
       if (nextExpiryMs > 0) {
         acc.tokenExpiryMs = nextExpiryMs;
       }
-      acc.authError = '';
-      acc.authErrorCode = '';
-      acc.authErrorAtMs = 0;
+      acc.hasRefreshToken = Boolean(extractRefreshToken(remote.updatedCredObj || parsedCred));
+      clearAccountErrorFields(acc);
       acc.updatedAtMs = nowMs;
 
       if (remote.renewed && remote.updatedCredObj && vault?.secrets?.[acc.id]) {
@@ -4308,6 +4769,13 @@ export function createAccountManager({
       if (target.enabled === false) {
         return { ok: false, status: 400, error: '该账号当前已禁用，请先启用后再切换' };
       }
+      const targetStatus = buildAccountStatus(target, ts, false);
+      if (targetStatus.code === 'ACCOUNT_BANNED') {
+        return { ok: false, status: 422, error: '该账号已被 Google 封禁或停用，已中止切换' };
+      }
+      if (targetStatus.code === 'RT_EXPIRED') {
+        return { ok: false, status: 422, error: '该账号 Refresh Token (RT) 已过期或失效，请先重新授权后再切换' };
+      }
 
       const secret = vault.secrets[id];
       if (!secret || !secret.credJson) {
@@ -4355,9 +4823,8 @@ export function createAccountManager({
                   if (renewed.expiryMs > 0) freshAcc.tokenExpiryMs = renewed.expiryMs;
                   if (renewed.matchedClientId) freshAcc.oauthClientId = renewed.matchedClientId;
                   if (renewedRtHash) freshAcc.refreshTokenHash = renewedRtHash;
-                  freshAcc.authError = '';
-                  freshAcc.authErrorCode = '';
-                  freshAcc.authErrorAtMs = 0;
+                  freshAcc.hasRefreshToken = Boolean(extractRefreshToken(renewed.credObj));
+                  clearAccountErrorFields(freshAcc);
                   freshAcc.updatedAtMs = ts;
                   await writeIndex(freshIndex);
                 }
@@ -4371,22 +4838,29 @@ export function createAccountManager({
               }).catch(() => {});
             }
           } catch (err) {
-            if (err?.code === 'INVALID_GRANT' || err?.code === 'MISSING_REFRESH_TOKEN') {
+            if (
+              err?.code === 'INVALID_GRANT' ||
+              err?.code === 'RT_EXPIRED' ||
+              err?.code === 'ACCOUNT_BANNED' ||
+              err?.code === 'MISSING_REFRESH_TOKEN'
+            ) {
+              const classified = classifyAccountError(err);
               await withStoreLock(async () => {
                 const freshIndex = await readIndex();
                 const freshAcc = freshIndex.accounts.find((a) => a.id === id);
                 if (freshAcc) {
-                  freshAcc.authError = err?.message || 'OAuth 凭据已失效或被撤销';
-                  freshAcc.authErrorCode = err.code;
+                  freshAcc.authError = classified.message;
+                  freshAcc.authErrorCode = classified.code;
                   freshAcc.authErrorAtMs = ts;
+                  freshAcc.authValidationUrl = classified.validationUrl || '';
                   await writeIndex(freshIndex);
                 }
               }).catch(() => {});
               return {
                 ok: false,
-                status: 401,
+                status: err.code === 'ACCOUNT_BANNED' ? 403 : 401,
                 code: err.code,
-                error: `切号前续签失败（已安全中止，未关闭 Antigravity）：${err?.message || 'OAuth 凭据已失效，请重新授权'}`,
+                error: `切号前续签失败（已安全中止，未关闭 Antigravity）：${classified.message}`,
               };
             }
             // Transient/offline failure: allow fallback only if stored access_token is still unexpired
@@ -4781,6 +5255,7 @@ export function createAccountManager({
               lastUsedAtMs: 0,
               tokenExpiryMs: oauthExpiryMs,
               ...(oauthRtHash ? { refreshTokenHash: oauthRtHash } : {}),
+              hasRefreshToken: Boolean(extractRefreshToken(norm.credObj)),
               ...(oauthCid ? { oauthClientId: oauthCid } : {}),
               quota: null,
             };
@@ -4791,9 +5266,8 @@ export function createAccountManager({
             if (oauthExpiryMs > 0) existing.tokenExpiryMs = oauthExpiryMs;
             if (oauthRtHash) existing.refreshTokenHash = oauthRtHash;
             if (oauthCid) existing.oauthClientId = oauthCid;
-            existing.authError = '';
-            existing.authErrorCode = '';
-            existing.authErrorAtMs = 0;
+            existing.hasRefreshToken = Boolean(extractRefreshToken(norm.credObj));
+            clearAccountErrorFields(existing);
             if (session.remark && sanitizeRemark(session.remark)) {
               existing.remark = sanitizeRemark(session.remark);
             }
@@ -5080,16 +5554,13 @@ export function createAccountManager({
             { skipAutoSwitch: true },
           ).catch(() => {});
         }
-        // Optional (default OFF): background remote refresh for stale enabled inactive accounts
+        // Optional (default OFF): background remote refresh for stale enabled healthy inactive accounts
         if (allowInactiveBgPoll) {
           for (const acc of indexForSchedule.accounts) {
             if (!acc || acc.enabled === false) continue;
             if (liveInfo.email && sanitizeEmail(acc.email) === liveInfo.email) continue;
-            const lastAttempt = autoTokenAttemptAtMs.get(acc.id) || 0;
-            const isInvalidGrantBackoff =
-              acc.authErrorCode === 'INVALID_GRANT' &&
-              nowMs - Number(acc.authErrorAtMs || lastAttempt || 0) < OAUTH_INVALID_GRANT_BACKOFF_MS;
-            if (isInvalidGrantBackoff) continue;
+            // NEVER re-poke blocking abnormal accounts (banned / verification / RT expired) in background ticks
+            if (ACCOUNT_ABNORMAL_BACKOFF_CODES.has(String(acc.authErrorCode || '').toUpperCase())) continue;
             const fetchedAt = Number(acc.quota?.fetchedAtMs || 0);
             const expMs = Number(acc.tokenExpiryMs || 0);
             const tokenExpiringSoon = expMs > 0 && expMs - nowMs <= OAUTH_PROACTIVE_RENEW_WINDOW_MS;
@@ -5104,17 +5575,15 @@ export function createAccountManager({
         }
       } else if (!switchedThisTick && indexForSchedule.accounts.length > 0) {
         // Passively sync active account's natively-refreshed credential into vault (zero remote API calls);
-        // only trigger remote inactive-account renewal when user explicitly enabled `backgroundRefreshInactive`.
+        // only trigger remote inactive-account renewal when user explicitly enabled `backgroundRefreshInactive`
+        // and `quotaRefreshIntervalMin > 0`.
         const dueForProactiveRenew = indexForSchedule.accounts.filter((acc) => {
           if (!acc || acc.enabled === false) return false;
+          if (ACCOUNT_ABNORMAL_BACKOFF_CODES.has(String(acc.authErrorCode || '').toUpperCase())) return false;
           const expMs = Number(acc.tokenExpiryMs || 0);
           if (!expMs || expMs - nowMs > OAUTH_PROACTIVE_RENEW_WINDOW_MS) return false;
           const lastAttempt = autoTokenAttemptAtMs.get(acc.id) || 0;
-          const cooldown =
-            acc.authErrorCode === 'INVALID_GRANT'
-              ? OAUTH_INVALID_GRANT_BACKOFF_MS
-              : OAUTH_BACKGROUND_RETRY_COOLDOWN_MS;
-          return nowMs - Math.max(lastAttempt, Number(acc.authErrorAtMs || 0)) >= cooldown;
+          return nowMs - Math.max(lastAttempt, Number(acc.authErrorAtMs || 0)) >= OAUTH_BACKGROUND_RETRY_COOLDOWN_MS;
         });
         if (dueForProactiveRenew.length > 0) {
           const liveInfo = await readLiveEmailSafe();
@@ -5162,6 +5631,106 @@ export function createAccountManager({
     }
   }
 
+  async function openAccountValidationUrl(
+    accountId,
+    { openExternal = null, fallbackUrl = '', refreshIfStale = false, copyOnly = false } = {},
+  ) {
+    const id = String(accountId || '').trim();
+    if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
+    const index = await readIndex();
+    const acc = index.accounts.find((a) => a.id === id);
+    if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
+
+    const nowMs = now();
+    let safeUrl = sanitizeValidationUrl(acc.authValidationUrl || '') || sanitizeValidationUrl(fallbackUrl || '');
+    const isStalePlt =
+      Boolean(safeUrl && /[?&]plt=/.test(safeUrl)) &&
+      nowMs - Number(acc.authErrorAtMs || 0) > 2 * 60_000;
+
+    // Refresh stale one-time Google `plt=` validation tokens so opening in browser never hits a Google error
+    if (refreshIfStale && (!safeUrl || isStalePlt)) {
+      try {
+        const probed = await refreshAccountQuota(id);
+        if (probed?.ok && probed.account) {
+          return {
+            ok: true,
+            alreadyVerified: true,
+            opened: false,
+            account: probed.account,
+            message: `${acc.email} 已完成验证，额度已恢复正常`,
+          };
+        }
+        const freshUrl = sanitizeValidationUrl(probed?.account?.authValidationUrl || '');
+        if (freshUrl) {
+          safeUrl = freshUrl;
+        }
+      } catch {
+        // Non-fatal: fall back to cached safeUrl if live re-probe failed transiently
+      }
+    }
+
+    if (!safeUrl) {
+      return { ok: false, status: 400, error: '该账号未返回可打开的 Google 验证链接，请先点击刷新额度重试' };
+    }
+
+    // Route Google verification URLs through AccountChooser?Email=<email>&continue=<url>
+    // so browsers not signed into that specific account prompt to sign in with the right email
+    // instead of displaying a "not signed in" error page.
+    const launchUrl = buildVerificationLaunchUrl(safeUrl, acc.email);
+    if (copyOnly) {
+      return {
+        ok: true,
+        opened: false,
+        validationUrl: launchUrl,
+        rawValidationUrl: safeUrl,
+      };
+    }
+
+    let opened = false;
+    try {
+      opened = openExternal
+        ? Boolean(await Promise.resolve(openExternal(launchUrl)))
+        : Boolean(await openExternalUrlVerified(launchUrl));
+    } catch {
+      opened = false;
+    }
+    return {
+      ok: true,
+      opened,
+      validationUrl: launchUrl,
+      rawValidationUrl: safeUrl,
+      ...(opened ? {} : { fallbackRequired: true }),
+    };
+  }
+
+  async function disableAbnormalAccounts() {
+    const nowMs = now();
+    const liveInfo = await readLiveEmailSafe();
+    return withStoreLock(async () => {
+      const index = await readIndex();
+      let disabledCount = 0;
+      for (const acc of index.accounts) {
+        if (!acc || acc.enabled === false) continue;
+        const isCurrent = Boolean(liveInfo.email && sanitizeEmail(acc.email) === liveInfo.email);
+        if (isCurrent) continue;
+        const st = buildAccountStatus(acc, nowMs, isCurrent);
+        if (st.blocking) {
+          acc.enabled = false;
+          acc.updatedAtMs = nowMs;
+          disabledCount += 1;
+        }
+      }
+      if (disabledCount > 0) {
+        await writeIndex(index);
+      }
+      return {
+        ok: true,
+        disabledCount,
+        accounts: index.accounts.map((a) => formatPublicAccount(a, liveInfo.email, nowMs)),
+      };
+    });
+  }
+
   return {
     listAccounts,
     updateAccountSettings,
@@ -5172,6 +5741,8 @@ export function createAccountManager({
     deleteAccount,
     exportAccountJson,
     refreshAccountQuota,
+    openAccountValidationUrl,
+    disableAbnormalAccounts,
     switchAccount,
     maybeTriggerAutoSwitch,
     startOauthWatch,
