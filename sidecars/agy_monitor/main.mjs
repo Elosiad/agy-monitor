@@ -2401,6 +2401,23 @@ export function createMonitorHandlers({
     }
   });
 
+  register('POST', '/api/accounts/renew-at', async (data = {}) => {
+    try {
+      const result = await accounts.renewAccountAccessToken(data.accountId, {
+        forceRefresh: data.forceRefresh !== false,
+      });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '续签 Access Token 失败', {
+          code: result.code || '',
+          account: result.account || null,
+        });
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
   register('POST', '/api/accounts/open-validation-url', async (data = {}) => {
     try {
       const accountId = typeof data?.accountId === 'string' ? data.accountId : '';

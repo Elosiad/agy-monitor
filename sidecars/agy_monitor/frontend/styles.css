@@ -7909,6 +7909,16 @@ body.host-backdrop-shared .mad-lightbox-img {
   cursor: not-allowed;
 }
 
+.acc-filter-action-btn.is-teal {
+  color: var(--accent-teal);
+  border-color: color-mix(in srgb, var(--accent-teal) 42%, transparent);
+  background: var(--accent-teal-bg);
+}
+
+.acc-filter-action-btn.is-teal:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-teal) 70%, transparent);
+}
+
 .acc-filter-action-btn.is-warn {
   color: var(--accent-amber);
   border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);

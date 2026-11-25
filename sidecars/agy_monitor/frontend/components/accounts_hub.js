@@ -275,6 +275,8 @@ export function createAccountsHub({
   const filterCountAllEl = document.getElementById("accFilterCountAll");
   const filterCountHealthyEl = document.getElementById("accFilterCountHealthy");
   const filterCountAbnormalEl = document.getElementById("accFilterCountAbnormal");
+  const renewAtBtn = document.getElementById("accRenewAtBtn");
+  const renewAtLabelEl = document.getElementById("accRenewAtLabel");
   const batchRefreshBtn = document.getElementById("accBatchRefreshBtn");
   const batchRefreshLabelEl = document.getElementById("accBatchRefreshLabel");
   const disableAbnormalBtn = document.getElementById("accDisableAbnormalBtn");
@@ -360,7 +362,10 @@ export function createAccountsHub({
   let activeFilter = "all";
   let batchRefreshing = false;
   let batchProgressText = "";
+  let batchRenewingAt = false;
+  let renewAtProgressText = "";
   const refreshingIds = new Set();
+  const renewingAtIds = new Set();
   const togglingIds = new Set();
   const openingValidationIds = new Set();
   const openedValidationIds = new Set();
@@ -840,7 +845,7 @@ export function createAccountsHub({
           });
           alertBar.appendChild(reauthBtn);
         } else if (accStatus.code === "AT_EXPIRED" && !accStatus.blocking) {
-          const isRenewing = refreshingIds.has(acc.id);
+          const isRenewing = renewingAtIds.has(acc.id) || refreshingIds.has(acc.id);
           const renewBtn = document.createElement("button");
           renewBtn.type = "button";
           renewBtn.className = `acc-item-alert-btn${isRenewing ? " is-launching" : ""}`;
@@ -851,10 +856,10 @@ export function createAccountsHub({
           const lbl = document.createElement("span");
           lbl.textContent = isRenewing ? "续签中…" : "立即续签";
           renewBtn.appendChild(lbl);
-          renewBtn.title = "使用保存的 RT 立即续签 AT 并同步最新额度";
+          renewBtn.title = "仅使用保存的 RT 立即续签 AT（不触发额度接口，低风控）";
           renewBtn.addEventListener("click", () => {
             triggerCardPulse(acc.id);
-            void handleRefreshQuota(acc);
+            void handleRenewSingleAt(acc);
           });
           alertBar.appendChild(renewBtn);
         }
@@ -1158,6 +1163,7 @@ export function createAccountsHub({
     let healthyCount = 0;
     let abnormalCount = 0;
     let enabledBlockingCount = 0;
+    let renewableAtCount = 0;
     for (const acc of allAccounts) {
       const st = resolveAccountStatus(acc, nowMs);
       if (st.state === "healthy") {
@@ -1166,6 +1172,9 @@ export function createAccountsHub({
         abnormalCount += 1;
         if (acc.enabled !== false && !acc.isCurrent && st.blocking) {
           enabledBlockingCount += 1;
+        }
+        if (acc.enabled !== false && st.code === "AT_EXPIRED" && !st.blocking) {
+          renewableAtCount += 1;
         }
       }
     }
@@ -1184,8 +1193,18 @@ export function createAccountsHub({
         }
       });
     }
+    if (renewAtBtn) {
+      renewAtBtn.hidden = renewableAtCount === 0 && !batchRenewingAt;
+      renewAtBtn.disabled = batchRenewingAt || batchRefreshing;
+      renewAtBtn.classList.toggle("is-spinning", batchRenewingAt);
+    }
+    if (renewAtLabelEl) {
+      renewAtLabelEl.textContent = batchRenewingAt
+        ? renewAtProgressText || "续签 AT 中…"
+        : `一键刷新 AT (${renewableAtCount})`;
+    }
     if (batchRefreshBtn) {
-      batchRefreshBtn.disabled = batchRefreshing;
+      batchRefreshBtn.disabled = batchRefreshing || batchRenewingAt;
       batchRefreshBtn.classList.toggle("is-spinning", batchRefreshing);
     }
     if (batchRefreshLabelEl) {
@@ -1193,7 +1212,7 @@ export function createAccountsHub({
     }
     if (disableAbnormalBtn) {
       disableAbnormalBtn.hidden = enabledBlockingCount === 0;
-      disableAbnormalBtn.disabled = batchRefreshing;
+      disableAbnormalBtn.disabled = batchRefreshing || batchRenewingAt;
     }
     if (disableAbnormalLabelEl) {
       disableAbnormalLabelEl.textContent = `禁用异常 (${enabledBlockingCount})`;
@@ -1735,8 +1754,88 @@ export function createAccountsHub({
     }
   }
 
+  async function handleRenewSingleAt(acc, { silentToast = false } = {}) {
+    if (!acc || !acc.id || renewingAtIds.has(acc.id)) return { ok: false, skipped: true };
+    renewingAtIds.add(acc.id);
+    renderAccountList();
+    try {
+      const res = await requestJson("/api/accounts/renew-at", {
+        method: "POST",
+        body: JSON.stringify({ accountId: acc.id, forceRefresh: true }),
+      });
+      const idx = state.accounts.findIndex((a) => a.id === acc.id);
+      if (idx >= 0 && res.account) {
+        state.accounts[idx] = res.account;
+      }
+      if (!silentToast) {
+        onToast?.(res.message || `已续签 ${acc.email} 的 AT`, "success");
+      }
+      return { ok: true, account: res.account || null };
+    } catch (err) {
+      const idx = state.accounts.findIndex((a) => a.id === acc.id);
+      if (idx >= 0 && err?.data?.account) {
+        state.accounts[idx] = err.data.account;
+      }
+      if (!silentToast) {
+        onToast?.(err?.message || "续签 AT 失败", "error");
+      }
+      return { ok: false, error: err?.message || "续签 AT 失败", code: err?.data?.code || "" };
+    } finally {
+      renewingAtIds.delete(acc.id);
+      renderQuotaSummaryCard();
+      renderFilterBar();
+      renderAccountList();
+    }
+  }
+
+  async function handleBatchRenewAt() {
+    if (batchRenewingAt || batchRefreshing) return;
+    const nowMs = Date.now();
+    const targets = state.accounts.filter((a) => {
+      if (!a || a.enabled === false) return false;
+      const st = resolveAccountStatus(a, nowMs);
+      return st.code === "AT_EXPIRED" && !st.blocking;
+    });
+    if (targets.length === 0) {
+      onToast?.("当前没有需要续签 AT 的已启用账号", "info");
+      return;
+    }
+    batchRenewingAt = true;
+    let done = 0;
+    let okCount = 0;
+    let failCount = 0;
+    renewAtProgressText = `续签 AT 0/${targets.length}`;
+    renderFilterBar();
+
+    try {
+      // Strictly sequential OAuth-only AT refresh with 1s pacing (no CloudCode quota probe)
+      for (let i = 0; i < targets.length && !destroyed; i += 1) {
+        const acc = targets[i];
+        const r = await handleRenewSingleAt(acc, { silentToast: true });
+        done += 1;
+        if (r?.ok) okCount += 1;
+        else if (!r?.skipped) failCount += 1;
+        renewAtProgressText = `续签 AT ${done}/${targets.length}`;
+        renderFilterBar();
+        if (i < targets.length - 1 && !destroyed) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+      onToast?.(
+        failCount > 0
+          ? `AT 续签完成：${okCount} 个已刷新，${failCount} 个失败（已标出具体原因）`
+          : `AT 续签完成：全部 ${okCount} 个账号已刷新有效`,
+        failCount > 0 ? "info" : "success",
+      );
+    } finally {
+      batchRenewingAt = false;
+      renewAtProgressText = "";
+      renderAll();
+    }
+  }
+
   async function handleBatchRefreshAll() {
-    if (batchRefreshing) return;
+    if (batchRefreshing || batchRenewingAt) return;
     const nowMs = Date.now();
     // Skip blocking abnormal accounts (banned / verification / RT expired) to avoid triggering Google risk control
     const targets = state.accounts.filter(
@@ -1969,6 +2068,7 @@ export function createAccountsHub({
   bindClick(settingsSaveBtn, () => void handleSaveSettings());
   bindClick(rollbackBtn, () => void handleRollbackBackup());
   bindClick(statusCancelBtn, () => void handleStatusBannerAction());
+  bindClick(renewAtBtn, () => void handleBatchRenewAt());
   bindClick(batchRefreshBtn, () => void handleBatchRefreshAll());
   bindClick(disableAbnormalBtn, () => void handleDisableAbnormal());
 

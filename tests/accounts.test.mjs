@@ -1980,6 +1980,8 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
     'goodacc@gmail.com': 'ok',
   };
 
+  let remoteQuotaCalls = 0;
+  let renewAtCalls = 0;
   const mgr = createAccountManager({
     paths,
     storage,
@@ -1988,7 +1990,10 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
     driver,
     now: () => nowMs,
     remoteQuotaFetcher: async (credObj) => {
-      const m = modeByEmail[credObj.id_token_email] || 'ok';
+      remoteQuotaCalls += 1;
+      const rt = String(credObj?.token?.refresh_token || '');
+      const emailKey = rt.startsWith('1//0e_') ? rt.slice('1//0e_'.length) : credObj.id_token_email;
+      const m = modeByEmail[emailKey] || 'ok';
       if (m === 'verify') throw verifyErr;
       if (m === 'banned') throw bannedErr;
       if (m === 'rt_expired') {
@@ -2005,6 +2010,33 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
         tokenExpiryMs: nowMs + 3600_000,
         updatedCredObj: credObj,
         renewed: false,
+      };
+    },
+    tokenRefresher: async (credObj, opts) => {
+      renewAtCalls += 1;
+      const rt = String(credObj?.token?.refresh_token || '');
+      const emailKey = rt.startsWith('1//0e_') ? rt.slice('1//0e_'.length) : credObj.id_token_email;
+      const m = modeByEmail[emailKey] || 'ok';
+      if (m === 'rt_expired') {
+        const e = new Error('Refresh Token (RT) 已过期或被撤销');
+        e.status = 401;
+        e.code = 'RT_EXPIRED';
+        throw e;
+      }
+      const nextExp = opts.nowMs + 3600_000;
+      return {
+        accessToken: 'ya29.at_only_renewed',
+        renewed: true,
+        matchedClientId: 'test-client-at.apps.googleusercontent.com',
+        expiryMs: nextExp,
+        credObj: {
+          ...credObj,
+          token: {
+            ...credObj.token,
+            access_token: 'ya29.at_only_renewed',
+            expiry: formatRfc3339Micros(nextExp),
+          },
+        },
       };
     },
   });
@@ -2069,14 +2101,51 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
   assert.ok(openedValidationUrl.includes('Email=needverify%40gmail.com'));
   assert.ok(openedValidationUrl.includes(encodeURIComponent('https://accounts.google.com/verify?token=abc')));
 
-  // Switching into confirmed ACCOUNT_BANNED or RT_EXPIRED account is refused before touching Antigravity
+  // Switching into confirmed ACCOUNT_BANNED (422) or RT_EXPIRED (401 via pre-switch verify) is refused before touching Antigravity
   const swBanned = await mgr.switchAccount({ accountId: byEmail['bannedacc@gmail.com'], autoResume: false });
   assert.equal(swBanned.ok, false);
   assert.equal(swBanned.status, 422);
   const swRt = await mgr.switchAccount({ accountId: byEmail['rtexpired@gmail.com'], autoResume: false });
   assert.equal(swRt.ok, false);
-  assert.equal(swRt.status, 422);
+  assert.equal(swRt.status, 401);
   assert.equal(driver.launchedTxs.length, 0);
+
+  // One-click AT-only renewal: imports an AT-expired account with valid RT and renews ONLY via OAuth (zero CloudCode calls)
+  const impAtExp = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'atexpired@gmail.com',
+      credential: {
+        token: {
+          access_token: 'ya29.old_expired_at',
+          refresh_token: '1//0e_atexpired@gmail.com',
+          expiry: new Date(nowMs - 600_000).toISOString(),
+        },
+        auth_method: 'consumer',
+      },
+    }),
+  });
+  assert.equal(impAtExp.ok, true);
+  const atExpiredId = impAtExp.accounts[0].id;
+  assert.equal(impAtExp.accounts[0].accountStatus.code, 'AT_EXPIRED');
+  assert.equal(impAtExp.accounts[0].accountStatus.blocking, false);
+
+  const remoteBeforeAtRenew = remoteQuotaCalls;
+  const renewBeforeAtRenew = renewAtCalls;
+  const rAtRenew = await mgr.renewAccountAccessToken(atExpiredId);
+  assert.equal(rAtRenew.ok, true);
+  assert.equal(rAtRenew.renewed, true);
+  assert.equal(rAtRenew.mode, 'oauth_at_only');
+  assert.equal(rAtRenew.account.accountStatus.code, 'OK');
+  assert.equal(renewAtCalls, renewBeforeAtRenew + 1);
+  assert.equal(remoteQuotaCalls, remoteBeforeAtRenew); // ZERO CloudCode quota calls!
+  const expAtRenewed = await mgr.exportAccountJson(atExpiredId);
+  assert.equal(expAtRenewed.data.credential.token.access_token, 'ya29.at_only_renewed');
+
+  // AT-only renewal on revoked RT accurately persists RT_EXPIRED
+  const rAtRevoked = await mgr.renewAccountAccessToken(byEmail['rtexpired@gmail.com']);
+  assert.equal(rAtRevoked.ok, false);
+  assert.equal(rAtRevoked.code, 'RT_EXPIRED');
+  assert.equal(rAtRevoked.account.accountStatus.code, 'RT_EXPIRED');
 
   // Disable all blocking abnormal accounts in one shot without disabling healthy/current accounts
   const disRes = await mgr.disableAbnormalAccounts();

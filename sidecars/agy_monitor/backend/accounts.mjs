@@ -4678,6 +4678,174 @@ export function createAccountManager({
     });
   }
 
+  /**
+   * Lightweight AT-only renewal via OAuth refresh_token (zero CloudCode / loadCodeAssist calls).
+   * Designed for one-click AT refresh on inactive accounts whose access_token has expired.
+   */
+  async function renewAccountAccessToken(accountId, { forceRefresh = true } = {}) {
+    const id = String(accountId || '').trim();
+    if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
+
+    const nowMs = now();
+    const liveInfo = await readLiveEmailSafe();
+
+    const snap = await withStoreLock(async () => {
+      const [index, vault] = await Promise.all([readIndex(), readVault()]);
+      const acc = index.accounts.find((a) => a.id === id);
+      if (!acc) return { missing: true };
+      const secret = vault?.secrets?.[acc.id] || null;
+      return {
+        missing: false,
+        email: acc.email,
+        oauthClientId: typeof acc.oauthClientId === 'string' ? acc.oauthClientId : '',
+        secretCredJson: typeof secret?.credJson === 'string' ? secret.credJson : '',
+      };
+    });
+
+    if (snap.missing) {
+      return { ok: false, status: 404, error: '目标账号不存在' };
+    }
+
+    const isCurrent = Boolean(liveInfo.email && sanitizeEmail(snap.email) === liveInfo.email);
+    let parsedCred = null;
+    if (snap.secretCredJson) {
+      try {
+        parsedCred = JSON.parse(snap.secretCredJson);
+      } catch {
+        parsedCred = null;
+      }
+    }
+    if (isCurrent && liveInfo.parsed && extractRefreshToken(liveInfo.parsed)) {
+      const liveExp = extractTokenExpiryMs(liveInfo.parsed);
+      const storedExp = extractTokenExpiryMs(parsedCred);
+      if (!parsedCred || !extractRefreshToken(parsedCred) || liveExp > storedExp) {
+        parsedCred = liveInfo.parsed;
+      }
+      // If active account's live AT is already fresh, sync from Windows Credential Manager with zero remote calls
+      if (!forceRefresh && liveExp > nowMs + OAUTH_REFRESH_SAFETY_MS) {
+        return withStoreLock(async () => {
+          const [index, vault] = await Promise.all([readIndex(), readVault()]);
+          const acc = index.accounts.find((a) => a.id === id);
+          if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
+          const vaultUpdated = syncLiveCredentialIntoVaultLocked(acc, vault, liveInfo, nowMs);
+          acc.hasRefreshToken = true;
+          clearAccountErrorFields(acc);
+          acc.updatedAtMs = nowMs;
+          if (vaultUpdated) await writeVault(vault);
+          await writeIndex(index);
+          return {
+            ok: true,
+            renewed: false,
+            mode: 'live_sync',
+            message: `${acc.email} 的 Access Token (AT) 当前有效，已同步本地凭据`,
+            account: formatPublicAccount(acc, liveInfo.email, nowMs),
+          };
+        });
+      }
+    }
+
+    if (!parsedCred || !extractRefreshToken(parsedCred)) {
+      const existingAccess =
+        (typeof parsedCred?.token?.access_token === 'string' && parsedCred.token.access_token.trim()) ||
+        (typeof parsedCred?.access_token === 'string' && parsedCred.access_token.trim()) ||
+        '';
+      const credExpMs = extractTokenExpiryMs(parsedCred);
+      const hasExplicitExpiry = Boolean(parsedCred?.token?.expiry || parsedCred?.expiry);
+      const isAtExpired = Boolean(
+        existingAccess && ((credExpMs > 0 && credExpMs <= nowMs) || (hasExplicitExpiry && credExpMs <= nowMs)),
+      );
+      const code = isAtExpired ? 'AT_EXPIRED' : 'MISSING_REFRESH_TOKEN';
+      const errMsg = isAtExpired
+        ? 'Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入'
+        : '该账号缺少 Refresh Token (RT)，无法续签，请重新授权或导入';
+      return withStoreLock(async () => {
+        const index = await readIndex();
+        const acc = index.accounts.find((a) => a.id === id);
+        if (acc) {
+          acc.hasRefreshToken = false;
+          if (credExpMs > 0) acc.tokenExpiryMs = credExpMs;
+          acc.authError = errMsg;
+          acc.authErrorCode = code;
+          acc.authErrorAtMs = nowMs;
+          acc.authValidationUrl = '';
+          await writeIndex(index);
+        }
+        return {
+          ok: false,
+          status: 422,
+          code,
+          error: errMsg,
+          account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
+        };
+      });
+    }
+
+    let renewed;
+    try {
+      renewed = await activeTokenRefresher(parsedCred, {
+        nowMs,
+        forceRefresh: Boolean(forceRefresh),
+        preferredClientId: snap.oauthClientId || '',
+      });
+    } catch (err) {
+      const classified = classifyAccountError(err);
+      return withStoreLock(async () => {
+        const index = await readIndex();
+        const acc = index.accounts.find((a) => a.id === id);
+        if (acc) {
+          acc.hasRefreshToken = Boolean(extractRefreshToken(parsedCred));
+          acc.authError = classified.message;
+          acc.authErrorCode = classified.code;
+          acc.authErrorAtMs = nowMs;
+          acc.authValidationUrl = classified.validationUrl || '';
+          await writeIndex(index);
+        }
+        return {
+          ok: false,
+          status: Number(err?.status) || 502,
+          code: classified.code,
+          error: classified.message,
+          account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
+        };
+      });
+    }
+
+    return withStoreLock(async () => {
+      const [index, vault] = await Promise.all([readIndex(), readVault()]);
+      const acc = index.accounts.find((a) => a.id === id);
+      if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
+
+      const nextCredObj = renewed?.credObj || parsedCred;
+      const nextExpiryMs = Number(renewed?.expiryMs) || extractTokenExpiryMs(nextCredObj);
+      const nextRtHash = computeRefreshTokenHash(extractRefreshToken(nextCredObj));
+      if (nextExpiryMs > 0) acc.tokenExpiryMs = nextExpiryMs;
+      if (renewed?.matchedClientId) acc.oauthClientId = renewed.matchedClientId;
+      if (nextRtHash) acc.refreshTokenHash = nextRtHash;
+      acc.hasRefreshToken = Boolean(extractRefreshToken(nextCredObj));
+      clearAccountErrorFields(acc);
+      acc.updatedAtMs = nowMs;
+
+      if (renewed?.renewed && renewed.credObj && vault?.secrets?.[acc.id]) {
+        vault.secrets[acc.id] = {
+          ...vault.secrets[acc.id],
+          credJson: JSON.stringify(renewed.credObj),
+        };
+        await writeVault(vault);
+      }
+      await writeIndex(index);
+
+      return {
+        ok: true,
+        renewed: Boolean(renewed?.renewed),
+        mode: 'oauth_at_only',
+        message: renewed?.renewed
+          ? `已成功续签 ${acc.email} 的 Access Token (AT)`
+          : `${acc.email} 的 Access Token (AT) 当前仍有效`,
+        account: formatPublicAccount(acc, liveInfo.email, nowMs),
+      };
+    });
+  }
+
   async function resolveRunningConversationsSnapshot() {
     if (typeof getRunningConversations !== 'function') return [];
     try {
@@ -4773,9 +4941,6 @@ export function createAccountManager({
       if (targetStatus.code === 'ACCOUNT_BANNED') {
         return { ok: false, status: 422, error: '该账号已被 Google 封禁或停用，已中止切换' };
       }
-      if (targetStatus.code === 'RT_EXPIRED') {
-        return { ok: false, status: 422, error: '该账号 Refresh Token (RT) 已过期或失效，请先重新授权后再切换' };
-      }
 
       const secret = vault.secrets[id];
       if (!secret || !secret.credJson) {
@@ -4803,12 +4968,16 @@ export function createAccountManager({
           (typeof parsedTargetCred?.access_token === 'string' &&
             parsedTargetCred.access_token.trim()) ||
           '';
-        const needsRenew = !existingAccess || !storedExp || storedExp - ts <= OAUTH_REFRESH_SAFETY_MS;
+        const needsRenew =
+          targetStatus.code === 'RT_EXPIRED' ||
+          !existingAccess ||
+          !storedExp ||
+          storedExp - ts <= OAUTH_REFRESH_SAFETY_MS;
         if (needsRenew) {
           try {
             const renewed = await activeTokenRefresher(parsedTargetCred, {
               nowMs: ts,
-              forceRefresh: false,
+              forceRefresh: targetStatus.code === 'RT_EXPIRED',
               preferredClientId: target.oauthClientId || '',
               signal: AbortSignal.timeout(12_000),
             });
@@ -5741,6 +5910,7 @@ export function createAccountManager({
     deleteAccount,
     exportAccountJson,
     refreshAccountQuota,
+    renewAccountAccessToken,
     openAccountValidationUrl,
     disableAbnormalAccounts,
     switchAccount,
