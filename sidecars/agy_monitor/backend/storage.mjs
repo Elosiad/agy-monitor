@@ -184,8 +184,10 @@ function defaultThemesState() {
     syncGlobal: true,
     backdropEnabled: true,
     hudEnabled: true,
+    hudInjectionMode: 'asar',
+    hudAutoReinject: true,
     zeroUiaMode: false,
-    hostThemeMode: 'backdrop',
+    hostThemeMode: 'inject',
     cdpPort: 9229,
     hostBlendPct: 25,
     activeWallpaperId: 'wp-1',
@@ -695,12 +697,25 @@ export function createStorage(paths) {
         ? safeRaw.hudEnabled
         : base.hudEnabled;
 
+    const hudInjectionMode =
+      safeRaw.hudInjectionMode === 'cdp' || safeRaw.hudInjectionMode === 'uia' || safeRaw.hudInjectionMode === 'asar'
+        ? safeRaw.hudInjectionMode
+        : base.hudInjectionMode;
+
+    const hudAutoReinject =
+      typeof safeRaw.hudAutoReinject === 'boolean'
+        ? safeRaw.hudAutoReinject
+        : base.hudAutoReinject;
+
     const zeroUiaMode =
       typeof safeRaw.zeroUiaMode === 'boolean'
         ? safeRaw.zeroUiaMode
         : base.zeroUiaMode;
 
-    const hostThemeMode = safeRaw.hostThemeMode === 'cdp' ? 'cdp' : 'backdrop';
+    const hostThemeMode =
+      safeRaw.hostThemeMode === 'cdp' || safeRaw.hostThemeMode === 'backdrop' || safeRaw.hostThemeMode === 'inject'
+        ? safeRaw.hostThemeMode
+        : base.hostThemeMode;
     const cdpPort = clampInt(safeRaw.cdpPort, 1024, 65535, base.cdpPort);
 
     return {
@@ -714,6 +729,8 @@ export function createStorage(paths) {
       syncGlobal: followHostTheme,
       backdropEnabled,
       hudEnabled,
+      hudInjectionMode,
+      hudAutoReinject,
       zeroUiaMode,
       hostThemeMode,
       cdpPort,
@@ -738,8 +755,12 @@ export function createStorage(paths) {
       syncGlobal: Boolean(state.followHostTheme ?? state.syncGlobal),
       backdropEnabled: Boolean(state.backdropEnabled),
       hudEnabled: state.hudEnabled !== false,
+      hudInjectionMode:
+        state.hudInjectionMode === 'cdp' || state.hudInjectionMode === 'uia' ? state.hudInjectionMode : 'asar',
+      hudAutoReinject: state.hudAutoReinject !== false,
       zeroUiaMode: Boolean(state.zeroUiaMode),
-      hostThemeMode: state.hostThemeMode === 'cdp' ? 'cdp' : 'backdrop',
+      hostThemeMode:
+        state.hostThemeMode === 'cdp' || state.hostThemeMode === 'backdrop' ? state.hostThemeMode : 'inject',
       cdpPort: clampInt(state.cdpPort, 1024, 65535, 9229),
       hostBlendPct: clampInt(state.hostBlendPct, 5, 42, 25),
       activeWallpaperId: state.activeWallpaperId,

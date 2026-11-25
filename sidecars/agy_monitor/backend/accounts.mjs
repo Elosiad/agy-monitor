@@ -7,9 +7,14 @@
  *   (CurrentUser scope) via native AgyAccountTool.exe.
  * - Zero CLI argument exposure: secrets move exclusively over stdin/stdout pipes
  *   or DPAPI-encrypted temporary files.
- * - Detached offline switch daemon: gracefully closes Antigravity & language_server
- *   via WM_CLOSE before updating Windows Credential Manager + app_storage.json +
- *   credential-user-scope, with automatic DPAPI rollback on any error.
+ * - Detached offline switch daemon (Cockpit-aligned): gracefully closes Antigravity
+ *   & language_server (`taskkill /T` + WM_CLOSE) before atomically syncing Windows
+ *   Credential Manager (`gemini:antigravity`), `~/.gemini/jetski-standalone-oauth-token`,
+ *   and initialized `~/.gemini/antigravity-cli/antigravity-oauth-token`, without mutating
+ *   `app_storage.json` or `credential-user-scope`, with automatic DPAPI rollback on error.
+ * - Conservative anti-ban policy: defaults to zero silent background remote polling for
+ *   inactive accounts; refreshes target token right before switching (15-min skew) or on
+ *   explicit user click.
  * - At-Most-Once auto-resume: consumes pending_resume.json before dispatching
  *   `agentapi send-message` only after the new account's quota RPC confirms readiness.
  */
@@ -28,6 +33,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { atomicWriteBuffer, atomicWriteJson, atomicWriteText } from './paths.mjs';
 import { findAntigravityExePath } from './cdp_theme_bridge.mjs';
 import { restoreHostOpacityFallback } from './backdrop_manager.mjs';
+import { extractAsarFile, parseAsar } from './hud_injector.mjs';
 import { normalizeQuotaSummary } from './quota.mjs';
 import { detectWindowsHostEnv } from './wsl_bridge.mjs';
 
@@ -39,6 +45,8 @@ export const PENDING_OAUTH_TTL_MS = 10 * 60 * 1000;
 export const AUTO_SWITCH_COOLDOWN_MS = 2 * 60 * 1000;
 export const AUTO_SWITCH_CROSS_ACCOUNT_SETTLE_MS = 15 * 1000;
 export const QUOTA_ERROR_FRESHNESS_MS = 90 * 1000;
+export const WINDOWS_CRED_MAX_BLOB_BYTES = 5 * 512; // 2560 bytes (Windows CredWriteW limit)
+export const NATIVE_OAUTH_USER_AGENT = 'vscode/1.X.X (Antigravity/4.3.0)';
 const MAX_HANDLED_QUOTA_ERRORS = 40;
 const MAX_BACKUPS_RETAINED = 10;
 const MAX_IMPORT_CHARS = 1024 * 1024;
@@ -53,16 +61,19 @@ export const DEFAULT_ACCOUNT_SETTINGS = Object.freeze({
   quotaRefreshIntervalMin: 5,
   autoSwitchTarget: 'gemini',
   autoSwitchEnabled: false,
+  backgroundRefreshInactive: false,
   sortBy: 'lastUsed',
   sortOrder: 'desc',
 });
 
 export const ANTIGRAVITY_OAUTH_SCOPES = Object.freeze([
+  'openid',
   'https://www.googleapis.com/auth/cloud-platform',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
   'https://www.googleapis.com/auth/cclog',
   'https://www.googleapis.com/auth/experimentsandconfigs',
+  'https://www.googleapis.com/auth/aicode',
 ]);
 
 let cachedLocalOAuthClient = null;
@@ -309,7 +320,8 @@ export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChalle
   u.searchParams.set('response_type', 'code');
   u.searchParams.set('scope', ANTIGRAVITY_OAUTH_SCOPES.join(' '));
   u.searchParams.set('access_type', 'offline');
-  u.searchParams.set('prompt', 'select_account consent');
+  u.searchParams.set('prompt', 'consent');
+  u.searchParams.set('include_granted_scopes', 'true');
   u.searchParams.set('state', String(state || '').trim());
   u.searchParams.set('code_challenge', String(codeChallenge || '').trim());
   u.searchParams.set('code_challenge_method', 'S256');
@@ -873,7 +885,10 @@ export async function exchangeOAuthCode(
   for (const secret of secretsToTry) {
     const res = await fetchImpl('https://oauth2.googleapis.com/token', {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'user-agent': NATIVE_OAUTH_USER_AGENT,
+      },
       body: new URLSearchParams({
         client_id: cid,
         client_secret: secret,
@@ -913,14 +928,228 @@ export async function fetchGoogleProfile(accessToken, fetchImpl = proxyAwareFetc
 
 const CLOUD_CODE_DAILY_BASE_URL = 'https://daily-cloudcode-pa.googleapis.com';
 const CLOUD_CODE_PROD_BASE_URL = 'https://cloudcode-pa.googleapis.com';
-const CLOUD_CODE_IDE_VERSION = '2.25.0';
-const CLOUD_CODE_LOAD_UA = `antigravity/${CLOUD_CODE_IDE_VERSION} windows/amd64 google-api-nodejs-client/10.3.0`;
-const CLOUD_CODE_QUOTA_UA = `antigravity/${CLOUD_CODE_IDE_VERSION} (aidev_client; os_type=windows; arch=amd64; cl=1003475615)`;
+const DEFAULT_CLOUD_CODE_IDE_VERSION = '2.25.0';
+const DEFAULT_CLOUD_CODE_CL = '1003475615';
+const DEFAULT_GOOGLE_API_NODEJS_CLIENT_VERSION = '10.3.0';
 const CLOUD_CODE_X_GOOG_API_CLIENT = 'gl-node/22.21.1';
-const OAUTH_REFRESH_SAFETY_MS = 5 * 60_000;
-const OAUTH_PROACTIVE_RENEW_WINDOW_MS = 10 * 60_000;
+const OAUTH_REFRESH_SAFETY_MS = 15 * 60_000; // 900s (matches Cockpit TOKEN_REFRESH_SKEW_SECONDS)
+const OAUTH_INVALID_GRANT_RETRY_MS = 500; // 1x 500ms retry (matches Cockpit oauth.rs)
+const OAUTH_PROACTIVE_RENEW_WINDOW_MS = 15 * 60_000;
 const OAUTH_BACKGROUND_RETRY_COOLDOWN_MS = 5 * 60_000;
 const OAUTH_INVALID_GRANT_BACKOFF_MS = 30 * 60_000;
+
+let cachedCloudCodeClientProfile = null;
+
+function parseSemverTuple(raw) {
+  const parts = String(raw || '')
+    .trim()
+    .replace(/^v/i, '')
+    .split(/[^0-9]+/)
+    .filter(Boolean);
+  if (parts.length === 0) return null;
+  const major = Number(parts[0]);
+  const minor = Number(parts[1] || 0);
+  const patch = Number(parts[2] || 0);
+  if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) return null;
+  return [major, minor, patch];
+}
+
+function compareSemverTuple(a, b) {
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+function readPackageVersionFromFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return '';
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return typeof parsed?.version === 'string' ? parsed.version.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+export function detectLocalAntigravityVersion({ exePath = '', forceRefresh = false } = {}) {
+  if (!forceRefresh && cachedCloudCodeClientProfile?.ideVersion) {
+    return cachedCloudCodeClientProfile.ideVersion;
+  }
+  let resolvedExe = exePath || '';
+  if (!resolvedExe) {
+    try {
+      resolvedExe = findAntigravityExePath() || '';
+    } catch {
+      resolvedExe = '';
+    }
+  }
+  const roots = [];
+  if (resolvedExe) {
+    const exeDir = path.dirname(resolvedExe);
+    roots.push(path.join(exeDir, 'resources'), path.join(exeDir, '..', 'Resources'), exeDir);
+  }
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    roots.push(
+      path.join(localAppData, 'Programs', 'antigravity', 'resources'),
+      path.join(localAppData, 'Programs', 'Antigravity', 'resources'),
+    );
+  } else if (process.platform === 'darwin') {
+    roots.push('/Applications/Antigravity.app/Contents/Resources');
+  } else {
+    roots.push('/opt/Antigravity/resources', '/usr/share/antigravity/resources');
+  }
+
+  let detected = '';
+  for (const root of uniqueStrings(roots.map((r) => path.resolve(r)))) {
+    const directPkg = readPackageVersionFromFile(path.join(root, 'app', 'package.json'));
+    if (directPkg) {
+      detected = directPkg;
+      break;
+    }
+    const asarBuf = readRawFileBypassingAsar(path.join(root, 'app.asar'), 160 * 1024 * 1024);
+    if (asarBuf) {
+      try {
+        const parsedAsar = parseAsar(asarBuf);
+        const pkgBuf = extractAsarFile(parsedAsar, 'package.json');
+        const pkg = JSON.parse(pkgBuf.toString('utf8'));
+        if (typeof pkg?.version === 'string' && pkg.version.trim()) {
+          detected = pkg.version.trim();
+          break;
+        }
+      } catch {
+        // ignore malformed asar
+      }
+    }
+  }
+
+  if (!detected) return DEFAULT_CLOUD_CODE_IDE_VERSION;
+  const detTuple = parseSemverTuple(detected);
+  const minTuple = parseSemverTuple(DEFAULT_CLOUD_CODE_IDE_VERSION);
+  if (detTuple && minTuple && compareSemverTuple(detTuple, minTuple) < 0) {
+    return DEFAULT_CLOUD_CODE_IDE_VERSION;
+  }
+  return detected;
+}
+
+export function getCloudCodeClientProfile({ forceRefresh = false } = {}) {
+  if (!forceRefresh && cachedCloudCodeClientProfile) {
+    return cachedCloudCodeClientProfile;
+  }
+  const ideVersion = detectLocalAntigravityVersion({ forceRefresh });
+  const uaOs =
+    process.platform === 'darwin'
+      ? 'darwin'
+      : process.platform === 'linux'
+        ? 'linux'
+        : 'windows';
+  const uaArch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+  const platformMap = {
+    'darwin:amd64': 'DARWIN_AMD64',
+    'darwin:arm64': 'DARWIN_ARM64',
+    'linux:amd64': 'LINUX_AMD64',
+    'linux:arm64': 'LINUX_ARM64',
+    'windows:amd64': 'WINDOWS_AMD64',
+    'windows:arm64': 'WINDOWS_AMD64',
+  };
+  const platform = platformMap[`${uaOs}:${uaArch}`] || 'WINDOWS_AMD64';
+  cachedCloudCodeClientProfile = {
+    ideVersion,
+    uaOs,
+    uaArch,
+    platform,
+    loadUserAgent: `antigravity/${ideVersion} ${uaOs}/${uaArch} google-api-nodejs-client/${DEFAULT_GOOGLE_API_NODEJS_CLIENT_VERSION}`,
+    quotaUserAgent: `antigravity/${ideVersion} (aidev_client; os_type=${uaOs}; arch=${uaArch}; cl=${DEFAULT_CLOUD_CODE_CL})`,
+    xGoogApiClient: CLOUD_CODE_X_GOOG_API_CLIENT,
+  };
+  return cachedCloudCodeClientProfile;
+}
+
+export function clearCloudCodeClientProfileCache() {
+  cachedCloudCodeClientProfile = null;
+}
+
+export function formatRfc3339Micros(timestampMs) {
+  const ms = Number(timestampMs);
+  const safeMs = Number.isFinite(ms) && ms > 0 ? Math.trunc(ms) : Date.now();
+  const iso = new Date(safeMs).toISOString(); // YYYY-MM-DDTHH:mm:ss.sssZ
+  return iso.replace(/(\.\d{3})Z$/, '$1000Z');
+}
+
+function computeRefreshTokenHash(refreshToken) {
+  const rt = String(refreshToken || '').trim();
+  if (!rt) return '';
+  return crypto.createHash('sha256').update(rt).digest('hex').slice(0, 24);
+}
+
+/**
+ * Build the exact minimal official Antigravity Go `compositeTokenStorage` JSON payload
+ * (100% aligned with Cockpit Tools `antigravity_credential.rs`):
+ * `{ token: { access_token, token_type: "Bearer", refresh_token, expiry }, auth_method: "consumer", id_token? }`.
+ * Enforces Windows `CRED_MAX_CREDENTIAL_BLOB_SIZE` (2560 bytes), dropping optional `id_token`
+ * cleanly only if needed to fit within Windows Credential Manager's hard limit.
+ */
+export function buildCockpitCredentialPayload(
+  credObj,
+  { maxBytes = WINDOWS_CRED_MAX_BLOB_BYTES, nowMs = Date.now() } = {},
+) {
+  if (!credObj || typeof credObj !== 'object') {
+    throw new Error('凭据对象无效');
+  }
+  const tok = credObj.token && typeof credObj.token === 'object' ? credObj.token : {};
+  const refreshToken = extractRefreshToken(credObj);
+  if (!refreshToken) {
+    throw new Error('缺少有效的 refresh_token');
+  }
+  const accessToken =
+    (typeof tok.access_token === 'string' && tok.access_token.trim()) ||
+    (typeof credObj.access_token === 'string' && credObj.access_token.trim()) ||
+    '';
+  const expiryMs = extractTokenExpiryMs(credObj);
+  const expiry = formatRfc3339Micros(expiryMs > 0 ? expiryMs : nowMs);
+  const idToken =
+    (typeof credObj.id_token === 'string' && credObj.id_token.trim()) ||
+    (typeof tok.id_token === 'string' && tok.id_token.trim()) ||
+    '';
+
+  const basePayload = {
+    token: {
+      access_token: accessToken,
+      token_type: 'Bearer',
+      refresh_token: refreshToken,
+      expiry,
+    },
+    auth_method: 'consumer',
+  };
+
+  let payload = idToken ? { ...basePayload, id_token: idToken } : basePayload;
+  let json = JSON.stringify(payload);
+  let byteLength = Buffer.byteLength(json, 'utf8');
+  let idTokenOmittedForSize = false;
+
+  if (byteLength > maxBytes && idToken) {
+    payload = basePayload;
+    json = JSON.stringify(payload);
+    byteLength = Buffer.byteLength(json, 'utf8');
+    idTokenOmittedForSize = true;
+  }
+
+  if (byteLength > maxBytes) {
+    const err = new Error(
+      `ANTIGRAVITY_WINDOWS_CREDENTIAL_TOO_LARGE: 凭据大小 ${byteLength} 字节超出 Windows 上限 ${maxBytes} 字节`,
+    );
+    err.code = 'CREDENTIAL_TOO_LARGE';
+    err.status = 422;
+    throw err;
+  }
+
+  return {
+    payload,
+    json,
+    byteLength,
+    idTokenOmittedForSize,
+  };
+}
 
 function formatOAuthErrorDetail(rawText = '') {
   const s = String(rawText || '').trim();
@@ -1003,6 +1232,7 @@ export async function refreshAccessTokenForCredential(
     oauthClient = null,
     preferredClientId = '',
     signal = undefined,
+    invalidGrantRetryMs = OAUTH_INVALID_GRANT_RETRY_MS,
   } = {},
 ) {
   if (!credObj || typeof credObj !== 'object') {
@@ -1101,60 +1331,75 @@ export async function refreshAccessTokenForCredential(
   let invalidGrantErr = null;
 
   for (const attempt of attempts) {
-    const res = await fetchImpl('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      ...(signal ? { signal } : {}),
-      body: new URLSearchParams({
-        client_id: attempt.clientId,
-        client_secret: attempt.clientSecret,
-        refresh_token: refreshToken,
-        grant_type: 'refresh_token',
-      }).toString(),
-    });
+    let invalidGrantRetriesLeft = 1;
+    while (true) {
+      const res = await fetchImpl('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          'user-agent': NATIVE_OAUTH_USER_AGENT,
+        },
+        ...(signal ? { signal } : {}),
+        body: new URLSearchParams({
+          client_id: attempt.clientId,
+          client_secret: attempt.clientSecret,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token',
+        }).toString(),
+      });
 
-    if (res.ok) {
-      matchedClientId = attempt.clientId;
-      if (cachedLocalOAuthClient) {
-        if (cachedLocalOAuthClient.clientId === attempt.clientId) {
-          cachedLocalOAuthClient = { ...cachedLocalOAuthClient, clientSecret: attempt.clientSecret };
+      if (res.ok) {
+        matchedClientId = attempt.clientId;
+        if (cachedLocalOAuthClient) {
+          if (cachedLocalOAuthClient.clientId === attempt.clientId) {
+            cachedLocalOAuthClient = { ...cachedLocalOAuthClient, clientSecret: attempt.clientSecret };
+          }
+          if (Array.isArray(cachedLocalOAuthClient.candidateClients)) {
+            const hit = cachedLocalOAuthClient.candidateClients.find((c) => c.clientId === attempt.clientId);
+            if (hit) hit.clientSecret = attempt.clientSecret;
+          }
         }
-        if (Array.isArray(cachedLocalOAuthClient.candidateClients)) {
-          const hit = cachedLocalOAuthClient.candidateClients.find((c) => c.clientId === attempt.clientId);
-          if (hit) hit.clientSecret = attempt.clientSecret;
-        }
+        payload = await res.json();
+        break;
       }
-      payload = await res.json();
-      break;
-    }
 
-    const errText = await res.text().catch(() => '');
-    const errDetail = formatOAuthErrorDetail(errText);
-    if (res.status === 401 && /invalid_client|unauthorized_client/i.test(errText)) {
-      lastClientErr = new Error(
-        `Google OAuth 客户端校验失败 (HTTP 401)${errDetail ? `: ${errDetail}` : ''}`,
+      const errText = await res.text().catch(() => '');
+      const errDetail = formatOAuthErrorDetail(errText);
+      if (res.status === 401 && /invalid_client|unauthorized_client/i.test(errText)) {
+        lastClientErr = new Error(
+          `Google OAuth 客户端校验失败 (HTTP 401)${errDetail ? `: ${errDetail}` : ''}`,
+        );
+        lastClientErr.status = 401;
+        lastClientErr.code = 'CLIENT_MISMATCH';
+        break;
+      }
+      if ((res.status === 400 || res.status === 401) && /invalid_grant/i.test(errText)) {
+        // Cockpit oauth.rs: retry invalid_grant once after 500ms backoff before treating as revoked
+        if (invalidGrantRetriesLeft > 0) {
+          invalidGrantRetriesLeft -= 1;
+          if (invalidGrantRetryMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, invalidGrantRetryMs));
+          }
+          continue;
+        }
+        invalidGrantErr = new Error('该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权');
+        invalidGrantErr.status = 401;
+        invalidGrantErr.code = 'INVALID_GRANT';
+        if (preferredCid && attempt.clientId === preferredCid) {
+          throw invalidGrantErr;
+        }
+        // Keep checking remaining distinct client_ids if we weren't sure which client minted the token
+        break;
+      }
+      const err = new Error(
+        res.status === 400 || res.status === 401
+          ? `该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权${errDetail ? ` (${errDetail})` : ''}`
+          : `刷新 Google OAuth 令牌失败 (HTTP ${res.status})${errDetail ? `: ${errDetail}` : ''}`,
       );
-      lastClientErr.status = 401;
-      lastClientErr.code = 'CLIENT_MISMATCH';
-      continue;
+      err.status = res.status === 400 || res.status === 401 ? 401 : res.status || 502;
+      throw err;
     }
-    if ((res.status === 400 || res.status === 401) && /invalid_grant/i.test(errText)) {
-      invalidGrantErr = new Error('该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权');
-      invalidGrantErr.status = 401;
-      invalidGrantErr.code = 'INVALID_GRANT';
-      if (preferredCid && attempt.clientId === preferredCid) {
-        throw invalidGrantErr;
-      }
-      // Keep checking remaining distinct client_ids if we weren't sure which client minted the token
-      continue;
-    }
-    const err = new Error(
-      res.status === 400 || res.status === 401
-        ? `该账号 OAuth 凭据已失效或被撤销，请重新通过 OAuth 授权${errDetail ? ` (${errDetail})` : ''}`
-        : `刷新 Google OAuth 令牌失败 (HTTP ${res.status})${errDetail ? `: ${errDetail}` : ''}`,
-    );
-    err.status = res.status === 400 || res.status === 401 ? 401 : res.status || 502;
-    throw err;
+    if (payload) break;
   }
 
   if (!payload) {
@@ -1169,28 +1414,26 @@ export async function refreshAccessTokenForCredential(
 
   const expiresIn = Math.max(60, Number(payload.expires_in) || 3600);
   const nextExpiryMs = nowMs + expiresIn * 1000;
-  const nextExpiry = new Date(nextExpiryMs).toISOString();
+  const nextExpiry = formatRfc3339Micros(nextExpiryMs);
+  const nextIdToken =
+    (typeof payload.id_token === 'string' && payload.id_token.trim()) ||
+    (typeof credObj.id_token === 'string' && credObj.id_token.trim()) ||
+    (typeof existingToken.id_token === 'string' && existingToken.id_token.trim()) ||
+    '';
+
   const nextToken = {
-    ...existingToken,
     access_token: accessToken,
-    token_type:
-      (typeof payload.token_type === 'string' && payload.token_type.trim()) ||
-      existingToken.token_type ||
-      'Bearer',
+    token_type: 'Bearer',
     refresh_token:
       (typeof payload.refresh_token === 'string' && payload.refresh_token.trim()) || refreshToken,
     expiry: nextExpiry,
-    expires_in: expiresIn,
-    ...(typeof payload.id_token === 'string' && payload.id_token.trim()
-      ? { id_token: payload.id_token.trim() }
-      : {}),
   };
 
   const updatedCredObj = {
     ...credObj,
     token: nextToken,
-    auth_method:
-      (typeof credObj.auth_method === 'string' && credObj.auth_method.trim()) || 'consumer',
+    auth_method: 'consumer',
+    ...(nextIdToken ? { id_token: nextIdToken } : {}),
   };
 
   return {
@@ -1286,13 +1529,14 @@ function hasUsableQuotaGroups(summary) {
   });
 }
 
-async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl) {
+async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl, baseUrl = CLOUD_CODE_DAILY_BASE_URL) {
   const validCached = validCloudCodeProjectId(cachedProjectId);
+  const clientProfile = getCloudCodeClientProfile();
   const metadata = {
     ideName: 'antigravity',
     ideType: 'ANTIGRAVITY',
-    ideVersion: CLOUD_CODE_IDE_VERSION,
-    platform: 'WINDOWS_AMD64',
+    ideVersion: clientProfile.ideVersion,
+    platform: clientProfile.platform,
     updateChannel: 'stable',
     pluginType: 'GEMINI',
     ...(validCached ? { duetProject: validCached } : {}),
@@ -1307,13 +1551,13 @@ async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl) 
   let subscriptionTier = '';
   let allowedTiers = [];
 
-  const res = await fetchImpl(`${CLOUD_CODE_DAILY_BASE_URL}/v1internal:loadCodeAssist`, {
+  const res = await fetchImpl(`${baseUrl}/v1internal:loadCodeAssist`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${accessToken}`,
       'content-type': 'application/json',
-      'user-agent': CLOUD_CODE_LOAD_UA,
-      'x-goog-api-client': CLOUD_CODE_X_GOOG_API_CLIENT,
+      'user-agent': clientProfile.loadUserAgent,
+      'x-goog-api-client': clientProfile.xGoogApiClient,
       accept: '*/*',
     },
     body: JSON.stringify(body),
@@ -1345,13 +1589,13 @@ async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl) 
       subscriptionTier ||
       'free-tier';
     try {
-      const obRes = await fetchImpl(`${CLOUD_CODE_DAILY_BASE_URL}/v1internal:onboardUser`, {
+      const obRes = await fetchImpl(`${baseUrl}/v1internal:onboardUser`, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${accessToken}`,
           'content-type': 'application/json',
-          'user-agent': CLOUD_CODE_LOAD_UA,
-          'x-goog-api-client': CLOUD_CODE_X_GOOG_API_CLIENT,
+          'user-agent': clientProfile.loadUserAgent,
+          'x-goog-api-client': clientProfile.xGoogApiClient,
           accept: '*/*',
         },
         body: JSON.stringify({
@@ -1373,14 +1617,15 @@ async function resolveCloudCodeProject(accessToken, cachedProjectId, fetchImpl) 
 }
 
 /**
- * Fetch real-time 3-category (Gemini / GPT&Claude / Argon) 5h + weekly quota
+ * Fetch real-time 2-category (Gemini / GPT&Claude) 5h + weekly quota
  * for ANY stored account directly via Google's official CloudCode endpoints
- * (aligned with Cockpit Tools `quota.rs` and Antigravity Hub).
+ * (aligned with Cockpit Tools `quota.rs` — single routed base URL, dynamic IDE version).
  */
 export async function fetchCloudCodeQuotaForCredential(
   credObj,
   {
     cachedProjectId = '',
+    isGcpTos = false,
     fetchImpl = proxyAwareFetch,
     nowMs = Date.now(),
     oauthClient = null,
@@ -1395,106 +1640,109 @@ export async function fetchCloudCodeQuotaForCredential(
     preferredClientId,
   });
 
+  const baseUrl =
+    isGcpTos && validCloudCodeProjectId(cachedProjectId)
+      ? CLOUD_CODE_PROD_BASE_URL
+      : CLOUD_CODE_DAILY_BASE_URL;
+
   const runWithToken = async (accessToken) => {
+    const clientProfile = getCloudCodeClientProfile();
     const { projectId, subscriptionTier } = await resolveCloudCodeProject(
       accessToken,
       cachedProjectId,
       fetchImpl,
+      baseUrl,
     );
     const reqBody = JSON.stringify(projectId ? { project: projectId } : {});
     const reqHeaders = {
       authorization: `Bearer ${accessToken}`,
       'content-type': 'application/json',
-      'user-agent': CLOUD_CODE_QUOTA_UA,
+      'user-agent': clientProfile.quotaUserAgent,
       accept: '*/*',
     };
 
     let lastDenialError = null;
     let lastHttpError = null;
 
-    // 1. Primary: v1internal:retrieveUserQuotaSummary (provides exact 5h + weekly buckets)
-    for (const baseUrl of [CLOUD_CODE_DAILY_BASE_URL, CLOUD_CODE_PROD_BASE_URL]) {
-      try {
-        const res = await fetchImpl(`${baseUrl}/v1internal:retrieveUserQuotaSummary`, {
-          method: 'POST',
-          headers: reqHeaders,
-          body: reqBody,
-        });
-        if (res.status === 401) {
-          const err = new Error('retrieveUserQuotaSummary 401');
-          err.status = 401;
-          throw err;
+    // 1. Primary: v1internal:retrieveUserQuotaSummary on single Cockpit-routed base URL
+    try {
+      const res = await fetchImpl(`${baseUrl}/v1internal:retrieveUserQuotaSummary`, {
+        method: 'POST',
+        headers: reqHeaders,
+        body: reqBody,
+      });
+      if (res.status === 401) {
+        const err = new Error('retrieveUserQuotaSummary 401');
+        err.status = 401;
+        throw err;
+      }
+      if (res.ok) {
+        const raw = await res.json().catch(() => null);
+        if (raw && typeof raw === 'object') {
+          const normalized = normalizeQuotaSummary(raw, nowMs);
+          if (hasUsableQuotaGroups(normalized)) {
+            return {
+              quota: normalizeStoredQuota(normalized, nowMs),
+              projectId,
+              subscriptionTier,
+              source: 'retrieveUserQuotaSummary',
+            };
+          }
         }
-        if (res.ok) {
-          const raw = await res.json().catch(() => null);
-          if (raw && typeof raw === 'object') {
-            const normalized = normalizeQuotaSummary(raw, nowMs);
-            if (hasUsableQuotaGroups(normalized)) {
-              return {
-                quota: normalizeStoredQuota(normalized, nowMs),
-                projectId,
-                subscriptionTier,
-                source: 'retrieveUserQuotaSummary',
-              };
-            }
-          }
+      } else {
+        const errText = await res.text().catch(() => '');
+        const parsedErr = parseGoogleCloudCodeError(res.status, errText);
+        if (parsedErr.reason === 'VALIDATION_REQUIRED' || parsedErr.validationUrl) {
+          lastDenialError = parsedErr;
         } else {
-          const errText = await res.text().catch(() => '');
-          const parsedErr = parseGoogleCloudCodeError(res.status, errText);
-          if (parsedErr.reason === 'VALIDATION_REQUIRED' || parsedErr.validationUrl) {
-            lastDenialError = parsedErr;
-            break;
-          }
           lastHttpError = parsedErr;
         }
-      } catch (err) {
-        if (err?.status === 401) throw err;
-        lastHttpError = err;
       }
+    } catch (err) {
+      if (err?.status === 401) throw err;
+      lastHttpError = err;
     }
 
     if (lastDenialError) throw lastDenialError;
 
-    // 2. Fallback: v1internal:fetchAvailableModels (per-model quotaInfo collapsed into 3 groups)
-    for (const baseUrl of [CLOUD_CODE_DAILY_BASE_URL, CLOUD_CODE_PROD_BASE_URL]) {
-      try {
-        const res = await fetchImpl(`${baseUrl}/v1internal:fetchAvailableModels`, {
-          method: 'POST',
-          headers: reqHeaders,
-          body: reqBody,
-        });
-        if (res.status === 401) {
-          const err = new Error('fetchAvailableModels 401');
-          err.status = 401;
-          throw err;
-        }
-        if (res.ok) {
-          const raw = await res.json().catch(() => null);
-          const built = buildQuotaFromAvailableModels(raw, nowMs);
-          if (built && hasUsableQuotaGroups(built)) {
-            return {
-              quota: normalizeStoredQuota(built, nowMs),
-              projectId,
-              subscriptionTier,
-              source: 'fetchAvailableModels',
-            };
-          }
-        } else {
-          const errText = await res.text().catch(() => '');
-          const parsedErr = parseGoogleCloudCodeError(res.status, errText);
-          if (
-            parsedErr.reason === 'VALIDATION_REQUIRED' ||
-            parsedErr.reason === 'SUBSCRIPTION_REQUIRED' ||
-            parsedErr.validationUrl
-          ) {
-            throw parsedErr;
-          }
-          lastHttpError = parsedErr;
-        }
-      } catch (err) {
-        if (err?.status === 401 || err?.reason) throw err;
-        lastHttpError = err;
+    // 2. Fallback: v1internal:fetchAvailableModels on the same routed base URL
+    try {
+      const res = await fetchImpl(`${baseUrl}/v1internal:fetchAvailableModels`, {
+        method: 'POST',
+        headers: reqHeaders,
+        body: reqBody,
+      });
+      if (res.status === 401) {
+        const err = new Error('fetchAvailableModels 401');
+        err.status = 401;
+        throw err;
       }
+      if (res.ok) {
+        const raw = await res.json().catch(() => null);
+        const built = buildQuotaFromAvailableModels(raw, nowMs);
+        if (built && hasUsableQuotaGroups(built)) {
+          return {
+            quota: normalizeStoredQuota(built, nowMs),
+            projectId,
+            subscriptionTier,
+            source: 'fetchAvailableModels',
+          };
+        }
+      } else {
+        const errText = await res.text().catch(() => '');
+        const parsedErr = parseGoogleCloudCodeError(res.status, errText);
+        if (
+          parsedErr.reason === 'VALIDATION_REQUIRED' ||
+          parsedErr.reason === 'SUBSCRIPTION_REQUIRED' ||
+          parsedErr.validationUrl
+        ) {
+          throw parsedErr;
+        }
+        lastHttpError = parsedErr;
+      }
+    } catch (err) {
+      if (err?.status === 401 || err?.reason) throw err;
+      lastHttpError = err;
     }
 
     throw lastHttpError || new Error('Google 配额接口未返回有效的模型额度数据');
@@ -1744,6 +1992,7 @@ export function normalizeAccountSettings(raw = {}) {
     : DEFAULT_ACCOUNT_SETTINGS.autoSwitchTarget;
 
   const autoSwitchEnabled = Boolean(src.autoSwitchEnabled);
+  const backgroundRefreshInactive = Boolean(src.backgroundRefreshInactive);
 
   let rawSortBy = String(src.sortBy || DEFAULT_ACCOUNT_SETTINGS.sortBy).trim();
   if (rawSortBy === 'argon') rawSortBy = 'gemini';
@@ -1758,6 +2007,7 @@ export function normalizeAccountSettings(raw = {}) {
     quotaRefreshIntervalMin: refreshMin,
     autoSwitchTarget,
     autoSwitchEnabled,
+    backgroundRefreshInactive,
     sortBy,
     sortOrder,
   };
@@ -2389,34 +2639,35 @@ export function normalizeCredentialObject(rawObj, fallbackEmail = '') {
     (typeof rawObj.token_type === 'string' && rawObj.token_type.trim()) ||
     'Bearer';
 
-  const expiry =
+  const expiryRaw =
     (typeof existingToken.expiry === 'string' && existingToken.expiry.trim()) ||
     (typeof rawObj.expiry === 'string' && rawObj.expiry.trim()) ||
-    '1970-01-01T00:00:00Z';
+    '';
+  const parsedExpiryMs = expiryRaw ? Date.parse(expiryRaw) : Number.NaN;
+  const expiry =
+    Number.isFinite(parsedExpiryMs) && parsedExpiryMs > 0
+      ? formatRfc3339Micros(parsedExpiryMs)
+      : '1970-01-01T00:00:00.000000Z';
 
-  const expiresInRaw = existingToken.expires_in ?? rawObj.expires_in ?? 0;
-  const expiresIn = Number.isFinite(Number(expiresInRaw)) ? Number(expiresInRaw) : 0;
+  const idToken =
+    (typeof rawObj.id_token === 'string' && rawObj.id_token.trim()) ||
+    (typeof existingToken.id_token === 'string' && existingToken.id_token.trim()) ||
+    (typeof rawObj.idToken === 'string' && rawObj.idToken.trim()) ||
+    '';
 
+  // Store clean Cockpit-compatible shape (top-level id_token, minimal token object)
   const tokenPayload = {
-    ...existingToken,
     access_token: accessToken,
     token_type: tokenType,
     refresh_token: refreshToken,
     expiry,
-    expires_in: expiresIn,
   };
-  if (typeof rawObj.id_token === 'string' && rawObj.id_token.trim() && !tokenPayload.id_token) {
-    tokenPayload.id_token = rawObj.id_token.trim();
-  }
 
   const normalized = {
     token: tokenPayload,
     auth_method:
       (typeof rawObj.auth_method === 'string' && rawObj.auth_method.trim()) || 'consumer',
-    ...(email ? { id_token_email: email } : {}),
-    ...(typeof rawObj.writer_id === 'string' && rawObj.writer_id.trim()
-      ? { writer_id: rawObj.writer_id.trim() }
-      : {}),
+    ...(idToken ? { id_token: idToken } : {}),
   };
 
   return {
@@ -2989,6 +3240,7 @@ export function createAccountManager({
   let lastAutoSwitchAtMs = 0;
   let lastAutoSwitchFromEmail = '';
   let autoSwitchInFlight = false;
+  let switchInFlight = false;
   let watcherTimer = null;
   let watcherBusy = false;
   let activeDirectOauth = null;
@@ -3128,7 +3380,19 @@ export function createAccountManager({
         return { supported: true, email: '', found: false };
       }
       const parsed = JSON.parse(live.credJson);
-      const email = extractEmailFromCred(parsed);
+      let email = extractEmailFromCred(parsed);
+      if (!email) {
+        // Pure Cockpit credential payloads omit non-standard id_token_email;
+        // match by non-reversible SHA-256 refreshTokenHash in accounts_index.json.
+        const rtHash = computeRefreshTokenHash(extractRefreshToken(parsed));
+        if (rtHash) {
+          const idx = await readIndex().catch(() => null);
+          const matched = idx?.accounts?.find((a) => a && a.refreshTokenHash === rtHash);
+          if (matched?.email) {
+            email = sanitizeEmail(matched.email);
+          }
+        }
+      }
       return { supported: true, email, found: true, live, parsed };
     } catch {
       return { supported: true, email: '', found: false };
@@ -3335,6 +3599,10 @@ export function createAccountManager({
     if (liveClientId && !acc.oauthClientId) {
       acc.oauthClientId = liveClientId;
     }
+    const liveRtHash = computeRefreshTokenHash(liveRefresh);
+    if (liveRtHash && acc.refreshTokenHash !== liveRtHash) {
+      acc.refreshTokenHash = liveRtHash;
+    }
     if (shouldUpdateVault) {
       vault.secrets[acc.id] = {
         credTarget: liveInfo.live.credTarget || existingSecret?.credTarget || 'gemini:antigravity',
@@ -3535,18 +3803,20 @@ export function createAccountManager({
       const isNew = !existing;
       const credExpiryMs = extractTokenExpiryMs(norm.credObj);
       const credClientId = extractPreferredClientIdFromCred(norm.credObj);
+      const rtHash = computeRefreshTokenHash(norm.refreshToken);
       if (!existing) {
         existing = {
           id: `acc_${crypto.randomBytes(6).toString('hex')}`,
           email,
           remark: sanitizeRemark(remark),
           enabled: true,
-          authMethod: norm.credObj.auth_method || 'oauth',
+          authMethod: norm.credObj.auth_method || 'consumer',
           source,
           createdAtMs: ts,
           updatedAtMs: ts,
           lastUsedAtMs: ts,
           tokenExpiryMs: credExpiryMs,
+          ...(rtHash ? { refreshTokenHash: rtHash } : {}),
           ...(credClientId ? { oauthClientId: credClientId } : {}),
           quota: liveQuota,
         };
@@ -3554,8 +3824,9 @@ export function createAccountManager({
       } else {
         existing.updatedAtMs = ts;
         existing.lastUsedAtMs = ts;
-        existing.authMethod = norm.credObj.auth_method || existing.authMethod || 'oauth';
+        existing.authMethod = norm.credObj.auth_method || existing.authMethod || 'consumer';
         if (credExpiryMs > 0) existing.tokenExpiryMs = credExpiryMs;
+        if (rtHash) existing.refreshTokenHash = rtHash;
         if (credClientId) existing.oauthClientId = credClientId;
         existing.authError = '';
         existing.authErrorCode = '';
@@ -3620,6 +3891,7 @@ export function createAccountManager({
         }
         const itemExpiryMs = extractTokenExpiryMs(itemCredObj);
         const itemClientId = extractPreferredClientIdFromCred(itemCredObj);
+        const itemRtHash = computeRefreshTokenHash(extractRefreshToken(itemCredObj));
         let existing = index.accounts.find((a) => sanitizeEmail(a.email) === sanitizeEmail(item.email));
         if (!existing) {
           existing = {
@@ -3627,12 +3899,13 @@ export function createAccountManager({
             email: item.email,
             remark: item.remark || '',
             enabled: item.enabled !== false,
-            authMethod: item.authMethod || 'oauth',
+            authMethod: item.authMethod || 'consumer',
             source: 'import',
             createdAtMs: ts,
             updatedAtMs: ts,
             lastUsedAtMs: 0,
             tokenExpiryMs: itemExpiryMs,
+            ...(itemRtHash ? { refreshTokenHash: itemRtHash } : {}),
             ...(itemClientId ? { oauthClientId: itemClientId } : {}),
             quota: item.quota || null,
           };
@@ -3641,6 +3914,7 @@ export function createAccountManager({
         } else {
           existing.updatedAtMs = ts;
           if (itemExpiryMs > 0) existing.tokenExpiryMs = itemExpiryMs;
+          if (itemRtHash) existing.refreshTokenHash = itemRtHash;
           if (itemClientId) existing.oauthClientId = itemClientId;
           existing.authError = '';
           existing.authErrorCode = '';
@@ -3983,197 +4257,255 @@ export function createAccountManager({
     const id = String(accountId || '').trim();
     if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
 
-    const ts = now();
-    await ensureDirs();
-
-    // Pre-switch: snapshot live quota of current account so we don't lose its latest remaining %
-    if (!skipPreQuotaCheck) {
-      const currentLiveQuota = await fetchLiveQuotaNormalized();
-      if (currentLiveQuota) {
-        await syncActiveAccountQuotaFromLive(
-          { ok: true, ...currentLiveQuota },
-          { skipAutoSwitch: true },
-        ).catch(() => {});
-      }
+    // Cockpit account_desktop_switch.rs: strict single-flight gate preventing concurrent switch races
+    if (switchInFlight) {
+      return { ok: false, status: 409, error: '当前已有切号任务正在执行，请勿重复点击' };
     }
+    switchInFlight = true;
 
-    const [index, vault, liveInfo, activeRunningConversations] = await Promise.all([
-      readIndex(),
-      readVault(),
-      readLiveEmailSafe(),
-      autoResume ? resolveRunningConversationsSnapshot() : Promise.resolve([]),
-    ]);
-
-    const resumeDedup = new Map();
-    for (const item of activeRunningConversations) {
-      if (item && item.id) resumeDedup.set(item.id, item);
-    }
-    if (autoResume && Array.isArray(extraResumeConversations)) {
-      for (const item of extraResumeConversations) {
-        const cid = String(item?.id || '').trim();
-        if (!cid || resumeDedup.has(cid)) continue;
-        resumeDedup.set(cid, {
-          id: cid,
-          title: String(item?.title || '').trim().slice(0, 120),
-        });
-      }
-    }
-    const runningConversations = Array.from(resumeDedup.values());
-
-    const target = index.accounts.find((a) => a.id === id);
-    if (!target) {
-      return { ok: false, status: 404, error: '目标账号不存在' };
-    }
-    if (target.enabled === false) {
-      return { ok: false, status: 400, error: '该账号当前已禁用，请先启用后再切换' };
-    }
-
-    const secret = vault.secrets[id];
-    if (!secret || !secret.credJson) {
-      return { ok: false, status: 422, error: '目标账号凭证缺失，无法切换' };
-    }
-
-    let parsedTargetCred;
     try {
-      parsedTargetCred = JSON.parse(secret.credJson);
-    } catch {
-      return { ok: false, status: 422, error: '目标账号凭证 JSON 损坏，已中止切换' };
-    }
-    if (!extractRefreshToken(parsedTargetCred)) {
-      return { ok: false, status: 422, error: '目标账号缺少有效的 refresh_token，已中止切换' };
-    }
+      const ts = now();
+      await ensureDirs();
 
-    // Best-effort pre-switch token auto-renewal (Cockpit Tools style): if target access_token is
-    // expired or near expiry, renew it right before injecting into Windows Credential Manager.
-    let effectiveCredJson = secret.credJson;
-    if (allowPreSwitchTokenRefresh) {
-      const storedExp = extractTokenExpiryMs(parsedTargetCred);
-      const needsRenew = !storedExp || storedExp - ts <= OAUTH_REFRESH_SAFETY_MS;
-      if (needsRenew) {
-        try {
-          const renewed = await activeTokenRefresher(parsedTargetCred, {
-            nowMs: ts,
-            forceRefresh: false,
-            preferredClientId: target.oauthClientId || '',
-            signal: AbortSignal.timeout(6000),
-          });
-          if (renewed?.renewed && renewed.credObj) {
-            effectiveCredJson = JSON.stringify(renewed.credObj);
-            await withStoreLock(async () => {
-              const [freshIndex, freshVault] = await Promise.all([readIndex(), readVault()]);
-              const freshAcc = freshIndex.accounts.find((a) => a.id === id);
-              if (freshAcc) {
-                if (renewed.expiryMs > 0) freshAcc.tokenExpiryMs = renewed.expiryMs;
-                if (renewed.matchedClientId) freshAcc.oauthClientId = renewed.matchedClientId;
-                freshAcc.authError = '';
-                freshAcc.authErrorCode = '';
-                freshAcc.authErrorAtMs = 0;
-                freshAcc.updatedAtMs = ts;
-                await writeIndex(freshIndex);
-              }
-              if (freshVault?.secrets?.[id]) {
-                freshVault.secrets[id] = {
-                  ...freshVault.secrets[id],
-                  credJson: effectiveCredJson,
-                };
-                await writeVault(freshVault);
-              }
-            }).catch(() => {});
-          }
-        } catch {
-          // Non-fatal: offline or transient error still falls back to stored refresh_token
+      // Pre-switch: snapshot live quota of current account so we don't lose its latest remaining %
+      if (!skipPreQuotaCheck) {
+        const currentLiveQuota = await fetchLiveQuotaNormalized();
+        if (currentLiveQuota) {
+          await syncActiveAccountQuotaFromLive(
+            { ok: true, ...currentLiveQuota },
+            { skipAutoSwitch: true },
+          ).catch(() => {});
         }
       }
-    }
 
-    // Also ensure current account is safely backed up inside vault or backup dir before leaving
-    const launchCfg = await activeDriver.detectAntigravityLaunchConfig();
-    if (!launchCfg?.exePath) {
-      return { ok: false, status: 500, error: '未定位到 Antigravity.exe 路径，无法自动重启' };
-    }
+      const [index, vault, liveInfo, activeRunningConversations] = await Promise.all([
+        readIndex(),
+        readVault(),
+        readLiveEmailSafe(),
+        autoResume ? resolveRunningConversationsSnapshot() : Promise.resolve([]),
+      ]);
 
-    const txId = `tx_${ts}_${crypto.randomBytes(4).toString('hex')}`;
-    const backupFile = path.join(paths.accountsBackupsDir, `pre_switch_${ts}_${txId.slice(-6)}.bak.dat`);
-    const payloadFile = path.join(paths.accountsDir, `switch_payload_${txId}.dat`);
+      const resumeDedup = new Map();
+      for (const item of activeRunningConversations) {
+        if (item && item.id) resumeDedup.set(item.id, item);
+      }
+      if (autoResume && Array.isArray(extraResumeConversations)) {
+        for (const item of extraResumeConversations) {
+          const cid = String(item?.id || '').trim();
+          if (!cid || resumeDedup.has(cid)) continue;
+          resumeDedup.set(cid, {
+            id: cid,
+            title: String(item?.title || '').trim().slice(0, 120),
+          });
+        }
+      }
+      const runningConversations = Array.from(resumeDedup.values());
 
-    // Seal one-time switch payload with DPAPI so plaintext token never touches disk
-    const sealedPayload = await activeDriver.protectSecret(
-      JSON.stringify({
-        credTarget: secret.credTarget || 'gemini:antigravity',
-        credUserName: secret.credUserName || 'antigravity',
-        credPersist: Number(secret.credPersist) || 2,
-        credJson: effectiveCredJson,
-        credentialUserScope: secret.credentialUserScope || '',
-      }),
-    );
-    await atomicWriteText(payloadFile, sealedPayload);
+      const target = index.accounts.find((a) => a.id === id);
+      if (!target) {
+        return { ok: false, status: 404, error: '目标账号不存在' };
+      }
+      if (target.enabled === false) {
+        return { ok: false, status: 400, error: '该账号当前已禁用，请先启用后再切换' };
+      }
 
-    // Record At-Most-Once pending resume ONLY when genuinely running conversations exist
-    const cleanPrompt = String(resumePrompt || DEFAULT_RESUME_PROMPT).trim() || DEFAULT_RESUME_PROMPT;
-    if (autoResume && runningConversations.length > 0) {
-      await atomicWriteJson(paths.accountPendingResumeFile, {
-        id: `resume_${txId}`,
-        transactionId: txId,
-        conversations: runningConversations,
-        prompt: cleanPrompt.slice(0, 4000),
+      const secret = vault.secrets[id];
+      if (!secret || !secret.credJson) {
+        return { ok: false, status: 422, error: '目标账号凭证缺失，无法切换' };
+      }
+
+      let parsedTargetCred;
+      try {
+        parsedTargetCred = JSON.parse(secret.credJson);
+      } catch {
+        return { ok: false, status: 422, error: '目标账号凭证 JSON 损坏，已中止切换' };
+      }
+      if (!extractRefreshToken(parsedTargetCred)) {
+        return { ok: false, status: 422, error: '目标账号缺少有效的 refresh_token，已中止切换' };
+      }
+
+      // Cockpit prepare_account_for_injection: ensure access_token is fresh (15-min skew) BEFORE
+      // closing Antigravity & writing credentials; abort cleanly on definite revocation (INVALID_GRANT).
+      let targetCredForInjection = parsedTargetCred;
+      if (allowPreSwitchTokenRefresh) {
+        const storedExp = extractTokenExpiryMs(parsedTargetCred);
+        const existingAccess =
+          (typeof parsedTargetCred?.token?.access_token === 'string' &&
+            parsedTargetCred.token.access_token.trim()) ||
+          (typeof parsedTargetCred?.access_token === 'string' &&
+            parsedTargetCred.access_token.trim()) ||
+          '';
+        const needsRenew = !existingAccess || !storedExp || storedExp - ts <= OAUTH_REFRESH_SAFETY_MS;
+        if (needsRenew) {
+          try {
+            const renewed = await activeTokenRefresher(parsedTargetCred, {
+              nowMs: ts,
+              forceRefresh: false,
+              preferredClientId: target.oauthClientId || '',
+              signal: AbortSignal.timeout(12_000),
+            });
+            if (renewed?.renewed && renewed.credObj) {
+              targetCredForInjection = renewed.credObj;
+              const renewedJson = JSON.stringify(renewed.credObj);
+              const renewedRtHash = computeRefreshTokenHash(extractRefreshToken(renewed.credObj));
+              await withStoreLock(async () => {
+                const [freshIndex, freshVault] = await Promise.all([readIndex(), readVault()]);
+                const freshAcc = freshIndex.accounts.find((a) => a.id === id);
+                if (freshAcc) {
+                  if (renewed.expiryMs > 0) freshAcc.tokenExpiryMs = renewed.expiryMs;
+                  if (renewed.matchedClientId) freshAcc.oauthClientId = renewed.matchedClientId;
+                  if (renewedRtHash) freshAcc.refreshTokenHash = renewedRtHash;
+                  freshAcc.authError = '';
+                  freshAcc.authErrorCode = '';
+                  freshAcc.authErrorAtMs = 0;
+                  freshAcc.updatedAtMs = ts;
+                  await writeIndex(freshIndex);
+                }
+                if (freshVault?.secrets?.[id]) {
+                  freshVault.secrets[id] = {
+                    ...freshVault.secrets[id],
+                    credJson: renewedJson,
+                  };
+                  await writeVault(freshVault);
+                }
+              }).catch(() => {});
+            }
+          } catch (err) {
+            if (err?.code === 'INVALID_GRANT' || err?.code === 'MISSING_REFRESH_TOKEN') {
+              await withStoreLock(async () => {
+                const freshIndex = await readIndex();
+                const freshAcc = freshIndex.accounts.find((a) => a.id === id);
+                if (freshAcc) {
+                  freshAcc.authError = err?.message || 'OAuth 凭据已失效或被撤销';
+                  freshAcc.authErrorCode = err.code;
+                  freshAcc.authErrorAtMs = ts;
+                  await writeIndex(freshIndex);
+                }
+              }).catch(() => {});
+              return {
+                ok: false,
+                status: 401,
+                code: err.code,
+                error: `切号前续签失败（已安全中止，未关闭 Antigravity）：${err?.message || 'OAuth 凭据已失效，请重新授权'}`,
+              };
+            }
+            // Transient/offline failure: allow fallback only if stored access_token is still unexpired
+            const stillUsableOffline = Boolean(existingAccess && storedExp > ts + 60_000);
+            if (!stillUsableOffline) {
+              return {
+                ok: false,
+                status: Number(err?.status) || 502,
+                error: `切号前刷新令牌失败（已中止切号以免写入过期凭据）：${err?.message || '网络不可用'}`,
+              };
+            }
+          }
+        }
+      }
+
+      // Build exact Cockpit minimal official credential payload + validate Windows 2560-byte cap
+      let cockpitPayload;
+      try {
+        cockpitPayload = buildCockpitCredentialPayload(targetCredForInjection, { nowMs: ts });
+      } catch (err) {
+        return {
+          ok: false,
+          status: Number(err?.status) || 422,
+          code: err?.code || 'INVALID_CREDENTIAL',
+          error: err?.message || '目标账号凭据格式校验失败，已中止切号',
+        };
+      }
+
+      const launchCfg = await activeDriver.detectAntigravityLaunchConfig();
+      if (!launchCfg?.exePath) {
+        return { ok: false, status: 500, error: '未定位到 Antigravity.exe 路径，无法自动重启' };
+      }
+
+      const txId = `tx_${ts}_${crypto.randomBytes(4).toString('hex')}`;
+      const backupFile = path.join(paths.accountsBackupsDir, `pre_switch_${ts}_${txId.slice(-6)}.bak.dat`);
+      const payloadFile = path.join(paths.accountsDir, `switch_payload_${txId}.dat`);
+
+      // Seal one-time switch payload with DPAPI (strict Cockpit-aligned minimal credential only)
+      const sealedPayload = await activeDriver.protectSecret(
+        JSON.stringify({
+          credTarget: 'gemini:antigravity',
+          credUserName: 'antigravity',
+          credPersist: 2,
+          credJson: cockpitPayload.json,
+        }),
+      );
+      await atomicWriteText(payloadFile, sealedPayload);
+
+      // Record At-Most-Once pending resume ONLY when genuinely running conversations exist
+      const cleanPrompt = String(resumePrompt || DEFAULT_RESUME_PROMPT).trim() || DEFAULT_RESUME_PROMPT;
+      if (autoResume && runningConversations.length > 0) {
+        await atomicWriteJson(paths.accountPendingResumeFile, {
+          id: `resume_${txId}`,
+          transactionId: txId,
+          conversations: runningConversations,
+          prompt: cleanPrompt.slice(0, 4000),
+          targetAccountId: target.id,
+          targetEmail: target.email,
+          createdAtMs: ts,
+          ttlMs: PENDING_RESUME_TTL_MS,
+          consumed: false,
+        });
+      } else {
+        await fsp.rm(paths.accountPendingResumeFile, { force: true }).catch(() => {});
+      }
+
+      // Update target lastUsedAtMs & refreshTokenHash
+      const finalRtHash = computeRefreshTokenHash(extractRefreshToken(targetCredForInjection));
+      await withStoreLock(async () => {
+        const freshIndex = await readIndex();
+        const item = freshIndex.accounts.find((a) => a.id === id);
+        if (item) {
+          item.lastUsedAtMs = ts;
+          item.updatedAtMs = ts;
+          if (finalRtHash) item.refreshTokenHash = finalRtHash;
+          freshIndex.activeAccountId = id;
+          await writeIndex(freshIndex);
+        }
+      });
+
+      const txData = {
+        id: txId,
+        mode: 'switch',
+        stage: 'queued',
         targetAccountId: target.id,
         targetEmail: target.email,
-        createdAtMs: ts,
-        ttlMs: PENDING_RESUME_TTL_MS,
-        consumed: false,
-      });
-    } else {
-      await fsp.rm(paths.accountPendingResumeFile, { force: true }).catch(() => {});
-    }
+        previousEmail: liveInfo.email || '',
+        roamingDir: activeDriver.getRoamingDir(),
+        antigravityExe: launchCfg.exePath,
+        launchArgs: launchCfg.launchArgs || '',
+        workDir: launchCfg.workDir || '',
+        payloadFile,
+        backupFile,
+        startedAtMs: ts,
+        updatedAtMs: ts,
+      };
+      await atomicWriteJson(paths.accountSwitchTxFile, txData);
+      void pruneBackups();
 
-    // Update target lastUsedAtMs
-    await withStoreLock(async () => {
-      const freshIndex = await readIndex();
-      const item = freshIndex.accounts.find((a) => a.id === id);
-      if (item) {
-        item.lastUsedAtMs = ts;
-        item.updatedAtMs = ts;
-        freshIndex.activeAccountId = id;
-        await writeIndex(freshIndex);
+      // Restore host window opacity before closing so backdrop companion never leaves a translucent ghost
+      if (typeof onBeforeHostClose === 'function') {
+        await Promise.resolve(onBeforeHostClose()).catch(() => {});
+      } else {
+        await restoreHostOpacityFallback(paths).catch(() => {});
       }
-    });
 
-    const txData = {
-      id: txId,
-      mode: 'switch',
-      stage: 'queued',
-      targetAccountId: target.id,
-      targetEmail: target.email,
-      previousEmail: liveInfo.email || '',
-      roamingDir: activeDriver.getRoamingDir(),
-      antigravityExe: launchCfg.exePath,
-      launchArgs: launchCfg.launchArgs || '',
-      workDir: launchCfg.workDir || '',
-      payloadFile,
-      backupFile,
-      startedAtMs: ts,
-      updatedAtMs: ts,
-    };
-    await atomicWriteJson(paths.accountSwitchTxFile, txData);
-    void pruneBackups();
+      await activeDriver.launchSwitchDaemon(paths.accountSwitchTxFile);
 
-    // Restore host window opacity before closing so backdrop companion never leaves a translucent ghost
-    if (typeof onBeforeHostClose === 'function') {
-      await Promise.resolve(onBeforeHostClose()).catch(() => {});
-    } else {
-      await restoreHostOpacityFallback(paths).catch(() => {});
+      return {
+        ok: true,
+        switching: true,
+        transactionId: txId,
+        targetEmail: target.email,
+        autoResumeScheduled: runningConversations.length > 0,
+        autoResumeCount: runningConversations.length,
+      };
+    } finally {
+      switchInFlight = false;
     }
-
-    await activeDriver.launchSwitchDaemon(paths.accountSwitchTxFile);
-
-    return {
-      ok: true,
-      switching: true,
-      transactionId: txId,
-      targetEmail: target.email,
-      autoResumeScheduled: runningConversations.length > 0,
-      autoResumeCount: runningConversations.length,
-    };
   }
 
   /**
@@ -4403,9 +4735,9 @@ export function createAccountManager({
             .slice(0, 8)}@gmail.com`;
         }
 
-        const expiryIso = new Date(
+        const expiryIso = formatRfc3339Micros(
           Date.now() + (Number(tokenPayload.expires_in) || 3600) * 1000,
-        ).toISOString();
+        );
         const norm = normalizeCredentialObject(
           {
             token: {
@@ -4413,11 +4745,9 @@ export function createAccountManager({
               refresh_token: tokenPayload.refresh_token || '',
               token_type: tokenPayload.token_type || 'Bearer',
               expiry: expiryIso,
-              expires_in: Number(tokenPayload.expires_in) || 3600,
-              id_token: tokenPayload.id_token || '',
             },
             auth_method: 'consumer',
-            id_token_email: email,
+            ...(tokenPayload.id_token ? { id_token: tokenPayload.id_token } : {}),
           },
           email,
         );
@@ -4437,6 +4767,7 @@ export function createAccountManager({
           isNew = !existing;
           const oauthExpiryMs = extractTokenExpiryMs(norm.credObj);
           const oauthCid = extractPreferredClientIdFromCred(norm.credObj, clientId);
+          const oauthRtHash = computeRefreshTokenHash(norm.refreshToken);
           if (!existing) {
             existing = {
               id: `acc_${crypto.randomBytes(6).toString('hex')}`,
@@ -4449,6 +4780,7 @@ export function createAccountManager({
               updatedAtMs: ts,
               lastUsedAtMs: 0,
               tokenExpiryMs: oauthExpiryMs,
+              ...(oauthRtHash ? { refreshTokenHash: oauthRtHash } : {}),
               ...(oauthCid ? { oauthClientId: oauthCid } : {}),
               quota: null,
             };
@@ -4457,6 +4789,7 @@ export function createAccountManager({
             existing.updatedAtMs = ts;
             existing.authMethod = norm.credObj.auth_method || 'consumer';
             if (oauthExpiryMs > 0) existing.tokenExpiryMs = oauthExpiryMs;
+            if (oauthRtHash) existing.refreshTokenHash = oauthRtHash;
             if (oauthCid) existing.oauthClientId = oauthCid;
             existing.authError = '';
             existing.authErrorCode = '';
@@ -4724,12 +5057,19 @@ export function createAccountManager({
         }
       }
 
-      // 4. Scheduled automatic quota refresh + proactive OAuth token auto-renewal (Cockpit Tools style)
+      // 4. Scheduled local active-account quota sync + opt-in inactive background refresh
+      // Conservative anti-ban default (`backgroundRefreshInactive: false`):
+      // NEVER silently batch-poll remote OAuth / CloudCode APIs for inactive accounts in background;
+      // only sync the active account via local language_server RPC and renew inactive tokens on
+      // explicit user refresh or right before switching (`prepare_account_for_injection`).
       const refreshIntervalMs = settings.quotaRefreshIntervalMin * 60 * 1000;
       const shouldAutoRefresh =
         !switchedThisTick &&
         refreshIntervalMs > 0 &&
         (lastAutoRefreshAtMs === 0 || nowMs - lastAutoRefreshAtMs >= refreshIntervalMs);
+      const allowInactiveBgPoll =
+        allowBackgroundRemoteRefresh && Boolean(settings.backgroundRefreshInactive);
+
       if (shouldAutoRefresh && indexForSchedule.accounts.length > 0) {
         lastAutoRefreshAtMs = nowMs;
         const liveInfo = await readLiveEmailSafe();
@@ -4740,8 +5080,8 @@ export function createAccountManager({
             { skipAutoSwitch: true },
           ).catch(() => {});
         }
-        // Also refresh stale enabled inactive accounts via Cockpit Tools OAuth CloudCode API
-        if (allowBackgroundRemoteRefresh) {
+        // Optional (default OFF): background remote refresh for stale enabled inactive accounts
+        if (allowInactiveBgPoll) {
           for (const acc of indexForSchedule.accounts) {
             if (!acc || acc.enabled === false) continue;
             if (liveInfo.email && sanitizeEmail(acc.email) === liveInfo.email) continue;
@@ -4762,9 +5102,9 @@ export function createAccountManager({
         if (freshQuota && liveInfo.email) {
           await maybeTriggerAutoSwitch(liveInfo.email, freshQuota).catch(() => {});
         }
-      } else if (!switchedThisTick && allowBackgroundRemoteRefresh && indexForSchedule.accounts.length > 0) {
-        // Between scheduled quota cycles, proactively auto-renew any enabled account whose
-        // access_token is expiring within 10 minutes (keeps stored tokens always warm like Cockpit Tools)
+      } else if (!switchedThisTick && indexForSchedule.accounts.length > 0) {
+        // Passively sync active account's natively-refreshed credential into vault (zero remote API calls);
+        // only trigger remote inactive-account renewal when user explicitly enabled `backgroundRefreshInactive`.
         const dueForProactiveRenew = indexForSchedule.accounts.filter((acc) => {
           if (!acc || acc.enabled === false) return false;
           const expMs = Number(acc.tokenExpiryMs || 0);
@@ -4791,6 +5131,7 @@ export function createAccountManager({
               }).catch(() => {});
               continue;
             }
+            if (!allowInactiveBgPoll) continue;
             autoTokenAttemptAtMs.set(acc.id, nowMs);
             await refreshAccountQuota(acc.id).catch(() => {});
           }

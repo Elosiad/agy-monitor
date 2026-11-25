@@ -1,7 +1,6 @@
 /**
- * Global default model selector (read-only list + write-once on user click +
- * "New Chat with Default Model") and system prompt rules selector
- * (builtin presets, custom .md import with security feedback, and ? modal).
+ * System prompt rules selector (builtin presets, custom .md import with security
+ * feedback, and ? security help modal).
  */
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -63,31 +62,6 @@ function createCheckSvg() {
   return svg;
 }
 
-function normalizeModel(raw) {
-  if (!raw || typeof raw !== "object") return null;
-  const id = String(raw.id || raw.model || "").trim();
-  if (!id) return null;
-  const name = String(raw.name || raw.label || id);
-  const tiers = Array.isArray(raw.tiers) && raw.tiers.length > 0 ? raw.tiers.map(String) : null;
-  const tier = raw.tier ? String(raw.tier) : "";
-  const badge = raw.badge
-    ? String(raw.badge)
-    : raw.source === "observed"
-      ? "Live"
-      : raw.provider
-        ? String(raw.provider)
-        : "";
-  return {
-    id,
-    name,
-    tiers,
-    tier,
-    badge,
-    source: raw.source || "catalog",
-    disabled: Boolean(raw.disabled),
-  };
-}
-
 function normalizePrompt(raw) {
   if (!raw || typeof raw !== "object") return null;
   const id = String(raw.id || "").trim();
@@ -106,25 +80,14 @@ function normalizePrompt(raw) {
 }
 
 /**
- * Mounts global default model selector, new chat button, prompt rules dropdown,
- * .md importer, and ? security help modal.
+ * Mounts prompt rules dropdown, .md importer, and ? security help modal.
  */
 export function createModelAndPrompt({
   apiFetch,
   t,
-  onModelChanged,
-  onSessionCreated,
   onPromptChanged,
   onToast,
 } = {}) {
-  const modelSelector = document.getElementById("globalModelSelector");
-  const modelBtn = document.getElementById("globalModelBtn");
-  const modelDropdown = document.getElementById("globalModelDropdown");
-  const modelActiveNameEl = document.getElementById("globalModelActiveName");
-  const modelActiveTierEl = document.getElementById("globalModelActiveTier");
-  const modelActiveBadgeEl = document.getElementById("globalModelActiveBadge");
-  const newConvBtn = document.getElementById("newConvDefaultModelBtn");
-
   const promptSelector = document.getElementById("promptSelector");
   const promptBtn = document.getElementById("promptSelectBtn");
   const promptDropdown = document.getElementById("promptDropdown");
@@ -137,12 +100,8 @@ export function createModelAndPrompt({
   const promptHelpModal = document.getElementById("promptHelpModal");
 
   let translator = t;
-  let models = [];
-  let defaultModel = { id: "", tier: "" };
   let prompts = [];
   let activePromptId = "official";
-  let isSavingModel = false;
-  let isCreatingConv = false;
   let isSavingPrompt = false;
   let statusHideTimer = null;
   const cleanups = [];
@@ -190,194 +149,11 @@ export function createModelAndPrompt({
     }
   }
 
-  function setModelDropdownOpen(open) {
-    if (!modelDropdown || !modelSelector || !modelBtn) return;
-    modelDropdown.hidden = !open;
-    modelSelector.classList.toggle("is-open", open);
-    modelBtn.setAttribute("aria-expanded", String(open));
-  }
-
   function setPromptDropdownOpen(open) {
     if (!promptDropdown || !promptSelector || !promptBtn) return;
     promptDropdown.hidden = !open;
     promptSelector.classList.toggle("is-open", open);
     promptBtn.setAttribute("aria-expanded", String(open));
-  }
-
-  function getActiveModelRecord() {
-    if (!defaultModel?.id) return null;
-    return (
-      models.find((m) => m.id === defaultModel.id) || {
-        id: defaultModel.id,
-        name: defaultModel.id,
-        tier: defaultModel.tier || "",
-        badge: "",
-        disabled: false,
-      }
-    );
-  }
-
-  function renderModelTrigger() {
-    const active = getActiveModelRecord();
-    if (modelActiveNameEl) {
-      modelActiveNameEl.textContent = active
-        ? active.name
-        : tr("model.notSet", "跟随宿主当前");
-    }
-    if (modelActiveTierEl) {
-      modelActiveTierEl.textContent = active ? defaultModel.tier || active.tier || "" : "";
-    }
-    if (modelActiveBadgeEl) {
-      const badge = active?.badge || "";
-      modelActiveBadgeEl.textContent = badge;
-      modelActiveBadgeEl.className = `global-model-status-tag${
-        badge === "Notice" ? " is-notice" : ""
-      }`;
-    }
-  }
-
-  async function selectDefaultModel(model, tierOverride) {
-    if (!model || model.disabled || isSavingModel) return;
-    const nextTier = tierOverride !== undefined ? tierOverride : model.tier || "";
-    const prev = { ...defaultModel };
-    if (prev.id === model.id && prev.tier === nextTier) {
-      setModelDropdownOpen(false);
-      return;
-    }
-
-    defaultModel = { id: model.id, tier: nextTier };
-    if (tierOverride !== undefined) model.tier = tierOverride;
-    renderModelTrigger();
-    renderModelOptions();
-    setModelDropdownOpen(false);
-
-    isSavingModel = true;
-    try {
-      const resp = await requestJson(apiFetch, "/api/model/default", {
-        method: "POST",
-        body: JSON.stringify({ modelId: model.id, tier: nextTier }),
-      });
-      if (resp?.ok === false) {
-        throw new Error(resp.reason || resp.error || "save failed");
-      }
-      if (resp?.defaultModel) {
-        defaultModel = {
-          id: String(resp.defaultModel.id || model.id),
-          tier: String(resp.defaultModel.tier ?? nextTier),
-        };
-      }
-      renderModelTrigger();
-      renderModelOptions();
-      onModelChanged?.(defaultModel);
-      onToast?.(
-        tr("model.saved", "已记录全局默认模型：{model}", { model: model.name }),
-        "success"
-      );
-    } catch (err) {
-      defaultModel = prev;
-      renderModelTrigger();
-      renderModelOptions();
-      onToast?.(tr("model.saveFailed", "保存默认模型失败"), "error");
-    } finally {
-      isSavingModel = false;
-    }
-  }
-
-  function renderModelOptions() {
-    if (!modelDropdown) return;
-    modelDropdown.innerHTML = "";
-
-    if (models.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "favorite-add-empty";
-      empty.textContent = tr("model.noModels", "暂未发现可用模型记录");
-      modelDropdown.appendChild(empty);
-      return;
-    }
-
-    models.forEach((model) => {
-      const isActive = defaultModel.id === model.id;
-      const optionRow = document.createElement("div");
-      optionRow.className = `global-model-option${isActive ? " is-active" : ""}${
-        model.disabled ? " is-disabled" : ""
-      }`;
-      optionRow.setAttribute("role", "option");
-      optionRow.setAttribute("aria-selected", String(isActive));
-      if (!model.disabled) optionRow.tabIndex = 0;
-
-      const left = document.createElement("div");
-      left.className = "global-model-option-left";
-
-      const nameSpan = document.createElement("span");
-      nameSpan.className = "global-model-option-name";
-      nameSpan.textContent = model.name;
-      nameSpan.title = model.id;
-      left.appendChild(nameSpan);
-
-      const effectiveTier = isActive && defaultModel.tier ? defaultModel.tier : model.tier;
-      if (!model.tiers && effectiveTier) {
-        const tierText = document.createElement("span");
-        tierText.className = "global-model-option-tier-text";
-        tierText.textContent = effectiveTier;
-        left.appendChild(tierText);
-      }
-
-      const right = document.createElement("div");
-      right.className = "global-model-option-right";
-
-      if (model.tiers) {
-        const tierGroup = document.createElement("div");
-        tierGroup.className = "model-tier-pills";
-        model.tiers.forEach((tierName) => {
-          const chip = document.createElement("button");
-          chip.type = "button";
-          chip.className = `model-tier-chip${effectiveTier === tierName ? " is-active" : ""}`;
-          chip.textContent = tierName;
-          chip.addEventListener("click", (e) => {
-            e.stopPropagation();
-            selectDefaultModel(model, tierName);
-          });
-          tierGroup.appendChild(chip);
-        });
-        right.appendChild(tierGroup);
-      }
-
-      if (model.badge) {
-        const badgeSpan = document.createElement("span");
-        const badgeClass =
-          model.badge === "Notice"
-            ? " is-notice"
-            : model.badge === "Unavailable"
-              ? " is-unavailable"
-              : "";
-        badgeSpan.className = `global-model-badge${badgeClass}`;
-        badgeSpan.textContent = model.badge;
-        right.appendChild(badgeSpan);
-      }
-
-      const checkSpan = document.createElement("span");
-      checkSpan.className = "global-model-check";
-      if (isActive) checkSpan.appendChild(createCheckSvg());
-      right.appendChild(checkSpan);
-
-      optionRow.appendChild(left);
-      optionRow.appendChild(right);
-
-      if (!model.disabled) {
-        optionRow.addEventListener("click", (e) => {
-          e.stopPropagation();
-          selectDefaultModel(model);
-        });
-        optionRow.addEventListener("keydown", (e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            selectDefaultModel(model);
-          }
-        });
-      }
-
-      modelDropdown.appendChild(optionRow);
-    });
   }
 
   function renderPromptTrigger() {
@@ -631,7 +407,6 @@ export function createModelAndPrompt({
 
   function openHelpModal() {
     if (!promptHelpModal) return;
-    setModelDropdownOpen(false);
     setPromptDropdownOpen(false);
     promptHelpModal.hidden = false;
     const closeBtn = document.getElementById("promptHelpCloseBtn");
@@ -644,247 +419,9 @@ export function createModelAndPrompt({
     promptHelpBtn?.focus();
   }
 
-  // Event bindings
-  if (modelBtn && modelDropdown) {
-    const onModelBtnClick = (e) => {
-      e.stopPropagation();
-      setPromptDropdownOpen(false);
-      setModelDropdownOpen(modelDropdown.hidden);
-    };
-    modelBtn.addEventListener("click", onModelBtnClick);
-    cleanups.push(() => modelBtn.removeEventListener("click", onModelBtnClick));
-  }
-
-  let newConvDrawer = null;
-  let newConvWarnEl = null;
-  let newConvPromptInput = null;
-  let newConvCancelBtn = null;
-  let newConvConfirmBtn = null;
-
-  function ensureNewConvDrawer() {
-    if (newConvDrawer) return newConvDrawer;
-    const modelRow = newConvBtn?.closest?.(".model-selector-row") || modelSelector?.closest?.(".model-selector-row");
-    const hostParent = modelRow?.parentNode;
-    if (!hostParent || typeof document === "undefined") return null;
-
-    const existing = document.getElementById("newConvComposerBox");
-    if (existing) {
-      newConvDrawer = existing;
-      newConvWarnEl = existing.querySelector(".new-conv-warn-text");
-      newConvPromptInput = existing.querySelector("#newConvPromptInput");
-      newConvCancelBtn = existing.querySelector("#newConvCancelBtn");
-      newConvConfirmBtn = existing.querySelector("#newConvConfirmBtn");
-      return newConvDrawer;
-    }
-
-    const box = document.createElement("div");
-    box.id = "newConvComposerBox";
-    box.className = "new-conv-composer-box";
-    box.hidden = true;
-    box.style.cssText = [
-      "padding:8px 10px",
-      "border-radius:8px",
-      "background:var(--bg-elevated, #17161d)",
-      "border:1px solid var(--border-subtle, #25242c)",
-      "display:flex",
-      "flex-direction:column",
-      "gap:6px",
-    ].join(";");
-
-    const warn = document.createElement("div");
-    warn.className = "new-conv-warn-text";
-    warn.style.cssText = [
-      "font-size:11px",
-      "line-height:1.4",
-      "padding:5px 8px",
-      "border-radius:6px",
-      "background:var(--accent-amber-bg, rgba(233,147,21,0.14))",
-      "color:var(--accent-amber, #e99315)",
-    ].join(";");
-
-    const textarea = document.createElement("textarea");
-    textarea.id = "newConvPromptInput";
-    textarea.rows = 2;
-    textarea.maxLength = 4000;
-    textarea.style.cssText = [
-      "width:100%",
-      "resize:vertical",
-      "min-height:46px",
-      "padding:6px 8px",
-      "border-radius:6px",
-      "border:1px solid var(--border-subtle, #25242c)",
-      "background:var(--bg-control, rgba(255,255,255,0.045))",
-      "color:var(--text-primary, #e8e7ec)",
-      "font-size:12px",
-      "line-height:1.45",
-      "outline:none",
-    ].join(";");
-
-    const actions = document.createElement("div");
-    actions.style.cssText = "display:flex;align-items:center;justify-content:flex-end;gap:6px;";
-
-    const cancelBtn = document.createElement("button");
-    cancelBtn.id = "newConvCancelBtn";
-    cancelBtn.type = "button";
-    cancelBtn.className = "modal-secondary-btn";
-
-    const confirmBtn = document.createElement("button");
-    confirmBtn.id = "newConvConfirmBtn";
-    confirmBtn.type = "button";
-    confirmBtn.className = "modal-primary-btn";
-
-    actions.appendChild(cancelBtn);
-    actions.appendChild(confirmBtn);
-    box.appendChild(warn);
-    box.appendChild(textarea);
-    box.appendChild(actions);
-
-    hostParent.insertBefore(box, modelRow.nextSibling);
-
-    newConvDrawer = box;
-    newConvWarnEl = warn;
-    newConvPromptInput = textarea;
-    newConvCancelBtn = cancelBtn;
-    newConvConfirmBtn = confirmBtn;
-
-    const onCancel = () => {
-      closeNewConvDrawer();
-      newConvBtn?.focus();
-    };
-    const onConfirm = () => submitNewConversation();
-    const onTextareaKeyDown = (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        submitNewConversation();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        closeNewConvDrawer();
-        newConvBtn?.focus();
-      }
-    };
-
-    cancelBtn.addEventListener("click", onCancel);
-    confirmBtn.addEventListener("click", onConfirm);
-    textarea.addEventListener("keydown", onTextareaKeyDown);
-    cleanups.push(() => cancelBtn.removeEventListener("click", onCancel));
-    cleanups.push(() => confirmBtn.removeEventListener("click", onConfirm));
-    cleanups.push(() => textarea.removeEventListener("keydown", onTextareaKeyDown));
-
-    syncNewConvDrawerLocale();
-    return newConvDrawer;
-  }
-
-  function syncNewConvDrawerLocale() {
-    if (!newConvDrawer) return;
-    if (newConvWarnEl) {
-      newConvWarnEl.textContent = tr(
-        "model.newConvWarn",
-        "将使用当前选定模型立即发送首条消息并消耗额度，不修改宿主左侧默认模型"
-      );
-    }
-    if (newConvPromptInput) {
-      newConvPromptInput.placeholder = tr(
-        "model.newConvPromptPlaceholder",
-        "输入首句指令（留空发送默认确认语）…"
-      );
-    }
-    if (newConvCancelBtn) {
-      newConvCancelBtn.textContent = tr("common.cancel", "取消");
-    }
-    if (newConvConfirmBtn) {
-      newConvConfirmBtn.textContent = tr("model.newConvSubmit", "立即发起并发送");
-    }
-  }
-
-  function openNewConvDrawer() {
-    const drawer = ensureNewConvDrawer();
-    if (!drawer) return false;
-    setModelDropdownOpen(false);
-    setPromptDropdownOpen(false);
-    syncNewConvDrawerLocale();
-    drawer.hidden = false;
-    newConvBtn?.setAttribute("aria-expanded", "true");
-    setTimeout(() => newConvPromptInput?.focus(), 0);
-    return true;
-  }
-
-  function closeNewConvDrawer() {
-    if (!newConvDrawer || newConvDrawer.hidden) return;
-    newConvDrawer.hidden = true;
-    newConvBtn?.setAttribute("aria-expanded", "false");
-  }
-
-  async function submitNewConversation() {
-    if (isCreatingConv) return;
-    isCreatingConv = true;
-    if (newConvBtn) newConvBtn.disabled = true;
-    if (newConvConfirmBtn) newConvConfirmBtn.disabled = true;
-    const active = getActiveModelRecord();
-    const modelLabel = active ? active.name : tr("model.notSet", "跟随宿主当前");
-    const customPrompt = newConvPromptInput ? newConvPromptInput.value.trim() : "";
-
-    try {
-      const payload = { useDefaultModel: true };
-      if (customPrompt) {
-        payload.prompt = customPrompt;
-      }
-      const resp = await requestJson(apiFetch, "/api/sessions/new", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      if (resp?.ok === false) {
-        throw new Error(resp.reason || resp.error || "failed");
-      }
-      if (newConvPromptInput) newConvPromptInput.value = "";
-      closeNewConvDrawer();
-      if (resp?.conversationId && typeof window !== "undefined") {
-        try {
-          window.sidecar?.ui?.toggleConversation?.(String(resp.conversationId));
-        } catch {
-          // Ignore host postMessage bridge error; conversation is already created
-        }
-      }
-      onSessionCreated?.(resp);
-      onToast?.(
-        tr("model.createdConv", "已发送按默认模型新建对话指令（{model}）", {
-          model: modelLabel,
-        }),
-        "success"
-      );
-    } catch (err) {
-      onToast?.(
-        err?.message ||
-          tr("model.createConvFailed", "宿主环境暂不支持自动触发新建，请在左侧主栏手动新建对话"),
-        "error"
-      );
-    } finally {
-      isCreatingConv = false;
-      if (newConvBtn) newConvBtn.disabled = false;
-      if (newConvConfirmBtn) newConvConfirmBtn.disabled = false;
-    }
-  }
-
-  if (newConvBtn) {
-    newConvBtn.setAttribute("aria-expanded", "false");
-    const onNewConvClick = () => {
-      if (isCreatingConv) return;
-      if (newConvDrawer && !newConvDrawer.hidden) {
-        closeNewConvDrawer();
-        return;
-      }
-      const opened = openNewConvDrawer();
-      if (!opened) {
-        submitNewConversation();
-      }
-    };
-    newConvBtn.addEventListener("click", onNewConvClick);
-    cleanups.push(() => newConvBtn.removeEventListener("click", onNewConvClick));
-  }
-
   if (promptBtn && promptDropdown) {
     const onPromptBtnClick = (e) => {
       e.stopPropagation();
-      setModelDropdownOpen(false);
       setPromptDropdownOpen(promptDropdown.hidden);
     };
     promptBtn.addEventListener("click", onPromptBtnClick);
@@ -893,7 +430,6 @@ export function createModelAndPrompt({
 
   if (promptImportBtn && promptMdInput) {
     const onImportClick = () => {
-      setModelDropdownOpen(false);
       setPromptDropdownOpen(false);
       promptMdInput.click();
     };
@@ -923,9 +459,6 @@ export function createModelAndPrompt({
   }
 
   const onDocClick = (e) => {
-    if (modelSelector && !modelSelector.contains(e.target)) {
-      setModelDropdownOpen(false);
-    }
     if (promptSelector && !promptSelector.contains(e.target)) {
       setPromptDropdownOpen(false);
     }
@@ -936,15 +469,6 @@ export function createModelAndPrompt({
     if (promptHelpModal && !promptHelpModal.hidden) {
       closeHelpModal();
       return;
-    }
-    if (newConvDrawer && !newConvDrawer.hidden) {
-      closeNewConvDrawer();
-      newConvBtn?.focus();
-      return;
-    }
-    if (modelDropdown && !modelDropdown.hidden) {
-      setModelDropdownOpen(false);
-      modelBtn?.focus();
     }
     if (promptDropdown && !promptDropdown.hidden) {
       setPromptDropdownOpen(false);
@@ -957,47 +481,25 @@ export function createModelAndPrompt({
   cleanups.push(() => document.removeEventListener("click", onDocClick));
   cleanups.push(() => document.removeEventListener("keydown", onDocKeyDown));
 
-  renderModelTrigger();
-  renderModelOptions();
   renderPromptTrigger();
   renderPromptOptions();
 
   return {
     update(prefs) {
       if (!prefs || typeof prefs !== "object") return;
-      if (Array.isArray(prefs.availableModels)) {
-        models = prefs.availableModels.map(normalizeModel).filter(Boolean);
-      }
-      if (prefs.defaultModel !== undefined) {
-        if (typeof prefs.defaultModel === "string") {
-          defaultModel = { id: prefs.defaultModel, tier: "" };
-        } else if (prefs.defaultModel && typeof prefs.defaultModel === "object") {
-          defaultModel = {
-            id: String(prefs.defaultModel.id || ""),
-            tier: String(prefs.defaultModel.tier || ""),
-          };
-        } else {
-          defaultModel = { id: "", tier: "" };
-        }
-      }
       if (Array.isArray(prefs.prompts)) {
         prompts = prefs.prompts.map(normalizePrompt).filter(Boolean);
       }
       if (prefs.activePromptId) {
         activePromptId = String(prefs.activePromptId);
       }
-      renderModelTrigger();
-      renderModelOptions();
       renderPromptTrigger();
       renderPromptOptions();
     },
     setTranslator(nextT) {
       translator = nextT;
-      renderModelTrigger();
-      renderModelOptions();
       renderPromptTrigger();
       renderPromptOptions();
-      syncNewConvDrawerLocale();
     },
     destroy() {
       if (statusHideTimer) {
@@ -1006,10 +508,6 @@ export function createModelAndPrompt({
       }
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
-      if (newConvDrawer && typeof newConvDrawer.remove === "function") {
-        newConvDrawer.remove();
-      }
-      newConvDrawer = null;
     },
   };
 }

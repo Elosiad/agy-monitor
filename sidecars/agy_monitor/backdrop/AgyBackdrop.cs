@@ -28,7 +28,7 @@ namespace AgyBackdropCompanion
     {
         public bool backdropEnabled = true;
         public bool hudEnabled = true;
-        public string hostThemeMode = "backdrop";
+        public string hostThemeMode = "inject";
         public int hostBlendPct = 25;
         public string activeWallpaperId = "wp-1";
         public int opacity = 100;
@@ -48,6 +48,7 @@ namespace AgyBackdropCompanion
         public bool showCacheHit = true;
         public bool showModel = true;
         public bool showContext = true;
+        public bool showQuota = true;
 
         public HudDisplayConfig Clone()
         {
@@ -56,7 +57,8 @@ namespace AgyBackdropCompanion
                 showSpeed = showSpeed,
                 showCacheHit = showCacheHit,
                 showModel = showModel,
-                showContext = showContext
+                showContext = showContext,
+                showQuota = showQuota
             };
         }
     }
@@ -3395,40 +3397,97 @@ namespace AgyBackdropCompanion
             catch { }
         }
 
-        private static bool IsInsideAgyConsoleDocument(AutomationElement el)
+        public static volatile string LastOcclusionDebug = "";
+
+        private static string SafeCtName(AutomationElement el)
         {
-            if (el == null) return false;
+            if (el == null) return "null";
+            try
+            {
+                ControlType ct = el.Current.ControlType;
+                return ct != null ? (ct.ProgrammaticName ?? "ct") : "null";
+            }
+            catch { return "err"; }
+        }
+
+        private static string SafeRectStr(System.Windows.Rect r)
+        {
+            if (r.IsEmpty) return "empty";
+            return ((int)Math.Round(r.Left)).ToString() + "," + ((int)Math.Round(r.Top)).ToString() + "," +
+                   ((int)Math.Round(r.Width)).ToString() + "x" + ((int)Math.Round(r.Height)).ToString();
+        }
+
+        private static AutomationElement FindNearestDocument(AutomationElement el)
+        {
+            if (el == null) return null;
             try
             {
                 AutomationElement cur = el;
-                for (int hop = 0; hop < 32 && cur != null; hop++)
+                for (int hop = 0; hop < 36 && cur != null; hop++)
                 {
                     ControlType ct = null;
                     try { ct = cur.Current.ControlType; } catch { }
-                    if (ct == ControlType.Document)
-                    {
-                        string docName = "";
-                        try { docName = cur.Current.Name ?? ""; } catch { docName = ""; }
-                        if (!string.IsNullOrEmpty(docName) &&
-                            (docName.IndexOf("Antigravity Monitor", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             docName.IndexOf("AGY 控制台", StringComparison.OrdinalIgnoreCase) >= 0))
-                        {
-                            return true;
-                        }
-                        return false;
-                    }
-                    if (ct == ControlType.Window) return false;
+                    if (ct == ControlType.Document) return cur;
+                    if (ct == ControlType.Window) return null;
                     try { cur = TreeWalker.ControlViewWalker.GetParent(cur); }
-                    catch { return false; }
+                    catch { return null; }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static bool IsCandidateUncovered(AutomationElement btn, System.Windows.Rect r, int selfPid)
+        {
+            if (btn == null || r.Width < 4 || r.Height < 4) return false;
+            try
+            {
+                double cx = r.Left + r.Width * 0.5;
+                double cy = r.Top + r.Height * 0.5;
+                AutomationElement hit = AutomationElement.FromPoint(new System.Windows.Point(cx, cy));
+                if (hit == null) return true;
+                int hitPid = 0;
+                try { hitPid = hit.Current.ProcessId; } catch { }
+                if (hitPid == selfPid) return true;
+                if (SameElement(hit, btn)) return true;
+
+                AutomationElement btnDoc = FindNearestDocument(btn);
+                AutomationElement hitDoc = FindNearestDocument(hit);
+                if (hitDoc != null && btnDoc != null && !SameElement(hitDoc, btnDoc))
+                {
+                    return false;
+                }
+            }
+            catch { }
+            return true;
+        }
+
+        private static bool IsAgyConsoleDocument(AutomationElement doc)
+        {
+            if (doc == null) return false;
+            try
+            {
+                string docName = doc.Current.Name ?? "";
+                if (!string.IsNullOrEmpty(docName) &&
+                    (docName.IndexOf("Antigravity Monitor", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     docName.IndexOf("AGY 控制台", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return true;
                 }
             }
             catch { }
             return false;
         }
 
+        private static bool IsInsideAgyConsoleDocument(AutomationElement el)
+        {
+            return IsAgyConsoleDocument(FindNearestDocument(el));
+        }
+
         public static HudAnchorInfo ProbeComposerAnchor(
             IntPtr hwnd,
             Native.RECT winRect,
+            int selfPid,
             ref AutomationElement cachedAnchor,
             ref int cachedKind,
             ref AutomationElement cachedLeftGuard,
@@ -3540,12 +3599,16 @@ namespace AgyBackdropCompanion
 
                 AutomationElement modeMatch = null;
                 System.Windows.Rect modeRect = System.Windows.Rect.Empty;
+                bool modeUncovered = false;
                 AutomationElement micMatch = null;
                 System.Windows.Rect micRect = System.Windows.Rect.Empty;
+                bool micUncovered = false;
                 AutomationElement sendMatch = null;
                 System.Windows.Rect sendRect = System.Windows.Rect.Empty;
+                bool sendUncovered = false;
                 var rowButtons = new List<KeyValuePair<AutomationElement, System.Windows.Rect>>();
                 int bottomButtonCount = 0;
+                bool isHostFg = Native.GetForegroundWindow() == hwnd;
 
                 double minBtnH = 14.0 * dpiScale;
                 double maxBtnH = 54.0 * dpiScale;
@@ -3570,33 +3633,68 @@ namespace AgyBackdropCompanion
 
                     if (ContainsAny(name, ModeKeywords) && r.Width >= minModeW && r.Width <= maxModeW)
                     {
-                        if ((modeMatch == null || r.Bottom > modeRect.Bottom) && !IsInsideAgyConsoleDocument(btn))
+                        if (!IsInsideAgyConsoleDocument(btn))
                         {
-                            modeMatch = btn;
-                            modeRect = r;
+                            bool candUncovered = !isHostFg || IsCandidateUncovered(btn, r, selfPid);
+                            bool better = modeMatch == null
+                                || (candUncovered && !modeUncovered)
+                                || (candUncovered == modeUncovered && r.Bottom > modeRect.Bottom);
+                            if (better)
+                            {
+                                modeMatch = btn;
+                                modeRect = r;
+                                modeUncovered = candUncovered;
+                            }
                         }
                     }
                     else if (ContainsAny(name, MicKeywords) && r.Width <= maxIconW)
                     {
-                        if ((micMatch == null || r.Bottom > micRect.Bottom) && !IsInsideAgyConsoleDocument(btn))
+                        if (!IsInsideAgyConsoleDocument(btn))
                         {
-                            micMatch = btn;
-                            micRect = r;
+                            bool candUncovered = !isHostFg || IsCandidateUncovered(btn, r, selfPid);
+                            bool better = micMatch == null
+                                || (candUncovered && !micUncovered)
+                                || (candUncovered == micUncovered && r.Bottom > micRect.Bottom);
+                            if (better)
+                            {
+                                micMatch = btn;
+                                micRect = r;
+                                micUncovered = candUncovered;
+                            }
                         }
                     }
                     else if (ContainsAny(name, SendStopKeywords) && r.Width <= maxIconW)
                     {
-                        if ((sendMatch == null || r.Bottom > sendRect.Bottom) && !IsInsideAgyConsoleDocument(btn))
+                        if (!IsInsideAgyConsoleDocument(btn))
                         {
-                            sendMatch = btn;
-                            sendRect = r;
+                            bool candUncovered = !isHostFg || IsCandidateUncovered(btn, r, selfPid);
+                            bool better = sendMatch == null
+                                || (candUncovered && !sendUncovered)
+                                || (candUncovered == sendUncovered && r.Bottom > sendRect.Bottom);
+                            if (better)
+                            {
+                                sendMatch = btn;
+                                sendRect = r;
+                                sendUncovered = candUncovered;
+                            }
                         }
                     }
+                }
+
+                // Prefer any uncovered foreground composer candidate over a covered background conversation's candidate
+                if (modeMatch != null && !modeUncovered && ((micMatch != null && micUncovered) || (sendMatch != null && sendUncovered)))
+                {
+                    modeMatch = null;
+                }
+                if (micMatch != null && !micUncovered && sendMatch != null && sendUncovered)
+                {
+                    micMatch = null;
                 }
 
                 // When narrow pane collapses Turbo into an unlabeled shield icon directly left of Mic, anchor before it
                 if (modeMatch == null && micMatch != null)
                 {
+                    AutomationElement micDoc = FindNearestDocument(micMatch);
                     double mcy = (micRect.Top + micRect.Bottom) / 2.0;
                     for (int i = 0; i < rowButtons.Count; i++)
                     {
@@ -3606,6 +3704,11 @@ namespace AgyBackdropCompanion
                         double bcy = (br.Top + br.Bottom) / 2.0;
                         if (Math.Abs(bcy - mcy) <= 14.0 * dpiScale && br.Right <= micRect.Left + 2.0 * dpiScale && (micRect.Left - br.Right) <= 28.0 * dpiScale && br.Width <= 52.0 * dpiScale)
                         {
+                            if (micDoc != null)
+                            {
+                                AutomationElement candDoc = FindNearestDocument(cand);
+                                if (candDoc != null && !SameElement(candDoc, micDoc)) continue;
+                            }
                             modeMatch = cand;
                             modeRect = br;
                             break;
@@ -3641,6 +3744,7 @@ namespace AgyBackdropCompanion
                     }
 
                     // Verify this is a real multi-button composer toolbar row (prevents false attachment on Settings/Terminal/Diff buttons)
+                    AutomationElement chosenDoc = FindNearestDocument(chosen);
                     int sameRowCount = 0;
                     AutomationElement bestLeft = null;
                     for (int i = 0; i < rowButtons.Count; i++)
@@ -3648,6 +3752,11 @@ namespace AgyBackdropCompanion
                         System.Windows.Rect br = rowButtons[i].Value;
                         double bcy = (br.Top + br.Bottom) / 2.0;
                         if (Math.Abs(bcy - cy) > rowAlignTol) continue;
+                        if (!SameElement(rowButtons[i].Key, chosen) && chosenDoc != null)
+                        {
+                            AutomationElement candDoc = FindNearestDocument(rowButtons[i].Key);
+                            if (candDoc != null && !SameElement(candDoc, chosenDoc)) continue;
+                        }
                         sameRowCount++;
                         if (SameElement(rowButtons[i].Key, chosen)) continue;
                         double bMidX = (br.Left + br.Right) / 2.0;
@@ -4008,11 +4117,43 @@ namespace AgyBackdropCompanion
 
                                     if (!hitMatchesAnchor && !hitSharesComposer)
                                     {
-                                        // Case A: Hit belongs to a DIFFERENT Document (e.g. maximized AGY Console sidecar iframe)
+                                        // Case A: Hit belongs to a DIFFERENT Document (e.g. maximized AGY Console sidecar iframe or another conversation tab)
                                         if (hitNearestDoc != null && anchorDoc != null && !SameElement(hitNearestDoc, anchorDoc))
                                         {
-                                            reason = "anchor-covered-doc";
-                                            return true;
+                                            bool hitIsConsoleDoc = IsAgyConsoleDocument(hitNearestDoc);
+                                            System.Windows.Rect hrA;
+                                            bool hitInsideAnchorRect =
+                                                TryGetValidRect(aHit, out hrA) &&
+                                                hrA.Left >= ar.Left - 6 && hrA.Right <= ar.Right + 6 &&
+                                                hrA.Top >= ar.Top - 6 && hrA.Bottom <= ar.Bottom + 6;
+                                            // Never false-occlude if FromPoint inside the exact anchor rect hits an equivalent composer button (non-Console)
+                                            bool hitIsVisibleComposerTwin = false;
+                                            if (!hitIsConsoleDoc && hitInsideAnchorRect)
+                                            {
+                                                try
+                                                {
+                                                    string hitName = aHit.Current.Name ?? "";
+                                                    if (!string.IsNullOrEmpty(hitName) &&
+                                                        (ContainsAny(hitName, ModeKeywords) || ContainsAny(hitName, MicKeywords) || ContainsAny(hitName, SendStopKeywords)))
+                                                    {
+                                                        hitIsVisibleComposerTwin = true;
+                                                    }
+                                                }
+                                                catch { }
+                                            }
+                                            if (!hitIsVisibleComposerTwin)
+                                            {
+                                                uint hostPid = 0;
+                                                Native.GetWindowThreadProcessId(hostHwnd, out hostPid);
+                                                LastOcclusionDebug =
+                                                    "aRect=" + SafeRectStr(ar) +
+                                                    " hitCt=" + SafeCtName(aHit) +
+                                                    " hRect=" + SafeRectStr(hrA) +
+                                                    " samePid=" + (aHitPid == (int)hostPid ? "1" : "0") +
+                                                    " consoleDoc=" + (hitIsConsoleDoc ? "1" : "0");
+                                                reason = hitIsConsoleDoc ? "anchor-covered-console" : "anchor-covered-doc";
+                                                return true;
+                                            }
                                         }
 
                                         // Case B: Unrelated same-document covering panel (skip outer Document/Pane fallback
@@ -5091,7 +5232,7 @@ namespace AgyBackdropCompanion
                                 bool hadCached = cachedEl != null;
                                 HudAnchorInfo anchor = useZeroUia
                                     ? UiaHelper.ComputePureWin32ComposerAnchor(h, winRect, snapConsoleVis, snapConsolePhysW)
-                                    : UiaHelper.ProbeComposerAnchor(h, winRect, ref cachedEl, ref cachedKind, ref cachedLeft, ref cachedBox);
+                                    : UiaHelper.ProbeComposerAnchor(h, winRect, selfPid, ref cachedEl, ref cachedKind, ref cachedLeft, ref cachedBox);
                                 DateTime scanTime = (!hadCached || cachedEl == null) ? DateTime.UtcNow : lastScan;
 
                                 HudAnchorInfo finalAnchor = anchor;
@@ -5122,6 +5263,36 @@ namespace AgyBackdropCompanion
                                             uiaScanCycles++;
                                         }
                                         finalAnchor.Occluded = UiaHelper.IsHudOccluded(h, hudHwnd, backdropHwnd, selfPid, winRect, anchor, cachedEl, cachedLeft, runUiaChecks, prevAnchor.Occluded, prevOccReason, out occReason);
+
+                                        // Self-heal when cached anchor belongs to a background conversation Document after switching tabs:
+                                        // invalidate stale cachedEl (throttled: 650ms on fresh hit, 2500ms backoff if still covered) and immediately re-probe!
+                                        bool isStaleDocCover =
+                                            string.Equals(occReason, "anchor-covered-doc", StringComparison.Ordinal) ||
+                                            string.Equals(occReason, "anchor-covered", StringComparison.Ordinal);
+                                        bool wasAlreadyDocCover =
+                                            string.Equals(prevOccReason, "anchor-covered-doc", StringComparison.Ordinal) ||
+                                            string.Equals(prevOccReason, "anchor-covered", StringComparison.Ordinal);
+                                        double selfHealCooldownMs = (wasAlreadyDocCover && !clickJustReleased) ? 2500.0 : 650.0;
+                                        if (!useZeroUia && finalAnchor.Occluded && isStaleDocCover &&
+                                            hadCached && cachedEl != null &&
+                                            (loopNow - lastScan).TotalMilliseconds >= selfHealCooldownMs)
+                                        {
+                                            cachedEl = null;
+                                            cachedKind = 0;
+                                            cachedLeft = null;
+                                            cachedBox = null;
+                                            scanTime = DateTime.UtcNow;
+                                            HudAnchorInfo healed = UiaHelper.ProbeComposerAnchor(h, winRect, selfPid, ref cachedEl, ref cachedKind, ref cachedLeft, ref cachedBox);
+                                            if (healed.HasAnchor && healed.ComposerVisible)
+                                            {
+                                                string healedOccReason;
+                                                bool healedOcc = UiaHelper.IsHudOccluded(h, hudHwnd, backdropHwnd, selfPid, winRect, healed, cachedEl, cachedLeft, true, false, "", out healedOccReason);
+                                                healed.Occluded = healedOcc;
+                                                finalAnchor = healed;
+                                                occReason = healedOccReason;
+                                                nextOccCheck = DateTime.UtcNow;
+                                            }
+                                        }
                                     }
                                     if (finalAnchor.Occluded) anyOccluded = true;
                                 }
@@ -5985,7 +6156,8 @@ namespace AgyBackdropCompanion
                     showSpeed = ReadBool(doc, "showSpeed", true),
                     showCacheHit = ReadBool(doc, "showCacheHit", true),
                     showModel = ReadBool(doc, "showModel", true),
-                    showContext = ReadBool(doc, "showContext", true)
+                    showContext = ReadBool(doc, "showContext", true),
+                    showQuota = ReadBool(doc, "showQuota", true)
                 };
             }
             catch { }
@@ -6005,6 +6177,7 @@ namespace AgyBackdropCompanion
                     { "showCacheHit", _hudDisplay.showCacheHit },
                     { "showModel", _hudDisplay.showModel },
                     { "showContext", _hudDisplay.showContext },
+                    { "showQuota", _hudDisplay.showQuota },
                     { "updatedAtMs", epochMs }
                 };
                 string tmp = _hudDisplayPath + ".tmp";
@@ -6453,7 +6626,7 @@ namespace AgyBackdropCompanion
                 {
                     backdropEnabled = ReadBool(doc, "backdropEnabled", true),
                     hudEnabled = ReadBool(doc, "hudEnabled", true),
-                    hostThemeMode = ReadString(doc, "hostThemeMode", "backdrop"),
+                    hostThemeMode = ReadString(doc, "hostThemeMode", "inject"),
                     hostBlendPct = ClampInt(ReadInt(doc, "hostBlendPct", 18), 5, 42),
                     activeWallpaperId = ReadString(doc, "activeWallpaperId", ""),
                     opacity = ClampInt(ReadInt(doc, "opacity", 32), 0, 100),
@@ -6865,8 +7038,9 @@ namespace AgyBackdropCompanion
                     SweepOrphanedWindows();
                 }
 
-                bool isCdpMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase);
-                bool activeEffect = _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCdpMode;
+                bool isCssMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(_config.hostThemeMode, "inject", StringComparison.OrdinalIgnoreCase);
+                bool activeEffect = _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCssMode;
                 byte targetAlpha = activeEffect
                     ? (byte)Math.Max(148, Math.Min(254, Math.Round(255.0 * (100 - _config.hostBlendPct) / 100.0)))
                     : (byte)255;
@@ -7300,8 +7474,9 @@ namespace AgyBackdropCompanion
             {
                 _lastStatusWriteUtc = DateTime.UtcNow;
                 long epochMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
-                bool isCdpMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase);
-                bool activeEffect = running && _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCdpMode;
+                bool isCssMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(_config.hostThemeMode, "inject", StringComparison.OrdinalIgnoreCase);
+                bool activeEffect = running && _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCssMode;
                 byte alpha = activeEffect
                     ? (byte)Math.Max(148, Math.Min(254, Math.Round(255.0 * (100 - _config.hostBlendPct) / 100.0)))
                     : (byte)255;
@@ -7389,6 +7564,7 @@ namespace AgyBackdropCompanion
                     { "hudAnchorFound", running && anyHudAnchor },
                     { "hudOccluded", running && anyHudOccluded },
                     { "hudOccludedReason", running ? occReason : "" },
+                    { "hudOccludedDetail", running && anyHudOccluded ? (UiaHelper.LastOcclusionDebug ?? "") : "" },
                     { "hudActiveWorkspace", _lastViewWorkspace ?? "" },
                     { "hudActiveTitle", _lastViewTitle ?? "" },
                     { "hudLastAction", _hudLastAction ?? "" },

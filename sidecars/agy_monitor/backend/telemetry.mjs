@@ -504,18 +504,18 @@ export async function queryTelemetrySnapshot(cacheDbPath, storage, paths, opts =
         ? 'conv_db_gen_metadata'
         : 'transcript_log';
 
-    // When we have the exact step's requested model alongside upstream responseModel from conv DB,
-    // compare against THAT step's actual requested model (never a stale plugin defaultModel preference).
+    // Compare upstream responseModel strictly against the step's actual requested model from conv DB
+    // (the legacy plugin-level defaultModel launch preference has been removed).
     const comparisonBaseline =
       rawUpstreamFromGen && (requestedModelId || requestedModelLabel)
         ? { id: requestedModelId || requestedModelLabel, label: requestedModelLabel || undefined }
-        : prefs.defaultModel;
+        : null;
     const upstreamModelStatus = classifyUpstreamModelStatus(
       comparisonBaseline,
       upstreamModelId
     );
 
-    const etagSeed = `${scanEtag}|${targetConvId}|${isExplicitConvId ? 1 : 0}|${scope}|${range}|${windowCap}|${rulesAddonTokens}|${prefs.activePromptId || ''}|${prefs.defaultModel?.id || ''}|${upstreamModelId || ''}|${upstreamModelStatus}`;
+    const etagSeed = `${scanEtag}|${targetConvId}|${isExplicitConvId ? 1 : 0}|${scope}|${range}|${windowCap}|${rulesAddonTokens}|${prefs.activePromptId || ''}|${upstreamModelId || ''}|${upstreamModelStatus}`;
     const etag = crypto.createHash('sha1').update(etagSeed).digest('hex').slice(0, 12);
 
     return {

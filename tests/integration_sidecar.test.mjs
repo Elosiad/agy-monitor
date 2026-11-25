@@ -463,13 +463,11 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
   const snapFav = await (await fetch(base + '/api/snapshot?scope=global&range=30d')).json();
   assert.equal(snapFav.sessionsHub.favorites[0].title, 'Archived Title Kept');
 
-  const modelRes = await (
-    await jsonPost('/api/model/default', { modelId: 'gemini-4-hydrogen-xhigh', tier: 'Extra' })
-  ).json();
-  assert.equal(modelRes.ok, true);
-
-  const snapMatched = await (await fetch(base + '/api/snapshot?scope=current&range=30d')).json();
-  assert.equal(snapMatched.runtimeTelemetry.upstreamModelStatus, 'match');
+  // Removed launch model preference routes return 404
+  const removedModelRes = await jsonPost('/api/model/default', { modelId: 'gemini-4-hydrogen-xhigh', tier: 'Extra' });
+  assert.equal(removedModelRes.status, 404);
+  const removedNewSessRes = await jsonPost('/api/sessions/new', { prompt: 'hi' });
+  assert.equal(removedNewSessRes.status, 404);
 
   const bdStatusRes = await (await fetch(base + '/api/theme/backdrop/status')).json();
   assert.equal(bdStatusRes.ok, true);
@@ -504,6 +502,18 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
     assert.ok(fs.readFileSync(handle.paths.cdpLauncherCmd, 'utf8').includes('wscript.exe'));
   }
   await jsonPost('/api/theme/backdrop/action', { action: 'sync', hostThemeMode: 'backdrop' });
+
+  // Scheme 3 (Persistent Pure-CSS Injection, default) switches cleanly and stages live wallpaper CSS
+  const injectModeRes = await (
+    await jsonPost('/api/theme/backdrop/action', {
+      action: 'inject_sync',
+      hostThemeMode: 'inject',
+    })
+  ).json();
+  assert.equal(injectModeRes.ok, true);
+  assert.equal(injectModeRes.themeState.hostThemeMode, 'inject');
+  assert.equal(fs.existsSync(handle.paths.nativeWallpaperCssFile), true);
+  assert.ok(fs.readFileSync(handle.paths.nativeWallpaperCssFile, 'utf8').includes('html::before'));
 
   // 8. Theme save preserves host config.json untouched, never generates host_injector.js, supports 'custom' & thumbBase64
   const saveThemeRes = await (

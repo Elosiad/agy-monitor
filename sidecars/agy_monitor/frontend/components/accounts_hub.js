@@ -173,6 +173,8 @@ export function createAccountsHub({
 
   // Settings modal controls
   const settingRefreshMinInput = document.getElementById("accSettingRefreshMinInput");
+  const settingBgInactiveToggleBtn = document.getElementById("accSettingBgInactiveToggleBtn");
+  const settingBgInactiveToggleText = document.getElementById("accSettingBgInactiveToggleText");
   const settingAutoTargetSelect = document.getElementById("accSettingAutoTargetSelect");
   const settingAutoToggleBtn = document.getElementById("accSettingAutoToggleBtn");
   const settingAutoToggleText = document.getElementById("accSettingAutoToggleText");
@@ -223,6 +225,7 @@ export function createAccountsHub({
   let lastNotifiedOauthMs = 0;
   let lastNotifiedAutoSwitchMs = 0;
   let draftAutoSwitchEnabled = false;
+  let draftBgRefreshInactive = false;
   let activeRemarkAccount = null;
   let activeDeleteAccount = null;
   let activeExportPayload = { filename: "agy-account.json", jsonText: "" };
@@ -240,6 +243,7 @@ export function createAccountsHub({
       quotaRefreshIntervalMin: 5,
       autoSwitchTarget: "gemini",
       autoSwitchEnabled: false,
+      backgroundRefreshInactive: false,
       sortBy: "lastUsed",
       sortOrder: "desc",
     },
@@ -879,6 +883,7 @@ export function createAccountsHub({
               : 5,
           autoSwitchTarget: String(data.settings.autoSwitchTarget || "gemini"),
           autoSwitchEnabled: Boolean(data.settings.autoSwitchEnabled),
+          backgroundRefreshInactive: Boolean(data.settings.backgroundRefreshInactive),
           sortBy: String(data.settings.sortBy || "lastUsed"),
           sortOrder: data.settings.sortOrder === "asc" ? "asc" : "desc",
         };
@@ -1290,11 +1295,18 @@ export function createAccountsHub({
   }
 
   function renderSettingsAutoToggle() {
-    if (!settingAutoToggleBtn || !settingAutoToggleText) return;
-    settingAutoToggleBtn.classList.toggle("is-on", draftAutoSwitchEnabled);
-    settingAutoToggleBtn.classList.toggle("is-off", !draftAutoSwitchEnabled);
-    settingAutoToggleBtn.setAttribute("aria-pressed", String(draftAutoSwitchEnabled));
-    settingAutoToggleText.textContent = draftAutoSwitchEnabled ? "已启用" : "已弃用";
+    if (settingAutoToggleBtn && settingAutoToggleText) {
+      settingAutoToggleBtn.classList.toggle("is-on", draftAutoSwitchEnabled);
+      settingAutoToggleBtn.classList.toggle("is-off", !draftAutoSwitchEnabled);
+      settingAutoToggleBtn.setAttribute("aria-pressed", String(draftAutoSwitchEnabled));
+      settingAutoToggleText.textContent = draftAutoSwitchEnabled ? "已启用" : "已弃用";
+    }
+    if (settingBgInactiveToggleBtn && settingBgInactiveToggleText) {
+      settingBgInactiveToggleBtn.classList.toggle("is-on", draftBgRefreshInactive);
+      settingBgInactiveToggleBtn.classList.toggle("is-off", !draftBgRefreshInactive);
+      settingBgInactiveToggleBtn.setAttribute("aria-pressed", String(draftBgRefreshInactive));
+      settingBgInactiveToggleText.textContent = draftBgRefreshInactive ? "已启用" : "已关闭";
+    }
   }
 
   function openSettingsModal() {
@@ -1309,6 +1321,7 @@ export function createAccountsHub({
       settingAutoTargetSelect.value = state.settings.autoSwitchTarget || "gemini";
     }
     draftAutoSwitchEnabled = Boolean(state.settings.autoSwitchEnabled);
+    draftBgRefreshInactive = Boolean(state.settings.backgroundRefreshInactive);
     renderSettingsAutoToggle();
     openModal("settings");
   }
@@ -1326,6 +1339,7 @@ export function createAccountsHub({
           quotaRefreshIntervalMin,
           autoSwitchTarget,
           autoSwitchEnabled: draftAutoSwitchEnabled,
+          backgroundRefreshInactive: draftBgRefreshInactive,
         },
         { silent: false },
       );
@@ -1370,6 +1384,10 @@ export function createAccountsHub({
   bindClick(sortBtn, cycleSortField);
   bindClick(settingAutoToggleBtn, () => {
     draftAutoSwitchEnabled = !draftAutoSwitchEnabled;
+    renderSettingsAutoToggle();
+  });
+  bindClick(settingBgInactiveToggleBtn, () => {
+    draftBgRefreshInactive = !draftBgRefreshInactive;
     renderSettingsAutoToggle();
   });
   bindClick(settingsSaveBtn, () => void handleSaveSettings());

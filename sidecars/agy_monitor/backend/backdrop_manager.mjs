@@ -434,7 +434,8 @@ export async function getBackdropStatus(paths, themes = {}) {
     backdropEnabled: Boolean(themes?.backdropEnabled),
     hudEnabled: themes?.hudEnabled !== false,
     zeroUiaMode: Boolean(themes?.zeroUiaMode),
-    hostThemeMode: themes?.hostThemeMode === 'cdp' ? 'cdp' : 'backdrop',
+    hostThemeMode:
+      themes?.hostThemeMode === 'cdp' || themes?.hostThemeMode === 'backdrop' ? themes.hostThemeMode : 'inject',
     cdpPort: Number(themes?.cdpPort || 9229),
     hudVisible: running && Boolean(raw?.hudVisible),
     hudAnchorFound: running && Boolean(raw?.hudAnchorFound),
@@ -472,13 +473,18 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
   const desk = await detectOwnDesktopInfo({ exePath: rt?.exePosix || '' });
   const current = await getBackdropStatus(paths, themes);
 
+  const hostMode =
+    themes?.hostThemeMode === 'cdp' || themes?.hostThemeMode === 'backdrop' ? themes.hostThemeMode : 'inject';
   const wantRunning =
     action === 'start'
       ? true
       : action === 'stop'
         ? false
         : action === 'sync'
-          ? Boolean((themes?.backdropEnabled && themes?.activeWallpaperId) || themes?.hudEnabled !== false)
+          ? Boolean(
+              (themes?.backdropEnabled && themes?.activeWallpaperId && hostMode === 'backdrop') ||
+                (themes?.hudEnabled !== false && themes?.hudInjectionMode === 'uia' && !themes?.zeroUiaMode),
+            )
           : current.running;
 
   let launched = false;

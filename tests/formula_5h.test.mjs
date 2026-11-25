@@ -216,11 +216,7 @@ test('runtimeTelemetry detects upstream model mismatch, recovers legacy model=nu
     ],
   });
 
-  await storage.updatePrefs({
-    defaultModel: { id: 'gemini-4-hydrogen-xhigh', tier: 'Extra' },
-  });
-
-  // 1. Speed & downgrade detection + __unrecorded__ bucket recovery
+  // 1. Speed & __unrecorded__ bucket recovery (no per-step requestedModel -> honest no_baseline)
   const snapMain = await queryTelemetrySnapshot(paths.telemetryCacheDb, storage, paths, {
     convId: 'conv-main',
     isExplicitConvId: true,
@@ -231,7 +227,7 @@ test('runtimeTelemetry detects upstream model mismatch, recovers legacy model=nu
   });
 
   assert.equal(snapMain.runtimeTelemetry.upstreamModelId, 'gemini-3-8-flash');
-  assert.equal(snapMain.runtimeTelemetry.upstreamModelStatus, 'downgrade_suspected');
+  assert.equal(snapMain.runtimeTelemetry.upstreamModelStatus, 'no_baseline');
   assert.equal(snapMain.runtimeTelemetry.speedSource, 'tool_step_e2e_est');
   assert.ok(Math.abs(snapMain.runtimeTelemetry.latestTokPerSec - 100) <= 5);
 

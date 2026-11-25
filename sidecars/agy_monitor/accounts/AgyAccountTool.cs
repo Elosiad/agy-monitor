@@ -15,7 +15,12 @@ namespace AgyAccountTool
         private static readonly byte[] DpapiEntropy = Encoding.UTF8.GetBytes("agy-monitor-account-vault-v1");
         private const int CRED_TYPE_GENERIC = 1;
         private const int CRED_PERSIST_LOCAL_MACHINE = 2;
+        private const int CRED_MAX_CREDENTIAL_BLOB_SIZE = 5 * 512; // 2560 bytes (Windows CredWriteW limit)
+        private const int ERROR_NOT_ENOUGH_MEMORY = 8;
         private const uint WM_CLOSE = 0x0010;
+        private const string DESKTOP_FALLBACK_FILE = "jetski-standalone-oauth-token";
+        private const string CLI_DIR_NAME = "antigravity-cli";
+        private const string CLI_SESSION_FILE = "antigravity-oauth-token";
 
         [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
@@ -76,7 +81,7 @@ namespace AgyAccountTool
             {
                 if (cmd == "--version")
                 {
-                    WriteJson(new Dictionary<string, object> { { "ok", true }, { "version", "1.0.0" } });
+                    WriteJson(new Dictionary<string, object> { { "ok", true }, { "version", "2.0.0" } });
                     return 0;
                 }
                 if (cmd == "--cred-read")
@@ -140,7 +145,41 @@ namespace AgyAccountTool
             }
         }
 
-        private static Dictionary<string, object> ReadCredentialInternal(string preferredTarget)
+        private static string GetGeminiDir(string overrideDir)
+        {
+            if (!string.IsNullOrEmpty(overrideDir))
+            {
+                return overrideDir;
+            }
+            string envOverride = Environment.GetEnvironmentVariable("AGY_TEST_GEMINI_DIR");
+            if (!string.IsNullOrEmpty(envOverride))
+            {
+                return envOverride;
+            }
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrEmpty(home))
+            {
+                home = Environment.GetEnvironmentVariable("USERPROFILE");
+            }
+            return Path.Combine(home ?? "", ".gemini");
+        }
+
+        private static string GetDesktopFallbackPath(string geminiDir)
+        {
+            return Path.Combine(geminiDir, DESKTOP_FALLBACK_FILE);
+        }
+
+        private static string GetInitializedCliSessionPath(string geminiDir)
+        {
+            string cliDir = Path.Combine(geminiDir, CLI_DIR_NAME);
+            if (Directory.Exists(cliDir))
+            {
+                return Path.Combine(cliDir, CLI_SESSION_FILE);
+            }
+            return null;
+        }
+
+        private static Dictionary<string, object> ReadSystemCredentialInternal(string preferredTarget)
         {
             List<string> candidates = new List<string>();
             if (!string.IsNullOrEmpty(preferredTarget))
@@ -183,6 +222,7 @@ namespace AgyAccountTool
                         {
                             { "ok", true },
                             { "found", true },
+                            { "source", "windows_credential_manager" },
                             { "target", cred.TargetName ?? target },
                             { "userName", cred.UserName ?? "antigravity" },
                             { "persist", (int)cred.Persist },
@@ -205,8 +245,65 @@ namespace AgyAccountTool
             };
         }
 
-        private static bool WriteCredentialInternal(string target, string userName, int persist, byte[] blobBytes)
+        // Cockpit-aligned read_desktop_credential: prefer Windows Credential Manager,
+        // fall back to ~/.gemini/jetski-standalone-oauth-token when Keyring has no entry.
+        private static Dictionary<string, object> ReadCredentialInternal(string preferredTarget)
         {
+            Dictionary<string, object> sysCred = ReadSystemCredentialInternal(preferredTarget);
+            if (Convert.ToBoolean(sysCred["found"]))
+            {
+                return sysCred;
+            }
+
+            try
+            {
+                string fallbackPath = GetDesktopFallbackPath(GetGeminiDir(null));
+                if (File.Exists(fallbackPath))
+                {
+                    byte[] raw = File.ReadAllBytes(fallbackPath);
+                    string txt = new UTF8Encoding(false).GetString(raw).Trim();
+                    if (!string.IsNullOrEmpty(txt))
+                    {
+                        byte[] cleanBytes = new UTF8Encoding(false).GetBytes(txt);
+                        string mtimeIso = "";
+                        try { mtimeIso = File.GetLastWriteTimeUtc(fallbackPath).ToString("o"); } catch { }
+                        return new Dictionary<string, object>
+                        {
+                            { "ok", true },
+                            { "found", true },
+                            { "source", "desktop_fallback" },
+                            { "target", string.IsNullOrEmpty(preferredTarget) ? "gemini:antigravity" : preferredTarget },
+                            { "userName", "antigravity" },
+                            { "persist", CRED_PERSIST_LOCAL_MACHINE },
+                            { "blobBase64", Convert.ToBase64String(cleanBytes) },
+                            { "lastWrittenUtc", mtimeIso }
+                        };
+                    }
+                }
+            }
+            catch { }
+
+            return sysCred;
+        }
+
+        private static string FormatWindowsCredWriteError(int win32Error)
+        {
+            if (win32Error == ERROR_NOT_ENOUGH_MEMORY)
+            {
+                return "ANTIGRAVITY_WINDOWS_CREDENTIAL_STORE_CAPACITY (Win32=8)";
+            }
+            return "CredWriteW failed: Win32=" + win32Error;
+        }
+
+        private static bool WriteCredentialInternal(string target, string userName, int persist, byte[] blobBytes, out string errorMsg)
+        {
+            errorMsg = null;
+            if (blobBytes != null && blobBytes.Length > CRED_MAX_CREDENTIAL_BLOB_SIZE)
+            {
+                errorMsg = "ANTIGRAVITY_WINDOWS_CREDENTIAL_TOO_LARGE (" + blobBytes.Length + " > " + CRED_MAX_CREDENTIAL_BLOB_SIZE + ")";
+                return false;
+            }
+
             IntPtr blobPtr = IntPtr.Zero;
             try
             {
@@ -229,7 +326,13 @@ namespace AgyAccountTool
                 cred.Comment = null;
                 cred.TargetAlias = null;
 
-                return CredWrite(ref cred, 0);
+                // CredWriteW updates an existing target in-place without deleting it first (Cockpit-aligned).
+                if (!CredWrite(ref cred, 0))
+                {
+                    errorMsg = FormatWindowsCredWriteError(Marshal.GetLastWin32Error());
+                    return false;
+                }
+                return true;
             }
             finally
             {
@@ -280,11 +383,11 @@ namespace AgyAccountTool
             string blobB64 = GetString(req, "blobBase64", "");
             byte[] blob = string.IsNullOrEmpty(blobB64) ? new byte[0] : Convert.FromBase64String(blobB64);
 
-            bool ok = WriteCredentialInternal(target, userName, persist, blob);
+            string writeErr;
+            bool ok = WriteCredentialInternal(target, userName, persist, blob, out writeErr);
             if (!ok)
             {
-                int err = Marshal.GetLastWin32Error();
-                WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", "CredWriteW failed: Win32=" + err } });
+                WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", writeErr ?? "CredWriteW failed" } });
                 return 1;
             }
             WriteJson(new Dictionary<string, object> { { "ok", true }, { "target", target } });
@@ -402,18 +505,21 @@ namespace AgyAccountTool
         private static bool IsAntigravityProcessName(string procName)
         {
             return string.Equals(procName, "Antigravity", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(procName, "Antigravity IDE", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(procName, "Antigravity_Original", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsAnyAntigravityAlive()
         {
-            return IsProcessAliveByName("Antigravity") || IsProcessAliveByName("Antigravity_Original");
+            return IsProcessAliveByName("Antigravity")
+                || IsProcessAliveByName("Antigravity IDE")
+                || IsProcessAliveByName("Antigravity_Original");
         }
 
         private static List<Process> FindHostProcesses(int selfPid)
         {
             List<Process> list = new List<Process>();
-            string[] names = new string[] { "Antigravity", "Antigravity_Original", "language_server" };
+            string[] names = new string[] { "Antigravity", "Antigravity IDE", "Antigravity_Original", "language_server" };
             foreach (string name in names)
             {
                 try
@@ -430,6 +536,32 @@ namespace AgyAccountTool
             return list;
         }
 
+        private static void RunTaskkill(int pid, bool force)
+        {
+            if (pid <= 0) return;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "taskkill.exe";
+                psi.Arguments = force
+                    ? ("/PID " + pid + " /T /F")
+                    : ("/PID " + pid + " /T");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process tk = Process.Start(psi))
+                {
+                    if (tk != null)
+                    {
+                        tk.WaitForExit(3000);
+                    }
+                }
+            }
+            catch { }
+        }
+
         private static void CloseHostGracefullyAndWait(int gracefulTimeoutMs, int forceTimeoutMs)
         {
             int selfPid = Process.GetCurrentProcess().Id;
@@ -437,6 +569,8 @@ namespace AgyAccountTool
             if (initial.Count == 0) return;
 
             HashSet<uint> targetPids = new HashSet<uint>();
+            List<int> windowedPids = new List<int>();
+            List<int> allHostPids = new List<int>();
             foreach (Process p in initial)
             {
                 try
@@ -444,13 +578,30 @@ namespace AgyAccountTool
                     if (IsAntigravityProcessName(p.ProcessName))
                     {
                         targetPids.Add((uint)p.Id);
+                        allHostPids.Add(p.Id);
+                        try
+                        {
+                            if (p.MainWindowHandle != IntPtr.Zero)
+                            {
+                                windowedPids.Add(p.Id);
+                            }
+                        }
+                        catch { }
                         try { p.CloseMainWindow(); } catch { }
                     }
                 }
                 catch { }
             }
 
-            // Send WM_CLOSE to all visible top-level windows owned by Antigravity.exe
+            // Cockpit-aligned Windows graceful close: send non-forced `taskkill /PID <pid> /T`
+            // to main Antigravity window process(es) first so Electron & language_server flush cleanly.
+            List<int> gracefulTargets = windowedPids.Count > 0 ? windowedPids : allHostPids;
+            foreach (int pid in gracefulTargets)
+            {
+                RunTaskkill(pid, false);
+            }
+
+            // Belt-and-suspenders: also send WM_CLOSE to all visible top-level windows owned by Antigravity
             try
             {
                 EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
@@ -470,12 +621,28 @@ namespace AgyAccountTool
             while (sw.ElapsedMilliseconds < gracefulTimeoutMs)
             {
                 List<Process> alive = FindHostProcesses(selfPid);
-                if (alive.Count == 0) return;
+                if (alive.Count == 0)
+                {
+                    Thread.Sleep(350);
+                    return;
+                }
                 Thread.Sleep(150);
             }
 
             // Fallback termination only for lingering processes after graceful window
             List<Process> lingering = FindHostProcesses(selfPid);
+            foreach (Process p in lingering)
+            {
+                try
+                {
+                    if (!p.HasExited && IsAntigravityProcessName(p.ProcessName))
+                    {
+                        RunTaskkill(p.Id, true);
+                    }
+                }
+                catch { }
+            }
+            lingering = FindHostProcesses(selfPid);
             foreach (Process p in lingering)
             {
                 try
@@ -499,34 +666,54 @@ namespace AgyAccountTool
             Thread.Sleep(350);
         }
 
-        private static Dictionary<string, object> CaptureLiveHostSnapshot(string roamingDir)
+        private static Dictionary<string, object> CaptureFileSnapshot(string filePath)
+        {
+            Dictionary<string, object> info = new Dictionary<string, object>();
+            if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+            {
+                info["exists"] = false;
+                return info;
+            }
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(filePath);
+                info["exists"] = true;
+                info["contentBase64"] = Convert.ToBase64String(bytes);
+            }
+            catch
+            {
+                info["exists"] = false;
+            }
+            return info;
+        }
+
+        private static void RestoreFileSnapshot(string filePath, object rawSnap)
+        {
+            if (string.IsNullOrEmpty(filePath)) return;
+            Dictionary<string, object> info = rawSnap as Dictionary<string, object>;
+            if (info == null) return;
+            bool existed = info.ContainsKey("exists") && Convert.ToBoolean(info["exists"]);
+            if (!existed)
+            {
+                try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
+                return;
+            }
+            string b64 = GetString(info, "contentBase64", "");
+            byte[] bytes = string.IsNullOrEmpty(b64) ? new byte[0] : Convert.FromBase64String(b64);
+            AtomicWriteUtf8(filePath, new UTF8Encoding(false).GetString(bytes));
+        }
+
+        private static Dictionary<string, object> CaptureLiveHostSnapshot(string roamingDir, string geminiDir)
         {
             Dictionary<string, object> snap = new Dictionary<string, object>();
-            snap["credential"] = ReadCredentialInternal("gemini:antigravity");
+            snap["credential"] = ReadSystemCredentialInternal("gemini:antigravity");
+            snap["desktopFallback"] = CaptureFileSnapshot(GetDesktopFallbackPath(geminiDir));
 
-            string scopePath = Path.Combine(roamingDir, "credential-user-scope");
-            if (File.Exists(scopePath))
+            string cliSessionPath = GetInitializedCliSessionPath(geminiDir);
+            if (!string.IsNullOrEmpty(cliSessionPath))
             {
-                try { snap["credentialUserScope"] = File.ReadAllText(scopePath, new UTF8Encoding(false)); } catch { }
-            }
-
-            string appStoragePath = Path.Combine(roamingDir, "app_storage.json");
-            if (File.Exists(appStoragePath))
-            {
-                try
-                {
-                    string txt = File.ReadAllText(appStoragePath, new UTF8Encoding(false));
-                    Dictionary<string, object> parsed = CreateSerializer().Deserialize<Dictionary<string, object>>(txt);
-                    if (parsed != null)
-                    {
-                        object lastUser;
-                        if (parsed.TryGetValue("agy.onboarding.lastLoginUsername", out lastUser) && lastUser != null)
-                        {
-                            snap["lastLoginUsername"] = Convert.ToString(lastUser);
-                        }
-                    }
-                }
-                catch { }
+                snap["cliSessionPath"] = cliSessionPath;
+                snap["cliSession"] = CaptureFileSnapshot(cliSessionPath);
             }
             return snap;
         }
@@ -552,7 +739,7 @@ namespace AgyAccountTool
             AtomicWriteUtf8(appStoragePath, ser.Serialize(parsed));
         }
 
-        private static void RestoreSnapshot(string roamingDir, Dictionary<string, object> snap)
+        private static void RestoreSnapshot(string roamingDir, string geminiDir, Dictionary<string, object> snap)
         {
             if (snap == null) return;
             object credObj;
@@ -565,9 +752,28 @@ namespace AgyAccountTool
                     string userName = GetString(cred, "userName", "antigravity");
                     int persist = GetInt(cred, "persist", CRED_PERSIST_LOCAL_MACHINE);
                     string b64 = GetString(cred, "blobBase64", "");
-                    WriteCredentialInternal(target, userName, persist, Convert.FromBase64String(b64));
+                    string ignoreErr;
+                    WriteCredentialInternal(target, userName, persist, Convert.FromBase64String(b64), out ignoreErr);
                 }
             }
+
+            object fallbackSnap;
+            if (snap.TryGetValue("desktopFallback", out fallbackSnap))
+            {
+                try { RestoreFileSnapshot(GetDesktopFallbackPath(geminiDir), fallbackSnap); } catch { }
+            }
+
+            object cliSnap;
+            if (snap.TryGetValue("cliSession", out cliSnap))
+            {
+                string cliPath = GetString(snap, "cliSessionPath", null) ?? GetInitializedCliSessionPath(geminiDir);
+                if (!string.IsNullOrEmpty(cliPath))
+                {
+                    try { RestoreFileSnapshot(cliPath, cliSnap); } catch { }
+                }
+            }
+
+            // Backward compatibility: restore legacy snapshots that predated Cockpit alignment
             string scopePath = Path.Combine(roamingDir, "credential-user-scope");
             string prevScope = GetString(snap, "credentialUserScope", null);
             if (prevScope != null)
@@ -728,22 +934,22 @@ namespace AgyAccountTool
 
             string mode = GetString(tx, "mode", "switch");
             string roamingDir = GetString(tx, "roamingDir", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Antigravity"));
+            string geminiDir = GetGeminiDir(GetString(tx, "geminiDir", null));
             string antigravityExe = GetString(tx, "antigravityExe", "");
             string launchArgs = GetString(tx, "launchArgs", "");
             string workDir = GetString(tx, "workDir", "");
             string payloadFile = GetString(tx, "payloadFile", "");
             string backupFile = GetString(tx, "backupFile", "");
-            string targetEmail = GetString(tx, "targetEmail", "");
 
             Dictionary<string, object> preSwitchSnapshot = null;
 
             try
             {
                 UpdateTxFile(txPath, tx, "closing_host", null);
-                CloseHostGracefullyAndWait(6500, 2500);
+                CloseHostGracefullyAndWait(15000, 3500);
 
                 UpdateTxFile(txPath, tx, "backing_up", null);
-                preSwitchSnapshot = CaptureLiveHostSnapshot(roamingDir);
+                preSwitchSnapshot = CaptureLiveHostSnapshot(roamingDir, geminiDir);
                 if (!string.IsNullOrEmpty(backupFile))
                 {
                     try
@@ -756,17 +962,17 @@ namespace AgyAccountTool
                 }
 
                 UpdateTxFile(txPath, tx, "applying", null);
-                string scopePath = Path.Combine(roamingDir, "credential-user-scope");
+                string fallbackPath = GetDesktopFallbackPath(geminiDir);
+                string cliSessionPath = GetInitializedCliSessionPath(geminiDir);
 
                 if (mode == "oauth_new")
                 {
                     DeleteCredentialInternal("gemini:antigravity");
-                    try
+                    try { if (File.Exists(fallbackPath)) File.Delete(fallbackPath); } catch { }
+                    if (!string.IsNullOrEmpty(cliSessionPath))
                     {
-                        if (File.Exists(scopePath)) File.Delete(scopePath);
+                        try { if (File.Exists(cliSessionPath)) File.Delete(cliSessionPath); } catch { }
                     }
-                    catch { }
-                    try { ApplyAppStorageUsername(roamingDir, "", true); } catch { }
                 }
                 else if (mode == "rollback")
                 {
@@ -782,7 +988,7 @@ namespace AgyAccountTool
                     {
                         throw new Exception("Invalid backup snapshot");
                     }
-                    RestoreSnapshot(roamingDir, snap);
+                    RestoreSnapshot(roamingDir, geminiDir, snap);
                 }
                 else
                 {
@@ -808,14 +1014,15 @@ namespace AgyAccountTool
                     }
 
                     byte[] credBlob = new UTF8Encoding(false).GetBytes(credJson);
-                    bool written = WriteCredentialInternal(credTarget, credUserName, credPersist, credBlob);
+                    string writeErr;
+                    bool written = WriteCredentialInternal(credTarget, credUserName, credPersist, credBlob, out writeErr);
                     if (!written)
                     {
-                        throw new Exception("CredWriteW failed: Win32=" + Marshal.GetLastWin32Error());
+                        throw new Exception(writeErr ?? ("CredWriteW failed: Win32=" + Marshal.GetLastWin32Error()));
                     }
 
-                    // Read-back verification to guarantee the new account credential persisted cleanly
-                    Dictionary<string, object> verify = ReadCredentialInternal(credTarget);
+                    // Read-back verification against Windows Credential Manager to guarantee persistence
+                    Dictionary<string, object> verify = ReadSystemCredentialInternal(credTarget);
                     string verifyB64 = GetString(verify, "blobBase64", "");
                     if (!Convert.ToBoolean(verify["found"]) || verifyB64 != Convert.ToBase64String(credBlob))
                     {
@@ -823,40 +1030,36 @@ namespace AgyAccountTool
                     }
                     tx["verifiedCredBytes"] = credBlob.Length;
 
-                    string targetScope = GetString(payload, "credentialUserScope", "");
-                    if (!string.IsNullOrEmpty(targetScope))
+                    // Cockpit-aligned dual-write #1: ~/.gemini/jetski-standalone-oauth-token
+                    // Standalone 2.13+ compositeTokenStorage falls back to this file on Keyring timeout;
+                    // writing the exact same payload prevents resurrecting a previous account.
+                    try
                     {
-                        AtomicWriteUtf8(scopePath, targetScope);
+                        AtomicWriteUtf8(fallbackPath, credJson);
+                        tx["desktopFallbackSynced"] = true;
                     }
-                    else
+                    catch (Exception fbEx)
                     {
-                        // Remove stale previous user scope so Antigravity generates a clean scope bound to the switched user
-                        try { if (File.Exists(scopePath)) File.Delete(scopePath); } catch { }
+                        throw new Exception("Desktop fallback sync failed (please retry switch): " + fbEx.Message);
                     }
 
-                    try { ApplyAppStorageUsername(roamingDir, targetEmail, false); } catch { }
-
-                    // Optional Antigravity 1.x state.vscdb sync when target payload includes v1State
-                    string v1NodeExe = GetString(tx, "v1SyncNodeExe", "");
-                    string v1Script = GetString(tx, "v1SyncScript", "");
-                    if (!string.IsNullOrEmpty(v1NodeExe) && !string.IsNullOrEmpty(v1Script) && File.Exists(v1NodeExe) && File.Exists(v1Script))
+                    // Cockpit-aligned dual-write #2: ~/.gemini/antigravity-cli/antigravity-oauth-token
+                    // Only written when the agy CLI directory is already initialized; never touches ~/.gemini/oauth_creds.json.
+                    if (!string.IsNullOrEmpty(cliSessionPath))
                     {
                         try
                         {
-                            ProcessStartInfo nsi = new ProcessStartInfo();
-                            nsi.FileName = v1NodeExe;
-                            nsi.Arguments = "\"" + v1Script + "\" \"" + roamingDir + "\" \"" + payloadFile + "\"";
-                            nsi.UseShellExecute = false;
-                            nsi.CreateNoWindow = true;
-                            nsi.WindowStyle = ProcessWindowStyle.Hidden;
-                            Process np = Process.Start(nsi);
-                            if (np != null)
-                            {
-                                np.WaitForExit(8000);
-                            }
+                            AtomicWriteUtf8(cliSessionPath, credJson);
+                            tx["cliSessionSynced"] = true;
                         }
-                        catch { }
+                        catch (Exception cliEx)
+                        {
+                            throw new Exception("ANTIGRAVITY_SWITCH_STATE_SAVE_FAILED: agy: " + cliEx.Message);
+                        }
                     }
+
+                    // Cockpit-aligned minimalism: NEVER delete credential-user-scope or mutate app_storage.json
+                    // during account switch — let Antigravity manage its own internal onboarding/scope files.
                 }
 
                 // Clean up temporary one-time encrypted payload
@@ -879,7 +1082,7 @@ namespace AgyAccountTool
                 {
                     if (preSwitchSnapshot != null)
                     {
-                        RestoreSnapshot(roamingDir, preSwitchSnapshot);
+                        RestoreSnapshot(roamingDir, geminiDir, preSwitchSnapshot);
                     }
                 }
                 catch { }

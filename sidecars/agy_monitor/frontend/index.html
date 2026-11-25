@@ -217,54 +217,8 @@
             </section>
           </div>
 
-          <!-- 配置行：全局默认模型 + 系统提示词 -->
+          <!-- 配置行：全局系统提示词 -->
           <div class="config-rows-stack">
-            <!-- 全局默认模型选择 -->
-            <div class="model-selector-row" aria-label="全局默认模型配置">
-              <span class="prompt-row-label" data-i18n="model.defaultLabel">发起模型偏好</span>
-
-              <div class="model-row-controls">
-                <div class="global-model-selector" id="globalModelSelector">
-                  <button
-                    class="global-model-btn"
-                    id="globalModelBtn"
-                    type="button"
-                    aria-haspopup="listbox"
-                    aria-expanded="false"
-                  >
-                    <span class="global-model-active-info">
-                      <svg class="model-spark-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                        <path d="M8 1.5 9.6 6.4 14.5 8 9.6 9.6 8 14.5 6.4 9.6 1.5 8 6.4 6.4 8 1.5Z" fill="currentColor"/>
-                      </svg>
-                      <span class="global-model-active-name" id="globalModelActiveName" data-i18n="model.loading">读取可用模型…</span>
-                      <span class="global-model-active-tier" id="globalModelActiveTier"></span>
-                    </span>
-                    <span class="global-model-active-meta">
-                      <span class="global-model-status-tag" id="globalModelActiveBadge"></span>
-                      <svg class="prompt-chevron" width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                        <path d="M4.2 6.2 8 10l3.8-3.8" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
-                      </svg>
-                    </span>
-                  </button>
-
-                  <div class="global-model-dropdown" id="globalModelDropdown" role="listbox" aria-label="全局默认模型列表" hidden></div>
-                </div>
-
-                <button
-                  class="action-pill-btn"
-                  id="newConvDefaultModelBtn"
-                  type="button"
-                  title="使用选定模型立即发起新对话（需发送首句）"
-                  data-i18n-title="model.newConvTitle"
-                >
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                    <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
-                  </svg>
-                  <span data-i18n="model.newConvBtn">发起新对话</span>
-                </button>
-              </div>
-            </div>
-
             <!-- 当前系统提示词选择 -->
             <div class="prompt-selector-row" aria-label="系统提示词配置">
               <span class="prompt-row-label" data-i18n="prompt.label">全局 Rules 预设</span>
@@ -825,22 +779,23 @@
               <div class="wallpaper-options-row">
                 <span class="theme-sub-label" data-i18n="backdrop.modeLabel">渲染方案</span>
                 <div class="filter-tab-group" id="hostThemeModeGroup" role="tablist" aria-label="整机美化渲染方案">
-                  <button class="filter-tab is-active" type="button" data-host-mode="backdrop" aria-selected="true" data-i18n="backdrop.modeBackdrop">方案一 · 贴背微透</button>
-                  <button class="filter-tab" type="button" data-host-mode="cdp" aria-selected="false" data-i18n="backdrop.modeCdp">方案二 · CDP 高清纯CSS</button>
+                  <button class="filter-tab" type="button" data-host-mode="backdrop" aria-selected="false" data-i18n="backdrop.modeBackdrop">方案一 · 贴背微透</button>
+                  <button class="filter-tab" type="button" data-host-mode="cdp" aria-selected="false" data-i18n="backdrop.modeCdp">方案二 · CDP 纯CSS</button>
+                  <button class="filter-tab is-active" type="button" data-host-mode="inject" aria-selected="true" data-i18n="backdrop.modeInject">方案三 · 持久注入 (默认)</button>
                 </div>
               </div>
 
               <label class="theme-slider-item">
                 <span class="theme-slider-head">
-                  <span id="backdropBlendLabel" data-i18n="backdrop.blendLabel">整机壁纸透显度（主窗柔和透明）</span>
+                  <span id="backdropBlendLabel" data-i18n="backdrop.blendLabelCdp">底层壁纸透出强度（文字 100% 锐利）</span>
                   <span class="theme-slider-val" id="backdropBlendVal">25%</span>
                 </span>
                 <input class="theme-range" id="backdropBlendInput" type="range" min="5" max="42" value="25" />
               </label>
 
               <div class="backdrop-helper-row" id="backdropHelperRow">
-                <span class="backdrop-helper-desc" id="backdropStatusHint" data-i18n="backdrop.descAuto">
-                  将在 Antigravity 窗口正后方贴合当前壁纸并同步模糊与压暗参数（绝不修改 app.asar）。
+                <span class="backdrop-helper-desc" id="backdropStatusHint" data-i18n="backdrop.descInjectNeed">
+                  方案三默认持久注入已启用，检测到 app.asar 待补注时将自动写入并保留原版备份（也可在下方点「立即注入 / 补注」或「还原原版」）。
                 </span>
                 <button
                   class="theme-pill-btn"
@@ -860,6 +815,55 @@
                 hidden
                 aria-label="桌面壁纸伴侣启动命令"
               />
+            </div>
+
+            <div class="backdrop-companion-card" id="nativeHudCard" style="margin-top: 10px;">
+              <div class="backdrop-companion-head">
+                <div class="backdrop-title-wrap">
+                  <span class="backdrop-companion-title" data-i18n="nativeHud.title">输入框上下文状态栏</span>
+                  <span class="boundary-badge is-scoped" id="nativeHudStatusBadge" data-i18n="nativeHud.statusChecking">检测中</span>
+                </div>
+                <button
+                  class="theme-pill-btn is-toggled"
+                  id="nativeHudEnableBtn"
+                  type="button"
+                  aria-pressed="true"
+                >
+                  <span class="theme-toggle-dot" aria-hidden="true"></span>
+                  <span data-i18n="nativeHud.enableBtn">启用状态栏</span>
+                </button>
+              </div>
+
+              <div class="wallpaper-options-row">
+                <span class="theme-sub-label" data-i18n="nativeHud.modeLabel">挂载方式</span>
+                <div class="filter-tab-group" id="nativeHudModeGroup" role="tablist" aria-label="状态栏挂载方式">
+                  <button class="filter-tab is-active" type="button" data-hud-mode="asar" aria-selected="true" data-i18n="nativeHud.modeAsar">持久化注入 (默认)</button>
+                  <button class="filter-tab" type="button" data-hud-mode="cdp" aria-selected="false" data-i18n="nativeHud.modeCdp">纯 CDP 热注入</button>
+                  <button class="filter-tab" type="button" data-hud-mode="uia" aria-selected="false" data-i18n="nativeHud.modeUia">旧版 UIA 浮窗</button>
+                </div>
+              </div>
+
+              <div class="backdrop-helper-row">
+                <span class="backdrop-helper-desc" id="nativeHudStatusHint" data-i18n="nativeHud.descDefault">
+                  通过 Shadow DOM 原生挂载到输入框工具栏内，0 漂移、0 遮挡误判、0 UIA 内存；检测到官方更新覆盖或失效时自动补注。
+                </span>
+              </div>
+
+              <div class="wallpaper-options-row" style="justify-content: space-between; flex-wrap: wrap; gap: 6px;">
+                <button
+                  class="theme-pill-btn is-toggled"
+                  id="nativeHudAutoReinjectBtn"
+                  type="button"
+                  aria-pressed="true"
+                >
+                  <span class="theme-toggle-dot" aria-hidden="true"></span>
+                  <span data-i18n="nativeHud.autoReinjectBtn">失效自动补注</span>
+                </button>
+                <div style="display: inline-flex; gap: 6px; flex-wrap: wrap;">
+                  <button class="theme-pill-btn" id="nativeHudInstallBtn" type="button" data-i18n="nativeHud.installBtn">立即注入 / 补注</button>
+                  <button class="theme-pill-btn" id="nativeHudRestoreBtn" type="button" data-i18n="nativeHud.restoreBtn">还原原版</button>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -890,11 +894,11 @@
                 </div>
                 <div class="boundary-item">
                   <div class="boundary-item-head">
-                    <span class="boundary-item-name" data-i18n="theme.boundaryWallpaperLabel">整机壁纸（贴背伴侣）</span>
-                    <span class="boundary-badge is-synced" data-i18n="theme.boundaryBackdropBadge">零侵入桌面伴侣</span>
+                    <span class="boundary-item-name" data-i18n="theme.boundaryWallpaperLabel">整机壁纸方案</span>
+                    <span class="boundary-badge is-synced" data-i18n="theme.boundaryBackdropBadge">三方案可选</span>
                   </div>
                   <div class="boundary-item-desc" data-i18n="theme.boundaryWallpaperDesc">
-                    严格遵守不篡改 app.asar、不注入宿主 DOM 的红线：通过外置桌面贴背窗与系统窗口微透实现全窗壁纸，壁纸、模糊与压暗参数与本面板实时联动。
+                    默认方案三复用 app.asar 持久化钩子注入全窗纯 CSS 壁纸（免快捷方式、文字 100% 锐利、留存原版备份且支持一键还原）；如需零改包也可随时切至方案一（外置贴背微透窗）或方案二（纯 CDP 注入）。
                   </div>
                 </div>
                 <div class="boundary-item">
@@ -1382,7 +1386,19 @@
                 <span class="acc-setting-unit">min</span>
               </div>
             </div>
-            <p class="acc-setting-hint">按此间隔在后台自动续签凭证并同步官方实时额度，填 0 表示关闭定时自动刷新。</p>
+            <p class="acc-setting-hint">默认仅按此间隔通过本机 language_server 同步当前登录账号额度（不主动批量请求未激活账号远端接口，更保守防风控）；填 0 关闭定时刷新。</p>
+            <div class="acc-setting-sentence" style="margin-top: 8px;">
+              <span>同时在后台轮询刷新未激活账号（保守模式建议保持关闭）</span>
+              <button
+                class="acc-setting-toggle-btn is-off"
+                id="accSettingBgInactiveToggleBtn"
+                type="button"
+                aria-pressed="false"
+              >
+                <span class="acc-toggle-dot" aria-hidden="true"></span>
+                <span id="accSettingBgInactiveToggleText">已关闭</span>
+              </button>
+            </div>
           </div>
 
           <div class="acc-setting-card">

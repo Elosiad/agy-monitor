@@ -384,6 +384,13 @@ export function createThemeStudio({
   const copyBackdropCmdBtn = document.getElementById("copyBackdropCmdBtn");
   const backdropCmdInput = document.getElementById("backdropCmdInput");
   const hostModeBtns = document.querySelectorAll("[data-host-mode]");
+  const nativeHudStatusBadge = document.getElementById("nativeHudStatusBadge");
+  const nativeHudEnableBtn = document.getElementById("nativeHudEnableBtn");
+  const nativeHudModeBtns = document.querySelectorAll("[data-hud-mode]");
+  const nativeHudStatusHint = document.getElementById("nativeHudStatusHint");
+  const nativeHudAutoReinjectBtn = document.getElementById("nativeHudAutoReinjectBtn");
+  const nativeHudInstallBtn = document.getElementById("nativeHudInstallBtn");
+  const nativeHudRestoreBtn = document.getElementById("nativeHudRestoreBtn");
 
   let translator = t;
   let currentLang = "zh-CN";
@@ -420,7 +427,10 @@ export function createThemeStudio({
     colors: { ...BUILTIN_PALETTES[0].colors },
     syncGlobal: true,
     backdropEnabled: true,
-    hostThemeMode: "backdrop",
+    hudEnabled: true,
+    hudInjectionMode: "asar",
+    hudAutoReinject: true,
+    hostThemeMode: "inject",
     cdpPort: 9229,
     hostBlendPct: 25,
     backdropStatus: null,
@@ -491,7 +501,11 @@ export function createThemeStudio({
     syncGlobal: Boolean(state.syncGlobal),
     followHostTheme: Boolean(state.syncGlobal),
     backdropEnabled: Boolean(state.backdropEnabled),
-    hostThemeMode: state.hostThemeMode === "cdp" ? "cdp" : "backdrop",
+    hudEnabled: state.hudEnabled !== false,
+    hudInjectionMode: state.hudInjectionMode || "asar",
+    hudAutoReinject: state.hudAutoReinject !== false,
+    hostThemeMode:
+      state.hostThemeMode === "cdp" || state.hostThemeMode === "backdrop" ? state.hostThemeMode : "inject",
     cdpPort: state.cdpPort || 9229,
     hostBlendPct: state.hostBlendPct,
     activeWallpaperId: state.activeWallpaperId || null,
@@ -505,10 +519,15 @@ export function createThemeStudio({
   const renderBackdropCompanion = () => {
     const bd = state.backdropStatus || {};
     const cdp = bd.cdp || {};
+    const nh = bd.nativeHud || {};
     const supported = bd.supported !== false || cdp.supported === true;
     const isWsl = Boolean(bd.isWsl || cdp.isWsl);
     const enabled = Boolean(state.backdropEnabled);
-    const isCdp = state.hostThemeMode === "cdp";
+    const hostMode =
+      state.hostThemeMode === "cdp" || state.hostThemeMode === "backdrop" ? state.hostThemeMode : "inject";
+    const isCdp = hostMode === "cdp";
+    const isInject = hostMode === "inject";
+    const isCssMode = isCdp || isInject;
     const hasWp = Boolean(state.activeWallpaperId);
     const running = Boolean(bd.running);
     const paused = Boolean(bd.paused);
@@ -517,7 +536,11 @@ export function createThemeStudio({
     const alphaPct = Math.round(((Number(bd.appliedAlpha || 255) / 255) * 100));
     const cdpPort = Number(cdp.port || state.cdpPort || 9229);
     const cdpConnected = Boolean(cdp.connected);
+    const cdpStyleLive = Boolean(cdp.styleApplied);
     const cdpTransport = String(cdp.transport || "direct");
+    const nativeWpAlive = Boolean(nh.heartbeat?.wallpaperAlive);
+    const asarInstalledWp = nh.state === "installed";
+    const asarVerWp = nh.installedVersion || nh.currentVersion || "2.1.0";
     const quickCmd = isCdp
       ? (typeof cdp.launchCommand === "string" ? cdp.launchCommand : "")
       : (typeof bd.quickLaunchCommand === "string" ? bd.quickLaunchCommand : "");
@@ -531,7 +554,7 @@ export function createThemeStudio({
 
     hostModeBtns.forEach((btn) => {
       const mode = btn.getAttribute("data-host-mode");
-      const isCurrent = mode === (isCdp ? "cdp" : "backdrop");
+      const isCurrent = mode === hostMode;
       btn.classList.toggle("is-active", isCurrent);
       btn.setAttribute("aria-selected", String(isCurrent));
       btn.disabled = !supported;
@@ -543,7 +566,7 @@ export function createThemeStudio({
       backdropToggleBtn.disabled = !supported;
     }
     if (backdropBlendLabel) {
-      backdropBlendLabel.textContent = isCdp
+      backdropBlendLabel.textContent = isCssMode
         ? tr("backdrop.blendLabelCdp", "底层壁纸透出强度（文字 100% 锐利）", "Wallpaper Show-Through (100% Crisp Text)")
         : tr("backdrop.blendLabel", "整机壁纸透显度（主窗柔和透明）", "Desktop Blend (Soft Host Translucency)");
     }
@@ -567,6 +590,22 @@ export function createThemeStudio({
       } else if (!hasWp) {
         badgeCls = "boundary-badge is-scoped";
         badgeText = tr("backdrop.statusStandby", "待选壁纸", "Pick Wallpaper");
+      } else if (isInject) {
+        if (nativeWpAlive) {
+          badgeCls = "boundary-badge is-synced";
+          badgeText = tr("backdrop.statusInjectLive", "持久注入生效 (v{ver})", "Inject Active (v{ver})", {
+            ver: asarVerWp,
+          });
+        } else if (cdpStyleLive) {
+          badgeCls = "boundary-badge is-synced";
+          badgeText = tr("backdrop.statusInjectHotLive", "热注入已生效", "Hot-Inject Live");
+        } else if (asarInstalledWp) {
+          badgeCls = "boundary-badge is-scoped";
+          badgeText = tr("backdrop.statusInjectPending", "已持久化 · 重启生效", "Persisted · Restart AGY");
+        } else {
+          badgeCls = "boundary-badge is-scoped";
+          badgeText = tr("backdrop.statusInjectNeed", "待自动注入", "Pending Inject");
+        }
       } else if (isCdp) {
         if (cdpConnected) {
           badgeCls = "boundary-badge is-synced";
@@ -619,6 +658,35 @@ export function createThemeStudio({
           "请先在上方选择或上传一张壁纸，即可点亮整机背景。",
           "Select or upload a wallpaper above to light up the whole-window background."
         );
+      } else if (isInject) {
+        if (nativeWpAlive) {
+          backdropStatusHint.textContent = tr(
+            "backdrop.descInjectLive",
+            "方案三持久纯 CSS 壁纸已原生激活（v{ver} · 免快捷方式 · 文字 100% 锐利 · 滑块秒级热同步），官方更新后将自动补注。",
+            "Mode 3 persistent pure-CSS wallpaper is live (v{ver} · no shortcut needed · 100% crisp text · instant live sync); auto-reinjects after updates.",
+            { ver: asarVerWp }
+          );
+        } else if (cdpStyleLive) {
+          backdropStatusHint.textContent = tr(
+            "backdrop.descInjectHotLive",
+            "当前已通过 CDP 热注入立即生效，且已写入 app.asar（v{ver}）；下次重启 Antigravity 后将完全免快捷方式原生加载。",
+            "Wallpaper is live immediately via CDP hot-inject and persisted into app.asar (v{ver}); next Antigravity restart loads natively with no shortcut.",
+            { ver: asarVerWp }
+          );
+        } else if (asarInstalledWp) {
+          backdropStatusHint.textContent = tr(
+            "backdrop.descInjectPending",
+            "已将持久壁纸钩子写入 app.asar（v{ver} · 原版已备份）；重启 Antigravity 即可无感加载全窗纯 CSS 壁纸，文字 100% 锐利。",
+            "Persistent wallpaper hook written to app.asar (v{ver} · clean backup saved); restart Antigravity for automatic crisp pure-CSS wallpaper.",
+            { ver: asarVerWp }
+          );
+        } else {
+          backdropStatusHint.textContent = tr(
+            "backdrop.descInjectNeed",
+            "方案三默认持久注入已启用，检测到 app.asar 待补注时将自动写入并保留原版备份（也可在下方点「立即注入 / 补注」或「还原原版」）。",
+            "Mode 3 persistent injection is enabled; watchdog auto-patches app.asar with a clean backup (or use Inject / Restore below)."
+          );
+        }
       } else if (isCdp) {
         if (cdpConnected) {
           backdropStatusHint.textContent = isWsl
@@ -655,8 +723,8 @@ export function createThemeStudio({
       } else if (running) {
         backdropStatusHint.textContent = tr(
           "backdrop.descRunning",
-          "方案一在线（追踪 {count} 窗 · 主窗不透明度 {alpha}%）；若觉得文字偏柔可切换方案二。",
-          "Mode 1 active ({count} win · {alpha}% opacity); switch to Mode 2 if you prefer 100% crisp text.",
+          "方案一在线（追踪 {count} 窗 · 主窗不透明度 {alpha}%）；若觉得文字偏柔可切换方案二或方案三。",
+          "Mode 1 active ({count} win · {alpha}% opacity); switch to Mode 2 or Mode 3 for 100% crisp text.",
           { count: trackedCount, alpha: alphaPct }
         );
       } else if (isolated && quickCmd) {
@@ -678,6 +746,7 @@ export function createThemeStudio({
     const showQuickLaunch = Boolean(
       supported &&
         enabled &&
+        !isInject &&
         quickCmd &&
         (isCdp ? !cdpConnected : !running && isolated)
     );
@@ -688,6 +757,120 @@ export function createThemeStudio({
       backdropCmdInput.hidden = !showQuickLaunch;
       if (showQuickLaunch) {
         backdropCmdInput.value = quickCmd;
+      }
+    }
+
+    const hudEnabled = state.hudEnabled !== false;
+    const hudMode = state.hudInjectionMode || "asar";
+    const autoReinject = state.hudAutoReinject !== false;
+    const nativeAlive = Boolean(nh.heartbeat?.alive);
+    const cdpHudLive = Boolean(cdp.hudInjected);
+    const asarInstalled = nh.state === "installed";
+    const ver = nh.installedVersion || nh.currentVersion || "2.0.0";
+
+    if (nativeHudEnableBtn) {
+      nativeHudEnableBtn.classList.toggle("is-toggled", hudEnabled);
+      nativeHudEnableBtn.setAttribute("aria-pressed", String(hudEnabled));
+    }
+    if (nativeHudAutoReinjectBtn) {
+      nativeHudAutoReinjectBtn.classList.toggle("is-toggled", autoReinject);
+      nativeHudAutoReinjectBtn.setAttribute("aria-pressed", String(autoReinject));
+      nativeHudAutoReinjectBtn.disabled = hudMode === "uia";
+    }
+    nativeHudModeBtns.forEach((btn) => {
+      const m = btn.getAttribute("data-hud-mode");
+      const isCur = m === hudMode;
+      btn.classList.toggle("is-active", isCur);
+      btn.setAttribute("aria-selected", String(isCur));
+    });
+    if (nativeHudInstallBtn) {
+      nativeHudInstallBtn.disabled = !supported || hudMode === "uia";
+    }
+    if (nativeHudRestoreBtn) {
+      nativeHudRestoreBtn.disabled = !supported || (!asarInstalled && !nh.bakExists && !cdpHudLive);
+    }
+
+    if (nativeHudStatusBadge) {
+      let cls = "boundary-badge is-scoped";
+      let txt = tr("nativeHud.statusChecking", "检测中", "Checking");
+      if (!hudEnabled) {
+        cls = "boundary-badge is-disabled";
+        txt = tr("nativeHud.statusOff", "已关闭", "Disabled");
+      } else if (hudMode === "uia") {
+        cls = "boundary-badge is-scoped";
+        txt = tr("nativeHud.statusUia", "旧版 UIA 浮窗", "Legacy UIA");
+      } else if (nativeAlive) {
+        cls = "boundary-badge is-synced";
+        txt = tr("nativeHud.statusNativeLive", "原生 DOM 运行中", "Native DOM Active");
+      } else if (cdpHudLive) {
+        cls = "boundary-badge is-synced";
+        txt = tr("nativeHud.statusCdpLive", "CDP 热注入运行中", "CDP Hot-Inject Active");
+      } else if (hudMode === "asar" && asarInstalled) {
+        cls = "boundary-badge is-scoped";
+        txt = tr("nativeHud.statusPendingRestart", "已持久化 · 重启后免捷径生效", "Persisted · Restart AGY");
+      } else if (hudMode === "asar") {
+        cls = "boundary-badge is-scoped";
+        txt = tr("nativeHud.statusNeedInject", "待自动补注", "Pending Reinject");
+      } else {
+        cls = "boundary-badge is-scoped";
+        txt = tr("nativeHud.statusWaitCdp", "等待 CDP 连接", "Waiting for CDP");
+      }
+      nativeHudStatusBadge.className = cls;
+      nativeHudStatusBadge.textContent = txt;
+    }
+
+    if (nativeHudStatusHint) {
+      if (!hudEnabled) {
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descDefault",
+          "通过 Shadow DOM 原生挂载到输入框工具栏内，0 漂移、0 遮挡误判、0 UIA 内存；检测到官方更新覆盖或失效时自动补注。",
+          "Mounts via Shadow DOM directly inside the composer toolbar: 0 drift, 0 occlusion bugs, 0 UIA RAM; auto-reinjects after updates."
+        );
+      } else if (hudMode === "uia") {
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descUia",
+          "当前使用旧版外部 Win32 + UIA 浮窗；如遇飘移或遮挡建议切回「持久化注入」。",
+          "Using legacy Win32 + UIA overlay; switch back to Persistent Inject to eliminate drift/occlusion."
+        );
+      } else if (nativeAlive) {
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descNativeLive",
+          "持久化原生 DOM 状态栏已激活（v{ver} · 0 漂移 / 0 UIA 内存），原版备份已留存。",
+          "Persistent native Shadow DOM HUD is live (v{ver} · 0 drift / 0 UIA RAM), clean backup verified.",
+          { ver }
+        );
+      } else if (cdpHudLive) {
+        const persistHint =
+          hudMode === "asar" && asarInstalled
+            ? "app.asar 已完成持久化，下次正常启动即免快捷方式生效。"
+            : hudMode === "asar"
+              ? "检测到 app.asar 待写入，看门狗将自动补注持久化。"
+              : "纯 CDP 模式零修改安装文件。";
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descCdpLive",
+          "当前窗口已通过 CDP 热注入原生 Shadow DOM 状态栏（0 漂移、0 遮挡）；{persistHint}",
+          "Native Shadow DOM HUD is live via CDP hot-inject (0 drift, 0 occlusion); {persistHint}",
+          { persistHint }
+        );
+      } else if (hudMode === "asar" && asarInstalled) {
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descPendingRestart",
+          "已将持久化钩子写入 app.asar（v{ver} · 备份已保存），重启 Antigravity 后即自动原生挂载并开放 CDP 通道。",
+          "Persistent hook written to app.asar (v{ver} · backup saved); restart Antigravity for automatic native mounting.",
+          { ver }
+        );
+      } else if (hudMode === "asar") {
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descAsarWait",
+          "默认持久化注入已启用；检测到 app.asar 未注入或已更新，看门狗将自动补注（也可点右侧「立即注入 / 补注」）。",
+          "Persistent injection enabled; watchdog will auto-reinject when stock/updated app.asar is detected."
+        );
+      } else {
+        nativeHudStatusHint.textContent = tr(
+          "nativeHud.descCdpWait",
+          "纯 CDP 模式不修改 app.asar，启动带调试端口的 Antigravity 后自动挂载原生 DOM 状态栏。",
+          "Pure CDP mode keeps app.asar untouched and mounts Shadow DOM HUD once debugging port connects."
+        );
       }
     }
   };
@@ -776,22 +959,38 @@ export function createThemeStudio({
 
     if (workspaceWallpaperLayer) {
       const bd = state.backdropStatus || {};
+      const cdp = bd.cdp || {};
+      const nh = bd.nativeHud || {};
+      const hostMode =
+        state.hostThemeMode === "cdp" || state.hostThemeMode === "backdrop" ? state.hostThemeMode : "inject";
       const sharedWithHostBackdrop = Boolean(
         wpUrl &&
           state.backdropEnabled &&
-          state.hostThemeMode !== "cdp" &&
+          hostMode === "backdrop" &&
           bd.running &&
           !bd.paused
       );
+      const sharedWithHostCss = Boolean(
+        wpUrl &&
+          state.backdropEnabled &&
+          ((hostMode === "inject" && (Boolean(nh.heartbeat?.wallpaperAlive) || Boolean(cdp.styleApplied))) ||
+            (hostMode === "cdp" && (Boolean(cdp.styleApplied) || Boolean(cdp.connected))))
+      );
+      const dimFrac = state.dim / 100;
+      const blendFrac = state.hostBlendPct / 100;
       const panelVeilPct =
-        wpUrl && state.backdropEnabled && !sharedWithHostBackdrop
-          ? Math.max(58, Math.min(95, 100 - state.hostBlendPct))
+        wpUrl && state.backdropEnabled && !sharedWithHostBackdrop && !sharedWithHostCss
+          ? Math.round(Math.max(28, Math.min(96, (1 - (1 - dimFrac) * blendFrac) * 100)))
           : 0;
+      const hostSurfaceAlphaPct = Math.round(Math.max(58, Math.min(92, 100 - state.hostBlendPct)));
       rootStyle.setProperty("--panel-surface-veil-pct", `${panelVeilPct}%`);
+      rootStyle.setProperty("--host-surface-alpha-pct", `${hostSurfaceAlphaPct}%`);
       workspaceWallpaperLayer.style.backgroundImage = wpCssUrl;
       workspaceWallpaperLayer.style.backgroundSize = state.fit;
-      document.body.classList.toggle("has-wallpaper", Boolean(wpUrl) && !sharedWithHostBackdrop);
+      document.documentElement.classList.toggle("host-css-shared", sharedWithHostCss);
+      document.body.classList.toggle("has-wallpaper", Boolean(wpUrl) && !sharedWithHostBackdrop && !sharedWithHostCss);
       document.body.classList.toggle("host-backdrop-shared", sharedWithHostBackdrop);
+      document.body.classList.toggle("host-css-shared", sharedWithHostCss);
     }
 
     if (syncGlobalBtn) {
@@ -891,7 +1090,20 @@ export function createThemeStudio({
     if (typeof themeState.backdropEnabled === "boolean") {
       state.backdropEnabled = themeState.backdropEnabled;
     }
-    if (themeState.hostThemeMode === "cdp" || themeState.hostThemeMode === "backdrop") {
+    if (typeof themeState.hudEnabled === "boolean") {
+      state.hudEnabled = themeState.hudEnabled;
+    }
+    if (themeState.hudInjectionMode === "asar" || themeState.hudInjectionMode === "cdp" || themeState.hudInjectionMode === "uia") {
+      state.hudInjectionMode = themeState.hudInjectionMode;
+    }
+    if (typeof themeState.hudAutoReinject === "boolean") {
+      state.hudAutoReinject = themeState.hudAutoReinject;
+    }
+    if (
+      themeState.hostThemeMode === "inject" ||
+      themeState.hostThemeMode === "cdp" ||
+      themeState.hostThemeMode === "backdrop"
+    ) {
       state.hostThemeMode = themeState.hostThemeMode;
     }
     if (typeof themeState.cdpPort === "number" && Number.isFinite(themeState.cdpPort)) {
@@ -1396,7 +1608,7 @@ export function createThemeStudio({
       state.colors = { ...BUILTIN_PALETTES[0].colors };
       state.syncGlobal = true;
       state.backdropEnabled = true;
-      state.hostThemeMode = "backdrop";
+      state.hostThemeMode = "inject";
       state.hostBlendPct = 25;
       state.activeWallpaperId = "wp-1";
       state.opacity = 100;
@@ -1602,11 +1814,13 @@ export function createThemeStudio({
       const res = await fetchViaSidecar(apiFetch, "/api/theme/backdrop/status");
       if (destroyed) return;
       if (res?.status) {
-        const prevShared = Boolean(state.backdropStatus?.running && !state.backdropStatus?.paused);
+        const prevBd = state.backdropStatus || {};
+        const prevKey = `${Boolean(prevBd.running && !prevBd.paused)}|${Boolean(prevBd.cdp?.styleApplied || prevBd.cdp?.connected)}|${Boolean(prevBd.nativeHud?.heartbeat?.wallpaperAlive)}`;
         state.backdropStatus = res.status;
-        const nextShared = Boolean(state.backdropStatus?.running && !state.backdropStatus?.paused);
+        const nextBd = state.backdropStatus || {};
+        const nextKey = `${Boolean(nextBd.running && !nextBd.paused)}|${Boolean(nextBd.cdp?.styleApplied || nextBd.cdp?.connected)}|${Boolean(nextBd.nativeHud?.heartbeat?.wallpaperAlive)}`;
         renderBackdropCompanion();
-        if (prevShared !== nextShared) {
+        if (prevKey !== nextKey) {
           applyTheme();
         }
       }
@@ -1655,7 +1869,8 @@ export function createThemeStudio({
 
   hostModeBtns.forEach((btn) => {
     const onModeClick = async () => {
-      const nextMode = btn.getAttribute("data-host-mode") === "cdp" ? "cdp" : "backdrop";
+      const rawMode = btn.getAttribute("data-host-mode");
+      const nextMode = rawMode === "cdp" || rawMode === "backdrop" ? rawMode : "inject";
       if (nextMode === state.hostThemeMode) return;
       mutationSeq += 1;
       const prevMode = state.hostThemeMode;
@@ -1664,7 +1879,7 @@ export function createThemeStudio({
       renderBackdropCompanion();
       try {
         const res = await postJson(apiFetch, "/api/theme/backdrop/action", {
-          action: nextMode === "cdp" ? "cdp_sync" : "sync",
+          action: nextMode === "inject" ? "inject_sync" : nextMode === "cdp" ? "cdp_sync" : "sync",
           backdropEnabled: state.backdropEnabled,
           hostThemeMode: nextMode,
           cdpPort: state.cdpPort,
@@ -1677,9 +1892,11 @@ export function createThemeStudio({
         renderBackdropCompanion();
         scheduleTrackedTimeout(() => void refreshBackdropStatus(), 200);
         onToast?.(
-          nextMode === "cdp"
-            ? tr("backdrop.modeSwitchedCdp", "已切换到方案二（CDP 高清纯 CSS，主窗文字已恢复 100% 实心）", "Switched to Mode 2 (CDP Crisp CSS; host opacity restored 100%)")
-            : tr("backdrop.modeSwitchedBackdrop", "已切回方案一（贴背微透窗）", "Switched to Mode 1 (Backdrop Window)"),
+          nextMode === "inject"
+            ? tr("backdrop.modeSwitchedInject", "已切换到方案三（持久纯 CSS 注入，免快捷方式且文字 100% 锐利）", "Switched to Mode 3 (Persistent Pure-CSS Injection; 100% crisp text)")
+            : nextMode === "cdp"
+              ? tr("backdrop.modeSwitchedCdp", "已切换到方案二（CDP 高清纯 CSS，主窗文字已恢复 100% 实心）", "Switched to Mode 2 (CDP Crisp CSS; host opacity restored 100%)")
+              : tr("backdrop.modeSwitchedBackdrop", "已切回方案一（贴背微透窗）", "Switched to Mode 1 (Backdrop Window)"),
           "info"
         );
       } catch (err) {
@@ -1731,6 +1948,135 @@ export function createThemeStudio({
     };
     copyBackdropCmdBtn.addEventListener("click", onCopyCmd);
     cleanups.push(() => copyBackdropCmdBtn.removeEventListener("click", onCopyCmd));
+  }
+
+  const runNativeHudAction = async (payload, successMsg) => {
+    try {
+      const res = await postJson(apiFetch, "/api/hud/native/action", payload);
+      if (destroyed) return;
+      if (res?.themeState) hydrateThemeState(res.themeState);
+      state.backdropStatus = {
+        ...(state.backdropStatus || {}),
+        ...(res?.cdp ? { cdp: res.cdp } : {}),
+        ...(res?.nativeHud ? { nativeHud: res.nativeHud } : {}),
+      };
+      renderBackdropCompanion();
+      scheduleTrackedTimeout(() => void refreshBackdropStatus(), 220);
+      if (successMsg) {
+        onToast?.(successMsg, "success");
+      } else if (res?.error) {
+        onToast?.(res.error, res?.hotInjected ? "info" : "error");
+      }
+    } catch (err) {
+      if (!destroyed) {
+        onToast?.(err?.message || "操作失败", "error");
+      }
+    }
+  };
+
+  if (nativeHudEnableBtn) {
+    const onHudEnable = () => {
+      mutationSeq += 1;
+      state.hudEnabled = !(state.hudEnabled !== false);
+      renderBackdropCompanion();
+      void runNativeHudAction(
+        { action: "config", hudEnabled: state.hudEnabled },
+        state.hudEnabled ? tr("nativeHud.toastModeSwitched", "已开启输入框状态栏", "HUD enabled") : tr("nativeHud.statusOff", "已关闭输入框状态栏", "HUD disabled")
+      );
+    };
+    nativeHudEnableBtn.addEventListener("click", onHudEnable);
+    cleanups.push(() => nativeHudEnableBtn.removeEventListener("click", onHudEnable));
+  }
+
+  nativeHudModeBtns.forEach((btn) => {
+    const onHudModeClick = () => {
+      const nextMode = btn.getAttribute("data-hud-mode");
+      if (!nextMode || nextMode === state.hudInjectionMode) return;
+      mutationSeq += 1;
+      state.hudInjectionMode = nextMode;
+      renderBackdropCompanion();
+      void runNativeHudAction(
+        { action: "config", hudInjectionMode: nextMode, hudEnabled: state.hudEnabled },
+        tr("nativeHud.toastModeSwitched", "状态栏挂载方式已更新", "HUD mount mode updated")
+      );
+    };
+    btn.addEventListener("click", onHudModeClick);
+    cleanups.push(() => btn.removeEventListener("click", onHudModeClick));
+  });
+
+  if (nativeHudAutoReinjectBtn) {
+    const onAutoReinject = () => {
+      mutationSeq += 1;
+      state.hudAutoReinject = !(state.hudAutoReinject !== false);
+      renderBackdropCompanion();
+      void runNativeHudAction(
+        { action: "config", hudAutoReinject: state.hudAutoReinject },
+        state.hudAutoReinject ? "已开启失效自动补注" : "已关闭失效自动补注"
+      );
+    };
+    nativeHudAutoReinjectBtn.addEventListener("click", onAutoReinject);
+    cleanups.push(() => nativeHudAutoReinjectBtn.removeEventListener("click", onAutoReinject));
+  }
+
+  if (nativeHudInstallBtn) {
+    const onInstallClick = async () => {
+      nativeHudInstallBtn.disabled = true;
+      try {
+        const res = await postJson(apiFetch, "/api/hud/native/action", {
+          action: state.hudInjectionMode === "cdp" ? "hot_inject" : "install",
+          hudInjectionMode: state.hudInjectionMode === "uia" ? "asar" : state.hudInjectionMode,
+          hudEnabled: true,
+        });
+        if (destroyed) return;
+        if (res?.themeState) hydrateThemeState(res.themeState);
+        state.backdropStatus = {
+          ...(state.backdropStatus || {}),
+          ...(res?.cdp ? { cdp: res.cdp } : {}),
+          ...(res?.nativeHud ? { nativeHud: res.nativeHud } : {}),
+        };
+        renderBackdropCompanion();
+        if (res?.hotInjected || res?.nativeHud?.heartbeat?.alive) {
+          onToast?.(tr("nativeHud.toastInstalled", "原生 DOM 状态栏已注入并生效", "Native DOM HUD injected and active"), "success");
+        } else if (res?.diskWritten) {
+          onToast?.(tr("nativeHud.toastInstalledPending", "已写入 app.asar 持久化，重启 Antigravity 后原生生效", "Written to app.asar; restart Antigravity to activate natively"), "success");
+        } else if (res?.error) {
+          onToast?.(res.error, "info");
+        }
+      } catch (err) {
+        if (!destroyed) onToast?.(err?.message || "注入失败", "error");
+      } finally {
+        if (!destroyed) renderBackdropCompanion();
+      }
+    };
+    nativeHudInstallBtn.addEventListener("click", onInstallClick);
+    cleanups.push(() => nativeHudInstallBtn.removeEventListener("click", onInstallClick));
+  }
+
+  if (nativeHudRestoreBtn) {
+    const onRestoreClick = async () => {
+      nativeHudRestoreBtn.disabled = true;
+      try {
+        const res = await postJson(apiFetch, "/api/hud/native/action", { action: "restore" });
+        if (destroyed) return;
+        if (res?.themeState) hydrateThemeState(res.themeState);
+        state.backdropStatus = {
+          ...(state.backdropStatus || {}),
+          ...(res?.cdp ? { cdp: res.cdp } : {}),
+          ...(res?.nativeHud ? { nativeHud: res.nativeHud } : {}),
+        };
+        renderBackdropCompanion();
+        onToast?.(
+          res?.error || tr("nativeHud.toastRestored", "已还原官方纯净 app.asar 并卸载原生状态栏", "Restored stock app.asar and unmounted native HUD"),
+          res?.ok ? "success" : "info"
+        );
+      } catch (err) {
+        if (!destroyed) onToast?.(err?.message || "还原失败", "error");
+      } finally {
+        if (!destroyed) renderBackdropCompanion();
+      }
+    };
+    nativeHudRestoreBtn.addEventListener("click", onRestoreClick);
+    cleanups.push(() => nativeHudRestoreBtn.removeEventListener("click", onRestoreClick));
   }
 
   let backdropPollTicks = 0;

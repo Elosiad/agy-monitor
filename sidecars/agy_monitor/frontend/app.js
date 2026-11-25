@@ -440,22 +440,6 @@ export function mountMonitorApp() {
   components.modelAndPrompt = createModelAndPrompt({
     apiFetch,
     t: translator,
-    onModelChanged: (defaultModel) => {
-      if (state.preferences && defaultModel) {
-        state.preferences.defaultModel = defaultModel;
-      }
-      refreshSnapshot({ force: true });
-    },
-    onSessionCreated: (resp) => {
-      if (resp?.conversationId) {
-        state.followLatest = false;
-        state.lockedConvId = String(resp.conversationId);
-        state.displayConvId = state.lockedConvId;
-        updateFollowModeUi();
-        updateActiveConvBadge(state.lockedConvId);
-      }
-      refreshSnapshot({ force: true });
-    },
     onPromptChanged: async (resp) => {
       if (typeof resp?.rulesTokens === "number") {
         state.configuredRulesTokens = resp.rulesTokens;

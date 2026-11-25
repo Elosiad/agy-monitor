@@ -159,7 +159,25 @@ export function resolvePaths(overrides = {}) {
     hudTelemetryFile: path.join(pluginDataDir, 'hud_telemetry.json'),
     hudActiveViewFile: path.join(pluginDataDir, 'hud_active_view.json'),
     hudDisplayFile: path.join(pluginDataDir, 'hud_display.json'),
+    nativeHudStatusFile: path.join(pluginDataDir, 'native_hud_status.json'),
+    nativeHudRendererFile: path.join(pluginDataDir, 'native_hud_renderer.js'),
+    nativeHudGuideFile: path.join(pluginDataDir, 'native_hud_guide.txt'),
+    nativeWallpaperCssFile: path.join(pluginDataDir, 'native_wallpaper.css'),
+    nativeWallpaperEngineFile: path.join(pluginDataDir, 'native_wallpaper_engine.js'),
     consoleViewportFile: path.join(pluginDataDir, 'console_viewport.json'),
+    ...(typeof overrides.hostAsarPath === 'string'
+      ? { hostAsarPath: overrides.hostAsarPath }
+      : overrides.appDataDir
+        ? { hostAsarPath: '' }
+        : {}),
+    ...(typeof overrides.devToolsActivePortFile === 'string'
+      ? { devToolsActivePortFile: overrides.devToolsActivePortFile }
+      : overrides.appDataDir
+        ? { devToolsActivePortFile: '' }
+        : {}),
+    ...(overrides.appDataDir && overrides.allowLiveCdp !== true
+      ? { disableLiveCdp: true }
+      : {}),
     backdropLauncherVbs: path.join(pluginDataDir, 'launch_backdrop.vbs'),
     backdropLauncherCmd: path.join(pluginDataDir, '启动整机壁纸伴侣.cmd'),
     cdpLauncherVbs: path.join(pluginDataDir, 'launch_antigravity_cdp.vbs'),

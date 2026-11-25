@@ -27,6 +27,14 @@ import {
   restoreHostOpacityFallback,
 } from './backend/backdrop_manager.mjs';
 import { createCdpThemeBridge, ensureCdpLauncher } from './backend/cdp_theme_bridge.mjs';
+import {
+  inspectNativeHudState,
+  installNativeHud,
+  readNativeHudHeartbeat,
+  restoreStockAsar,
+  stageLiveHudAssets,
+  stageLiveWallpaperCss,
+} from './backend/hud_injector.mjs';
 import { buildFrontendBundle } from './backend/bundle_builder.mjs';
 import {
   buildMasterySnapshot,
@@ -430,7 +438,12 @@ async function resolveViewedConvInfo(paths, sessionsHub) {
   if (doc.isNewConversation === true) {
     return { convId: '', isNewConversation: true, source, updatedAtMs, ageMs };
   }
-  const exactConvId = typeof doc.conversationId === 'string' ? doc.conversationId.trim() : '';
+  const exactConvId =
+    typeof doc.conversationId === 'string' && doc.conversationId.trim()
+      ? doc.conversationId.trim()
+      : typeof doc.convId === 'string'
+        ? doc.convId.trim()
+        : '';
   if (exactConvId) {
     return { convId: exactConvId, isNewConversation: false, source, updatedAtMs, ageMs };
   }
@@ -541,13 +554,26 @@ function extractCompactQuota(summary) {
     bucket && !bucket.disabled && Number.isFinite(Number(bucket.remainingPct))
       ? Math.max(0, Math.min(100, Math.round(Number(bucket.remainingPct))))
       : null;
+  const pickResetMs = (bucket) => {
+    if (!bucket || bucket.disabled) return null;
+    const ms = Number(bucket.resetTimeMs);
+    return Number.isFinite(ms) && ms > 0 ? Math.round(ms) : null;
+  };
   const gem = summary.groups.find((g) => g?.key === 'gemini') || null;
   const claude = summary.groups.find((g) => g?.key === 'gpt_claude') || null;
   const out = {
     gemini5h: pickPct(gem?.fiveHour),
+    gemini5hResetMs: pickResetMs(gem?.fiveHour),
+    gemini5hFull: Boolean(gem?.fiveHour?.isFull),
     geminiWeekly: pickPct(gem?.weekly),
+    geminiWeeklyResetMs: pickResetMs(gem?.weekly),
+    geminiWeeklyFull: Boolean(gem?.weekly?.isFull),
     claude5h: pickPct(claude?.fiveHour),
+    claude5hResetMs: pickResetMs(claude?.fiveHour),
+    claude5hFull: Boolean(claude?.fiveHour?.isFull),
     claudeWeekly: pickPct(claude?.weekly),
+    claudeWeeklyResetMs: pickResetMs(claude?.weekly),
+    claudeWeeklyFull: Boolean(claude?.weekly?.isFull),
   };
   if (
     out.gemini5h === null &&
@@ -602,7 +628,15 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     return Boolean(id && lastHostConvId && id === lastHostConvId);
   };
 
-  const getQuotaSnapshot = () => (lastQuotaSnapshot ? { ...lastQuotaSnapshot } : null);
+  const getQuotaSnapshot = () =>
+    lastQuotaSnapshot
+      ? {
+          gemini5h: lastQuotaSnapshot.gemini5h,
+          geminiWeekly: lastQuotaSnapshot.geminiWeekly,
+          claude5h: lastQuotaSnapshot.claude5h,
+          claudeWeekly: lastQuotaSnapshot.claudeWeekly,
+        }
+      : null;
   const getSessionProgressSnapshot = () => lastSessionProgress.map((s) => ({ ...s }));
 
   const resolveSessionProgress = async (sessionsHub) => {
@@ -692,6 +726,18 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       const quotaGeminiWeekly = q ? q.geminiWeekly : null;
       const quotaClaude5h = q ? q.claude5h : null;
       const quotaClaudeWeekly = q ? q.claudeWeekly : null;
+      const quotaDetail = q
+        ? {
+            gemini: {
+              fiveHour: { pct: q.gemini5h, resetTimeMs: q.gemini5hResetMs || null, isFull: Boolean(q.gemini5hFull) },
+              weekly: { pct: q.geminiWeekly, resetTimeMs: q.geminiWeeklyResetMs || null, isFull: Boolean(q.geminiWeeklyFull) },
+            },
+            gpt_claude: {
+              fiveHour: { pct: q.claude5h, resetTimeMs: q.claude5hResetMs || null, isFull: Boolean(q.claude5hFull) },
+              weekly: { pct: q.claudeWeekly, resetTimeMs: q.claudeWeeklyResetMs || null, isFull: Boolean(q.claudeWeeklyFull) },
+            },
+          }
+        : null;
 
       const payload = {
         activeConvId,
@@ -714,15 +760,19 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
         quotaGeminiWeekly,
         quotaClaude5h,
         quotaClaudeWeekly,
+        quota: quotaDetail,
         sessionProgress: lastSessionProgress,
         cdpHudActive: false,
         sessions: lastSessionsSnapshot,
         updatedAtMs: Date.now(),
       };
 
+      const nativeHeartbeatAlive = readNativeHudHeartbeat(paths).alive;
       if (cdpBridge && typeof cdpBridge.updateHudData === 'function') {
         const injected = await cdpBridge.updateHudData(payload).catch(() => false);
-        payload.cdpHudActive = Boolean(injected || cdpBridge.isHudInjected?.());
+        payload.cdpHudActive = Boolean(injected || cdpBridge.isHudInjected?.() || nativeHeartbeatAlive);
+      } else {
+        payload.cdpHudActive = Boolean(nativeHeartbeatAlive);
       }
 
       const sessionsSig = lastSessionsSnapshot
@@ -731,7 +781,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       const spSig = lastSessionProgress
         .map((s) => `${s.id}:${s.status}:${s.progress}:${s.content}`)
         .join(',');
-      const quotaSig = `${quotaGemini5h ?? ''}:${quotaGeminiWeekly ?? ''}:${quotaClaude5h ?? ''}:${quotaClaudeWeekly ?? ''}`;
+      const quotaSig = `${quotaGemini5h ?? ''}:${q?.gemini5hResetMs ?? ''}:${quotaGeminiWeekly ?? ''}:${q?.geminiWeeklyResetMs ?? ''}:${quotaClaude5h ?? ''}:${q?.claude5hResetMs ?? ''}:${quotaClaudeWeekly ?? ''}:${q?.claudeWeeklyResetMs ?? ''}`;
       const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${spSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
@@ -751,9 +801,13 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     const changed =
       !lastQuotaSnapshot ||
       lastQuotaSnapshot.gemini5h !== compact.gemini5h ||
+      lastQuotaSnapshot.gemini5hResetMs !== compact.gemini5hResetMs ||
       lastQuotaSnapshot.geminiWeekly !== compact.geminiWeekly ||
+      lastQuotaSnapshot.geminiWeeklyResetMs !== compact.geminiWeeklyResetMs ||
       lastQuotaSnapshot.claude5h !== compact.claude5h ||
-      lastQuotaSnapshot.claudeWeekly !== compact.claudeWeekly;
+      lastQuotaSnapshot.claude5hResetMs !== compact.claude5hResetMs ||
+      lastQuotaSnapshot.claudeWeekly !== compact.claudeWeekly ||
+      lastQuotaSnapshot.claudeWeeklyResetMs !== compact.claudeWeeklyResetMs;
     lastQuotaSnapshot = compact;
     if (changed && lastWrittenTelemetry) {
       void writePayload(lastWrittenTelemetry, lastWrittenOpts || {});
@@ -1282,20 +1336,21 @@ export function createMonitorHandlers({
       observedModels = [];
     }
 
-    const [availableModels, rawBackdropStatus] = await Promise.all([
+    const [availableModels, rawBackdropStatus, nativeHud] = await Promise.all([
       listKnownModels(resolvedPaths, observedModels),
       getBackdropStatus(resolvedPaths, themes),
+      inspectNativeHudState(resolvedPaths).catch(() => null),
     ]);
     const backdropStatus = {
       ...rawBackdropStatus,
       cdp: cdp.getStatus(themes),
+      ...(nativeHud ? { nativeHud } : {}),
     };
     const seedsPreview = buildHostThemeSeedsPreview(themes.colors);
 
     return {
       language: prefs.language,
       windowCap: prefs.windowCap,
-      defaultModel: prefs.defaultModel,
       activePromptId: prefs.activePromptId,
       prompts: [...BUILTIN_PRESETS, ...customPresets],
       themeState: {
@@ -1306,63 +1361,6 @@ export function createMonitorHandlers({
       ...(seedsPreview.ok ? { seedsPreview } : {}),
       availableModels,
     };
-  });
-
-  register('POST', '/api/model/default', async (data = {}) => {
-    const modelId = typeof data.modelId === 'string' ? data.modelId.trim() : '';
-    if (!modelId || modelId.length > 128) {
-      return errorResponse(ResponseCtor, 400, '模型 ID 无效');
-    }
-    const tier = typeof data.tier === 'string' && data.tier.trim() ? data.tier.trim().slice(0, 48) : 'standard';
-    const label = typeof data.label === 'string' && data.label.trim() ? data.label.trim().slice(0, 128) : undefined;
-
-    const updated = await store.updatePrefs({
-      defaultModel: { id: modelId, tier, ...(label ? { label } : {}) },
-    });
-    return { ok: true, defaultModel: updated.defaultModel };
-  });
-
-  register('POST', '/api/sessions/new', async (data = {}) => {
-    const prefs = await store.getPrefs();
-    const useDefault = data.useDefaultModel !== false;
-    const requestedModel =
-      typeof data.modelId === 'string' && data.modelId.trim()
-        ? data.modelId.trim()
-        : typeof data.model === 'string' && data.model.trim()
-          ? data.model.trim()
-          : '';
-    const model =
-      requestedModel || (useDefault && prefs.defaultModel?.id ? prefs.defaultModel.id : 'flash');
-    const prompt =
-      typeof data.prompt === 'string' && data.prompt.trim()
-        ? data.prompt.trim()
-        : '请先确认当前工作区上下文并等待我的具体指令。';
-    const projectId =
-      typeof data.projectId === 'string' && data.projectId.trim()
-        ? data.projectId.trim()
-        : sidecarBridge?.getConfig?.()?.projectId;
-
-    if (typeof sidecarBridge?.startConversation !== 'function') {
-      return errorResponse(ResponseCtor, 503, '当前运行环境不支持通过 agentapi 新建对话');
-    }
-
-    try {
-      const resp = await sidecarBridge.startConversation(prompt, { model, projectId });
-      const conversationId = extractCreatedConvId(resp);
-      return {
-        ok: true,
-        conversationId,
-        model,
-        dispatchedPrompt: true,
-        hostDefaultModified: false,
-      };
-    } catch (err) {
-      return errorResponse(
-        ResponseCtor,
-        502,
-        `宿主暂无法自动拉起新对话：${sanitizeErrorMessage(err, 'agentapi 调用失败')}`,
-      );
-    }
   });
 
   register('POST', '/api/prompts/select', async (data = {}) => {
@@ -1860,17 +1858,133 @@ export function createMonitorHandlers({
 
   register('GET', '/api/theme/backdrop/status', async () => {
     const [themes, prefs] = await Promise.all([store.getThemes(), store.getPrefs()]);
-    const rawStatus = await getBackdropStatus(resolvedPaths, themes);
-    const cdpStatus =
-      themes.hostThemeMode === 'cdp'
-        ? await cdp.sync(themes, { hostLanguage: prefs.language })
-        : cdp.getStatus(themes);
+    const [rawStatus, nativeHud] = await Promise.all([
+      getBackdropStatus(resolvedPaths, themes),
+      inspectNativeHudState(resolvedPaths),
+    ]);
+    const wantCdp =
+      themes.hostThemeMode === 'cdp' ||
+      ((themes.hostThemeMode === 'inject' || !themes.hostThemeMode) &&
+        Boolean(themes.backdropEnabled && themes.activeWallpaperId) &&
+        !nativeHud.heartbeat?.wallpaperAlive) ||
+      (themes.hudEnabled !== false && themes.hudInjectionMode !== 'uia');
+    const cdpStatus = wantCdp
+      ? await cdp.sync(themes, { hostLanguage: prefs.language })
+      : cdp.getStatus(themes);
     return {
       ok: true,
       status: {
         ...rawStatus,
         cdp: cdpStatus,
+        nativeHud,
       },
+    };
+  });
+
+  register('GET', '/api/hud/native/status', async () => {
+    const [themes, nativeHud] = await Promise.all([
+      store.getThemes(),
+      inspectNativeHudState(resolvedPaths),
+    ]);
+    return {
+      ok: true,
+      nativeHud,
+      cdp: cdp.getStatus(themes),
+      config: {
+        hudEnabled: themes.hudEnabled !== false,
+        hudInjectionMode: themes.hudInjectionMode || 'asar',
+        hudAutoReinject: themes.hudAutoReinject !== false,
+      },
+    };
+  });
+
+  register('POST', '/api/hud/native/action', async (data = {}) => {
+    const action = typeof data.action === 'string' ? data.action.trim() : 'status';
+    const patch = {};
+    if (typeof data.hudEnabled === 'boolean') {
+      patch.hudEnabled = data.hudEnabled;
+    }
+    if (data.hudInjectionMode === 'asar' || data.hudInjectionMode === 'cdp' || data.hudInjectionMode === 'uia') {
+      patch.hudInjectionMode = data.hudInjectionMode;
+    }
+    if (typeof data.hudAutoReinject === 'boolean') {
+      patch.hudAutoReinject = data.hudAutoReinject;
+    }
+    if (action === 'install') {
+      patch.hudEnabled = true;
+      if (!patch.hudInjectionMode) patch.hudInjectionMode = 'asar';
+    } else if (action === 'restore') {
+      const curThemes = await store.getThemes();
+      if (!patch.hudInjectionMode) patch.hudInjectionMode = 'uia';
+      patch.hudAutoReinject = false;
+      if (curThemes.hostThemeMode === 'inject') {
+        patch.hostThemeMode = 'backdrop';
+      }
+    }
+
+    const [themes, prefs] = await Promise.all([
+      Object.keys(patch).length > 0 ? store.saveThemes(patch) : store.getThemes(),
+      store.getPrefs(),
+    ]);
+    await stageLiveWallpaperCss(resolvedPaths, themes).catch(() => {});
+
+    let actionResult = { ok: true };
+    if (action === 'install' || (action === 'config' && themes.hudEnabled !== false && themes.hudInjectionMode === 'asar')) {
+      actionResult = await installNativeHud(resolvedPaths, { force: action === 'install' });
+      const cdpStatus = await cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes));
+      void hud.refreshFromDb();
+      const nativeHud = actionResult.status || (await inspectNativeHudState(resolvedPaths));
+      return {
+        ok: Boolean(actionResult.ok || cdpStatus?.hudInjected),
+        diskWritten: Boolean(actionResult.diskWritten),
+        pendingRestart: Boolean(actionResult.pendingRestart),
+        hotInjected: Boolean(cdpStatus?.hudInjected),
+        alreadyUpToDate: Boolean(actionResult.alreadyUpToDate),
+        error: actionResult.error || '',
+        nativeHud,
+        cdp: cdpStatus,
+        themeState: themes,
+      };
+    }
+
+    if (action === 'restore') {
+      actionResult = await restoreStockAsar(resolvedPaths);
+      const cdpStatus = await cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes));
+      void hud.refreshFromDb();
+      const nativeHud = actionResult.status || (await inspectNativeHudState(resolvedPaths));
+      return {
+        ok: Boolean(actionResult.ok),
+        diskWritten: Boolean(actionResult.diskWritten),
+        pendingRestart: Boolean(actionResult.pendingRestart),
+        error: actionResult.error || '',
+        nativeHud,
+        cdp: cdpStatus,
+        themeState: themes,
+      };
+    }
+
+    if (action === 'hot_inject' || action === 'config') {
+      if (themes.hudEnabled !== false && themes.hudInjectionMode !== 'uia') {
+        await stageLiveHudAssets(resolvedPaths, themes).catch(() => {});
+      }
+      const cdpStatus = await cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes));
+      const nativeHud = await inspectNativeHudState(resolvedPaths);
+      void hud.refreshFromDb();
+      return {
+        ok: true,
+        hotInjected: Boolean(cdpStatus?.hudInjected),
+        nativeHud,
+        cdp: cdpStatus,
+        themeState: themes,
+      };
+    }
+
+    const nativeHud = await inspectNativeHudState(resolvedPaths);
+    return {
+      ok: true,
+      nativeHud,
+      cdp: cdp.getStatus(themes),
+      themeState: themes,
     };
   });
 
@@ -1887,10 +2001,16 @@ export function createMonitorHandlers({
     if (typeof data.hudEnabled === 'boolean') {
       patch.hudEnabled = data.hudEnabled;
     }
+    if (data.hudInjectionMode === 'asar' || data.hudInjectionMode === 'cdp' || data.hudInjectionMode === 'uia') {
+      patch.hudInjectionMode = data.hudInjectionMode;
+    }
+    if (typeof data.hudAutoReinject === 'boolean') {
+      patch.hudAutoReinject = data.hudAutoReinject;
+    }
     if (typeof data.zeroUiaMode === 'boolean') {
       patch.zeroUiaMode = data.zeroUiaMode;
     }
-    if (data.hostThemeMode === 'cdp' || data.hostThemeMode === 'backdrop') {
+    if (data.hostThemeMode === 'inject' || data.hostThemeMode === 'cdp' || data.hostThemeMode === 'backdrop') {
       patch.hostThemeMode = data.hostThemeMode;
     }
     if (typeof data.cdpPort === 'number' && Number.isFinite(data.cdpPort)) {
@@ -1904,13 +2024,37 @@ export function createMonitorHandlers({
       Object.keys(patch).length > 0 ? store.saveThemes(patch) : store.getThemes(),
       store.getPrefs(),
     ]);
-    const effectiveCompanionAction =
-      action === 'stop' && themes.hudEnabled !== false ? 'sync' : action;
-    const [result, cdpStatus] = await Promise.all([
-      action === 'cdp_sync'
-        ? getBackdropStatus(resolvedPaths, themes).then((status) => ({ ok: true, status }))
-        : controlBackdropCompanion(resolvedPaths, themes, effectiveCompanionAction),
+    await stageLiveWallpaperCss(resolvedPaths, themes).catch(() => {});
+
+    let nativeHudResult = null;
+    const isInjectMode = themes.hostThemeMode === 'inject' || !themes.hostThemeMode;
+    if ((action === 'inject_sync' || isInjectMode) && themes.backdropEnabled) {
+      const st = await inspectNativeHudState(resolvedPaths).catch(() => null);
+      if (st && st.supported && st.asarExists && (st.state === 'stock' || st.state === 'outdated')) {
+        nativeHudResult = await installNativeHud(resolvedPaths).catch(() => null);
+      }
+    }
+
+    const isCssHostMode = themes.hostThemeMode === 'cdp' || isInjectMode;
+    const handleCompanion = async () => {
+      if (action === 'cdp_sync' || action === 'inject_sync' || (isCssHostMode && (action === 'start' || action === 'stop'))) {
+        const curStatus = await getBackdropStatus(resolvedPaths, themes);
+        if (curStatus.canAutoLaunch && curStatus.compiled && curStatus.running) {
+          return await controlBackdropCompanion(resolvedPaths, themes, 'sync');
+        }
+        return { ok: true, status: curStatus };
+      }
+      const effectiveCompanionAction =
+        action === 'stop' && themes.hudEnabled !== false && themes.hudInjectionMode === 'uia' && !themes.zeroUiaMode
+          ? 'sync'
+          : action;
+      return await controlBackdropCompanion(resolvedPaths, themes, effectiveCompanionAction);
+    };
+
+    const [result, cdpStatus, nativeHud] = await Promise.all([
+      handleCompanion(),
       cdp.sync(themes, { hostLanguage: prefs.language }),
+      nativeHudResult?.status ? Promise.resolve(nativeHudResult.status) : inspectNativeHudState(resolvedPaths),
     ]);
     void hud.refreshFromDb();
     return {
@@ -1918,6 +2062,7 @@ export function createMonitorHandlers({
       status: {
         ...(result.status || {}),
         cdp: cdpStatus,
+        nativeHud,
       },
       themeState: {
         ...themes,
@@ -1941,13 +2086,16 @@ export function createMonitorHandlers({
         themes = created.themes;
       }
 
+      await stageLiveWallpaperCss(resolvedPaths, themes).catch(() => {});
+
       const [prefs, initialBdStatus] = await Promise.all([
         store.getPrefs(),
         getBackdropStatus(resolvedPaths, themes),
       ]);
       let backdropStatus = initialBdStatus;
       const wantRunning = Boolean(
-        (themes.backdropEnabled && themes.activeWallpaperId) || themes.hudEnabled !== false,
+        (themes.backdropEnabled && themes.activeWallpaperId && themes.hostThemeMode === 'backdrop') ||
+          (themes.hudEnabled !== false && themes.hudInjectionMode === 'uia' && !themes.zeroUiaMode),
       );
       if (backdropStatus.canAutoLaunch && backdropStatus.compiled && wantRunning !== backdropStatus.running) {
         const ctrl = await controlBackdropCompanion(resolvedPaths, themes, 'sync').catch(() => null);
@@ -1956,9 +2104,10 @@ export function createMonitorHandlers({
         }
       }
 
-      const cdpStatus = await cdp
-        .sync(themes, { hostLanguage: prefs.language })
-        .catch(() => cdp.getStatus(themes));
+      const [cdpStatus, nativeHud] = await Promise.all([
+        cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes)),
+        inspectNativeHudState(resolvedPaths).catch(() => null),
+      ]);
       const seedsPreview = buildHostThemeSeedsPreview(themes.colors);
       return {
         ok: true,
@@ -1967,6 +2116,7 @@ export function createMonitorHandlers({
         backdropStatus: {
           ...backdropStatus,
           cdp: cdpStatus,
+          ...(nativeHud ? { nativeHud } : {}),
         },
         ...(seedsPreview.ok ? { seedsPreview } : {}),
       };
@@ -2022,6 +2172,8 @@ export function createMonitorHandlers({
         base64: check.base64,
         ...(thumbPayload || {}),
       });
+      await stageLiveWallpaperCss(resolvedPaths, saved.themes).catch(() => {});
+      void store.getPrefs().then((prefs) => cdp.sync(saved.themes, { hostLanguage: prefs.language })).catch(() => {});
       return { ok: true, wallpaper: saved.wallpaper, themeState: saved.themes };
     } catch (err) {
       return errorResponse(ResponseCtor, mapStorageErrorStatus(err), err);
@@ -2035,6 +2187,8 @@ export function createMonitorHandlers({
     }
     try {
       const res = await store.deleteCustomWallpaperFile(wallpaperId);
+      await stageLiveWallpaperCss(resolvedPaths, res.themes).catch(() => {});
+      void store.getPrefs().then((prefs) => cdp.sync(res.themes, { hostLanguage: prefs.language })).catch(() => {});
       return { ok: true, themeState: res.themes };
     } catch (err) {
       return errorResponse(ResponseCtor, mapStorageErrorStatus(err), err);
@@ -2614,15 +2768,71 @@ export async function startSidecarServer({
   let companionWatchdogTimer = null;
   let companionRestartFailures = 0;
   let companionWatchdogBusy = false;
+  let nativeHudWatchdogBusy = false;
+  let lastAsarLockRetryMs = 0;
+
+  const ensureNativeHudHealthy = async () => {
+    if (nativeHudWatchdogBusy) return;
+    nativeHudWatchdogBusy = true;
+    try {
+      const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
+      const hudEnabled = themes.hudEnabled !== false;
+      const mode = themes.hudInjectionMode || 'asar';
+      const autoReinject = themes.hudAutoReinject !== false;
+      const wantNativeHud = hudEnabled && mode !== 'uia';
+      const wantNativeWallpaper = Boolean(
+        themes.backdropEnabled &&
+          themes.activeWallpaperId &&
+          (themes.hostThemeMode === 'inject' || !themes.hostThemeMode),
+      );
+
+      await stageLiveHudAssets(paths, themes).catch(() => {});
+      if (!wantNativeHud && !wantNativeWallpaper) {
+        return;
+      }
+
+      if (autoReinject && ((wantNativeHud && mode === 'asar') || wantNativeWallpaper)) {
+        const st = await inspectNativeHudState(paths).catch(() => null);
+        if (st && st.supported && st.asarExists && (st.state === 'stock' || st.state === 'outdated')) {
+          const now = Date.now();
+          if (now - lastAsarLockRetryMs >= 60_000) {
+            const res = await installNativeHud(paths).catch(() => null);
+            if (!res?.diskWritten) {
+              lastAsarLockRetryMs = now;
+            }
+          }
+        }
+      }
+
+      const hb = readNativeHudHeartbeat(paths);
+      const needHudHotInject = wantNativeHud && autoReinject && !hb.alive && !cdpBridge.isHudInjected();
+      const needWpHotInject =
+        wantNativeWallpaper && autoReinject && !hb.wallpaperAlive && !cdpBridge.getStatus(themes).styleApplied;
+      if (needHudHotInject || needWpHotInject) {
+        await cdpBridge.sync(themes, { hostLanguage: prefs.language, keepConnectedPort: true }).catch(() => {});
+        if (needHudHotInject) {
+          await hudPublisher.refreshFromDb().catch(() => {});
+        }
+      }
+    } catch {
+      // Non-fatal native HUD / wallpaper auto-reinject tick
+    } finally {
+      nativeHudWatchdogBusy = false;
+    }
+  };
 
   const ensureCompanionHealthy = async () => {
     if (companionWatchdogBusy) return;
     companionWatchdogBusy = true;
     try {
       const themes = await storage.getThemes();
-      const wantStart = Boolean(
-        (themes.backdropEnabled && themes.activeWallpaperId) || themes.hudEnabled !== false,
+      const nativeDomAlive = readNativeHudHeartbeat(paths).alive || cdpBridge.isHudInjected();
+      const wantBackdrop = Boolean(
+        themes.backdropEnabled && themes.activeWallpaperId && themes.hostThemeMode === 'backdrop',
       );
+      const wantUiaHud =
+        themes.hudEnabled !== false && themes.hudInjectionMode === 'uia' && !nativeDomAlive && !themes.zeroUiaMode;
+      const wantStart = wantBackdrop || wantUiaHud;
       if (!wantStart) {
         companionRestartFailures = 0;
         return;
@@ -2661,6 +2871,7 @@ export async function startSidecarServer({
         await ensureAccountTool(paths).catch(() => {});
         const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
         await ensureCdpLauncher(paths, themes.cdpPort);
+        await ensureNativeHudHealthy();
         await cdpBridge.sync(themes, { hostLanguage: prefs.language, probeForLang: true });
         await hudPublisher.refreshFromDb();
         await ensureCompanionHealthy();
@@ -2673,6 +2884,7 @@ export async function startSidecarServer({
     sharedMemoryManager.startAutoGuard();
 
     companionWatchdogTimer = setInterval(() => {
+      void ensureNativeHudHealthy();
       void ensureCompanionHealthy();
     }, 15_000);
     companionWatchdogTimer.unref?.();

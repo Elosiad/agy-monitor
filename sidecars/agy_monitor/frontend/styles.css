@@ -182,6 +182,35 @@ body.host-backdrop-shared .right-pane-canvas {
   background: var(--bg-canvas);
 }
 
+/* When Scheme 2 (CDP) or Scheme 3 (Persistent Inject) pure-CSS wallpaper is active on the host window,
+   make AGY Console iframe canvas transparent so it shares the exact same continuous host wallpaper & veil,
+   and give internal surfaces Scheme 1-matched translucent glass depth while keeping text/images 100% crisp */
+html.host-css-shared,
+body.host-css-shared,
+body.host-css-shared .aux-pane-shell,
+body.host-css-shared .right-pane-canvas {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+body.host-css-shared {
+  --bg-surface: color-mix(in srgb, color-mix(in srgb, var(--bg-bubble) 74%, var(--bg-chrome)) var(--host-surface-alpha-pct, 75%), transparent);
+  --bg-elevated: color-mix(in srgb, color-mix(in srgb, var(--bg-chrome) 86%, var(--text-primary) 10%) var(--host-surface-alpha-pct, 80%), transparent);
+  --bg-active-row: color-mix(in srgb, color-mix(in srgb, var(--bg-bubble) 78%, var(--text-primary) 12%) var(--host-surface-alpha-pct, 75%), transparent);
+  --bg-control: color-mix(in srgb, var(--bg-bubble) 48%, color-mix(in srgb, var(--text-primary) 6%, transparent));
+  --bg-control-hover: color-mix(in srgb, var(--bg-bubble) 58%, color-mix(in srgb, var(--text-primary) 12%, transparent));
+}
+
+body.host-css-shared .backdrop-companion-card,
+body.host-css-shared .host-boundary-card {
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+body.host-css-shared .workspace-wallpaper-layer {
+  opacity: 0 !important;
+}
+
 .right-pane-canvas {
   position: relative;
   z-index: 1;

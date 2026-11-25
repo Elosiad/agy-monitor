@@ -6,6 +6,15 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { atomicWriteBuffer, atomicWriteJson, atomicWriteText } from './paths.mjs';
 import {
+  buildHostWallpaperCss,
+  buildNativeHudRendererScript,
+  buildNativeWallpaperEngineScript,
+  HOST_WALLPAPER_STYLE_ID,
+  NATIVE_HUD_VERSION,
+  readDevToolsActivePort,
+  readNativeHudHeartbeat,
+} from './hud_injector.mjs';
+import {
   createWslCdpLocalProxy,
   detectWindowsHostEnv,
   resolveWindowsHostDirs,
@@ -15,7 +24,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const STYLE_ELEMENT_ID = 'agy-monitor-cdp-theme';
+const STYLE_ELEMENT_ID = HOST_WALLPAPER_STYLE_ID;
 const HUD_ELEMENT_ID = 'agy-monitor-cdp-hud';
 const HUD_POPOVER_ID = 'agy-monitor-cdp-hud-popover';
 const HUD_GUIDE_ID = 'agy-monitor-cdp-hud-guide';
@@ -29,6 +38,7 @@ function normalizeHudDisplayConfig(raw) {
     showCacheHit: src.showCacheHit !== false,
     showModel: src.showModel !== false,
     showContext: src.showContext !== false,
+    showQuota: src.showQuota !== false,
     updatedAtMs: Number.isFinite(Number(src.updatedAtMs)) ? Number(src.updatedAtMs) : 0,
   };
 }
@@ -297,147 +307,7 @@ export async function ensureCdpLauncher(paths, cdpPort = DEFAULT_CDP_PORT) {
  * matches 1:1 while keeping all text, code, icons, and popovers 100% solid & crisp.
  */
 export function buildCdpThemeCss(themes = {}, wallpaperDataUri = '') {
-  const opacity = clampInt(themes.opacity, 0, 100, 32);
-  const blur = clampInt(themes.blur, 0, 24, 4);
-  const dim = clampInt(themes.dim, 0, 85, 52);
-  const hostBlendPct = clampInt(themes.hostBlendPct, 5, 42, 18);
-  const fit = themes.fit === 'contain' ? 'contain' : 'cover';
-
-  const colors = themes.colors && typeof themes.colors === 'object' ? themes.colors : {};
-  const [cr, cg, cb] = parseHexRgb(colors.canvas, [7, 7, 9]);
-  const [chr, chg, chb] = parseHexRgb(colors.chrome, [17, 16, 21]);
-  const [br, bg, bb] = parseHexRgb(colors.bubble, [19, 19, 23]);
-  const accent =
-    typeof colors.accent === 'string' && /^#[0-9a-fA-F]{6}$/.test(colors.accent)
-      ? colors.accent
-      : '#3570e4';
-
-  const wpOpacity = (opacity / 100).toFixed(3);
-  const dimFrac = dim / 100;
-  const blendFrac = hostBlendPct / 100;
-  // Exact optical match to Scheme 1 & AGY Console: single unified veil on html::after
-  const totalVeilAlpha = Math.max(0.28, Math.min(0.96, 1 - (1 - dimFrac) * blendFrac)).toFixed(3);
-  const sidebarTintAlpha = Math.max(0.14, Math.min(0.36, 0.30 - blendFrac * 0.28)).toFixed(3);
-  const softSurfaceAlpha = Math.max(0.18, Math.min(0.48, 0.40 - blendFrac * 0.34)).toFixed(3);
-  const composerAlpha = Math.max(0.68, Math.min(0.90, 0.86 - blendFrac * 0.32)).toFixed(3);
-  const safeUrl = wallpaperDataUri ? `url("${wallpaperDataUri}")` : 'none';
-
-  return `
-/* Antigravity Monitor · Scheme 2 Pure-CSS Wallpaper (Zero app.asar edits) */
-html {
-  background-color: rgb(${cr}, ${cg}, ${cb}) !important;
-  --agy-mon-accent: ${accent};
-}
-
-html::before {
-  content: "" !important;
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 0 !important;
-  pointer-events: none !important;
-  background-image: ${safeUrl} !important;
-  background-position: center center !important;
-  background-repeat: no-repeat !important;
-  background-size: ${fit} !important;
-  opacity: ${wpOpacity} !important;
-  filter: ${blur > 0 ? `blur(${blur}px)` : 'none'} !important;
-  transform: ${blur > 0 ? 'scale(1.04)' : 'none'} !important;
-  will-change: opacity, filter !important;
-}
-
-html::after {
-  content: "" !important;
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 0 !important;
-  pointer-events: none !important;
-  background: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
-}
-
-body {
-  position: relative !important;
-  z-index: 1 !important;
-  background: transparent !important;
-  background-color: transparent !important;
-}
-
-body > #root,
-body > #app,
-body > div:first-of-type {
-  background-color: transparent !important;
-}
-
-/* Workbench & WSL Remote shell surfaces (clears stubborn opaque light/dark chrome panels) */
-.monaco-workbench,
-.monaco-workbench .part,
-.monaco-workbench .part > .content,
-.monaco-workbench .part.titlebar,
-.monaco-workbench .part.statusbar,
-.monaco-workbench .part.activitybar,
-.monaco-workbench .part.panel,
-.monaco-workbench .part.editor > .content .editor-group-container,
-.monaco-workbench .part.editor > .content .editor-group-container > .title,
-.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-and-actions-container,
-.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container,
-.monaco-workbench .part.editor > .content .editor-group-container > .title .editor-actions,
-.monaco-workbench .part.editor > .content .editor-group-container > .editor-container,
-.monaco-editor,
-.monaco-editor-background,
-.monaco-editor .margin,
-.monaco-editor .inputarea.ime-input,
-.monaco-pane-view .pane > .pane-header,
-.monaco-list .monaco-list-rows,
-.breadcrumbs-control {
-  background-color: transparent !important;
-  background-image: none !important;
-}
-
-.monaco-workbench .part.sidebar,
-.monaco-workbench .part.auxiliarybar {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
-}
-
-.monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab.active {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
-}
-
-/* Auto-discovered opaque structural shell containers (zero stacked double veils) */
-[data-agy-mon-layer="transparent"] {
-  background-color: transparent !important;
-  background-image: none !important;
-}
-
-[data-agy-mon-layer="sidebar"] {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
-  background-image: none !important;
-}
-
-[data-agy-mon-layer="surface-soft"] {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
-  background-image: none !important;
-}
-
-[data-agy-mon-layer="composer"] {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${composerAlpha}) !important;
-  backdrop-filter: blur(10px) !important;
-}
-
-/* Protect popups, dropdowns, dialogs, menus, hover widgets, and tooltips with crisp opaque surfaces */
-[role="dialog"],
-[role="alertdialog"],
-[role="menu"],
-[role="listbox"],
-[role="tooltip"],
-[data-radix-popper-content-wrapper] > *,
-[data-sonner-toast],
-.monaco-hover,
-.suggest-widget,
-.quick-input-widget,
-.context-view .monaco-menu {
-  background-color: rgba(${chr}, ${chg}, ${chb}, 0.96) !important;
-  backdrop-filter: blur(14px) !important;
-}
-`.trim();
+  return buildHostWallpaperCss(themes, wallpaperDataUri);
 }
 
 export function isAntigravityAppTarget(target) {
@@ -453,17 +323,21 @@ export function isAntigravityAppTarget(target) {
     low.startsWith('devtools://') ||
     low.startsWith('chrome-extension://') ||
     low.startsWith('chrome://') ||
+    low.startsWith('plugin://') ||
     low.startsWith('about:') ||
     low.startsWith('blob:') ||
     low.startsWith('data:')
   ) {
     return false;
   }
-  // Never inject host wallpaper into AGY Monitor's own sidecar console
+  // Never inject host wallpaper into AGY Monitor's own sidecar console or other plugin iframes
+  // (check pathname/origin only — ignore query params like ?tab=sidecar__agy-monitor%2Fagy_monitor__%2F on the main host page!)
+  const pathOnly = low.split(/[?#]/)[0];
   if (
     lowTitle === 'antigravity monitor' ||
     lowTitle === 'agy 控制台' ||
-    low.includes('/agy_monitor')
+    pathOnly.includes('agy_monitor') ||
+    pathOnly.includes('agy-monitor')
   ) {
     return false;
   }
@@ -511,233 +385,27 @@ export function rewriteTargetWsUrl(wsUrl, activePort, proxyHost, proxyPort) {
 }
 
 function buildApplyThemeAndScanExpr(cssText) {
-  return `(function(){
-    var styleId = ${JSON.stringify(STYLE_ELEMENT_ID)};
-    var el = document.getElementById(styleId);
-    if (!el) {
-      el = document.createElement('style');
-      el.id = styleId;
-      (document.head || document.documentElement).appendChild(el);
+  const engineSrc = buildNativeWallpaperEngineScript();
+  return `(function(css){
+    if (!window.__agyMonitorWallpaper || window.__agyMonitorWallpaper.version !== ${JSON.stringify(NATIVE_HUD_VERSION)}) {
+      try {
+        (0, eval)(${JSON.stringify(engineSrc)});
+      } catch (e) {
+        return false;
+      }
     }
-    el.textContent = ${JSON.stringify(cssText)};
-
-    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 3) {
-      try { window.__agyMonLayerEngine.stop(); } catch (e) {}
+    if (!window.__agyMonitorWallpaper || typeof window.__agyMonitorWallpaper.apply !== 'function') {
+      return false;
     }
-
-    if (!window.__agyMonLayerEngine) {
-      var probeCtx = null;
-      function parseBgRgba(raw) {
-        if (!raw || raw === 'transparent' || raw === 'rgba(0, 0, 0, 0)') return null;
-        var m = /^rgba?\\(\\s*([\\d.]+)[,\\s]+([\\d.]+)[,\\s]+([\\d.]+)(?:\\s*[,/]\\s*([\\d.]+%?))?\\s*\\)$/i.exec(raw);
-        if (m) {
-          var a = 1;
-          if (m[4] !== undefined) {
-            a = m[4].indexOf('%') >= 0 ? parseFloat(m[4]) / 100 : parseFloat(m[4]);
-          }
-          return { r: parseFloat(m[1]), g: parseFloat(m[2]), b: parseFloat(m[3]), a: a };
-        }
-        var cs = /^color\\(\\s*srgb\\s+([\\d.]+)\\s+([\\d.]+)\\s+([\\d.]+)(?:\\s*\\/\\s*([\\d.]+%?))?\\s*\\)$/i.exec(raw);
-        if (cs) {
-          var ca = 1;
-          if (cs[4] !== undefined) {
-            ca = cs[4].indexOf('%') >= 0 ? parseFloat(cs[4]) / 100 : parseFloat(cs[4]);
-          }
-          return {
-            r: Math.round(parseFloat(cs[1]) * 255),
-            g: Math.round(parseFloat(cs[2]) * 255),
-            b: Math.round(parseFloat(cs[3]) * 255),
-            a: ca
-          };
-        }
-        try {
-          if (!probeCtx) {
-            var cv = document.createElement('canvas');
-            cv.width = 1;
-            cv.height = 1;
-            probeCtx = cv.getContext('2d', { willReadFrequently: true });
-          }
-          if (probeCtx) {
-            probeCtx.clearRect(0, 0, 1, 1);
-            probeCtx.fillStyle = raw;
-            probeCtx.fillRect(0, 0, 1, 1);
-            var px = probeCtx.getImageData(0, 0, 1, 1).data;
-            return { r: px[0], g: px[1], b: px[2], a: px[3] / 255 };
-          }
-        } catch (e) {}
-        return null;
-      }
-
-      var SKIP_TAGS = {
-        HTML: 1, BODY: 1, SCRIPT: 1, STYLE: 1, LINK: 1, META: 1,
-        SVG: 1, IMG: 1, CANVAS: 1, VIDEO: 1, AUDIO: 1,
-        IFRAME: 1, WEBVIEW: 1, PRE: 1, CODE: 1, TABLE: 1,
-        BUTTON: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, A: 1
-      };
-      var PROTECT_SEL = '[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"],[role="tooltip"],[data-radix-popper-content-wrapper],[data-sonner-toast],.monaco-hover,.suggest-widget,.quick-input-widget,.context-view,pre,code,#' + ${JSON.stringify(HUD_ELEMENT_ID)};
-      var LANDMARK_SEL = 'header,nav,aside,main,footer,[role="main"],[role="navigation"],[role="complementary"],[role="banner"],[role="contentinfo"],.part,.pane-body,.editor-group-container,.tabs-and-actions-container,.breadcrumbs-control';
-
-      function evaluateNode(node, vw, vh) {
-        if (!node || node.nodeType !== 1) return 0;
-        if (SKIP_TAGS[node.tagName]) return 0;
-        if (node.getAttribute('data-agy-mon-layer')) return 0;
-        if (node.closest && node.closest(PROTECT_SEL)) return 0;
-
-        var rect = node.getBoundingClientRect();
-        if (!rect || rect.width < 44 || rect.height < 20) return 0;
-
-        var st = window.getComputedStyle(node);
-        var bg = parseBgRgba(st.backgroundColor);
-        var hasGradientBg = Boolean(st.backgroundImage && st.backgroundImage.indexOf('gradient(') >= 0);
-        if ((!bg || bg.a < 0.35) && !hasGradientBg) return 0;
-
-        // Skip vivid accent banners/pills; lift neutral dark & light chrome/surfaces (incl. light blue-gray tints)
-        if (bg && bg.a >= 0.35) {
-          var chroma = Math.max(bg.r, bg.g, bg.b) - Math.min(bg.r, bg.g, bg.b);
-          if (chroma > 52) return 0;
-        }
-
-        var isLeftSidebar =
-          rect.left <= 56 &&
-          rect.width >= 44 &&
-          rect.width <= Math.min(440, vw * 0.40) &&
-          rect.height >= vh * 0.34;
-        var isRightSidebar =
-          rect.right >= vw - 56 &&
-          rect.width >= 44 &&
-          rect.width <= Math.min(460, vw * 0.42) &&
-          rect.height >= vh * 0.34;
-        var isTopBar =
-          rect.top <= 130 &&
-          rect.height <= 116 &&
-          rect.width >= Math.min(180, vw * 0.22);
-        var isBottomBar =
-          rect.bottom >= vh - 48 &&
-          rect.height <= Math.max(120, vh * 0.42) &&
-          rect.width >= Math.min(180, vw * 0.22);
-        var isMainPane =
-          rect.width >= Math.min(180, vw * 0.16) &&
-          rect.height >= Math.min(120, vh * 0.16);
-
-        if (isLeftSidebar || isRightSidebar) {
-          var hasSidebarAnc = node.parentElement && node.parentElement.closest('[data-agy-mon-layer="sidebar"]');
-          if (hasSidebarAnc) {
-            node.setAttribute('data-agy-mon-layer', 'transparent');
-          } else {
-            node.setAttribute('data-agy-mon-layer', 'sidebar');
-            try {
-              var nestedSidebars = node.querySelectorAll('[data-agy-mon-layer="sidebar"]');
-              for (var nsi = 0; nsi < nestedSidebars.length; nsi++) {
-                nestedSidebars[nsi].setAttribute('data-agy-mon-layer', 'transparent');
-              }
-            } catch (e) {}
-          }
-          return 1;
-        }
-        if (isTopBar || isBottomBar || isMainPane) {
-          node.setAttribute('data-agy-mon-layer', 'transparent');
-          return 1;
-        }
-        return 0;
-      }
-
-      function scanLayers() {
-        var vw = window.innerWidth || 0;
-        var vh = window.innerHeight || 0;
-        if (vw < 300 || vh < 200) return 0;
-
-        var xs = [
-          12,
-          Math.min(44, Math.floor(vw * 0.04)),
-          Math.floor(vw * 0.12),
-          Math.floor(vw * 0.26),
-          Math.floor(vw * 0.42),
-          Math.floor(vw * 0.58),
-          Math.floor(vw * 0.74),
-          Math.floor(vw * 0.88),
-          Math.max(0, vw - 16)
-        ];
-        var ys = [
-          12,
-          44,
-          84,
-          Math.floor(vh * 0.18),
-          Math.floor(vh * 0.34),
-          Math.floor(vh * 0.52),
-          Math.floor(vh * 0.70),
-          Math.floor(vh * 0.85),
-          Math.max(0, vh - 14)
-        ];
-
-        var seen = new Set();
-        var tagged = 0;
-
-        for (var xi = 0; xi < xs.length; xi++) {
-          for (var yi = 0; yi < ys.length; yi++) {
-            var stack = document.elementsFromPoint(xs[xi], ys[yi]);
-            // Traverse outermost ancestor -> innermost child so nested sidebar layers never stack double tints
-            for (var si = stack.length - 1; si >= 0; si--) {
-              var node = stack[si];
-              if (!node || seen.has(node)) continue;
-              seen.add(node);
-              tagged += evaluateNode(node, vw, vh);
-            }
-          }
-        }
-
-        try {
-          var landmarks = document.querySelectorAll(LANDMARK_SEL);
-          for (var li = 0; li < landmarks.length; li++) {
-            var lm = landmarks[li];
-            if (!lm || seen.has(lm)) continue;
-            seen.add(lm);
-            tagged += evaluateNode(lm, vw, vh);
-          }
-        } catch (e) {}
-
-        return tagged;
-      }
-
-      var timer = setInterval(scanLayers, 1100);
-      var onResize = function() { setTimeout(scanLayers, 40); };
-      window.addEventListener('resize', onResize, { passive: true });
-      var mutTimer = null;
-      var layerObserver = null;
-      if (typeof MutationObserver === 'function' && document.body) {
-        layerObserver = new MutationObserver(function() {
-          if (mutTimer) return;
-          mutTimer = setTimeout(function() {
-            mutTimer = null;
-            scanLayers();
-          }, 32);
-        });
-        layerObserver.observe(document.body, { childList: true, subtree: true });
-      }
-
-      window.__agyMonLayerEngine = {
-        version: 3,
-        scan: scanLayers,
-        stop: function() {
-          clearInterval(timer);
-          if (mutTimer) { clearTimeout(mutTimer); mutTimer = null; }
-          if (layerObserver) { layerObserver.disconnect(); layerObserver = null; }
-          window.removeEventListener('resize', onResize);
-          var nodes = document.querySelectorAll('[data-agy-mon-layer]');
-          for (var i = 0; i < nodes.length; i++) {
-            nodes[i].removeAttribute('data-agy-mon-layer');
-          }
-          delete window.__agyMonLayerEngine;
-        }
-      };
-    }
-
-    window.__agyMonLayerEngine.scan();
-    return true;
-  })()`;
+    return window.__agyMonitorWallpaper.apply(css);
+  })(${JSON.stringify(cssText)})`;
 }
 
 function buildRemoveThemeExpr() {
   return `(function(){
+    if (window.__agyMonitorWallpaper && typeof window.__agyMonitorWallpaper.remove === 'function') {
+      return window.__agyMonitorWallpaper.remove();
+    }
     if (window.__agyMonLayerEngine && typeof window.__agyMonLayerEngine.stop === 'function') {
       window.__agyMonLayerEngine.stop();
     }
@@ -747,9 +415,21 @@ function buildRemoveThemeExpr() {
   })()`;
 }
 
-function buildHudSyncExpr(hudPayload, accentColor, displayConfig = null, guideImageDataUri = '') {
+function buildHudSyncExpr(
+  hudPayload,
+  accentColor,
+  displayConfig = null,
+  guideImageDataUri = '',
+  themeVisual = null,
+) {
   const disp = normalizeHudDisplayConfig(displayConfig);
+  const bubbleColor =
+    typeof themeVisual?.bubbleColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(themeVisual.bubbleColor)
+      ? themeVisual.bubbleColor
+      : '#212533';
+  const hostBlendPct = clampInt(themeVisual?.hostBlendPct, 5, 42, 25);
   const safePayload = JSON.stringify({
+    activeConvId: typeof hudPayload?.activeConvId === 'string' ? hudPayload.activeConvId : '',
     percent: clampInt(hudPayload?.percent, 0, 999, 0),
     totalUsed: Math.max(0, Math.round(Number(hudPayload?.totalUsed) || 0)),
     windowCap: Math.max(1, Math.round(Number(hudPayload?.windowCap) || 512000)),
@@ -762,516 +442,41 @@ function buildHudSyncExpr(hudPayload, accentColor, displayConfig = null, guideIm
         ? clampInt(hudPayload.cacheHitPct, 0, 100, 0)
         : null,
     upstreamModelId: typeof hudPayload?.upstreamModelId === 'string' ? hudPayload.upstreamModelId : '',
+    quota: hudPayload?.quota && typeof hudPayload.quota === 'object' ? hudPayload.quota : null,
+    sessions: Array.isArray(hudPayload?.sessions) ? hudPayload.sessions : [],
     accent:
       typeof accentColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(accentColor)
         ? accentColor
         : '#5b8cff',
+    bubbleColor,
+    hostBlendPct,
     display: disp,
     guideImageDataUri: typeof guideImageDataUri === 'string' ? guideImageDataUri : '',
   });
+  const rendererSrc = buildNativeHudRendererScript();
 
   return `(function(data){
-    var HUD_ID = ${JSON.stringify(HUD_ELEMENT_ID)};
-    var POP_ID = ${JSON.stringify(HUD_POPOVER_ID)};
-    var GUIDE_ID = ${JSON.stringify(HUD_GUIDE_ID)};
-    var STYLE_ID = ${JSON.stringify(HUD_STYLE_ID)};
-
-    if (!document.getElementById(STYLE_ID)) {
-      var st = document.createElement('style');
-      st.id = STYLE_ID;
-      st.textContent = [
-        '#' + HUD_ID + ' { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 auto; min-width: 0; max-width: 390px; margin-left: auto; margin-right: 4px; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; user-select: none; }',
-        '#' + HUD_ID + ' .agy-hud-ring-pill { display: inline-flex; align-items: center; height: 22px; padding: 0 3px; border-radius: 999px; border: 1px solid transparent; background: transparent; cursor: pointer; flex-shrink: 0; transition: background 0.14s ease, border-color 0.14s ease, padding 0.14s ease; }',
-        '#' + HUD_ID + ' .agy-hud-ring-pill:hover { background: rgba(22, 24, 32, 0.90); border-color: rgba(255, 255, 255, 0.22); padding: 0 7px 0 5px; }',
-        '#' + HUD_ID + ' .agy-hud-pct { max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; font-size: 11px; font-weight: 600; color: #eae9ef; font-variant-numeric: tabular-nums; margin-left: 0; transition: max-width 0.14s ease, opacity 0.12s ease, margin-left 0.14s ease; }',
-        '#' + HUD_ID + ' .agy-hud-ring-pill:hover .agy-hud-pct { max-width: 52px; opacity: 1; margin-left: 5px; }',
-        '#' + HUD_ID + ' .agy-hud-meta-pill { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(19, 21, 28, 0.78); cursor: pointer; min-width: 0; max-width: 320px; overflow: hidden; transition: background 0.14s ease, border-color 0.14s ease; }',
-        '#' + HUD_ID + ' .agy-hud-meta-pill:hover { background: rgba(28, 31, 41, 0.94); border-color: rgba(255, 255, 255, 0.28); }',
-        '#' + HUD_ID + ' .agy-hud-speed, #' + HUD_ID + ' .agy-hud-cache { font-size: 11px; font-weight: 400; line-height: 1; color: #e2e1e8; white-space: nowrap; flex-shrink: 0; font-variant-numeric: tabular-nums; }',
-        '#' + HUD_ID + ' .agy-hud-cache { font-size: 10.5px; color: #b8dfcf; }',
-        '#' + HUD_ID + ' .agy-hud-dot { font-size: 11px; color: rgba(255, 255, 255, 0.42); flex-shrink: 0; }',
-        '#' + HUD_ID + ' .agy-hud-model { font-size: 11px; color: #b6b5c0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }',
-        '#' + HUD_ID + ' .agy-hud-empty-pill { display: none; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.16); background: rgba(22,24,32,0.82); color: #c7c7d4; font-size: 12px; cursor: pointer; flex-shrink: 0; }',
-        '#' + HUD_ID + ' .agy-hud-empty-pill:hover { background: rgba(34,38,50,0.94); border-color: rgba(255,255,255,0.30); color: #ffffff; }',
-        '#' + POP_ID + ' { position: fixed; z-index: 2147483640; width: 238px; padding: 8px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.14); background: rgba(22,24,33,0.97); box-shadow: 0 12px 32px rgba(0,0,0,0.52); color: #eae9f0; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; user-select: none; backdrop-filter: blur(14px); }',
-        '#' + POP_ID + ' .agy-pop-head { display: flex; align-items: center; justify-content: space-between; padding: 3px 6px 7px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 4px; }',
-        '#' + POP_ID + ' .agy-pop-title { font-size: 11.5px; font-weight: 600; color: #dcdce6; }',
-        '#' + POP_ID + ' .agy-pop-badge { font-size: 11px; font-weight: 600; color: #9ec0ff; font-variant-numeric: tabular-nums; }',
-        '#' + POP_ID + ' .agy-pop-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 6px 6px; border: 0; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; text-align: left; }',
-        '#' + POP_ID + ' .agy-pop-row:hover { background: rgba(255,255,255,0.07); }',
-        '#' + POP_ID + ' .agy-pop-left { display: inline-flex; align-items: center; gap: 8px; min-width: 0; flex-shrink: 0; }',
-        '#' + POP_ID + ' .agy-pop-box { width: 15px; height: 15px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.04); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 10px; font-weight: 700; color: #fff; }',
-        '#' + POP_ID + ' .agy-pop-row[data-checked="1"] .agy-pop-box { border-color: transparent; background: var(--agy-pop-accent, #5b8cff); }',
-        '#' + POP_ID + ' .agy-pop-lbl { font-size: 12px; color: #e8e8f0; }',
-        '#' + POP_ID + ' .agy-pop-val { font-size: 11px; color: #9a9cae; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 112px; font-variant-numeric: tabular-nums; }',
-        '#' + POP_ID + ' .agy-pop-foot { margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(255,255,255,0.08); }',
-        '#' + POP_ID + ' .agy-pop-guide-row { display: flex; align-items: center; justify-content: space-between; width: 100%; height: 26px; padding: 0 7px 0 6px; border: 0; border-radius: 7px; background: rgba(255,255,255,0.045); color: #bac2d6; font-size: 11.5px; cursor: pointer; }',
-        '#' + POP_ID + ' .agy-pop-guide-row:hover, #' + POP_ID + ' .agy-pop-guide-row[data-pinned="1"] { background: rgba(255,255,255,0.11); color: #f0f4ff; }',
-        '#' + POP_ID + ' .agy-pop-q { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 999px; background: rgba(255,255,255,0.12); font-size: 10px; font-weight: 700; color: #bac6e4; }',
-        '#' + GUIDE_ID + ' { position: fixed; z-index: 2147483641; width: 306px; padding: 8px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.16); background: rgba(20,22,31,0.98); box-shadow: 0 14px 36px rgba(0,0,0,0.62); pointer-events: none; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; }',
-        '#' + GUIDE_ID + ' .agy-guide-cap { font-size: 11px; font-weight: 600; color: #dae0f2; margin: 0 2px 7px; }',
-        '#' + GUIDE_ID + ' .agy-guide-img { display: block; width: 100%; aspect-ratio: 784 / 439; object-fit: cover; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); }'
-      ].join('\\n');
-      (document.head || document.documentElement).appendChild(st);
-    }
-
-    function fmtTokK(n) {
-      var v = Math.max(0, Number(n) || 0);
-      if (v >= 1000000) return (v / 1000000).toFixed(1).replace(/\\.0$/, '') + 'M';
-      if (v >= 1000) return Math.round(v / 1000) + 'k';
-      return String(v);
-    }
-
-    function getDisplayState() {
-      var cur = window.__agyMonHudDisplay;
-      var incoming = data.display || { showSpeed: true, showCacheHit: true, showModel: true, showContext: true, updatedAtMs: 0 };
-      if (!cur || ((incoming.updatedAtMs || 0) > (cur.updatedAtMs || 0) && !window.__agyMonHudDisplayDirty)) {
-        cur = {
-          showSpeed: incoming.showSpeed !== false,
-          showCacheHit: incoming.showCacheHit !== false,
-          showModel: incoming.showModel !== false,
-          showContext: incoming.showContext !== false,
-          updatedAtMs: incoming.updatedAtMs || 0
-        };
-        window.__agyMonHudDisplay = cur;
-      }
-      return cur;
-    }
-
-    function hideGuideCard() {
-      var g = document.getElementById(GUIDE_ID);
-      if (g && g.parentNode) g.parentNode.removeChild(g);
-    }
-
-    function showGuideCard(popEl) {
-      var d = window.__agyMonHudLatestData || data;
-      if (!popEl || !d || !d.guideImageDataUri) return;
-      hideGuideCard();
-      var g = document.createElement('div');
-      g.id = GUIDE_ID;
-      g.innerHTML =
-        '<div class="agy-guide-cap">打开方式：右上角 Plugins → AGY 控制台</div>' +
-        '<img class="agy-guide-img" alt="AGY 控制台打开指引" />';
-      var imgEl = g.querySelector('.agy-guide-img');
-      if (imgEl) imgEl.src = d.guideImageDataUri;
-      document.body.appendChild(g);
-      var pr = popEl.getBoundingClientRect();
-      var vw = window.innerWidth || 1200;
-      var vh = window.innerHeight || 800;
-      var gw = g.offsetWidth || 306;
-      var gh = g.offsetHeight || 202;
-      var left = Math.round(pr.right + 6);
-      if (left + gw > vw - 8) {
-        left = Math.max(8, Math.round(pr.left - gw - 6));
-      }
-      var top = Math.round(pr.bottom - gh);
-      if (top < 8) top = 8;
-      if (top + gh > vh - 8) top = Math.max(8, vh - gh - 8);
-      g.style.left = left + 'px';
-      g.style.top = top + 'px';
-    }
-
-    function closePopover() {
-      hideGuideCard();
-      var pop = document.getElementById(POP_ID);
-      if (pop && pop.parentNode) pop.parentNode.removeChild(pop);
-    }
-
-    function applyHudDisplayToDom(hudEl, effectiveWidth) {
-      if (!hudEl) return;
-      var disp = getDisplayState();
-      var ringBtn = hudEl.querySelector('.agy-hud-ring-pill');
-      var metaBtn = hudEl.querySelector('.agy-hud-meta-pill');
-      var emptyBtn = hudEl.querySelector('.agy-hud-empty-pill');
-      var speedEl = hudEl.querySelector('.agy-hud-speed');
-      var dot1 = hudEl.querySelector('.agy-hud-dot-1');
-      var cacheEl = hudEl.querySelector('.agy-hud-cache');
-      var dot2 = hudEl.querySelector('.agy-hud-dot-2');
-      var modelEl = hudEl.querySelector('.agy-hud-model');
-
-      var anyMeta = disp.showSpeed || disp.showCacheHit || disp.showModel;
-      var anyAll = disp.showContext || anyMeta;
-      var showModel = disp.showModel && !(effectiveWidth > 0 && effectiveWidth < 520);
-      var showCache = disp.showCacheHit && !(effectiveWidth > 0 && effectiveWidth < 430);
-      var showSpeed = disp.showSpeed && !(effectiveWidth > 0 && effectiveWidth < 370);
-      var anyVisibleMeta = showSpeed || showCache || showModel;
-      if (ringBtn) ringBtn.style.display = disp.showContext ? 'inline-flex' : 'none';
-      if (emptyBtn) emptyBtn.style.display = (disp.showContext || anyVisibleMeta) ? 'none' : 'inline-flex';
-      if (speedEl) speedEl.style.display = showSpeed ? 'inline' : 'none';
-      if (cacheEl) cacheEl.style.display = showCache ? 'inline' : 'none';
-      if (modelEl) modelEl.style.display = showModel ? 'inline' : 'none';
-      if (dot1) dot1.style.display = (showSpeed && (showCache || showModel)) ? 'inline' : 'none';
-      if (dot2) dot2.style.display = (showCache && showModel) ? 'inline' : 'none';
-      if (metaBtn) {
-        metaBtn.style.display = anyVisibleMeta ? 'inline-flex' : 'none';
-      }
-      if (hudEl) {
-        hudEl.style.display = (effectiveWidth > 0 && effectiveWidth < 260) ? 'none' : 'inline-flex';
+    if (!window.__agyMonitorNativeHud || window.__agyMonitorNativeHud.version !== ${JSON.stringify(NATIVE_HUD_VERSION)}) {
+      try {
+        (0, eval)(${JSON.stringify(rendererSrc)});
+      } catch (e) {
+        return { hudInjected: false };
       }
     }
-
-    function refreshPopoverContents() {
-      var pop = document.getElementById(POP_ID);
-      if (!pop) return;
-      var disp = getDisplayState();
-      var d = window.__agyMonHudLatestData || data;
-      pop.style.setProperty('--agy-pop-accent', d.accent || '#5b8cff');
-      var badge = pop.querySelector('.agy-pop-badge');
-      if (badge) badge.textContent = Math.max(0, Math.min(999, Math.round(Number(d.percent) || 0))) + '%';
-      var valMap = {
-        showSpeed: (typeof d.tokPerSec === 'number' && d.tokPerSec > 0)
-          ? ((d.tokPerSec >= 100 ? Math.round(d.tokPerSec) : d.tokPerSec.toFixed(1)) + ' tok/s')
-          : '--',
-        showCacheHit: (typeof d.cacheHitPct === 'number') ? (d.cacheHitPct + '%') : '--',
-        showModel: d.upstreamModelId || '--',
-        showContext: d.totalUsed > 0 ? (fmtTokK(d.totalUsed) + ' / ' + fmtTokK(d.windowCap)) : '0%'
-      };
-      var rows = pop.querySelectorAll('.agy-pop-row');
-      for (var i = 0; i < rows.length; i++) {
-        var key = rows[i].getAttribute('data-key');
-        var checked = Boolean(disp[key]);
-        rows[i].setAttribute('data-checked', checked ? '1' : '0');
-        var box = rows[i].querySelector('.agy-pop-box');
-        if (box) box.textContent = checked ? '✓' : '';
-        var val = rows[i].querySelector('.agy-pop-val');
-        if (val && Object.prototype.hasOwnProperty.call(valMap, key)) val.textContent = valMap[key];
-      }
+    if (!window.__agyMonitorNativeHud || typeof window.__agyMonitorNativeHud.sync !== 'function') {
+      return { hudInjected: false };
     }
-
-    function togglePopover(anchorEl) {
-      var existing = document.getElementById(POP_ID);
-      if (existing) {
-        closePopover();
-        return;
-      }
-      var pop = document.createElement('div');
-      pop.id = POP_ID;
-      pop.innerHTML =
-        '<div class="agy-pop-head"><span class="agy-pop-title">底部状态栏显示</span><span class="agy-pop-badge">0%</span></div>' +
-        '<button type="button" class="agy-pop-row" data-key="showSpeed"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">生成速率</span></span><span class="agy-pop-val">--</span></button>' +
-        '<button type="button" class="agy-pop-row" data-key="showCacheHit"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">缓存命中</span></span><span class="agy-pop-val">--</span></button>' +
-        '<button type="button" class="agy-pop-row" data-key="showModel"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">上游模型</span></span><span class="agy-pop-val">--</span></button>' +
-        '<button type="button" class="agy-pop-row" data-key="showContext"><span class="agy-pop-left"><span class="agy-pop-box"></span><span class="agy-pop-lbl">上下文占用</span></span><span class="agy-pop-val">0%</span></button>' +
-        '<div class="agy-pop-foot"><button type="button" class="agy-pop-guide-row" data-pinned="0"><span class="agy-pop-left"><span class="agy-pop-q">?</span><span>如何打开 AGY 控制台</span></span><span>▸</span></button></div>';
-
-      var guideBtn = pop.querySelector('.agy-pop-guide-row');
-      if (guideBtn) {
-        guideBtn.addEventListener('mouseenter', function() { showGuideCard(pop); });
-        guideBtn.addEventListener('mouseleave', function() {
-          if (guideBtn.getAttribute('data-pinned') !== '1') hideGuideCard();
-        });
-        guideBtn.addEventListener('click', function(ev) {
-          ev.stopPropagation();
-          var nextPin = guideBtn.getAttribute('data-pinned') !== '1';
-          guideBtn.setAttribute('data-pinned', nextPin ? '1' : '0');
-          if (nextPin) showGuideCard(pop);
-          else hideGuideCard();
-        });
-      }
-
-      pop.addEventListener('click', function(ev) {
-        ev.stopPropagation();
-        var row = ev.target && ev.target.closest ? ev.target.closest('.agy-pop-row') : null;
-        if (row) {
-          var key = row.getAttribute('data-key');
-          var disp = getDisplayState();
-          disp[key] = !disp[key];
-          disp.updatedAtMs = Date.now();
-          window.__agyMonHudDisplay = disp;
-          window.__agyMonHudDisplayDirty = {
-            showSpeed: disp.showSpeed,
-            showCacheHit: disp.showCacheHit,
-            showModel: disp.showModel,
-            showContext: disp.showContext,
-            updatedAtMs: disp.updatedAtMs
-          };
-          refreshPopoverContents();
-          applyHudDisplayToDom(document.getElementById(HUD_ID), window.__agyMonHudLastCardWidth || 0);
-        }
-      });
-
-      document.body.appendChild(pop);
-      refreshPopoverContents();
-
-      var rect = anchorEl ? anchorEl.getBoundingClientRect() : null;
-      var vw = window.innerWidth || 1200;
-      var vh = window.innerHeight || 800;
-      var pw = pop.offsetWidth || 238;
-      var ph = pop.offsetHeight || 204;
-      var left = rect ? Math.round(rect.left + rect.width / 2 - pw / 2) : Math.round(vw - pw - 16);
-      var top = rect ? Math.round(rect.top - ph - 8) : Math.round(vh - ph - 48);
-      if (left < 10) left = 10;
-      if (left + pw > vw - 10) left = Math.max(10, vw - pw - 10);
-      if (top < 10) top = rect ? Math.min(vh - ph - 10, Math.round(rect.bottom + 8)) : 10;
-      pop.style.left = left + 'px';
-      pop.style.top = top + 'px';
-
-      if (!window.__agyMonHudPopDismissInstalled) {
-        window.__agyMonHudPopDismissInstalled = true;
-        window.__agyMonHudPopDocClick = function(ev) {
-          var p = document.getElementById(POP_ID);
-          if (!p) return;
-          var h = document.getElementById(HUD_ID);
-          if (p.contains(ev.target) || (h && h.contains(ev.target))) return;
-          closePopover();
-        };
-        window.__agyMonHudPopKeyDown = function(ev) {
-          if (ev.key === 'Escape') closePopover();
-        };
-        document.addEventListener('mousedown', window.__agyMonHudPopDocClick, true);
-        document.addEventListener('keydown', window.__agyMonHudPopKeyDown, true);
-      }
-    }
-
-    function findComposerAnchor() {
-      var vh = window.innerHeight || 0;
-      var vw = window.innerWidth || 0;
-      if (vh < 240 || vw < 320) return null;
-
-      var inputs = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]');
-      var bestInput = null;
-      var bestBottom = -1;
-      for (var i = 0; i < inputs.length; i++) {
-        var ir = inputs[i].getBoundingClientRect();
-        if (!ir || ir.width < 160 || ir.height < 16) continue;
-        if (ir.bottom < vh - 280 || ir.top > vh - 12) continue;
-        if (ir.bottom > bestBottom) {
-          bestBottom = ir.bottom;
-          bestInput = inputs[i];
-        }
-      }
-      if (!bestInput) return null;
-
-      var card = bestInput;
-      var chosenBtn = null;
-      var cardRect = null;
-      var MODE_RE = /turbo|planning|fast|auto|strict|review|proceed|sandbox|permission|ask|极速|规划|快速|自动|严格|审查|权限/i;
-      var MIC_RE = /microphone|voice|dictate|speech|audio|麦克风|语音/i;
-      var SEND_RE = /send|stop|submit|cancel|发送|停止/i;
-
-      for (var up = 0; up < 6 && card && card.parentElement && card.parentElement !== document.body; up++) {
-        card = card.parentElement;
-        var cr = card.getBoundingClientRect();
-        if (cr.height < 52 || cr.height > 360 || cr.width < 200) continue;
-        var btns = card.querySelectorAll('button');
-        if (btns.length < 3) continue;
-
-        var modeBtn = null, micBtn = null, sendBtn = null;
-        var rightRowBtns = [];
-        for (var bi = 0; bi < btns.length; bi++) {
-          var b = btns[bi];
-          if (b.closest && b.closest('#' + HUD_ID)) continue;
-          var br = b.getBoundingClientRect();
-          if (!br || br.width < 14 || br.height < 14 || br.top < cr.top + cr.height * 0.35) continue;
-          rightRowBtns.push({ el: b, r: br });
-          var label = ((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')).trim();
-          if (!modeBtn && MODE_RE.test(label) && br.width <= 170) modeBtn = b;
-          else if (!micBtn && MIC_RE.test(label) && br.width <= 56) micBtn = b;
-          else if (!sendBtn && SEND_RE.test(label) && br.width <= 56) sendBtn = b;
-        }
-
-        // If Turbo collapsed into an unlabeled shield icon directly to the left of Mic, anchor before it
-        if (!modeBtn && micBtn) {
-          var mr = micBtn.getBoundingClientRect();
-          var mcy = (mr.top + mr.bottom) / 2;
-          for (var ri = 0; ri < rightRowBtns.length; ri++) {
-            var cand = rightRowBtns[ri];
-            if (cand.el === micBtn) continue;
-            var ccy = (cand.r.top + cand.r.bottom) / 2;
-            if (Math.abs(ccy - mcy) <= 12 && cand.r.right <= mr.left + 2 && mr.left - cand.r.right <= 24 && cand.r.width <= 52) {
-              modeBtn = cand.el;
-              break;
-            }
-          }
-        }
-
-        chosenBtn = modeBtn || micBtn || sendBtn;
-        if (chosenBtn) {
-          cardRect = cr;
-          break;
-        }
-      }
-
-      if (!chosenBtn || !chosenBtn.parentElement) return null;
-      return { parent: chosenBtn.parentElement, before: chosenBtn, cardWidth: cardRect ? cardRect.width : 0 };
-    }
-
-    function isBadHeaderTitle(txt) {
-      if (!txt || txt.length < 2 || txt.length > 120) return true;
-      if (txt.indexOf('[AGY_PROGRESS') >= 0) return true;
-      var low = txt.toLowerCase();
-      if (low === 'antigravity' || low === 'workspace' || low === 'view' || low === 'window' || low === 'swarm' || low === 'agy 控制台') return true;
-      return false;
-    }
-
-    function readActiveView() {
-      var vh = window.innerHeight || 0;
-      var vw = window.innerWidth || 0;
-      if (vh < 240 || vw < 320) return null;
-      var nodes = document.querySelectorAll('header *, nav *, [role="banner"] *, button, span, div');
-      var parts = [];
-      for (var i = 0; i < nodes.length && parts.length < 28; i++) {
-        var el = nodes[i];
-        if (el.children && el.children.length > 0) continue;
-        var txt = (el.textContent || '').trim();
-        if (!txt || txt.length > 140) continue;
-        var r = el.getBoundingClientRect();
-        if (!r || r.top < 18 || r.bottom > 86 || r.left < 150 || r.right > vw - 90 || r.height > 40) continue;
-        parts.push({ x: r.left, text: txt });
-      }
-      parts.sort(function(a, b) { return a.x - b.x; });
-      for (var p = 0; p < parts.length; p++) {
-        var s = parts[p].text;
-        var low = s.toLowerCase();
-        if (low === 'new conversation' || low === '新建对话') {
-          return { workspace: '', title: s, isNewConversation: true };
-        }
-        var idx = s.indexOf(' / ');
-        if (idx > 0 && idx < s.length - 3) {
-          var t1 = s.slice(idx + 3).trim();
-          if (!isBadHeaderTitle(t1)) {
-            return { workspace: s.slice(0, idx).trim(), title: t1, isNewConversation: false };
-          }
-        }
-        if (s === '/' && p + 1 < parts.length) {
-          var t2 = parts[p + 1].text;
-          if (!isBadHeaderTitle(t2)) {
-            return { workspace: p > 0 ? parts[p - 1].text : '', title: t2, isNewConversation: false };
-          }
-        }
-      }
-      return null;
-    }
-
-    window.__agyMonHudLatestData = data;
-    var anchor = findComposerAnchor();
-    var hud = document.getElementById(HUD_ID);
-    var focused = typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
-    var dirtyPatch = window.__agyMonHudDisplayDirty || null;
-    if (dirtyPatch) window.__agyMonHudDisplayDirty = null;
-
-    if (!anchor) {
-      if (hud && hud.parentNode) hud.parentNode.removeChild(hud);
-      closePopover();
-      return { hudInjected: false, activeView: readActiveView(), focused: focused, displayPatch: dirtyPatch };
-    }
-
-    if (!hud) {
-      hud = document.createElement('div');
-      hud.id = HUD_ID;
-
-      var ringPill = document.createElement('button');
-      ringPill.type = 'button';
-      ringPill.className = 'agy-hud-ring-pill';
-      ringPill.title = '点击选择底部显示项';
-      ringPill.innerHTML =
-        '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">' +
-          '<circle cx="8" cy="8" r="6" fill="none" stroke="rgba(255,255,255,0.24)" stroke-width="2"></circle>' +
-          '<circle class="agy-hud-arc" cx="8" cy="8" r="6" fill="none" stroke="#5b8cff" stroke-width="2" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="37.7" stroke-dashoffset="37.7" style="opacity:0"></circle>' +
-        '</svg>' +
-        '<span class="agy-hud-pct">0%</span>';
-      ringPill.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        togglePopover(hud);
-      });
-
-      var metaPill = document.createElement('button');
-      metaPill.type = 'button';
-      metaPill.className = 'agy-hud-meta-pill';
-      metaPill.title = '点击选择底部显示项';
-      metaPill.innerHTML =
-        '<span class="agy-hud-speed">-- tok/s</span>' +
-        '<span class="agy-hud-dot agy-hud-dot-1">·</span>' +
-        '<span class="agy-hud-cache">缓存 --</span>' +
-        '<span class="agy-hud-dot agy-hud-dot-2">·</span>' +
-        '<span class="agy-hud-model">--</span>';
-      metaPill.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        togglePopover(hud);
-      });
-
-      var emptyPill = document.createElement('button');
-      emptyPill.type = 'button';
-      emptyPill.className = 'agy-hud-empty-pill';
-      emptyPill.title = '点击选择底部显示项';
-      emptyPill.textContent = '···';
-      emptyPill.addEventListener('click', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        togglePopover(hud);
-      });
-
-      hud.appendChild(ringPill);
-      hud.appendChild(metaPill);
-      hud.appendChild(emptyPill);
-    }
-
-    if (hud.parentElement !== anchor.parent || hud.nextSibling !== anchor.before) {
-      anchor.parent.insertBefore(hud, anchor.before);
-    }
-
-    var rawPct = Math.max(0, Math.min(999, Math.round(Number(data.percent) || 0)));
-    var clampedArcPct = Math.min(100, rawPct);
-    var arcColor = rawPct >= 90 ? '#ef5350' : (rawPct >= 75 ? '#e99315' : (data.accent || '#5b8cff'));
-    var circ = 2 * Math.PI * 6;
-    var offset = circ * (1 - clampedArcPct / 100);
-    var arc = hud.querySelector('.agy-hud-arc');
-    if (arc) {
-      arc.setAttribute('stroke', arcColor);
-      arc.setAttribute('stroke-dashoffset', offset.toFixed(2));
-      arc.style.opacity = rawPct > 0 ? '1' : '0';
-    }
-    var pctEl = hud.querySelector('.agy-hud-pct');
-    if (pctEl) pctEl.textContent = rawPct + '%';
-
-    var speedEl = hud.querySelector('.agy-hud-speed');
-    if (speedEl) {
-      if (typeof data.tokPerSec === 'number' && data.tokPerSec > 0) {
-        speedEl.textContent = (data.tokPerSec >= 100 ? Math.round(data.tokPerSec) : data.tokPerSec.toFixed(1)) + ' tok/s';
-      } else {
-        speedEl.textContent = '-- tok/s';
-      }
-    }
-    var cacheEl = hud.querySelector('.agy-hud-cache');
-    if (cacheEl) {
-      cacheEl.textContent = typeof data.cacheHitPct === 'number' ? ('缓存 ' + data.cacheHitPct + '%') : '缓存 --';
-    }
-    var modelEl = hud.querySelector('.agy-hud-model');
-    if (modelEl) {
-      modelEl.textContent = data.upstreamModelId || '--';
-    }
-
-    // Measure full composer card width rather than the narrow button-group flex wrapper
-    var effectiveWidth = anchor.cardWidth || (anchor.parent.getBoundingClientRect ? anchor.parent.getBoundingClientRect().width : 0);
-    window.__agyMonHudLastCardWidth = effectiveWidth;
-    applyHudDisplayToDom(hud, effectiveWidth);
-    refreshPopoverContents();
-
-    if (!window.__agyMonHudObserver && typeof MutationObserver === 'function' && document.body) {
-      var hudObsTimer = null;
-      var hudObs = new MutationObserver(function() {
-        if (document.getElementById(HUD_ID)) return;
-        if (hudObsTimer) return;
-        hudObsTimer = setTimeout(function() {
-          hudObsTimer = null;
-          var nextAnchor = findComposerAnchor();
-          if (nextAnchor && hud && hud.parentElement !== nextAnchor.parent) {
-            nextAnchor.parent.insertBefore(hud, nextAnchor.before);
-          }
-        }, 40);
-      });
-      hudObs.observe(document.body, { childList: true, subtree: true });
-      window.__agyMonHudObserver = hudObs;
-    }
-
-    return { hudInjected: true, activeView: readActiveView(), focused: focused, displayPatch: dirtyPatch };
+    return window.__agyMonitorNativeHud.sync(data);
   })(${safePayload})`;
 }
 
 function buildRemoveHudExpr() {
   return `(function(){
+    try {
+      if (window.__agyMonitorNativeHud && typeof window.__agyMonitorNativeHud.dispose === 'function') {
+        window.__agyMonitorNativeHud.dispose();
+      }
+    } catch (e) {}
     if (window.__agyMonHudObserver) {
       try { window.__agyMonHudObserver.disconnect(); } catch (e) {}
       delete window.__agyMonHudObserver;
@@ -1966,63 +1171,87 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       return false;
     }
 
-    const nextPort = clampInt(port, 1024, 65535, DEFAULT_CDP_PORT);
-    if (wslProxy && wslProxy.targetPort !== nextPort) {
-      closeWslProxy();
+    const configuredPort = clampInt(port, 1024, 65535, DEFAULT_CDP_PORT);
+    if (paths?.disableLiveCdp === true) {
+      activePort = configuredPort;
+      lastError = '测试隔离环境已跳过本机实时 CDP 探测';
+      return false;
     }
-    activePort = nextPort;
+    const devToolsPort = await readDevToolsActivePort(paths).catch(() => 0);
+    const candidatePorts = [configuredPort];
+    if (devToolsPort >= 1024 && devToolsPort <= 65535 && devToolsPort !== configuredPort) {
+      candidatePorts.push(devToolsPort);
+    }
     const hostInfo = detectWindowsHostEnv();
 
     let targets = [];
     let wsRewriteHost = '';
     let wsRewritePort = 0;
+    let connectedPort = configuredPort;
+    let directHttpStatus = 0;
+    let connectedOk = false;
 
-    // Tier 1: Direct loopback (native Windows, WSL2 mirrored mode, or manual port forwarding)
-    const directRes = await fetchTargetsFrom('127.0.0.1', activePort, hostInfo.isWsl ? 300 : 450);
-    if (directRes.ok) {
-      targets = directRes.targets;
-      activeTransport = 'direct';
-    } else if (hostInfo.isWsl && hostInfo.hasWindowsHost) {
-      // Tier 2: WSL2 NAT zero-config Interop tunnel (reaches Windows 127.0.0.1:<port> with zero firewall/admin config)
-      if (!wslProxy) {
-        wslProxy = await createWslCdpLocalProxy(activePort, { hostInfo }).catch(() => null);
+    for (const candPort of candidatePorts) {
+      if (wslProxy && wslProxy.targetPort !== candPort) {
+        closeWslProxy();
       }
-      let tunnelOk = false;
-      if (wslProxy && wslProxy.localPort > 0) {
-        const tunRes = await fetchTargetsFrom('127.0.0.1', wslProxy.localPort, 1800);
-        if (tunRes.ok) {
-          targets = tunRes.targets;
-          wsRewriteHost = '127.0.0.1';
-          wsRewritePort = wslProxy.localPort;
-          activeTransport = 'wsl_tunnel';
-          tunnelOk = true;
+      // Tier 1: Direct loopback (native Windows, WSL2 mirrored mode, or manual port forwarding)
+      const directRes = await fetchTargetsFrom('127.0.0.1', candPort, hostInfo.isWsl ? 300 : 450);
+      if (directRes.ok) {
+        targets = directRes.targets;
+        activeTransport = 'direct';
+        connectedPort = candPort;
+        connectedOk = true;
+        break;
+      }
+      if (directRes.status > 0) directHttpStatus = directRes.status;
+
+      if (hostInfo.isWsl && hostInfo.hasWindowsHost) {
+        // Tier 2: WSL2 NAT zero-config Interop tunnel
+        if (!wslProxy) {
+          wslProxy = await createWslCdpLocalProxy(candPort, { hostInfo }).catch(() => null);
         }
-      }
-
-      // Tier 3: Fallback to WSL2 NAT Windows gateway IP (if user bound --remote-debugging-address=0.0.0.0)
-      if (!tunnelOk) {
-        const gwIp = resolveWslGatewayIp();
-        if (gwIp) {
-          const gwRes = await fetchTargetsFrom(gwIp, activePort, 450);
-          if (gwRes.ok) {
-            targets = gwRes.targets;
-            wsRewriteHost = gwIp;
-            wsRewritePort = activePort;
-            activeTransport = 'wsl_gateway';
+        let tunnelOk = false;
+        if (wslProxy && wslProxy.localPort > 0) {
+          const tunRes = await fetchTargetsFrom('127.0.0.1', wslProxy.localPort, 1800);
+          if (tunRes.ok) {
+            targets = tunRes.targets;
+            wsRewriteHost = '127.0.0.1';
+            wsRewritePort = wslProxy.localPort;
+            activeTransport = 'wsl_tunnel';
+            connectedPort = candPort;
             tunnelOk = true;
           }
         }
+        // Tier 3: Fallback to WSL2 NAT Windows gateway IP
+        if (!tunnelOk) {
+          const gwIp = resolveWslGatewayIp();
+          if (gwIp) {
+            const gwRes = await fetchTargetsFrom(gwIp, candPort, 450);
+            if (gwRes.ok) {
+              targets = gwRes.targets;
+              wsRewriteHost = gwIp;
+              wsRewritePort = candPort;
+              activeTransport = 'wsl_gateway';
+              connectedPort = candPort;
+              tunnelOk = true;
+            }
+          }
+        }
+        if (tunnelOk) {
+          connectedOk = true;
+          break;
+        }
       }
+    }
 
-      if (!tunnelOk) {
-        lastError = `未检测到 Windows 侧 CDP 端口 ${activePort}（WSL2 NAT 已自动启用桥接，请用调试参数启动 Windows 版 Antigravity）`;
-        return false;
-      }
-    } else {
-      lastError =
-        directRes.status > 0
-          ? `CDP 端口 ${activePort} 返回 HTTP ${directRes.status}`
-          : `未检测到本地 CDP 端口 ${activePort}`;
+    activePort = connectedPort;
+    if (!connectedOk) {
+      lastError = hostInfo.isWsl && hostInfo.hasWindowsHost
+        ? `未检测到 Windows 侧 CDP 端口 ${configuredPort}（WSL2 NAT 已自动启用桥接，请用调试参数或持久化注入重启 Antigravity）`
+        : directHttpStatus > 0
+          ? `CDP 端口 ${configuredPort} 返回 HTTP ${directHttpStatus}`
+          : `未检测到本地 CDP 端口 ${configuredPort}`;
       return false;
     }
 
@@ -2095,41 +1324,45 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     if (!view || !paths?.hudActiveViewFile) return;
     if (sessions.size > 1 && !focused) return;
     const isNewConv = Boolean(view.isNewConversation);
+    const convId = typeof view.convId === 'string' ? view.convId.trim() : '';
     const title = String(view.title || '').trim();
     const workspace = String(view.workspace || '').trim();
-    if (!isNewConv && (!title || title.length < 2)) return;
-    const key = isNewConv ? '__new_conversation__' : `${workspace}|${title}`;
+    if (!isNewConv && !convId && (!title || title.length < 2)) return;
+    const key = isNewConv ? '__new_conversation__' : `${convId}|${workspace}|${title}`;
     if (key === lastActiveViewKey) return;
 
     // Preserve recent explicit sidecar_focus selections from being clobbered by title-only DOM reads
-    try {
-      const existingRaw = await fsp.readFile(paths.hudActiveViewFile, 'utf8');
-      const existing = JSON.parse(existingRaw);
-      if (
-        existing &&
-        existing.source === 'sidecar_focus' &&
-        typeof existing.conversationId === 'string' &&
-        existing.conversationId.trim()
-      ) {
-        const ageMs = Date.now() - Number(existing.updatedAtMs || 0);
-        if (ageMs >= 0 && ageMs < 3000) {
-          return;
+    if (!convId) {
+      try {
+        const existingRaw = await fsp.readFile(paths.hudActiveViewFile, 'utf8');
+        const existing = JSON.parse(existingRaw);
+        if (
+          existing &&
+          existing.source === 'sidecar_focus' &&
+          typeof existing.conversationId === 'string' &&
+          existing.conversationId.trim()
+        ) {
+          const ageMs = Date.now() - Number(existing.updatedAtMs || 0);
+          if (ageMs >= 0 && ageMs < 3000) {
+            return;
+          }
+          if (!isNewConv && String(existing.title || '').trim().toLowerCase() === title.toLowerCase()) {
+            lastActiveViewKey = key;
+            return;
+          }
         }
-        if (!isNewConv && String(existing.title || '').trim().toLowerCase() === title.toLowerCase()) {
-          lastActiveViewKey = key;
-          return;
-        }
+      } catch {
+        // ignore missing/corrupt active view file
       }
-    } catch {
-      // ignore missing/corrupt active view file
     }
 
     lastActiveViewKey = key;
     await atomicWriteJson(paths.hudActiveViewFile, {
+      ...(convId ? { conversationId: convId, convId } : {}),
       workspace,
       title,
       isNewConversation: isNewConv,
-      source: 'cdp_header',
+      source: convId ? 'native_dom_route' : 'cdp_header',
       updatedAtMs: Date.now(),
     }).catch(() => {});
   };
@@ -2165,9 +1398,14 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }
 
     const accent = latestThemes?.colors?.accent || '#5b8cff';
+    const bubbleColor = latestThemes?.colors?.bubble || '#212533';
+    const hostBlendPct = clampInt(latestThemes?.hostBlendPct, 5, 42, 25);
     const displayCfg = await readHudDisplayConfig();
     const guideDataUri = await resolveGuideImageDataUri();
-    const expr = buildHudSyncExpr(latestHudData || {}, accent, displayCfg, guideDataUri);
+    const expr = buildHudSyncExpr(latestHudData || {}, accent, displayCfg, guideDataUri, {
+      bubbleColor,
+      hostBlendPct,
+    });
     let anyInjected = false;
     let latestPatch = null;
     await Promise.allSettled(
@@ -2244,8 +1482,34 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }
   };
 
-  const probeSessionMarkers = async (needCss, needI18n) => {
-    const probeExpr = `(function(){ return { hasCss: Boolean(document.getElementById(${JSON.stringify(STYLE_ELEMENT_ID)})), hasI18n: Boolean(window.__agyHostI18nApplied) }; })()`;
+  const wantDomHudFor = (themes = latestThemes) =>
+    Boolean(themes && themes.hudEnabled !== false && themes.hudInjectionMode !== 'uia');
+
+  const isNativeMainProcessAlive = () => {
+    try {
+      return readNativeHudHeartbeat(paths).alive;
+    } catch {
+      return false;
+    }
+  };
+
+  const isNativeWallpaperAlive = () => {
+    try {
+      return Boolean(readNativeHudHeartbeat(paths).wallpaperAlive);
+    } catch {
+      return false;
+    }
+  };
+
+  const wantCdpCssFor = (themes = latestThemes) => {
+    if (!themes || !themes.backdropEnabled || !themes.activeWallpaperId) return false;
+    if (themes.hostThemeMode === 'cdp') return true;
+    const isInject = themes.hostThemeMode === 'inject' || !themes.hostThemeMode;
+    return isInject && !isNativeWallpaperAlive();
+  };
+
+  const probeSessionMarkers = async (needCss, needI18n, needHud) => {
+    const probeExpr = `(function(){ return { hasCss: Boolean(document.getElementById(${JSON.stringify(STYLE_ELEMENT_ID)})), hasI18n: Boolean(window.__agyHostI18nApplied), hasHud: Boolean(window.__agyMonitorNativeHud && document.getElementById('agy-monitor-native-hud')) }; })()`;
     let needsResync = false;
     await Promise.allSettled(
       [...sessions.values()].map(async (entry) => {
@@ -2261,6 +1525,10 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
           entry.hostLocalized = false;
           needsResync = true;
         }
+        if (needHud && !val.hasHud) {
+          entry.hudInjected = false;
+          needsResync = true;
+        }
       }),
     );
     return needsResync;
@@ -2270,8 +1538,13 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     if (wantCdp && !retryTimer && !disposed) {
       retryTimer = setInterval(() => {
         if (disposed || !latestThemes) return;
+        const wantHud = wantDomHudFor(latestThemes);
+        const isCdpMode = latestThemes.hostThemeMode === 'cdp';
+        const needCss = wantCdpCssFor(latestThemes);
         const stillWant =
-          latestThemes.hostThemeMode === 'cdp' ||
+          isCdpMode ||
+          needCss ||
+          wantHud ||
           (hasOpenSessions() && latestHostLanguage === 'zh-CN');
         if (!stillWant) {
           clearInterval(retryTimer);
@@ -2279,19 +1552,23 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
           return;
         }
         retryTickCount += 1;
-        const needCss =
-          latestThemes.hostThemeMode === 'cdp' &&
-          Boolean(latestThemes.backdropEnabled) &&
-          Boolean(latestThemes.activeWallpaperId);
         const needI18n = latestHostLanguage === 'zh-CN';
-        if (!hasOpenSessions() || (needCss && !isAnyStyleApplied()) || (needI18n && !isAnyHostLocalized())) {
+        const needCdpHud = wantHud && !isNativeMainProcessAlive();
+        if (!hasOpenSessions()) {
+          // Avoid noisy reconnect loops every 2s when native main-process already handles HUD & wallpaper
+          if (isCdpMode || needCss || needCdpHud || retryTickCount % 6 === 0) {
+            void sync(latestThemes, { hostLanguage: latestHostLanguage });
+          }
+          return;
+        }
+        if ((needCss && !isAnyStyleApplied()) || (needI18n && !isAnyHostLocalized()) || (needCdpHud && !isHudInjected())) {
           void sync(latestThemes, { hostLanguage: latestHostLanguage });
           return;
         }
         // Periodically detect newly opened windows & Ctrl+R page reloads whose DOM lost injected nodes
         if (retryTickCount % 3 === 0) {
           void (async () => {
-            const lostMarkers = await probeSessionMarkers(needCss, needI18n);
+            const lostMarkers = await probeSessionMarkers(needCss, needI18n, needCdpHud);
             if (disposed || !latestThemes) return;
             if (lostMarkers) {
               await sync(latestThemes, { hostLanguage: latestHostLanguage });
@@ -2315,7 +1592,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     if (wantCdp && !hudTickTimer && !disposed) {
       hudTickTimer = setInterval(() => {
         if (disposed || !hasOpenSessions()) return;
-        if (latestThemes?.hostThemeMode === 'cdp') {
+        const wantHud = wantDomHudFor(latestThemes);
+        if (wantHud && (latestThemes?.hostThemeMode === 'cdp' || !isNativeMainProcessAlive())) {
           void syncHudAll();
         }
       }, 900);
@@ -2328,7 +1606,10 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
 
   const updateHudData = async (hudPayload) => {
     latestHudData = hudPayload || null;
-    if (disposed || !hasOpenSessions() || latestThemes?.hostThemeMode !== 'cdp') return false;
+    if (disposed || !hasOpenSessions() || !wantDomHudFor(latestThemes)) return false;
+    if (latestThemes?.hostThemeMode !== 'cdp' && isNativeMainProcessAlive()) {
+      return true;
+    }
     return await syncHudAll();
   };
 
@@ -2339,21 +1620,25 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       latestHostLanguage = options.hostLanguage;
     }
     const port = clampInt(themes.cdpPort, 1024, 65535, DEFAULT_CDP_PORT);
-    if (port !== activePort && sessions.size > 0) {
-      await restoreHostI18nAll().catch(() => {});
-      await removeCssAll().catch(() => {});
-      await removeHudAll().catch(() => {});
-      closeAllSessions();
+    if (port !== activePort && sessions.size > 0 && !options.keepConnectedPort) {
+      const devToolsPort = await readDevToolsActivePort(paths).catch(() => 0);
+      if (activePort !== devToolsPort) {
+        await restoreHostI18nAll().catch(() => {});
+        if (!(themes.hostThemeMode === 'inject' && isNativeWallpaperAlive())) {
+          await removeCssAll().catch(() => {});
+        }
+        await removeHudAll().catch(() => {});
+        closeAllSessions();
+      }
     }
-    activePort = port;
     await ensureCdpLauncher(paths, port);
 
     const isCdpMode = themes.hostThemeMode === 'cdp';
-    const wantCdpCss =
-      isCdpMode &&
-      Boolean(themes.backdropEnabled) &&
-      Boolean(themes.activeWallpaperId);
-    const shouldConnect = isCdpMode || Boolean(options.probeForLang) || hasOpenSessions();
+    const isInjectMode = themes.hostThemeMode === 'inject' || !themes.hostThemeMode;
+    const nativeWpAlive = isNativeWallpaperAlive();
+    const wantDomHud = wantDomHudFor(themes);
+    const wantCdpCss = wantCdpCssFor(themes);
+    const shouldConnect = isCdpMode || wantCdpCss || wantDomHud || Boolean(options.probeForLang) || hasOpenSessions();
 
     if (!shouldConnect) {
       ensureLoops(false);
@@ -2361,7 +1646,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }
 
     const ok = await ensureConnected(port);
-    ensureLoops(isCdpMode || (hasOpenSessions() && latestHostLanguage === 'zh-CN'));
+    ensureLoops(isCdpMode || wantCdpCss || wantDomHud || (hasOpenSessions() && latestHostLanguage === 'zh-CN'));
     if (!ok) {
       return getStatus(themes);
     }
@@ -2370,16 +1655,18 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       if (wantCdpCss) {
         const dataUri = await resolveWallpaperDataUri(themes);
         if (!dataUri) {
-          await removeCssAll();
+          if (!(isInjectMode && nativeWpAlive)) {
+            await removeCssAll();
+          }
         } else {
           const css = buildCdpThemeCss(themes, dataUri);
           await applyCssAll(css);
         }
-      } else {
+      } else if (!(isInjectMode && nativeWpAlive && Boolean(themes.backdropEnabled) && Boolean(themes.activeWallpaperId))) {
         await removeCssAll();
       }
 
-      if (isCdpMode) {
+      if (wantDomHud) {
         await syncHudAll();
       } else {
         await removeHudAll();
@@ -2442,8 +1729,12 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     disposed = true;
     ensureLoops(false);
     await restoreHostI18nAll().catch(() => {});
-    await removeCssAll().catch(() => {});
-    await removeHudAll().catch(() => {});
+    if (!(latestThemes?.hostThemeMode === 'inject' && isNativeWallpaperAlive())) {
+      await removeCssAll().catch(() => {});
+    }
+    if (!isNativeMainProcessAlive()) {
+      await removeHudAll().catch(() => {});
+    }
     closeAllSessions();
     closeWslProxy();
   };

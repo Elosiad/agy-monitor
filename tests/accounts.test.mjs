@@ -8,9 +8,16 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   ACCOUNT_EXPORT_SCHEMA,
+  ANTIGRAVITY_OAUTH_SCOPES,
+  NATIVE_OAUTH_USER_AGENT,
+  WINDOWS_CRED_MAX_BLOB_BYTES,
+  buildAuthorizationUrl,
   buildCleanLaunchEnv,
+  buildCockpitCredentialPayload,
   createAccountManager,
+  detectLocalAntigravityVersion,
   fetchCloudCodeQuotaForCredential,
+  formatRfc3339Micros,
   inspectQuotaExhaustion,
   isFiveHourQuotaExhausted,
   mapModelToQuotaGroup,
@@ -1383,7 +1390,7 @@ test('refreshAccessTokenForCredential auto-matches JWT aud & falls back across c
   );
 });
 
-test('proactive background token renewal, live vault sync, and pre-switch auto-refresh keep credentials fresh', async (t) => {
+test('conservative default skips inactive background polling, live vault sync & opt-in renewal work, and pre-switch injects exact Cockpit payload', async (t) => {
   let fakeNow = Date.parse('2026-11-24T08:00:00Z');
   const { paths, storage, driver, quotaClient, sidecarBridge } = createFixture(t, {
     liveCred: {
@@ -1402,6 +1409,7 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
 
   const remoteCalls = [];
   const preSwitchCalls = [];
+  const backupIdToken = makeFakeJwt({ email: 'backup@gmail.com' });
   const mgr = createAccountManager({
     paths,
     storage,
@@ -1410,7 +1418,7 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
     driver,
     now: () => fakeNow,
     remoteQuotaFetcher: async (credObj, opts) => {
-      remoteCalls.push({ email: credObj.id_token_email, preferredClientId: opts.preferredClientId });
+      remoteCalls.push({ refreshToken: credObj?.token?.refresh_token, preferredClientId: opts.preferredClientId });
       const nextExpMs = opts.nowMs + 3600_000;
       return {
         ok: true,
@@ -1424,14 +1432,15 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
           token: {
             ...credObj.token,
             access_token: `ya29.bg_renewed_${remoteCalls.length}`,
-            expiry: new Date(nextExpMs).toISOString(),
+            expiry: formatRfc3339Micros(nextExpMs),
           },
+          id_token: backupIdToken,
         },
         renewed: true,
       };
     },
     tokenRefresher: async (credObj, opts) => {
-      preSwitchCalls.push({ email: credObj.id_token_email, preferredClientId: opts.preferredClientId });
+      preSwitchCalls.push({ refreshToken: credObj?.token?.refresh_token, preferredClientId: opts.preferredClientId });
       const nextExpMs = opts.nowMs + 3600_000;
       return {
         accessToken: 'ya29.preswitch_fresh_token',
@@ -1439,24 +1448,25 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
         matchedClientId: '222222222222-right.apps.googleusercontent.com',
         expiryMs: nextExpMs,
         credObj: {
-          ...credObj,
           token: {
-            ...credObj.token,
             access_token: 'ya29.preswitch_fresh_token',
-            expiry: new Date(nextExpMs).toISOString(),
+            token_type: 'Bearer',
+            refresh_token: credObj.token.refresh_token,
+            expiry: formatRfc3339Micros(nextExpMs),
           },
+          auth_method: 'consumer',
+          id_token: backupIdToken,
         },
       };
     },
     onBeforeHostClose: async () => {},
   });
 
-  // Set a long 60-min quota refresh interval so we prove proactive token renewal runs independently
-  await mgr.updateAccountSettings({ quotaRefreshIntervalMin: 60 });
+  // Default settings MUST be conservative (backgroundRefreshInactive = false)
   const capActive = await mgr.captureCurrentAccount();
   assert.equal(capActive.ok, true);
 
-  // Import a backup account whose token expires in 6 minutes (inside the 10-min proactive renew window)
+  // Import a backup account whose token expires in 6 minutes (inside 15-min skew)
   const imp = await mgr.importAccounts({
     rawInput: JSON.stringify({
       email: 'backup@gmail.com',
@@ -1468,32 +1478,39 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
           expiry: new Date(fakeNow + 6 * 60_000).toISOString(),
         },
         auth_method: 'consumer',
-        id_token_email: 'backup@gmail.com',
+        id_token: backupIdToken,
       },
     }),
   });
   assert.equal(imp.ok, true);
   const backupId = imp.accounts[0].id;
 
-  // Initial lifecycle tick triggers scheduled refresh + proactively renews expiring backup token
+  // Under conservative default, lifecycle tick MUST make ZERO background remote calls for inactive accounts!
+  await mgr.updateAccountSettings({ quotaRefreshIntervalMin: 60 });
+  await mgr.runLifecycleTick();
+  assert.equal(remoteCalls.length, 0, 'Default conservative mode must NOT batch-poll inactive accounts in background');
+
+  // Explicitly opting into backgroundRefreshInactive=true enables background renewal
+  await mgr.updateAccountSettings({ quotaRefreshIntervalMin: 60, backgroundRefreshInactive: true });
+  fakeNow += 61 * 60_000;
   await mgr.runLifecycleTick();
   assert.equal(remoteCalls.length, 1);
 
   const expAfterBg = await mgr.exportAccountJson(backupId);
   assert.equal(expAfterBg.data.credential.token.access_token, 'ya29.bg_renewed_1');
 
-  // Advance clock by 52 minutes (still < 60 min quota interval, but backup token now expires in 8 min!)
-  fakeNow += 52 * 60_000;
-  // Also simulate language_server refreshing the active account's live credential in Windows Credential Manager
+  // Advance clock by 50 minutes (still < 60 min quota interval, backup expires in 10 min <= 15-min window)
+  fakeNow += 50 * 60_000;
+  // Simulate language_server refreshing the active account's live credential in Windows Credential Manager
   driver.setLive({
     credObj: {
       token: {
         access_token: 'ya29.active_live_renewed',
+        token_type: 'Bearer',
         refresh_token: '1//0eACTIVE_RT_11111111',
-        expiry: new Date(fakeNow + 55 * 60_000).toISOString(),
+        expiry: formatRfc3339Micros(fakeNow + 55 * 60_000),
       },
       auth_method: 'consumer',
-      id_token_email: 'active@gmail.com',
     },
   });
   await mgr.syncActiveAccountQuotaFromLive(makeSampleQuota(75, 90, 100, fakeNow + 3600_000), {
@@ -1502,7 +1519,7 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
   const expActive = await mgr.exportAccountJson(capActive.account.id);
   assert.equal(expActive.data.credential.token.access_token, 'ya29.active_live_renewed');
 
-  // Between scheduled quota cycles, proactive background renewal kicks in for backup@gmail.com
+  // Opt-in proactive background renewal kicks in for backup@gmail.com
   await mgr.runLifecycleTick();
   assert.equal(remoteCalls.length, 2);
   assert.equal(remoteCalls[1].preferredClientId, '222222222222-right.apps.googleusercontent.com');
@@ -1516,6 +1533,230 @@ test('proactive background token renewal, live vault sync, and pre-switch auto-r
   const tx = driver.launchedTxs[0];
   const sealedPayload = fs.readFileSync(tx.payloadFile, 'utf8');
   const plainPayload = JSON.parse(await driver.unprotectSecret(sealedPayload));
+  assert.equal('credentialUserScope' in plainPayload, false, 'Cockpit switch payload must not mutate credentialUserScope');
   const injectedCred = JSON.parse(plainPayload.credJson);
+  assert.equal(injectedCred.auth_method, 'consumer');
+  assert.equal(injectedCred.id_token, backupIdToken);
   assert.equal(injectedCred.token.access_token, 'ya29.preswitch_fresh_token');
+  assert.equal(injectedCred.token.token_type, 'Bearer');
+  assert.match(injectedCred.token.expiry, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
+  assert.equal('id_token_email' in injectedCred, false);
+  assert.equal('expires_in' in injectedCred.token, false);
+});
+
+test('Cockpit parity: credential payload cap, OAuth headers/scopes, invalid_grant retry & abort, single-flight lock, and AgyAccountTool guards', async (t) => {
+  // 1. Exact Cockpit compositeTokenStorage payload & 2560-byte Windows CredWriteW guard
+  const sampleJwt = makeFakeJwt({ email: 'cockpit@gmail.com' });
+  const built = buildCockpitCredentialPayload(
+    {
+      token: {
+        access_token: 'ya29.abc',
+        refresh_token: '1//0eCOCKPIT_RT',
+        token_type: 'Bearer',
+        expiry: '2026-11-25T12:00:00Z',
+        expires_in: 3600,
+        id_token: sampleJwt,
+      },
+      auth_method: 'oauth',
+      id_token_email: 'cockpit@gmail.com',
+      writer_id: 'legacy',
+    },
+    { nowMs: Date.parse('2026-11-25T11:00:00Z') },
+  );
+  assert.equal(built.idTokenOmittedForSize, false);
+  assert.ok(built.byteLength <= WINDOWS_CRED_MAX_BLOB_BYTES);
+  assert.deepEqual(Object.keys(built.payload).sort(), ['auth_method', 'id_token', 'token']);
+  assert.deepEqual(Object.keys(built.payload.token).sort(), [
+    'access_token',
+    'expiry',
+    'refresh_token',
+    'token_type',
+  ]);
+  assert.equal(built.payload.auth_method, 'consumer');
+  assert.equal(built.payload.id_token, sampleJwt);
+  assert.equal(built.payload.token.expiry, '2026-11-25T12:00:00.000000Z');
+
+  // Oversized id_token is dropped cleanly so CredWriteW never exceeds 2560 bytes
+  const hugeBuilt = buildCockpitCredentialPayload({
+    token: {
+      access_token: 'ya29.abc',
+      refresh_token: '1//0eCOCKPIT_RT',
+      expiry: '2026-11-25T12:00:00Z',
+    },
+    id_token: 'x'.repeat(2600),
+  });
+  assert.equal(hugeBuilt.idTokenOmittedForSize, true);
+  assert.ok(hugeBuilt.byteLength <= WINDOWS_CRED_MAX_BLOB_BYTES);
+  assert.equal('id_token' in hugeBuilt.payload, false);
+
+  // Oversized base token without id_token fails fast before closing Antigravity
+  assert.throws(
+    () =>
+      buildCockpitCredentialPayload({
+        token: { access_token: 'a'.repeat(2600), refresh_token: '1//0eRT' },
+      }),
+    /ANTIGRAVITY_WINDOWS_CREDENTIAL_TOO_LARGE/,
+  );
+
+  // 2. Cockpit OAuth scopes (openid + aicode) and consent URL params
+  assert.ok(ANTIGRAVITY_OAUTH_SCOPES.includes('openid'));
+  assert.ok(ANTIGRAVITY_OAUTH_SCOPES.includes('https://www.googleapis.com/auth/aicode'));
+  const authUrl = new URL(
+    buildAuthorizationUrl({
+      clientId: 'cid.apps.googleusercontent.com',
+      redirectUri: 'http://127.0.0.1:12345/oauth-callback',
+      state: 'st',
+      codeChallenge: 'cc',
+    }),
+  );
+  assert.equal(authUrl.searchParams.get('include_granted_scopes'), 'true');
+  assert.equal(authUrl.searchParams.get('prompt'), 'consent');
+  assert.ok(authUrl.searchParams.get('scope').includes('openid'));
+  assert.ok(authUrl.searchParams.get('scope').includes('https://www.googleapis.com/auth/aicode'));
+
+  // 3. OAuth refresh sends native Cockpit User-Agent and retries invalid_grant once
+  const seenHeaders = [];
+  let attemptCount = 0;
+  const retryFetch = async (_url, opts) => {
+    seenHeaders.push(opts?.headers || {});
+    attemptCount += 1;
+    if (attemptCount === 1) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => JSON.stringify({ error: 'invalid_grant', error_description: 'transient' }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'ya29.recovered_after_retry',
+        expires_in: 3600,
+        token_type: 'Bearer',
+        id_token: sampleJwt,
+      }),
+    };
+  };
+  const retried = await refreshAccessTokenForCredential(
+    { token: { refresh_token: '1//0eRETRY_RT', expiry: '1970-01-01T00:00:00Z' } },
+    {
+      fetchImpl: retryFetch,
+      nowMs: Date.parse('2026-11-25T10:00:00Z'),
+      invalidGrantRetryMs: 1,
+      oauthClient: { clientId: 'cid.apps.googleusercontent.com', clientSecret: 'sec' },
+    },
+  );
+  assert.equal(attemptCount, 2);
+  assert.equal(retried.accessToken, 'ya29.recovered_after_retry');
+  assert.equal(retried.credObj.id_token, sampleJwt);
+  assert.equal(seenHeaders[0]['user-agent'], NATIVE_OAUTH_USER_AGENT);
+
+  // 4. Pre-switch INVALID_GRANT aborts cleanly without closing Antigravity, and single-flight blocks concurrent clicks
+  const fx = createFixture(t);
+  let releaseBlocker;
+  const blocker = new Promise((resolve) => {
+    releaseBlocker = resolve;
+  });
+  let mode = 'invalid_grant';
+  const mgr = createAccountManager({
+    paths: fx.paths,
+    storage: fx.storage,
+    quotaClient: fx.quotaClient,
+    sidecarBridge: fx.sidecarBridge,
+    driver: fx.driver,
+    tokenRefresher: async (credObj) => {
+      if (mode === 'invalid_grant') {
+        const err = new Error('OAuth 凭据已被撤销');
+        err.code = 'INVALID_GRANT';
+        err.status = 401;
+        throw err;
+      }
+      await blocker;
+      return {
+        accessToken: 'ya29.ok',
+        renewed: true,
+        expiryMs: Date.now() + 3600_000,
+        credObj: {
+          token: {
+            access_token: 'ya29.ok',
+            token_type: 'Bearer',
+            refresh_token: credObj.token.refresh_token,
+            expiry: formatRfc3339Micros(Date.now() + 3600_000),
+          },
+          auth_method: 'consumer',
+        },
+      };
+    },
+    onBeforeHostClose: async () => {},
+  });
+
+  const imp = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'revoked@gmail.com',
+      refresh_token: '1//0eREVOKED_RT_1234567890',
+    }),
+  });
+  const accId = imp.accounts[0].id;
+
+  // Revoked token -> abort switch cleanly, zero switch daemon launched!
+  const aborted = await mgr.switchAccount({ accountId: accId, autoResume: false });
+  assert.equal(aborted.ok, false);
+  assert.equal(aborted.status, 401);
+  assert.equal(aborted.code, 'INVALID_GRANT');
+  assert.equal(fx.driver.launchedTxs.length, 0);
+
+  // Single-flight gate: 2nd concurrent switch returns 409 while 1st is in flight
+  mode = 'block';
+  const firstSwitchPromise = mgr.switchAccount({ accountId: accId, autoResume: false });
+  await new Promise((r) => setTimeout(r, 15));
+  const secondSwitch = await mgr.switchAccount({ accountId: accId, autoResume: false });
+  assert.equal(secondSwitch.ok, false);
+  assert.equal(secondSwitch.status, 409);
+  releaseBlocker();
+  const firstSwitch = await firstSwitchPromise;
+  assert.equal(firstSwitch.ok, true);
+  assert.equal(fx.driver.launchedTxs.length, 1);
+
+  // Pure Cockpit live credential without id_token / id_token_email still resolves current account via refreshTokenHash
+  fx.driver.setLive({
+    credObj: {
+      token: {
+        access_token: 'ya29.ok',
+        token_type: 'Bearer',
+        refresh_token: '1//0eREVOKED_RT_1234567890',
+        expiry: formatRfc3339Micros(Date.now() + 3600_000),
+      },
+      auth_method: 'consumer',
+    },
+  });
+  const listed = await mgr.listAccounts();
+  assert.equal(listed.currentEmail, 'revoked@gmail.com');
+  assert.equal(listed.accounts[0].isCurrent, true);
+
+  // 5. Dynamic Antigravity IDE version detection never drops below 2.25.0
+  const ideVer = detectLocalAntigravityVersion();
+  assert.match(ideVer, /^\d+\.\d+\.\d+/);
+
+  // 6. Static guards on AgyAccountTool.cs (Cockpit dual-write, 2560B cap, taskkill /T, no app_storage/scope tampering on switch)
+  const csSource = fs.readFileSync(
+    path.resolve(process.cwd(), 'sidecars/agy_monitor/accounts/AgyAccountTool.cs'),
+    'utf8',
+  );
+  assert.ok(csSource.includes('CRED_MAX_CREDENTIAL_BLOB_SIZE = 5 * 512'));
+  assert.ok(csSource.includes('jetski-standalone-oauth-token'));
+  assert.ok(csSource.includes('antigravity-cli'));
+  assert.ok(csSource.includes('antigravity-oauth-token'));
+  assert.ok(csSource.includes('taskkill.exe'));
+  assert.ok(csSource.includes('"/PID " + pid + " /T"'));
+  // Extract normal switch branch (`else { ... }` after `else if (mode == "rollback")`) and strip comments
+  const switchBranchStart = csSource.indexOf('string credTarget = GetString(payload, "credTarget"');
+  const switchBranchEnd = csSource.indexOf('UpdateTxFile(txPath, tx, "relaunching"', switchBranchStart);
+  assert.ok(switchBranchStart > 0 && switchBranchEnd > switchBranchStart);
+  const switchBranchCode = csSource
+    .slice(switchBranchStart, switchBranchEnd)
+    .replace(/\/\/[^\r\n]*/g, '');
+  assert.equal(switchBranchCode.includes('ApplyAppStorageUsername'), false);
+  assert.equal(switchBranchCode.includes('credential-user-scope'), false);
+  assert.equal(switchBranchCode.includes('credentialUserScope'), false);
 });
