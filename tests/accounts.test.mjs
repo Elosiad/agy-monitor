@@ -11,9 +11,12 @@ import {
   ANTIGRAVITY_OAUTH_SCOPES,
   NATIVE_OAUTH_USER_AGENT,
   WINDOWS_CRED_MAX_BLOB_BYTES,
+  buildAccountStatus,
   buildAuthorizationUrl,
   buildCleanLaunchEnv,
   buildCockpitCredentialPayload,
+  buildVerificationLaunchUrl,
+  classifyAccountError,
   createAccountManager,
   detectLocalAntigravityVersion,
   fetchCloudCodeQuotaForCredential,
@@ -22,12 +25,14 @@ import {
   isFiveHourQuotaExhausted,
   mapModelToQuotaGroup,
   normalizeAccountSettings,
+  parseGoogleCloudCodeError,
   parseImportPayload,
   parseQuotaExhaustedStepError,
   parseWindowsProxyServer,
   refreshAccessTokenForCredential,
   requestOverProxy,
   resolveSystemProxyUrl,
+  sanitizeValidationUrl,
   selectBestAutoSwitchCandidate,
   shouldBypassProxy,
 } from '../sidecars/agy_monitor/backend/accounts.mjs';
@@ -1759,4 +1764,415 @@ test('Cockpit parity: credential payload cap, OAuth headers/scopes, invalid_gran
   assert.equal(switchBranchCode.includes('ApplyAppStorageUsername'), false);
   assert.equal(switchBranchCode.includes('credential-user-scope'), false);
   assert.equal(switchBranchCode.includes('credentialUserScope'), false);
+});
+
+test('abnormal account handling classifies verification, banned, RT expired, AT expired, blocks auto-switch, and disables abnormal accounts', async (t) => {
+  const nowMs = Date.parse('2026-11-24T12:00:00Z');
+
+  // 1. Validation URL sanitization strictly allows Google https URLs only
+  assert.equal(
+    sanitizeValidationUrl('https://accounts.google.com/v3/signin/challenge?id=1'),
+    'https://accounts.google.com/v3/signin/challenge?id=1',
+  );
+  assert.equal(sanitizeValidationUrl('https://evil.example/phish'), '');
+  assert.equal(sanitizeValidationUrl('javascript:alert(1)'), '');
+
+  // 2. CloudCode error parsing for VALIDATION_REQUIRED, ACCOUNT_BANNED, AT_EXPIRED, SUBSCRIPTION_REQUIRED
+  const verifyErr = parseGoogleCloudCodeError(
+    403,
+    JSON.stringify({
+      error: {
+        message: 'Please verify your account before continuing.',
+        details: [
+          {
+            reason: 'VALIDATION_REQUIRED',
+            metadata: { validation_url: 'https://accounts.google.com/verify?token=abc' },
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(verifyErr.code, 'VALIDATION_REQUIRED');
+  assert.equal(verifyErr.validationUrl, 'https://accounts.google.com/verify?token=abc');
+  assert.equal(classifyAccountError(verifyErr).badge, '需验证');
+
+  const bannedErr = parseGoogleCloudCodeError(
+    403,
+    JSON.stringify({
+      error: {
+        message: 'This account has been suspended due to Terms of Service violation.',
+        details: [{ reason: 'ACCOUNT_DISABLED' }],
+      },
+    }),
+  );
+  assert.equal(bannedErr.code, 'ACCOUNT_BANNED');
+  assert.equal(classifyAccountError(bannedErr).badge, '已封禁');
+  assert.equal(classifyAccountError(bannedErr).state, 'error');
+
+  // Banned account that ALSO includes an appeal_url must still classify as ACCOUNT_BANNED (not VALIDATION_REQUIRED)
+  const bannedWithAppealErr = parseGoogleCloudCodeError(
+    403,
+    JSON.stringify({
+      error: {
+        message: 'This account has been suspended due to Terms of Service violation.',
+        details: [
+          {
+            reason: 'ACCOUNT_DISABLED',
+            metadata: { appeal_url: 'https://accounts.google.com/appeal?id=ban123' },
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(bannedWithAppealErr.code, 'ACCOUNT_BANNED');
+  assert.equal(bannedWithAppealErr.validationUrl, 'https://accounts.google.com/appeal?id=ban123');
+  assert.equal(
+    classifyAccountError({
+      message: 'Account has been suspended',
+      validationUrl: 'https://accounts.google.com/appeal?id=ban123',
+    }).code,
+    'ACCOUNT_BANNED',
+  );
+
+  const atErr = parseGoogleCloudCodeError(
+    401,
+    JSON.stringify({ error: { status: 'UNAUTHENTICATED', message: 'Invalid authentication credentials' } }),
+  );
+  assert.equal(atErr.code, 'AT_EXPIRED');
+  assert.equal(classifyAccountError(atErr).badge, 'AT 过期');
+
+  // Docs link like request-license must classify as SUBSCRIPTION_REQUIRED (not VALIDATION_REQUIRED)
+  const licenseErr = parseGoogleCloudCodeError(
+    403,
+    JSON.stringify({
+      error: {
+        message: 'Gemini Code Assist license required',
+        details: [{ links: [{ url: 'https://cloud.google.com/gemini/docs/codeassist/request-license' }] }],
+      },
+    }),
+  );
+  assert.equal(licenseErr.code, 'SUBSCRIPTION_REQUIRED');
+  assert.equal(licenseErr.validationUrl, '');
+  assert.equal(classifyAccountError(licenseErr).badge, '无订阅');
+
+  // 3. OAuth refresh distinguishes ACCOUNT_BANNED vs RT_EXPIRED vs AT_EXPIRED (missing RT)
+  const oauthClient = {
+    clientId: 'test-client-abnormal.apps.googleusercontent.com',
+    clientSecret: 'test-secret-abnormal',
+  };
+  await assert.rejects(
+    () =>
+      refreshAccessTokenForCredential(
+        { token: { refresh_token: '1//0eBANNED_RT', expiry: '1970-01-01T00:00:00Z' } },
+        {
+          oauthClient,
+          nowMs,
+          fetchImpl: async () => ({
+            ok: false,
+            status: 400,
+            text: async () => JSON.stringify({ error: 'invalid_grant', error_description: 'Account has been disabled.' }),
+          }),
+        },
+      ),
+    (err) => err.code === 'ACCOUNT_BANNED' && err.status === 403,
+  );
+
+  await assert.rejects(
+    () =>
+      refreshAccessTokenForCredential(
+        { token: { refresh_token: '1//0eEXPIRED_RT', expiry: '1970-01-01T00:00:00Z' } },
+        {
+          oauthClient,
+          nowMs,
+          fetchImpl: async () => ({
+            ok: false,
+            status: 400,
+            text: async () => JSON.stringify({ error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }),
+          }),
+        },
+      ),
+    (err) => err.code === 'RT_EXPIRED' && err.status === 401,
+  );
+
+  await assert.rejects(
+    () =>
+      refreshAccessTokenForCredential(
+        { token: { access_token: 'ya29.only_at_expired', expiry: new Date(nowMs - 60_000).toISOString() } },
+        { oauthClient, nowMs },
+      ),
+    (err) => err.code === 'AT_EXPIRED' && err.status === 401,
+  );
+
+  // 4. Passive AT_EXPIRED detection via buildAccountStatus
+  const passiveAtWithRt = buildAccountStatus({ tokenExpiryMs: nowMs - 10_000, hasRefreshToken: true }, nowMs, false);
+  assert.equal(passiveAtWithRt.code, 'AT_EXPIRED');
+  assert.equal(passiveAtWithRt.badge, 'AT 过期');
+  assert.equal(passiveAtWithRt.blocking, false);
+
+  const passiveAtNoRt = buildAccountStatus({ tokenExpiryMs: nowMs - 10_000, hasRefreshToken: false }, nowMs, false);
+  assert.equal(passiveAtNoRt.code, 'AT_EXPIRED');
+  assert.equal(passiveAtNoRt.blocking, true);
+
+  // 5. Auto-switch strictly skips banned / verification-required / RT-expired / missing-RT accounts
+  const picked = selectBestAutoSwitchCandidate(
+    [
+      { id: 'a1', email: 'banned@gmail.com', enabled: true, authErrorCode: 'ACCOUNT_BANNED', quota: makeSampleQuota(100, 100, 100, nowMs + 3600_000) },
+      { id: 'a2', email: 'verify@gmail.com', enabled: true, authErrorCode: 'VALIDATION_REQUIRED', quota: makeSampleQuota(100, 100, 100, nowMs + 3600_000) },
+      { id: 'a3', email: 'rtexp@gmail.com', enabled: true, authErrorCode: 'RT_EXPIRED', quota: makeSampleQuota(100, 100, 100, nowMs + 3600_000) },
+      { id: 'a5', email: 'nort@gmail.com', enabled: true, hasRefreshToken: false, quota: makeSampleQuota(100, 100, 100, nowMs + 3600_000) },
+      { id: 'a4', email: 'healthy@gmail.com', enabled: true, quota: makeSampleQuota(55, 70, 100, nowMs + 3600_000) },
+    ],
+    { currentEmail: 'cur@gmail.com', targetGroupKey: 'gemini', nowMs },
+  );
+  assert.equal(picked?.id, 'a4');
+
+  // 5.5 fetchCloudCodeQuotaForCredential short-circuits immediately on SUBSCRIPTION_REQUIRED from retrieveUserQuotaSummary
+  let subCalls = 0;
+  await assert.rejects(
+    () =>
+      fetchCloudCodeQuotaForCredential(
+        {
+          token: {
+            access_token: 'ya29.valid_at_sub_test',
+            refresh_token: '1//0eSUB_RT',
+            expiry: new Date(nowMs + 3600_000).toISOString(),
+          },
+        },
+        {
+          cachedProjectId: 'proj-cached-sub',
+          nowMs,
+          fetchImpl: async () => {
+            subCalls += 1;
+            return {
+              ok: false,
+              status: 403,
+              text: async () =>
+                JSON.stringify({
+                  error: {
+                    message: 'Gemini Code Assist license required',
+                    details: [{ links: [{ url: 'https://cloud.google.com/gemini/docs/codeassist/request-license' }] }],
+                  },
+                }),
+            };
+          },
+        },
+      ),
+    (err) => err.code === 'SUBSCRIPTION_REQUIRED',
+  );
+  assert.equal(subCalls, 1);
+
+  // 6. End-to-end persistence in manager + openAccountValidationUrl + disableAbnormalAccounts + recovery clearing
+  const { paths, storage, driver, quotaClient, sidecarBridge } = createFixture(t, {
+    liveCred: {
+      credObj: {
+        token: { access_token: 'ya29.cur', refresh_token: '1//0eCUR_RT', expiry: new Date(nowMs + 3600_000).toISOString() },
+        auth_method: 'consumer',
+        id_token_email: 'cur@gmail.com',
+      },
+    },
+    quotaPayload: makeSampleQuota(80, 90, 100, nowMs + 3600_000),
+  });
+
+  let modeByEmail = {
+    'needverify@gmail.com': 'verify',
+    'bannedacc@gmail.com': 'banned',
+    'rtexpired@gmail.com': 'rt_expired',
+    'goodacc@gmail.com': 'ok',
+  };
+
+  let remoteQuotaCalls = 0;
+  let renewAtCalls = 0;
+  const mgr = createAccountManager({
+    paths,
+    storage,
+    quotaClient,
+    sidecarBridge,
+    driver,
+    now: () => nowMs,
+    remoteQuotaFetcher: async (credObj) => {
+      remoteQuotaCalls += 1;
+      const rt = String(credObj?.token?.refresh_token || '');
+      const emailKey = rt.startsWith('1//0e_') ? rt.slice('1//0e_'.length) : credObj.id_token_email;
+      const m = modeByEmail[emailKey] || 'ok';
+      if (m === 'verify') throw verifyErr;
+      if (m === 'banned') throw bannedErr;
+      if (m === 'rt_expired') {
+        const e = new Error('Refresh Token (RT) 已过期或被撤销');
+        e.status = 401;
+        e.code = 'RT_EXPIRED';
+        throw e;
+      }
+      return {
+        ok: true,
+        quota: makeSampleQuota(90, 95, 100, nowMs + 3600_000),
+        projectId: 'proj-ok',
+        source: 'retrieveUserQuotaSummary',
+        tokenExpiryMs: nowMs + 3600_000,
+        updatedCredObj: credObj,
+        renewed: false,
+      };
+    },
+    tokenRefresher: async (credObj, opts) => {
+      renewAtCalls += 1;
+      const rt = String(credObj?.token?.refresh_token || '');
+      const emailKey = rt.startsWith('1//0e_') ? rt.slice('1//0e_'.length) : credObj.id_token_email;
+      const m = modeByEmail[emailKey] || 'ok';
+      if (m === 'rt_expired') {
+        const e = new Error('Refresh Token (RT) 已过期或被撤销');
+        e.status = 401;
+        e.code = 'RT_EXPIRED';
+        throw e;
+      }
+      const nextExp = opts.nowMs + 3600_000;
+      return {
+        accessToken: 'ya29.at_only_renewed',
+        renewed: true,
+        matchedClientId: 'test-client-at.apps.googleusercontent.com',
+        expiryMs: nextExp,
+        credObj: {
+          ...credObj,
+          token: {
+            ...credObj.token,
+            access_token: 'ya29.at_only_renewed',
+            expiry: formatRfc3339Micros(nextExp),
+          },
+        },
+      };
+    },
+  });
+
+  const capCur = await mgr.captureCurrentAccount();
+  assert.equal(capCur.ok, true);
+  assert.equal(capCur.account.hasRefreshToken, true);
+
+  const imp = await mgr.importAccounts({
+    rawInput: JSON.stringify(
+      ['needverify@gmail.com', 'bannedacc@gmail.com', 'rtexpired@gmail.com', 'goodacc@gmail.com'].map((email) => ({
+        email,
+        credential: {
+          token: { access_token: 'ya29.x', refresh_token: `1//0e_${email}`, expiry: new Date(nowMs + 3600_000).toISOString() },
+          auth_method: 'consumer',
+          id_token_email: email,
+        },
+      })),
+    ),
+  });
+  assert.equal(imp.ok, true);
+  const byEmail = Object.fromEntries(imp.accounts.map((a) => [a.email, a.id]));
+
+  const rVerify = await mgr.refreshAccountQuota(byEmail['needverify@gmail.com']);
+  assert.equal(rVerify.ok, false);
+  assert.equal(rVerify.code, 'VALIDATION_REQUIRED');
+  assert.equal(rVerify.account.accountStatus.badge, '需验证');
+  assert.equal(rVerify.account.accountStatus.validationUrl, 'https://accounts.google.com/verify?token=abc');
+
+  const rBanned = await mgr.refreshAccountQuota(byEmail['bannedacc@gmail.com']);
+  assert.equal(rBanned.ok, false);
+  assert.equal(rBanned.code, 'ACCOUNT_BANNED');
+  assert.equal(rBanned.account.accountStatus.badge, '已封禁');
+
+  const rRt = await mgr.refreshAccountQuota(byEmail['rtexpired@gmail.com']);
+  assert.equal(rRt.ok, false);
+  assert.equal(rRt.code, 'RT_EXPIRED');
+  assert.equal(rRt.account.accountStatus.badge, 'RT 过期');
+
+  const rGood = await mgr.refreshAccountQuota(byEmail['goodacc@gmail.com']);
+  assert.equal(rGood.ok, true);
+  assert.equal(rGood.account.accountStatus.code, 'OK');
+
+  // Open validation URL routes accounts.google.com verify links through AccountChooser with target Email
+  const wrappedSample = buildVerificationLaunchUrl(
+    'https://accounts.google.com/v3/signin/continue?plt=TOK123&authuser',
+    'needverify@gmail.com',
+  );
+  assert.ok(wrappedSample.startsWith('https://accounts.google.com/AccountChooser?'));
+  assert.ok(wrappedSample.includes('Email=needverify%40gmail.com'));
+  assert.ok(wrappedSample.includes('authuser%3Dneedverify%2540gmail.com') || wrappedSample.includes('continue='));
+
+  let openedValidationUrl = '';
+  const openRes = await mgr.openAccountValidationUrl(byEmail['needverify@gmail.com'], {
+    openExternal: (u) => {
+      openedValidationUrl = u;
+      return true;
+    },
+  });
+  assert.equal(openRes.ok, true);
+  assert.ok(openedValidationUrl.startsWith('https://accounts.google.com/AccountChooser?'));
+  assert.ok(openedValidationUrl.includes('Email=needverify%40gmail.com'));
+  assert.ok(openedValidationUrl.includes(encodeURIComponent('https://accounts.google.com/verify?token=abc')));
+
+  // Switching into confirmed ACCOUNT_BANNED (422) or RT_EXPIRED (401 via pre-switch verify) is refused before touching Antigravity
+  const swBanned = await mgr.switchAccount({ accountId: byEmail['bannedacc@gmail.com'], autoResume: false });
+  assert.equal(swBanned.ok, false);
+  assert.equal(swBanned.status, 422);
+  const swRt = await mgr.switchAccount({ accountId: byEmail['rtexpired@gmail.com'], autoResume: false });
+  assert.equal(swRt.ok, false);
+  assert.equal(swRt.status, 401);
+  assert.equal(driver.launchedTxs.length, 0);
+
+  // One-click AT-only renewal: imports an AT-expired account with valid RT and renews ONLY via OAuth (zero CloudCode calls)
+  const impAtExp = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'atexpired@gmail.com',
+      credential: {
+        token: {
+          access_token: 'ya29.old_expired_at',
+          refresh_token: '1//0e_atexpired@gmail.com',
+          expiry: new Date(nowMs - 600_000).toISOString(),
+        },
+        auth_method: 'consumer',
+      },
+    }),
+  });
+  assert.equal(impAtExp.ok, true);
+  const atExpiredId = impAtExp.accounts[0].id;
+  assert.equal(impAtExp.accounts[0].accountStatus.code, 'AT_EXPIRED');
+  assert.equal(impAtExp.accounts[0].accountStatus.blocking, false);
+
+  const remoteBeforeAtRenew = remoteQuotaCalls;
+  const renewBeforeAtRenew = renewAtCalls;
+  const rAtRenew = await mgr.renewAccountAccessToken(atExpiredId);
+  assert.equal(rAtRenew.ok, true);
+  assert.equal(rAtRenew.renewed, true);
+  assert.equal(rAtRenew.mode, 'oauth_at_only');
+  assert.equal(rAtRenew.account.accountStatus.code, 'OK');
+  assert.equal(renewAtCalls, renewBeforeAtRenew + 1);
+  assert.equal(remoteQuotaCalls, remoteBeforeAtRenew); // ZERO CloudCode quota calls!
+  const expAtRenewed = await mgr.exportAccountJson(atExpiredId);
+  assert.equal(expAtRenewed.data.credential.token.access_token, 'ya29.at_only_renewed');
+
+  // AT-only renewal on revoked RT accurately persists RT_EXPIRED
+  const rAtRevoked = await mgr.renewAccountAccessToken(byEmail['rtexpired@gmail.com']);
+  assert.equal(rAtRevoked.ok, false);
+  assert.equal(rAtRevoked.code, 'RT_EXPIRED');
+  assert.equal(rAtRevoked.account.accountStatus.code, 'RT_EXPIRED');
+
+  // Disable all blocking abnormal accounts in one shot without disabling healthy/current accounts
+  const disRes = await mgr.disableAbnormalAccounts();
+  assert.equal(disRes.ok, true);
+  assert.equal(disRes.disabledCount, 3);
+  assert.equal(disRes.accounts.find((a) => a.email === 'goodacc@gmail.com').enabled, true);
+  assert.equal(disRes.accounts.find((a) => a.email === 'cur@gmail.com').enabled, true);
+  assert.equal(disRes.accounts.find((a) => a.email === 'bannedacc@gmail.com').enabled, false);
+
+  // syncActiveAccountQuotaFromLive clears stale abnormal errors on active account even if token hasn't rotated
+  const idxPath = paths.accountsIndexFile;
+  const idxMut = JSON.parse(fs.readFileSync(idxPath, 'utf8'));
+  const curRow = idxMut.accounts.find((a) => a.email === 'cur@gmail.com');
+  curRow.authError = 'stale transient error';
+  curRow.authErrorCode = 'NETWORK_ERROR';
+  curRow.authErrorAtMs = nowMs - 60_000;
+  fs.writeFileSync(idxPath, JSON.stringify(idxMut, null, 2), 'utf8');
+  await mgr.syncActiveAccountQuotaFromLive(makeSampleQuota(82, 91, 100, nowMs + 3600_000), { skipAutoSwitch: true });
+  const afterSyncList = await mgr.listAccounts();
+  const curAfterSync = afterSyncList.accounts.find((a) => a.email === 'cur@gmail.com');
+  assert.equal(curAfterSync.accountStatus.code, 'OK');
+  assert.equal(curAfterSync.authError, undefined);
+
+  // When verification completes and refresh succeeds, abnormal error clears cleanly
+  modeByEmail['needverify@gmail.com'] = 'ok';
+  const rRecovered = await mgr.refreshAccountQuota(byEmail['needverify@gmail.com']);
+  assert.equal(rRecovered.ok, true);
+  assert.equal(rRecovered.account.accountStatus.code, 'OK');
+  assert.equal(rRecovered.account.authError, undefined);
 });

@@ -2391,10 +2391,53 @@ export function createMonitorHandlers({
       const result = await accounts.refreshAccountQuota(data.accountId);
       if (!result.ok) {
         return errorResponse(ResponseCtor, result.status || 400, result.error || '刷新账号额度失败', {
+          code: result.code || '',
           account: result.account || null,
         });
       }
       return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/renew-at', async (data = {}) => {
+    try {
+      const result = await accounts.renewAccountAccessToken(data.accountId, {
+        forceRefresh: data.forceRefresh !== false,
+      });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '续签 Access Token 失败', {
+          code: result.code || '',
+          account: result.account || null,
+        });
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/open-validation-url', async (data = {}) => {
+    try {
+      const accountId = typeof data?.accountId === 'string' ? data.accountId : '';
+      const fallbackUrl = typeof data?.fallbackUrl === 'string' ? data.fallbackUrl : '';
+      const copyOnly = Boolean(data?.copyOnly);
+      const result = await accounts.openAccountValidationUrl(accountId, { fallbackUrl, copyOnly });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '打开验证链接失败', {
+          validationUrl: result.validationUrl || '',
+        });
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 400, err);
+    }
+  });
+
+  register('POST', '/api/accounts/disable-abnormal', async () => {
+    try {
+      return await accounts.disableAbnormalAccounts();
     } catch (err) {
       return errorResponse(ResponseCtor, err?.status || 500, err);
     }

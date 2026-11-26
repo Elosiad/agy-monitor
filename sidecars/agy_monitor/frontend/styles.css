@@ -7698,6 +7698,35 @@ body.host-backdrop-shared .mad-lightbox-img {
   opacity: 0.68;
 }
 
+.acc-item-card.is-abnormal-warn {
+  border-color: color-mix(in srgb, var(--accent-amber) 48%, var(--border-subtle));
+  background: color-mix(in srgb, var(--bg-surface) 84%, var(--accent-amber) 5%);
+}
+
+.acc-item-card.is-abnormal-error {
+  border-color: color-mix(in srgb, var(--accent-danger) 50%, var(--border-subtle));
+  background: color-mix(in srgb, var(--bg-surface) 84%, var(--accent-danger) 5%);
+}
+
+.acc-item-card.is-trigger-pulse {
+  animation: accCardPulse 0.56s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes accCardPulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-amber) 48%, transparent);
+    transform: scale(1);
+  }
+  35% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent-amber) 18%, transparent);
+    transform: scale(1.008);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    transform: scale(1);
+  }
+}
+
 .acc-item-head {
   display: flex;
   align-items: center;
@@ -7732,6 +7761,16 @@ body.host-backdrop-shared .mad-lightbox-img {
   background: var(--text-dim);
 }
 
+.acc-item-dot.is-warn {
+  background: var(--accent-amber);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent-amber) 72%, transparent);
+}
+
+.acc-item-dot.is-error {
+  background: var(--accent-danger);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent-danger) 76%, transparent);
+}
+
 .acc-item-email {
   font-size: 13px;
   font-weight: 600;
@@ -7762,6 +7801,283 @@ body.host-backdrop-shared .mad-lightbox-img {
   color: var(--text-muted);
   background: color-mix(in srgb, var(--bg-chrome) 72%, transparent);
   border: 1px solid var(--border-hairline);
+}
+
+.acc-badge.is-warn {
+  color: var(--accent-amber);
+  background: var(--accent-amber-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 42%, transparent);
+}
+
+.acc-badge.is-error {
+  color: var(--accent-danger);
+  background: var(--accent-danger-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 44%, transparent);
+}
+
+/* 账号异常状态筛选与批量操作栏 */
+.acc-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.acc-filter-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.acc-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--bg-surface) 74%, transparent);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.acc-filter-pill:hover {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+}
+
+.acc-filter-pill.is-active {
+  color: var(--accent-blue);
+  border-color: color-mix(in srgb, var(--accent-blue) 48%, transparent);
+  background: var(--accent-blue-bg);
+  font-weight: 600;
+}
+
+.acc-filter-pill.is-abnormal-tab.has-abnormal {
+  color: var(--accent-amber);
+  border-color: color-mix(in srgb, var(--accent-amber) 42%, transparent);
+}
+
+.acc-filter-pill.is-abnormal-tab.is-active {
+  color: var(--accent-danger);
+  border-color: color-mix(in srgb, var(--accent-danger) 48%, transparent);
+  background: var(--accent-danger-bg);
+}
+
+.acc-filter-count {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  opacity: 0.88;
+}
+
+.acc-filter-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.acc-filter-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--bg-control) 80%, transparent);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.acc-filter-action-btn:hover:not(:disabled) {
+  background: var(--bg-control-hover);
+  border-color: color-mix(in srgb, var(--accent-blue) 45%, var(--border-subtle));
+}
+
+.acc-filter-action-btn:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+}
+
+.acc-filter-action-btn.is-teal {
+  color: var(--accent-teal);
+  border-color: color-mix(in srgb, var(--accent-teal) 42%, transparent);
+  background: var(--accent-teal-bg);
+}
+
+.acc-filter-action-btn.is-teal:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-teal) 70%, transparent);
+}
+
+.acc-filter-action-btn.is-warn {
+  color: var(--accent-amber);
+  border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
+  background: var(--accent-amber-bg);
+}
+
+.acc-filter-action-btn.is-warn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-amber) 68%, transparent);
+}
+
+.acc-filter-action-btn.is-spinning svg {
+  animation: accSpin 0.9s linear infinite;
+}
+
+/* 单张账号卡内的异常详情提示条 */
+.acc-item-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  font-size: 11.2px;
+  line-height: 1.4;
+  animation: accAlertIn 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes accAlertIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.acc-item-alert.is-warn {
+  background: var(--accent-amber-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 36%, transparent);
+  color: var(--accent-amber);
+}
+
+.acc-item-alert.is-error {
+  background: var(--accent-danger-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 38%, transparent);
+  color: var(--accent-danger);
+}
+
+.acc-item-alert-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.acc-item-alert-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.acc-item-alert-text {
+  min-width: 0;
+  word-break: break-word;
+  color: var(--text-primary);
+}
+
+.acc-item-alert-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.acc-item-alert-btn.is-icon-only {
+  width: 23px;
+  padding: 0;
+  justify-content: center;
+}
+
+.acc-item-alert-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 23px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: color-mix(in srgb, var(--bg-surface) 74%, transparent);
+  color: inherit;
+  font-size: 10.8px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: transform 0.16s cubic-bezier(0.22, 1, 0.36, 1), background 0.16s ease, box-shadow 0.18s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.acc-item-alert-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--bg-surface) 94%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px color-mix(in srgb, currentColor 24%, transparent);
+}
+
+.acc-item-alert-btn:hover:not(:disabled) .acc-alert-arrow-icon {
+  transform: translate(1.5px, -1.5px);
+}
+
+.acc-item-alert-btn:active:not(:disabled) {
+  transform: scale(0.93);
+}
+
+.acc-item-alert-btn .acc-alert-arrow-icon {
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.acc-item-alert-btn.is-launching {
+  animation: accTriggerPulse 0.9s ease-in-out infinite;
+  opacity: 0.92;
+  cursor: wait;
+}
+
+.acc-item-alert-btn .acc-alert-spin-icon {
+  animation: accSpin 0.8s linear infinite;
+}
+
+.acc-item-alert-btn.is-done {
+  color: var(--accent-teal);
+  border-color: color-mix(in srgb, var(--accent-teal) 58%, transparent);
+  background: var(--accent-teal-bg);
+  animation: accBtnPop 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes accTriggerPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 42%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 0%, transparent);
+  }
+}
+
+@keyframes accBtnPop {
+  0% {
+    transform: scale(0.88);
+  }
+  55% {
+    transform: scale(1.06);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.acc-item-alert-btn:disabled:not(.is-launching) {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .acc-remark-chip {
