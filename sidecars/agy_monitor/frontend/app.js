@@ -18,6 +18,7 @@ import { createSessionsHub } from "./components/sessions_hub.js";
 import { createRuntimeBar } from "./components/runtime_bar.js";
 import { createMasteryHub } from "./components/mastery_hub.js";
 import { createAccountsHub } from "./components/accounts_hub.js";
+import { createOtherHub } from "./components/other_hub.js";
 import { createThemeStudio } from "./components/theme_studio.js";
 import { createChangelogModal } from "./components/changelog_modal.js";
 import { createMemoryModal } from "./components/memory_modal.js";
@@ -168,6 +169,7 @@ export function mountMonitorApp() {
     scope: "current",
     range: "today",
     etag: "",
+    quotaQueryEnabled: true,
     preferences: null,
     snapshot: null,
     configuredRulesTokens: 0,
@@ -234,6 +236,8 @@ export function mountMonitorApp() {
     components.accountsHub?.setTabActive?.(tabKey === "accounts");
     if (tabKey === "theme") {
       components.themeStudio?.refreshBackdropStatus?.();
+    } else if (tabKey === "other") {
+      void refreshPreferences();
     }
     mountedExtensions.forEach((ext) => ext?.onTabChange?.(tabKey));
   });
@@ -257,16 +261,50 @@ export function mountMonitorApp() {
     renderUpdateButtonUi?.();
   }
 
+  function applyQuotaQueryEnabled(nextEnabled, compliance = null, { fetchIfEnabled = false } = {}) {
+    const enabled = nextEnabled !== false;
+    state.quotaQueryEnabled = enabled;
+    if (state.preferences && typeof state.preferences === "object") {
+      state.preferences.quotaQueryEnabled = enabled;
+      if (compliance && typeof compliance === "object") {
+        state.preferences.quotaCompliance = compliance;
+      }
+    }
+    if (typeof document !== "undefined" && document.body) {
+      document.body.classList.toggle("is-quota-disabled", !enabled);
+    }
+    components.otherHub?.setQuotaEnabled?.(enabled, compliance);
+    components.accountsHub?.setQuotaEnabled?.(enabled);
+    const quotaPromise = components.quotaCards?.setEnabled?.(enabled, {
+      fetchNow: Boolean(fetchIfEnabled && enabled),
+    });
+    if (!enabled) {
+      mountedExtensions.forEach((ext) => ext?.onQuota?.(null));
+    }
+    if (state.preferences) {
+      mountedExtensions.forEach((ext) => ext?.onPreferences?.(state.preferences));
+    }
+    return quotaPromise;
+  }
+
   async function refreshPreferences() {
     try {
       const prefs = await fetchJson("/api/preferences");
       if (destroyed) return null;
       state.preferences = prefs;
+      const qEnabled = prefs.quotaQueryEnabled !== false;
+      state.quotaQueryEnabled = qEnabled;
+      if (typeof document !== "undefined" && document.body) {
+        document.body.classList.toggle("is-quota-disabled", !qEnabled);
+      }
       state.configuredRulesTokens = resolveConfiguredRulesTokens(prefs);
       components.contextPie?.setConfiguredRulesTokens?.(state.configuredRulesTokens);
       // AGY Console UI stays fixed in zh-CN; language setting exclusively controls Antigravity host UI via CDP.
       components.themeStudio?.update(prefs);
       components.modelAndPrompt?.update(prefs);
+      components.otherHub?.updateFromPreferences?.(prefs);
+      components.accountsHub?.setQuotaEnabled?.(qEnabled);
+      components.quotaCards?.setEnabled?.(qEnabled, { fetchNow: false });
       mountedExtensions.forEach((ext) => ext?.onPreferences?.(prefs));
       const dispId = state.displayConvId || state.snapshot?.activeConvId || state.lockedConvId || "";
       components.runtimeBar?.update(state.snapshot?.runtimeTelemetry, {
@@ -350,6 +388,13 @@ export function mountMonitorApp() {
           components.modelAndPrompt?.update({ availableModels: data.availableModels });
         }
 
+        if (
+          typeof data.quotaQueryEnabled === "boolean" &&
+          data.quotaQueryEnabled !== state.quotaQueryEnabled
+        ) {
+          void applyQuotaQueryEnabled(data.quotaQueryEnabled, null, { fetchIfEnabled: false });
+        }
+
         const effectiveCap =
           data.contextPie?.windowCap || state.preferences?.windowCap || 512000;
 
@@ -357,7 +402,9 @@ export function mountMonitorApp() {
           configuredRulesTokens: state.configuredRulesTokens,
         });
         components.tokenUsage?.update(data.tokenUsage);
-        components.quotaCards?.notifyTokenActivity?.(data.tokenUsage?.totalTokens);
+        if (state.quotaQueryEnabled) {
+          components.quotaCards?.notifyTokenActivity?.(data.tokenUsage?.totalTokens);
+        }
         components.sessionsHub?.update(data.sessionsHub, nextConvId);
         lastKnownActiveCount = Array.isArray(data.sessionsHub?.active)
           ? data.sessionsHub.active.length
@@ -432,6 +479,7 @@ export function mountMonitorApp() {
   components.quotaCards = createQuotaCards({
     apiFetch,
     t: translator,
+    deferStart: true,
     onQuotaUpdate: (quotaData) => {
       mountedExtensions.forEach((ext) => ext?.onQuota?.(quotaData));
     },
@@ -495,6 +543,15 @@ export function mountMonitorApp() {
 
   components.accountsHub = createAccountsHub({
     apiFetch,
+    onToast: showToast,
+  });
+
+  components.otherHub = createOtherHub({
+    apiFetch,
+    t: translator,
+    onQuotaEnabledChange: (nextEnabled, compliance) => {
+      void applyQuotaQueryEnabled(nextEnabled, compliance, { fetchIfEnabled: true });
+    },
     onToast: showToast,
   });
 
@@ -721,7 +778,9 @@ export function mountMonitorApp() {
     const onManualRefresh = () => {
       refreshPreferences();
       refreshSnapshot({ force: true, syncHud: true });
-      components.quotaCards?.refresh?.({ force: true });
+      if (state.quotaQueryEnabled) {
+        components.quotaCards?.refresh?.({ force: true });
+      }
       components.masteryHub?.refresh?.();
       components.accountsHub?.refresh?.({ silent: true });
       components.memoryModal?.refresh?.({ force: true });
@@ -904,7 +963,9 @@ export function mountMonitorApp() {
       state.etag = "";
       sendConsoleViewport({ force: true });
       refreshSnapshot({ force: false, syncHud: true });
-      components.quotaCards?.refresh?.({ force: false });
+      if (state.quotaQueryEnabled) {
+        components.quotaCards?.refresh?.({ force: false });
+      }
       startPolling();
     }
   };
@@ -921,7 +982,9 @@ export function mountMonitorApp() {
         state.etag = "";
         sendConsoleViewport({ force: false });
         refreshSnapshot({ force: false, syncHud: true });
-        components.quotaCards?.refresh?.({ force: false });
+        if (state.quotaQueryEnabled) {
+          components.quotaCards?.refresh?.({ force: false });
+        }
       }
     };
     const onWindowResize = () => {
@@ -986,9 +1049,13 @@ export function mountMonitorApp() {
     window.__agyMonitorMounted = true;
   }
   const readyPromise = Promise.all([
-    refreshPreferences(),
+    refreshPreferences().then((prefs) => {
+      const enabled = prefs ? prefs.quotaQueryEnabled !== false : true;
+      return applyQuotaQueryEnabled(enabled, prefs?.quotaCompliance || null, {
+        fetchIfEnabled: enabled,
+      });
+    }),
     refreshSnapshot({ force: true, syncHud: true }),
-    components.quotaCards?.refresh?.({ force: false }),
   ]).finally(() => {
     startPolling();
     if (!destroyed && updateStatusBtn) {

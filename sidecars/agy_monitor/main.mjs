@@ -69,7 +69,12 @@ import {
   queryTelemetrySnapshot,
 } from './backend/telemetry.mjs';
 import { createMemoryManager } from './backend/memory_manager.mjs';
-import { createQuotaClient } from './backend/quota.mjs';
+import {
+  createQuotaClient,
+  inspectOfficialStatusLine,
+  installOfficialStatusLineHook,
+  uninstallOfficialStatusLineHook,
+} from './backend/quota.mjs';
 import { createAccountManager, ensureAccountTool } from './backend/accounts.mjs';
 import {
   applyPluginUpdate,
@@ -158,6 +163,10 @@ const STATIC_ASSETS = new Map([
   [
     '/components/accounts_hub.js',
     { relPath: 'components/accounts_hub.js', contentType: 'application/javascript; charset=utf-8' },
+  ],
+  [
+    '/components/other_hub.js',
+    { relPath: 'components/other_hub.js', contentType: 'application/javascript; charset=utf-8' },
   ],
   [
     '/components/theme_studio.js',
@@ -684,7 +693,9 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     writeChain = writeChain.then(async () => {
       const pie = forceEmpty ? {} : (telemetry?.contextPie || {});
       const rt = forceEmpty ? {} : (telemetry?.runtimeTelemetry || {});
-      const cap = Number(pie.windowCap) || Number((await store?.getPrefs?.().catch(() => null))?.windowCap) || 512000;
+      const prefsForHud = await store?.getPrefs?.().catch(() => null);
+      const quotaQueryEnabled = prefsForHud?.quotaQueryEnabled !== false;
+      const cap = Number(pie.windowCap) || Number(prefsForHud?.windowCap) || 512000;
       const used = forceEmpty ? 0 : Math.max(0, Math.round(Number(pie.totalUsed) || 0));
       const percent = cap > 0 ? Math.max(0, Math.round((used / cap) * 100)) : 0;
       const tokPerSec =
@@ -721,7 +732,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       }
       const agentState =
         lastActiveSessionCount > 0 ? 'running' : lastUnreadSessionCount > 0 ? 'unread' : 'idle';
-      const q = lastQuotaSnapshot;
+      const q = quotaQueryEnabled ? lastQuotaSnapshot : null;
       const quotaGemini5h = q ? q.gemini5h : null;
       const quotaGeminiWeekly = q ? q.geminiWeekly : null;
       const quotaClaude5h = q ? q.claude5h : null;
@@ -756,6 +767,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
         activeSessionCount: lastActiveSessionCount,
         unreadSessionCount: lastUnreadSessionCount,
         agentState,
+        quotaQueryEnabled,
         quotaGemini5h,
         quotaGeminiWeekly,
         quotaClaude5h,
@@ -781,7 +793,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       const spSig = lastSessionProgress
         .map((s) => `${s.id}:${s.status}:${s.progress}:${s.content}`)
         .join(',');
-      const quotaSig = `${quotaGemini5h ?? ''}:${q?.gemini5hResetMs ?? ''}:${quotaGeminiWeekly ?? ''}:${q?.geminiWeeklyResetMs ?? ''}:${quotaClaude5h ?? ''}:${q?.claude5hResetMs ?? ''}:${quotaClaudeWeekly ?? ''}:${q?.claudeWeeklyResetMs ?? ''}`;
+      const quotaSig = `${quotaQueryEnabled ? 1 : 0}:${quotaGemini5h ?? ''}:${q?.gemini5hResetMs ?? ''}:${quotaGeminiWeekly ?? ''}:${q?.geminiWeeklyResetMs ?? ''}:${quotaClaude5h ?? ''}:${q?.claude5hResetMs ?? ''}:${quotaClaudeWeekly ?? ''}:${q?.claudeWeeklyResetMs ?? ''}`;
       const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${spSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
@@ -793,6 +805,14 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       }
     });
     return writeChain;
+  };
+
+  const clearQuotaSummary = () => {
+    lastQuotaSnapshot = null;
+    if (lastWrittenTelemetry) {
+      return writePayload(lastWrittenTelemetry, lastWrittenOpts || {});
+    }
+    return refreshFromDb();
   };
 
   const setQuotaSummary = (summary) => {
@@ -840,16 +860,22 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     }
     inFlight = true;
     try {
-      const [sessionsHub, prefs, liveQuota] = await Promise.all([
+      const [sessionsHub, prefs] = await Promise.all([
         querySessionsHub(paths.summariesDbPath, store, {}),
         store.getPrefs(),
-        quotaClient && typeof quotaClient.getQuotaSummary === 'function'
-          ? quotaClient.getQuotaSummary({ force: false }).catch(() => null)
-          : Promise.resolve(null),
       ]);
-      const compactQuota = extractCompactQuota(liveQuota);
-      if (compactQuota) {
-        lastQuotaSnapshot = compactQuota;
+      const quotaEnabled = prefs?.quotaQueryEnabled !== false;
+      const liveQuota =
+        quotaEnabled && quotaClient && typeof quotaClient.getQuotaSummary === 'function'
+          ? await quotaClient.getQuotaSummary({ force: false }).catch(() => null)
+          : null;
+      if (!quotaEnabled) {
+        lastQuotaSnapshot = null;
+      } else {
+        const compactQuota = extractCompactQuota(liveQuota);
+        if (compactQuota) {
+          lastQuotaSnapshot = compactQuota;
+        }
       }
       const allSelectable = Array.isArray(sessionsHub?.allSelectable) ? sessionsHub.allSelectable : [];
       const topLevelConvIds = allSelectable.map((s) => s.id).filter(Boolean);
@@ -899,6 +925,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     isActiveHostConv,
     resolveActiveConv,
     setQuotaSummary,
+    clearQuotaSummary,
     getQuotaSnapshot,
     resolveSessionProgress,
     getSessionProgressSnapshot,
@@ -928,7 +955,15 @@ export function createMonitorHandlers({
   const resolvedPaths = paths || resolvePaths();
   const store = storage || createStorage(resolvedPaths);
   const cdp = cdpBridge || createCdpThemeBridge(resolvedPaths);
-  const quota = quotaClient || createQuotaClient();
+  const isQuotaEnabledFn = async () => {
+    try {
+      const prefs = await store.getPrefs();
+      return prefs?.quotaQueryEnabled !== false;
+    } catch {
+      return true;
+    }
+  };
+  const quota = quotaClient || createQuotaClient({ paths: resolvedPaths, isEnabled: isQuotaEnabledFn });
   const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp, quota);
   const memory =
     memoryManager ||
@@ -951,6 +986,7 @@ export function createMonitorHandlers({
       paths: resolvedPaths,
       storage: store,
       quotaClient: quota,
+      isQuotaQueryEnabled: isQuotaEnabledFn,
       sidecarBridge,
       getRunningConversations: async () => {
         const hub = await querySessionsHub(resolvedPaths.summariesDbPath, store, {});
@@ -1224,6 +1260,8 @@ export function createMonitorHandlers({
       return { unchanged: true, etag };
     }
 
+    const quotaQueryEnabled = await isQuotaEnabledFn();
+
     return {
       unchanged: false,
       etag,
@@ -1234,7 +1272,8 @@ export function createMonitorHandlers({
       sessionsHub,
       sessionProgress,
       runtimeTelemetry: telemetry.runtimeTelemetry,
-      quota: hud.getQuotaSnapshot?.() || null,
+      quotaQueryEnabled,
+      quota: quotaQueryEnabled ? (hud.getQuotaSnapshot?.() || null) : null,
       availableModels,
     };
   });
@@ -1304,13 +1343,88 @@ export function createMonitorHandlers({
   });
 
   register('GET', '/api/quota', async (data = {}) => {
+    const enabled = await isQuotaEnabledFn();
+    if (!enabled) {
+      return {
+        ok: false,
+        disabled: true,
+        available: false,
+        stale: false,
+        source: 'disabled',
+        code: 'quota_disabled',
+        error: '已在「其他」页关闭额度查看与查询',
+        fetchedAtMs: Date.now(),
+        groups: [],
+      };
+    }
     const force = data.force === '1' || data.force === 'true' || data.force === true;
     const summary = await quota.getQuotaSummary({ force });
-    if (summary?.ok && Array.isArray(summary.groups) && summary.groups.length > 0) {
+    if (summary?.ok && !summary.disabled && Array.isArray(summary.groups) && summary.groups.length > 0) {
       hud.setQuotaSummary?.(summary);
       void accounts.syncActiveAccountQuotaFromLive(summary).catch(() => {});
     }
     return summary;
+  });
+
+  register('POST', '/api/preferences/quota-query', async (data = {}) => {
+    const enabled = data.enabled !== false;
+    const updatedPrefs = await store.updatePrefs({ quotaQueryEnabled: enabled });
+    if (!enabled) {
+      quota.clearCache?.();
+      await hud.clearQuotaSummary?.();
+    } else {
+      await hud.refreshFromDb?.();
+    }
+    const quotaCompliance =
+      typeof quota.getComplianceStatus === 'function'
+        ? quota.getComplianceStatus({ enabled: updatedPrefs.quotaQueryEnabled !== false })
+        : {
+            quotaQueryEnabled: updatedPrefs.quotaQueryEnabled !== false,
+            activeSource: updatedPrefs.quotaQueryEnabled !== false ? 'official_local_ls' : 'disabled',
+            directCloudCodeBlocked: true,
+            statusLine: inspectOfficialStatusLine(resolvedPaths),
+          };
+    return {
+      ok: true,
+      quotaQueryEnabled: updatedPrefs.quotaQueryEnabled !== false,
+      quotaCompliance,
+    };
+  });
+
+  register('POST', '/api/quota/statusline/install', async () => {
+    const res = await installOfficialStatusLineHook(resolvedPaths);
+    if (!res.ok) {
+      return errorResponse(ResponseCtor, 500, res.error || '配置官方 CLI statusLine 失败');
+    }
+    const enabled = await isQuotaEnabledFn();
+    const quotaCompliance =
+      typeof quota.getComplianceStatus === 'function'
+        ? quota.getComplianceStatus({ enabled })
+        : {
+            quotaQueryEnabled: enabled,
+            activeSource: enabled ? 'official_local_ls' : 'disabled',
+            directCloudCodeBlocked: true,
+            statusLine: res.statusLine,
+          };
+    return { ok: true, statusLine: res.statusLine, quotaCompliance };
+  });
+
+  register('POST', '/api/quota/statusline/uninstall', async () => {
+    const res = await uninstallOfficialStatusLineHook(resolvedPaths);
+    if (!res.ok) {
+      return errorResponse(ResponseCtor, 500, res.error || '移除官方 CLI statusLine 失败');
+    }
+    const enabled = await isQuotaEnabledFn();
+    const quotaCompliance =
+      typeof quota.getComplianceStatus === 'function'
+        ? quota.getComplianceStatus({ enabled })
+        : {
+            quotaQueryEnabled: enabled,
+            activeSource: enabled ? 'official_local_ls' : 'disabled',
+            directCloudCodeBlocked: true,
+            statusLine: res.statusLine,
+          };
+    return { ok: true, statusLine: res.statusLine, quotaCompliance };
   });
 
   register('POST', '/api/rescan', async () => {
@@ -1348,10 +1462,23 @@ export function createMonitorHandlers({
     };
     const seedsPreview = buildHostThemeSeedsPreview(themes.colors);
 
+    const quotaQueryEnabled = prefs.quotaQueryEnabled !== false;
+    const quotaCompliance =
+      typeof quota.getComplianceStatus === 'function'
+        ? quota.getComplianceStatus({ enabled: quotaQueryEnabled })
+        : {
+            quotaQueryEnabled,
+            activeSource: quotaQueryEnabled ? 'official_local_ls' : 'disabled',
+            directCloudCodeBlocked: true,
+            statusLine: inspectOfficialStatusLine(resolvedPaths),
+          };
+
     return {
       language: prefs.language,
       windowCap: prefs.windowCap,
       activePromptId: prefs.activePromptId,
+      quotaQueryEnabled,
+      quotaCompliance,
       prompts: [...BUILTIN_PRESETS, ...customPresets],
       themeState: {
         ...themes,
@@ -2721,7 +2848,15 @@ export async function startSidecarServer({
   const app = new SidecarApp();
   const paths = resolvePaths(pathsOverrides);
   const storage = createStorage(paths);
-  const sharedQuotaClient = createQuotaClient();
+  const isQuotaEnabledFn = async () => {
+    try {
+      const prefs = await storage.getPrefs();
+      return prefs?.quotaQueryEnabled !== false;
+    } catch {
+      return true;
+    }
+  };
+  const sharedQuotaClient = createQuotaClient({ paths, isEnabled: isQuotaEnabledFn });
   let hudPublisher = null;
   const cdpBridge = createCdpThemeBridge(paths, {
     onHudStateChange() {
@@ -2751,6 +2886,7 @@ export async function startSidecarServer({
     paths,
     storage,
     quotaClient: sharedQuotaClient,
+    isQuotaQueryEnabled: isQuotaEnabledFn,
     sidecarBridge: sidecarBridgeObj,
     getRunningConversations: async () => {
       const hub = await querySessionsHub(paths.summariesDbPath, storage, {});

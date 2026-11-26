@@ -13,7 +13,7 @@
 
     <div class="right-pane-canvas" id="rightPaneCanvas">
       <main class="monitor-dashboard" id="monitorDashboard" aria-label="Antigravity 上下文监控面板">
-        <!-- 顶部四级功能导航：通用 / 掌握 / 美化 / 账号 -->
+        <!-- 顶部功能导航：通用 / 掌握 / 美化 / 账号 / 其他 -->
         <nav class="monitor-subnav" aria-label="插件功能导航" data-i18n-aria="nav.ariaLabel">
           <div class="subnav-tabs-group" role="tablist">
             <button class="subnav-tab is-active" type="button" role="tab" data-subnav="general" aria-selected="true">
@@ -27,6 +27,9 @@
             </button>
             <button class="subnav-tab" type="button" role="tab" data-subnav="accounts" aria-selected="false">
               <span data-i18n="nav.accounts">账号</span>
+            </button>
+            <button class="subnav-tab" type="button" role="tab" data-subnav="other" aria-selected="false">
+              <span data-i18n="nav.other">其他</span>
             </button>
           </div>
 
@@ -1075,6 +1078,109 @@
           <!-- 账号列表 -->
           <div class="acc-list" id="accList" role="list" aria-label="已保存账号列表"></div>
         </div>
+
+        <!-- 其他面板：官方额度查看总开关、CLI statusLine 合规通道与关闭后布局说明 -->
+        <div class="monitor-tab-panel monitor-other-panel" id="panelOther" data-subnav-panel="other" aria-label="其他设置" data-i18n-aria="other.ariaLabel" hidden>
+          <!-- 模块一：额度查看与查询总开关 -->
+          <section class="other-card" id="otherQuotaMasterCard" aria-label="额度查看与查询开关">
+            <div class="other-card-head">
+              <div class="other-card-title-group">
+                <span class="other-card-title" data-i18n="other.quotaTitle">额度查看与查询</span>
+                <span class="other-card-sub" data-i18n="other.quotaSub">默认开启 · 仅走官方合规通道，关闭后立即停查并自动填满空位</span>
+              </div>
+              <div class="other-card-controls">
+                <span class="other-status-pill is-on" id="otherQuotaStatusBadge" data-i18n="other.quotaBadgeOn">已开启 · 官方通道</span>
+                <label class="other-switch">
+                  <input
+                    type="checkbox"
+                    id="otherQuotaToggle"
+                    checked
+                    aria-checked="true"
+                    aria-label="开启或关闭全部额度查询"
+                    data-i18n-aria="other.quotaToggleAria"
+                  />
+                  <span class="other-switch-slider" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <p class="other-card-desc" data-i18n="other.quotaDesc">
+              开启时优先被动读取官方 Antigravity CLI statusLine 回调数据，桌面端通过官方本机回环语言服务同步当前登录账号，彻底禁绝直接请求 Google cloudcode-pa.googleapis.com 内部接口。关闭后将立即停止一切前后台额度查询，并自动重排界面填满原配额区域。
+            </p>
+
+            <div class="other-meta-grid">
+              <div class="other-meta-item">
+                <span class="other-meta-label" data-i18n="other.channelLabel">当前数据通道</span>
+                <span class="other-meta-value" id="otherQuotaChannelVal" data-i18n="other.channelLocalLs">官方宿主本机回环服务</span>
+              </div>
+              <div class="other-meta-item">
+                <span class="other-meta-label" data-i18n="other.guardLabel">风控合规防护</span>
+                <span class="other-meta-value is-safe" id="otherQuotaGuardVal" data-i18n="other.guardBlocked">已禁绝 cloudcode-pa 直连</span>
+              </div>
+              <div class="other-meta-item">
+                <span class="other-meta-label" data-i18n="other.scopeLabel">影响范围</span>
+                <span class="other-meta-value" id="otherQuotaScopeVal" data-i18n="other.scopeOn">通用页 · 输入框 HUD · 账号页 · 桌宠</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- 模块二：官方 Antigravity CLI statusLine 零请求桥接 -->
+          <section class="other-card" aria-label="官方 CLI statusLine 回调配置">
+            <div class="other-card-head">
+              <div class="other-card-title-group">
+                <span class="other-card-title" data-i18n="other.slTitle">官方 CLI statusLine 回调</span>
+                <span class="other-card-sub" data-i18n="other.slSub">被动接收 Antigravity CLI 推送的官方额度 JSON · 零额外查询请求</span>
+              </div>
+              <span class="other-status-pill is-muted" id="otherStatusLineBadge" data-i18n="other.slBadgeIdle">未接入</span>
+            </div>
+
+            <p class="other-card-desc" data-i18n="other.slDesc">
+              若您日常同时使用 Antigravity CLI (agy)，可一键写入官方 ~/.gemini/antigravity-cli/settings.json 的 statusLine.command 桥接脚本；当 CLI 刷新底部状态栏时，官方配额快照会自动同步到本面板，全程无需额外 RPC 请求。
+            </p>
+
+            <div class="other-sl-actions">
+              <button class="theme-pill-btn is-primary" id="otherStatusLineInstallBtn" type="button" data-i18n="other.slInstallBtn">一键配置 CLI statusLine</button>
+              <button class="theme-pill-btn" id="otherStatusLineCopyBtn" type="button" data-i18n="other.slCopyBtn">复制 /statusline 命令</button>
+            </div>
+            <input
+              class="other-cmd-input"
+              id="otherStatusLineCmdInput"
+              type="text"
+              readonly
+              hidden
+              aria-label="Antigravity CLI statusLine 配置命令"
+              data-i18n-aria="other.slCmdAria"
+            />
+          </section>
+
+          <!-- 模块三：关闭额度后的界面自适应补位说明 -->
+          <section class="other-card" aria-label="关闭后界面自适应说明">
+            <div class="other-card-head">
+              <div class="other-card-title-group">
+                <span class="other-card-title" data-i18n="other.adaptTitle">关闭后的全界面自动填充</span>
+                <span class="other-card-sub" data-i18n="other.adaptSub">关闭开关后无空白留白、零冗余按钮、零后台轮询</span>
+              </div>
+            </div>
+            <div class="other-adapt-grid">
+              <div class="other-adapt-item">
+                <div class="other-adapt-title" data-i18n="other.adaptGeneralTitle">通用页 · Token 列表延展</div>
+                <div class="other-adapt-desc" data-i18n="other.adaptGeneralDesc">自动隐藏底部双配额卡片，模型 Token 用量列表无缝向下拉满，与左侧上下文饼图齐平。</div>
+              </div>
+              <div class="other-adapt-item">
+                <div class="other-adapt-title" data-i18n="other.adaptHudTitle">输入框 HUD · 指标加宽</div>
+                <div class="other-adapt-desc" data-i18n="other.adaptHudDesc">自动收起原生输入栏配额胶囊与设置项，多余宽度全量让给生成速率、缓存命中与模型名。</div>
+              </div>
+              <div class="other-adapt-item">
+                <div class="other-adapt-title" data-i18n="other.adaptAccountsTitle">账号页 · 精简紧凑卡片</div>
+                <div class="other-adapt-desc" data-i18n="other.adaptAccountsDesc">隐藏汇总栏、单卡配额条、刷新额度按钮与按额度排序项，剩余操作按钮等宽铺满整行。</div>
+              </div>
+              <div class="other-adapt-item">
+                <div class="other-adapt-title" data-i18n="other.adaptPetTitle">桌宠与后台 · 彻底静默</div>
+                <div class="other-adapt-desc" data-i18n="other.adaptPetDesc">全面停用所有定时器、焦点刷新与桌宠配额同步，保留纯本地 Token 与会话监控。</div>
+              </div>
+            </div>
+          </section>
+        </div>
       </main>
     </div>
 
@@ -1433,6 +1539,9 @@
           </button>
         </div>
         <div class="modal-body acc-modal-body">
+          <div class="acc-quota-paused-note" id="accSettingsQuotaPausedNote" hidden>
+            当前已在「其他」分页关闭额度查看与查询，配额自动刷新及按额度自动切号均已彻底暂停；如需恢复请前往「其他」分页重新开启。
+          </div>
           <div class="acc-setting-card">
             <div class="acc-setting-row">
               <label class="acc-setting-label" for="accSettingRefreshMinInput">配额自动刷新时间间隔：</label>
@@ -1449,14 +1558,15 @@
                 <span class="acc-setting-unit">min</span>
               </div>
             </div>
-            <p class="acc-setting-hint">默认仅按此间隔通过本机 language_server 同步当前登录账号额度（不主动批量请求未激活账号远端接口，更保守防风控）；填 0 关闭定时刷新。</p>
-            <div class="acc-setting-sentence" style="margin-top: 8px;">
-              <span>同时在后台轮询刷新未激活账号（保守模式建议保持关闭）</span>
+            <p class="acc-setting-hint">仅按此间隔通过官方通道（CLI statusLine 或本机 language_server）同步当前登录账号额度，已永久禁绝直接请求 cloudcode-pa 探测未激活账号；填 0 关闭定时刷新。</p>
+            <div class="acc-setting-sentence" style="margin-top: 8px;" hidden>
+              <span>后台探测未激活账号（已按官方合规策略永久停用）</span>
               <button
                 class="acc-setting-toggle-btn is-off"
                 id="accSettingBgInactiveToggleBtn"
                 type="button"
                 aria-pressed="false"
+                disabled
               >
                 <span class="acc-toggle-dot" aria-hidden="true"></span>
                 <span id="accSettingBgInactiveToggleText">已关闭</span>

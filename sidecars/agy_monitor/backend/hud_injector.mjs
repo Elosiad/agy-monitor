@@ -28,7 +28,7 @@ function loadRawFs() {
 
 const { fs, fsp } = loadRawFs();
 
-export const NATIVE_HUD_VERSION = '2.2.7';
+export const NATIVE_HUD_VERSION = '2.2.8';
 export const NATIVE_HUD_HEARTBEAT_TTL_MS = 14_000;
 export const HOST_WALLPAPER_STYLE_ID = 'agy-monitor-cdp-theme';
 
@@ -1592,6 +1592,7 @@ export function buildNativeHudRendererScript() {
             cacheHitPct: typeof s.cacheHitPct === 'number' ? s.cacheHitPct : null,
             upstreamModelId: s.upstreamModelId || '',
             quota: d.quota || null,
+            quotaQueryEnabled: d.quotaQueryEnabled !== false,
             accent: d.accent || '#5b8cff',
             bubbleColor: d.bubbleColor || '#212533',
             hostBlendPct: Number(d.hostBlendPct) || 25,
@@ -1608,6 +1609,7 @@ export function buildNativeHudRendererScript() {
       cacheHitPct: typeof d.cacheHitPct === 'number' ? d.cacheHitPct : null,
       upstreamModelId: d.upstreamModelId || '',
       quota: d.quota || null,
+      quotaQueryEnabled: d.quotaQueryEnabled !== false,
       accent: d.accent || '#5b8cff',
       bubbleColor: d.bubbleColor || '#212533',
       hostBlendPct: Number(d.hostBlendPct) || 25,
@@ -1767,7 +1769,8 @@ export function buildNativeHudRendererScript() {
     host.style.maxWidth = hostMaxW + 'px';
 
     var showContext = Boolean(disp.showContext);
-    var showQuota = Boolean(disp.showQuota) && !(fw > 0 && fw < 290);
+    var quotaGloballyEnabled = !(state.data && state.data.quotaQueryEnabled === false);
+    var showQuota = quotaGloballyEnabled && Boolean(disp.showQuota) && !(fw > 0 && fw < 290);
     var wantMeta = Boolean(disp.showSpeed || disp.showCacheHit || disp.showModel);
 
     var ringW = showContext ? 23 : 0;
@@ -1921,9 +1924,13 @@ export function buildNativeHudRendererScript() {
       showContext: m.totalUsed > 0 ? (fmtTokK(m.totalUsed) + ' / ' + fmtTokK(m.windowCap)) : '0%',
       showQuota: qPopVal
     };
+    var quotaGloballyEnabled = m.quotaQueryEnabled !== false;
     var rows = popEl.querySelectorAll('.pop-row');
     for (var i = 0; i < rows.length; i++) {
       var key = rows[i].getAttribute('data-key');
+      if (key === 'showQuota') {
+        rows[i].style.display = quotaGloballyEnabled ? '' : 'none';
+      }
       var checked = Boolean(state.display[key]);
       rows[i].setAttribute('data-checked', checked ? '1' : '0');
       var box = rows[i].querySelector('.pop-box');
@@ -2459,7 +2466,8 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
         tokPerSec: typeof telemetry.tokPerSec === 'number' ? telemetry.tokPerSec : null,
         cacheHitPct: typeof telemetry.cacheHitPct === 'number' ? telemetry.cacheHitPct : null,
         upstreamModelId: telemetry.upstreamModelId || '',
-        quota: telemetry.quota && typeof telemetry.quota === 'object' ? telemetry.quota : null,
+        quotaQueryEnabled: telemetry.quotaQueryEnabled !== false,
+        quota: telemetry.quotaQueryEnabled === false ? null : (telemetry.quota && typeof telemetry.quota === 'object' ? telemetry.quota : null),
         sessions: Array.isArray(telemetry.sessions) ? telemetry.sessions : [],
         accent,
         bubbleColor,

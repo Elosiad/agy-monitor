@@ -3712,19 +3712,42 @@ export function createAccountManager({
   getRunningConversations,
   driver,
   remoteQuotaFetcher,
+  allowUnsafeDirectCloudCode = false,
+  isQuotaQueryEnabled = null,
   tokenRefresher,
   now = () => Date.now(),
   onBeforeHostClose,
 } = {}) {
   const activeDriver = driver || createWindowsAccountDriver(paths, storage);
+  const allowDirectCloudCodeProbe =
+    typeof remoteQuotaFetcher === 'function' || allowUnsafeDirectCloudCode === true;
   const activeRemoteQuotaFetcher =
     typeof remoteQuotaFetcher === 'function' ? remoteQuotaFetcher : fetchCloudCodeQuotaForCredential;
   const activeTokenRefresher =
     typeof tokenRefresher === 'function' ? tokenRefresher : refreshAccessTokenForCredential;
-  const allowBackgroundRemoteRefresh = !driver || typeof remoteQuotaFetcher === 'function';
+  const allowBackgroundRemoteRefresh = allowDirectCloudCodeProbe;
   const allowPreSwitchTokenRefresh =
     !driver || typeof tokenRefresher === 'function';
   let storeLock = Promise.resolve();
+
+  async function checkQuotaQueryEnabled() {
+    if (typeof isQuotaQueryEnabled === 'function') {
+      try {
+        return (await isQuotaQueryEnabled()) !== false;
+      } catch {
+        return true;
+      }
+    }
+    if (storage && typeof storage.getPrefs === 'function') {
+      try {
+        const prefs = await storage.getPrefs();
+        return prefs?.quotaQueryEnabled !== false;
+      } catch {
+        return true;
+      }
+    }
+    return true;
+  }
   let lastResumeResult = null;
   let lastOauthCaptureResult = null;
   let lastAutoSwitchResult = null;
@@ -3902,10 +3925,11 @@ export function createAccountManager({
   }
 
   async function fetchLiveQuotaNormalized() {
+    if (!(await checkQuotaQueryEnabled())) return null;
     if (!quotaClient || typeof quotaClient.getQuotaSummary !== 'function') return null;
     try {
       const raw = await quotaClient.getQuotaSummary({ force: true });
-      if (raw && raw.ok && Array.isArray(raw.groups) && raw.groups.length > 0) {
+      if (raw && raw.ok && !raw.disabled && Array.isArray(raw.groups) && raw.groups.length > 0) {
         return normalizeStoredQuota(raw, now());
       }
       return null;
@@ -4244,11 +4268,14 @@ export function createAccountManager({
 
     const accounts = index.accounts.map((acc) => formatPublicAccount(acc, liveInfo.email, nowMs));
     const groups = normalizeAccountGroups(index.groups, index.accounts);
+    const quotaQueryEnabled = await checkQuotaQueryEnabled();
 
     return {
       ok: true,
       supported: activeDriver.isSupported(),
       dpapiProtected: activeDriver.isSupported(),
+      quotaQueryEnabled,
+      officialActiveOnly: !allowDirectCloudCodeProbe,
       currentEmail: liveInfo.email || '',
       hasLiveCredential: Boolean(liveInfo.found),
       accounts,
@@ -4676,6 +4703,16 @@ export function createAccountManager({
     const id = String(accountId || '').trim();
     if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
 
+    if (!(await checkQuotaQueryEnabled())) {
+      return {
+        ok: false,
+        status: 403,
+        disabled: true,
+        code: 'quota_disabled',
+        error: '已在「其他」页关闭额度查看与查询，已停止全部额度探测',
+      };
+    }
+
     const nowMs = now();
     const liveInfo = await readLiveEmailSafe();
 
@@ -4719,14 +4756,39 @@ export function createAccountManager({
           return {
             ok: true,
             mode: 'live',
-            message: `已实时同步 ${acc.email} 的官方额度`,
+            message: `已通过官方通道同步 ${acc.email} 的实时额度`,
             account: formatPublicAccount(acc, liveInfo.email, nowMs),
           };
         });
       }
+      if (!allowDirectCloudCodeProbe) {
+        const index = await readIndex();
+        const acc = index.accounts.find((a) => a.id === id);
+        return {
+          ok: false,
+          status: 503,
+          code: 'official_channel_unavailable',
+          error: '当前无法连接本机官方额度通道（已禁用非官方 CloudCode 直连以防风控）',
+          account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
+        };
+      }
     }
 
-    // Remote real-time OAuth + CloudCode quota fetch (Cockpit Tools compatible)
+    // Strict anti-ban policy: NEVER directly call Google internal CloudCode endpoints
+    // (`cloudcode-pa.googleapis.com`) for inactive background accounts in production.
+    if (!allowDirectCloudCodeProbe) {
+      const index = await readIndex();
+      const acc = index.accounts.find((a) => a.id === id);
+      return {
+        ok: true,
+        mode: 'official_active_only',
+        skippedRemote: true,
+        message: '为防 Google 风控已停用非官方 CloudCode 直连；仅通过官方通道同步当前登录号额度，切入该账号后将自动更新',
+        account: acc ? formatPublicAccount(acc, liveInfo.email, nowMs) : null,
+      };
+    }
+
+    // Remote real-time OAuth + CloudCode quota fetch (only when explicitly enabled in isolated tests)
     let parsedCred = null;
     if (snap.secretCredJson) {
       try {
@@ -5826,10 +5888,13 @@ export function createAccountManager({
             await fsp.rm(paths.accountPendingResumeFile, { force: true }).catch(() => {});
           } else {
             // Wait until local language_server confirms the switched account is authenticated & ready
-            const liveQuota = await fetchLiveQuotaNormalized();
-            if (liveQuota) {
-              const liveInfo = await readLiveEmailSafe();
-              const targetEmail = sanitizeEmail(pendingResume.targetEmail || '');
+            // (when quota query is disabled, verify readiness locally via live credential email only).
+            const quotaEnabledForResume = await checkQuotaQueryEnabled();
+            const liveQuota = quotaEnabledForResume ? await fetchLiveQuotaNormalized() : null;
+            const liveInfo = await readLiveEmailSafe();
+            const targetEmail = sanitizeEmail(pendingResume.targetEmail || '');
+            const localCredReady = !quotaEnabledForResume && liveInfo.found && (!targetEmail || liveInfo.email === targetEmail);
+            if (liveQuota || localCredReady) {
               if (!targetEmail || !liveInfo.email || liveInfo.email === targetEmail) {
                 // STRICT At-Most-Once: mark consumed & remove file BEFORE dispatching any message
                 await atomicWriteJson(paths.accountPendingResumeFile, {
@@ -5839,11 +5904,13 @@ export function createAccountManager({
                 }).catch(() => {});
                 await fsp.rm(paths.accountPendingResumeFile, { force: true }).catch(() => {});
 
-                // Sync fresh 3-category quota onto the newly activated account
-                await syncActiveAccountQuotaFromLive(
-                  { ok: true, ...liveQuota },
-                  { skipAutoSwitch: true },
-                ).catch(() => {});
+                // Sync fresh quota onto the newly activated account when enabled
+                if (liveQuota) {
+                  await syncActiveAccountQuotaFromLive(
+                    { ok: true, ...liveQuota },
+                    { skipAutoSwitch: true },
+                  ).catch(() => {});
+                }
 
                 if (sidecarBridge && typeof sidecarBridge.sendMessage === 'function') {
                   const resumedIds = [];
@@ -5908,18 +5975,18 @@ export function createAccountManager({
         }
       }
 
-      // 4. Scheduled local active-account quota sync + opt-in inactive background refresh
-      // Conservative anti-ban default (`backgroundRefreshInactive: false`):
-      // NEVER silently batch-poll remote OAuth / CloudCode APIs for inactive accounts in background;
-      // only sync the active account via local language_server RPC and renew inactive tokens on
-      // explicit user refresh or right before switching (`prepare_account_for_injection`).
-      const refreshIntervalMs = settings.quotaRefreshIntervalMin * 60 * 1000;
+      // 4. Scheduled local active-account quota sync (strictly gated by global quotaQueryEnabled switch)
+      const quotaEnabledNow = await checkQuotaQueryEnabled();
+      const refreshIntervalMs = quotaEnabledNow ? settings.quotaRefreshIntervalMin * 60 * 1000 : 0;
       const shouldAutoRefresh =
+        quotaEnabledNow &&
         !switchedThisTick &&
         refreshIntervalMs > 0 &&
         (lastAutoRefreshAtMs === 0 || nowMs - lastAutoRefreshAtMs >= refreshIntervalMs);
       const allowInactiveBgPoll =
-        allowBackgroundRemoteRefresh && Boolean(settings.backgroundRefreshInactive);
+        quotaEnabledNow &&
+        allowBackgroundRemoteRefresh &&
+        Boolean(settings.backgroundRefreshInactive);
 
       if (shouldAutoRefresh && indexForSchedule.accounts.length > 0) {
         lastAutoRefreshAtMs = nowMs;

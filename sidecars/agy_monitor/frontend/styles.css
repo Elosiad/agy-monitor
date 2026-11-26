@@ -9992,3 +9992,316 @@ body.host-backdrop-shared .mad-lightbox-img {
   font-size: 11px;
   color: var(--text-muted);
 }
+
+/* ========== 关闭额度查询后的全界面无缝补位适配 ========== */
+.token-usage-card.is-quota-disabled .token-models-list {
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.token-usage-card.is-quota-disabled .token-empty-tip {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 8px;
+}
+
+.monitor-accounts-panel.is-quota-disabled .acc-item-card {
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.monitor-accounts-panel.is-quota-disabled .acc-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 0;
+}
+
+.monitor-accounts-panel.is-quota-disabled .acc-item-actions .acc-act-btn {
+  flex: 1 1 0;
+  justify-content: center;
+  min-width: 72px;
+}
+
+.acc-quota-paused-note {
+  padding: 9px 11px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  border: 1px solid color-mix(in srgb, var(--accent-amber) 42%, transparent);
+  background: var(--accent-amber-bg);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.acc-setting-card.is-quota-paused {
+  opacity: 0.62;
+}
+
+/* ========== 其他分页：官方额度开关 & CLI statusLine 合规桥接 ========== */
+.monitor-other-panel {
+  gap: 12px;
+}
+
+.other-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 14px;
+  border-radius: var(--ui-radius);
+  background: color-mix(in srgb, var(--bg-surface) 82%, transparent);
+  border: 1px solid var(--border-hairline);
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+
+.other-card.is-disabled {
+  border-color: color-mix(in srgb, var(--accent-amber) 34%, var(--border-hairline));
+}
+
+body.host-css-shared .other-card {
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.other-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.other-card-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 200px;
+}
+
+.other-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.other-card-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.other-card-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+}
+
+.other-card-desc {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.58;
+  color: var(--text-secondary);
+}
+
+.other-status-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-control);
+  color: var(--text-secondary);
+}
+
+.other-status-pill.is-on {
+  color: var(--accent-teal);
+  background: var(--accent-teal-bg);
+  border-color: color-mix(in srgb, var(--accent-teal) 44%, transparent);
+}
+
+.other-status-pill.is-off {
+  color: var(--accent-amber);
+  background: var(--accent-amber-bg);
+  border-color: color-mix(in srgb, var(--accent-amber) 44%, transparent);
+}
+
+.other-status-pill.is-info {
+  color: var(--accent-blue);
+  background: var(--accent-blue-bg);
+  border-color: color-mix(in srgb, var(--accent-blue) 44%, transparent);
+}
+
+.other-status-pill.is-warn {
+  color: var(--accent-amber);
+  background: var(--accent-amber-bg);
+  border-color: color-mix(in srgb, var(--accent-amber) 44%, transparent);
+}
+
+.other-status-pill.is-muted {
+  color: var(--text-muted);
+  background: var(--bg-control);
+  border-color: var(--border-hairline);
+}
+
+.other-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 38px;
+  height: 22px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.other-switch input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.other-switch-slider {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--bg-track);
+  border: 1px solid var(--border-subtle);
+  transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.other-switch-slider::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-strong);
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), background 0.18s ease;
+}
+
+.other-switch input:checked + .other-switch-slider {
+  background: var(--accent-blue);
+  border-color: color-mix(in srgb, var(--accent-blue) 75%, var(--text-on-accent) 25%);
+}
+
+.other-switch input:checked + .other-switch-slider::after {
+  transform: translateX(16px);
+  background: var(--text-on-accent);
+}
+
+.other-switch input:focus-visible + .other-switch-slider {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.other-switch input:disabled + .other-switch-slider {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.other-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.other-meta-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  background: color-mix(in srgb, var(--bg-control) 76%, transparent);
+  border: 1px solid var(--border-hairline);
+  min-width: 0;
+}
+
+.other-meta-label {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.other-meta-value {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.other-meta-value.is-safe {
+  color: var(--accent-teal);
+}
+
+.other-sl-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.other-cmd-input {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: calc(var(--ui-radius) - 3px);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-control);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  outline: none;
+  user-select: text;
+}
+
+.other-cmd-input:focus {
+  border-color: var(--border-focus);
+}
+
+.other-adapt-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.other-adapt-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 11px;
+  border-radius: calc(var(--ui-radius) - 2px);
+  background: color-mix(in srgb, var(--bg-control) 70%, transparent);
+  border: 1px solid var(--border-hairline);
+  min-width: 0;
+}
+
+.other-adapt-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.other-adapt-desc {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+@container aux-pane (max-width: 560px) {
+  .other-meta-grid,
+  .other-adapt-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

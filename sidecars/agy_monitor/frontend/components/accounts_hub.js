@@ -345,6 +345,7 @@ export function createAccountsHub({
   };
 
   // Settings modal controls
+  const settingsQuotaPausedNote = document.getElementById("accSettingsQuotaPausedNote");
   const settingRefreshMinInput = document.getElementById("accSettingRefreshMinInput");
   const settingBgInactiveToggleBtn = document.getElementById("accSettingBgInactiveToggleBtn");
   const settingBgInactiveToggleText = document.getElementById("accSettingBgInactiveToggleText");
@@ -392,6 +393,8 @@ export function createAccountsHub({
 
   let destroyed = false;
   let tabActive = false;
+  let quotaQueryEnabled = true;
+  let officialActiveOnly = true;
   let pollTimer = null;
   let pollIntervalMs = 0;
   let directOauthPollTimer = null;
@@ -824,10 +827,12 @@ export function createAccountsHub({
     });
     return JSON.stringify({
       supported: state.supported,
+      quotaQueryEnabled,
+      officialActiveOnly,
       currentEmail: state.currentEmail,
       activeGroup,
       activeFilter,
-      sortBy: state.settings.sortBy,
+      sortBy: getEffectiveSortBy(),
       sortOrder: state.settings.sortOrder,
       groups,
       switchingAccountId,
@@ -896,7 +901,7 @@ export function createAccountsHub({
     const groupScoped = getGroupFilteredAccounts();
     const sortedAccounts = sortAccountsList(
       groupScoped,
-      state.settings.sortBy,
+      getEffectiveSortBy(),
       state.settings.sortOrder,
       nowMs,
     );
@@ -1052,7 +1057,7 @@ export function createAccountsHub({
 
       const idRight = document.createElement("div");
       idRight.className = "acc-item-meta";
-      if (acc.quota?.fetchedAtMs) {
+      if (quotaQueryEnabled && acc.quota?.fetchedAtMs) {
         const syncTime = document.createElement("span");
         syncTime.className = "acc-quota-sync-time";
         syncTime.textContent = `额度 ${formatClock(acc.quota.fetchedAtMs)}`;
@@ -1063,19 +1068,21 @@ export function createAccountsHub({
       topRow.appendChild(idRight);
       card.appendChild(topRow);
 
-      // Row 2: Two quota categories (Gemini / GPT&Claude)
-      const quotaRow = document.createElement("div");
-      quotaRow.className = "acc-quota-grid";
-      const groupsByKey = new Map();
-      if (Array.isArray(acc.quota?.groups)) {
-        acc.quota.groups.forEach((g) => {
-          if (g && g.key) groupsByKey.set(g.key, g);
+      // Row 2: Two quota categories (Gemini / GPT&Claude) — omitted cleanly when global quota viewing is OFF
+      if (quotaQueryEnabled) {
+        const quotaRow = document.createElement("div");
+        quotaRow.className = "acc-quota-grid";
+        const groupsByKey = new Map();
+        if (Array.isArray(acc.quota?.groups)) {
+          acc.quota.groups.forEach((g) => {
+            if (g && g.key) groupsByKey.set(g.key, g);
+          });
+        }
+        DEFAULT_GROUPS.forEach((def) => {
+          quotaRow.appendChild(buildQuotaGroupCell(def, groupsByKey.get(def.key) || null, nowMs));
         });
+        card.appendChild(quotaRow);
       }
-      DEFAULT_GROUPS.forEach((def) => {
-        quotaRow.appendChild(buildQuotaGroupCell(def, groupsByKey.get(def.key) || null, nowMs));
-      });
-      card.appendChild(quotaRow);
 
       // Row 2.5: Abnormal error detail banner with contextual recovery action
       if (isAbnormal && accStatus.message) {
@@ -1219,21 +1226,25 @@ export function createAccountsHub({
       switchBtn.addEventListener("click", () => void handleSwitchAccountDirect(acc));
       actionsRow.appendChild(switchBtn);
 
-      // 2. Refresh quota button
-      const isRefreshing = refreshingIds.has(acc.id);
-      const refreshBtn = document.createElement("button");
-      refreshBtn.type = "button";
-      refreshBtn.className = `acc-act-btn${isRefreshing ? " is-spinning" : ""}`;
-      refreshBtn.disabled = isRefreshing;
-      refreshBtn.appendChild(createSvgIcon("M13.3 8a5.3 5.3 0 1 1-1.45-3.65M13.3 2.8v2.7h-2.7"));
-      const refreshLabel = document.createElement("span");
-      refreshLabel.textContent = isRefreshing ? "刷新中" : "刷新额度";
-      refreshBtn.appendChild(refreshLabel);
-      refreshBtn.title = acc.isCurrent
-        ? "立即实时同步该账号官方额度并同步最新凭证"
-        : "自动续签凭证并实时同步该账号官方额度";
-      refreshBtn.addEventListener("click", () => void handleRefreshQuota(acc));
-      actionsRow.appendChild(refreshBtn);
+      // 2. Refresh quota button (hidden when global quota viewing is disabled so remaining buttons fill full width)
+      if (quotaQueryEnabled) {
+        const isRefreshing = refreshingIds.has(acc.id);
+        const refreshBtn = document.createElement("button");
+        refreshBtn.type = "button";
+        refreshBtn.className = `acc-act-btn${isRefreshing ? " is-spinning" : ""}`;
+        refreshBtn.disabled = isRefreshing;
+        refreshBtn.appendChild(createSvgIcon("M13.3 8a5.3 5.3 0 1 1-1.45-3.65M13.3 2.8v2.7h-2.7"));
+        const refreshLabel = document.createElement("span");
+        refreshLabel.textContent = isRefreshing ? "刷新中" : "刷新额度";
+        refreshBtn.appendChild(refreshLabel);
+        refreshBtn.title = acc.isCurrent
+          ? "立即通过官方通道同步当前账号实时额度"
+          : officialActiveOnly
+            ? "官方合规模式：已禁绝直连 cloudcode-pa，未激活账号切入后自动同步官方额度"
+            : "自动续签凭证并实时同步该账号官方额度";
+        refreshBtn.addEventListener("click", () => void handleRefreshQuota(acc));
+        actionsRow.appendChild(refreshBtn);
+      }
 
       // 3. Enable / Disable toggle button
       const toggleBtn = document.createElement("button");
@@ -1293,9 +1304,24 @@ export function createAccountsHub({
     });
   }
 
+  function getVisibleSortFields() {
+    return SORT_FIELDS.filter(
+      (f) => quotaQueryEnabled || (f.key !== "gemini" && f.key !== "gpt_claude"),
+    );
+  }
+
+  function getEffectiveSortBy() {
+    const raw = state.settings.sortBy || "lastUsed";
+    if (!quotaQueryEnabled && (raw === "gemini" || raw === "gpt_claude")) {
+      return "lastUsed";
+    }
+    return raw;
+  }
+
   function renderSortControls() {
+    const effectiveSortBy = getEffectiveSortBy();
     const curField =
-      SORT_FIELDS.find((f) => f.key === state.settings.sortBy) || SORT_FIELDS[SORT_FIELDS.length - 1];
+      SORT_FIELDS.find((f) => f.key === effectiveSortBy) || SORT_FIELDS[SORT_FIELDS.length - 1];
     const isAsc = state.settings.sortOrder === "asc";
     if (sortBtnLabel) {
       sortBtnLabel.textContent = `排序: ${curField.shortLabel} ${isAsc ? "↑" : "↓"}`;
@@ -1307,7 +1333,10 @@ export function createAccountsHub({
         btn.setAttribute("aria-pressed", String(active));
       });
       sortMenu.querySelectorAll("[data-sort-by]").forEach((btn) => {
-        const active = btn.getAttribute("data-sort-by") === state.settings.sortBy;
+        const key = btn.getAttribute("data-sort-by");
+        const isQuotaSort = key === "gemini" || key === "gpt_claude";
+        btn.hidden = !quotaQueryEnabled && isQuotaSort;
+        const active = key === effectiveSortBy;
         btn.classList.toggle("is-active", active);
         btn.setAttribute("aria-checked", String(active));
       });
@@ -1316,6 +1345,12 @@ export function createAccountsHub({
 
   function renderQuotaSummaryCard({ force = false } = {}) {
     if (!summaryCardEl || !summaryGridEl) return;
+    if (!quotaQueryEnabled) {
+      summaryCardEl.hidden = true;
+      summaryGridEl.innerHTML = "";
+      lastSummaryRenderSig = "";
+      return;
+    }
     const allAccounts = getGroupFilteredAccounts();
     if (allAccounts.length === 0) {
       summaryCardEl.hidden = true;
@@ -1541,11 +1576,19 @@ export function createAccountsHub({
         : `一键刷新 AT (${renewableAtCount})`;
     }
     if (batchRefreshBtn) {
+      batchRefreshBtn.hidden = !quotaQueryEnabled;
       batchRefreshBtn.disabled = batchRefreshing || batchRenewingAt;
       batchRefreshBtn.classList.toggle("is-spinning", batchRefreshing);
+      if (officialActiveOnly) {
+        batchRefreshBtn.title = "官方合规模式：仅通过官方通道刷新当前登录账号额度（不直连 cloudcode-pa 探测未激活账号）";
+      }
     }
     if (batchRefreshLabelEl) {
-      batchRefreshLabelEl.textContent = batchRefreshing ? batchProgressText || "检测中…" : "一键检测全部";
+      batchRefreshLabelEl.textContent = batchRefreshing
+        ? batchProgressText || "检测中…"
+        : officialActiveOnly
+          ? "刷新当前额度"
+          : "一键检测全部";
     }
     if (disableAbnormalBtn) {
       disableAbnormalBtn.hidden = enabledBlockingCount === 0;
@@ -1557,6 +1600,9 @@ export function createAccountsHub({
   }
 
   function renderAll({ force = true } = {}) {
+    if (panelEl) {
+      panelEl.classList.toggle("is-quota-disabled", !quotaQueryEnabled);
+    }
     renderHeaderMeta();
     renderSortControls();
     renderGroupBar();
@@ -1592,6 +1638,12 @@ export function createAccountsHub({
       if (destroyed) return null;
       state.supported = data.supported !== false;
       state.dpapiProtected = Boolean(data.dpapiProtected);
+      if (typeof data.quotaQueryEnabled === "boolean") {
+        quotaQueryEnabled = data.quotaQueryEnabled;
+      }
+      if (typeof data.officialActiveOnly === "boolean") {
+        officialActiveOnly = data.officialActiveOnly;
+      }
       state.currentEmail = String(data.currentEmail || "");
       state.hasLiveCredential = Boolean(data.hasLiveCredential);
       state.accounts = Array.isArray(data.accounts) ? data.accounts : [];
@@ -2048,6 +2100,9 @@ export function createAccountsHub({
   }
 
   async function handleRefreshQuota(acc, { silentToast = false } = {}) {
+    if (!quotaQueryEnabled) {
+      return { ok: false, skipped: true };
+    }
     if (refreshingIds.has(acc.id)) return { ok: false, skipped: true };
     refreshingIds.add(acc.id);
     renderAccountList();
@@ -2299,14 +2354,23 @@ export function createAccountsHub({
   }
 
   async function handleBatchRefreshAll() {
-    if (batchRefreshing || batchRenewingAt) return;
+    if (!quotaQueryEnabled || batchRefreshing || batchRenewingAt) return;
     const nowMs = Date.now();
-    // Skip blocking abnormal accounts (banned / verification / RT expired) to avoid triggering Google risk control
+    // Skip blocking abnormal accounts; under official active-only compliance, only refresh the live active account
     const targets = getGroupFilteredAccounts().filter(
-      (a) => a && a.enabled !== false && !resolveAccountStatus(a, nowMs).blocking,
+      (a) =>
+        a &&
+        a.enabled !== false &&
+        (!officialActiveOnly || a.isCurrent) &&
+        !resolveAccountStatus(a, nowMs).blocking,
     );
     if (targets.length === 0) {
-      onToast?.("暂无可安全检测的已启用账号（异常账号请单独处理）", "info");
+      onToast?.(
+        officialActiveOnly
+          ? "官方合规模式：仅同步当前登录账号额度，未激活账号切入后自动更新"
+          : "暂无可安全检测的已启用账号（异常账号请单独处理）",
+        "info",
+      );
       return;
     }
     batchRefreshing = true;
@@ -2448,6 +2512,17 @@ export function createAccountsHub({
     }
   }
 
+  function syncSettingsQuotaPausedUi() {
+    if (settingsQuotaPausedNote) {
+      settingsQuotaPausedNote.hidden = quotaQueryEnabled;
+    }
+    if (modals.settings) {
+      modals.settings.querySelectorAll(".acc-setting-card").forEach((card) => {
+        card.classList.toggle("is-quota-paused", !quotaQueryEnabled);
+      });
+    }
+  }
+
   function openSettingsModal() {
     if (settingRefreshMinInput) {
       settingRefreshMinInput.value = String(
@@ -2462,6 +2537,7 @@ export function createAccountsHub({
     draftAutoSwitchEnabled = Boolean(state.settings.autoSwitchEnabled);
     draftBgRefreshInactive = Boolean(state.settings.backgroundRefreshInactive);
     renderSettingsAutoToggle();
+    syncSettingsQuotaPausedUi();
     openModal("settings");
   }
 
@@ -2506,8 +2582,10 @@ export function createAccountsHub({
   }
 
   function cycleSortField() {
-    const curIdx = SORT_FIELDS.findIndex((f) => f.key === state.settings.sortBy);
-    const nextField = SORT_FIELDS[(curIdx + 1) % SORT_FIELDS.length];
+    const visibleFields = getVisibleSortFields();
+    if (visibleFields.length === 0) return;
+    const curIdx = visibleFields.findIndex((f) => f.key === getEffectiveSortBy());
+    const nextField = visibleFields[(curIdx + 1) % visibleFields.length];
     applySortChange(nextField.key, state.settings.sortOrder);
   }
 
@@ -2685,6 +2763,12 @@ export function createAccountsHub({
 
   return {
     refresh,
+    setQuotaEnabled(nextEnabled) {
+      const normalized = nextEnabled !== false;
+      quotaQueryEnabled = normalized;
+      syncSettingsQuotaPausedUi();
+      renderAll({ force: true });
+    },
     setTabActive(isActive) {
       tabActive = Boolean(isActive);
       if (tabActive) {

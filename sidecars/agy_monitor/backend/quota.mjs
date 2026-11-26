@@ -1,20 +1,32 @@
 /**
- * Antigravity native quota summary reader.
+ * Antigravity official quota reader.
  *
- * Calls the local Antigravity Language Server Connect-RPC endpoint
- * `/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
- * using the platform-injected loopback address (`ANTIGRAVITY_LS_ADDRESS`) and
- * CSRF token (`ANTIGRAVITY_CSRF_TOKEN`), with short in-memory TTL caching and
- * graceful degradation when unavailable.
+ * Strictly uses official Antigravity channels only (NEVER directly calls
+ * remote internal `cloudcode-pa.googleapis.com` APIs):
+ * 1. Priority 1 (Zero extra RPC): Passive local snapshot produced by
+ *    Antigravity CLI's official `statusLine` callback hook
+ *    (`~/.gemini/antigravity-cli/settings.json` -> `statusLine.command`).
+ * 2. Priority 2 (Desktop host native loopback): Local Antigravity Language
+ *    Server Connect-RPC endpoint
+ *    `/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
+ *    using the host-injected loopback address (`ANTIGRAVITY_LS_ADDRESS`) and
+ *    CSRF token (`ANTIGRAVITY_CSRF_TOKEN`), with TTL caching and strict
+ *    global disable support.
  */
 
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
+import path from 'node:path';
+import { atomicWriteJson, atomicWriteText } from './paths.mjs';
 
 const QUOTA_RPC_PATH =
   '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const ALLOWED_LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+const DEFAULT_STATUSLINE_MAX_AGE_MS = 180_000;
+const STATUSLINE_BRIDGE_MARKER = 'agy_statusline_bridge.mjs';
 
 /**
  * Parse and validate `ANTIGRAVITY_LS_ADDRESS` strictly against loopback hosts.
@@ -87,23 +99,34 @@ function normalizeBucket(raw, nowMs) {
     : typeof raw.reset_time === 'string'
       ? raw.reset_time.trim()
       : '';
-  const parsedResetMs = resetTime ? Date.parse(resetTime) : Number.NaN;
+  let parsedResetMs = resetTime ? Date.parse(resetTime) : Number.NaN;
+  if (!Number.isFinite(parsedResetMs)) {
+    const resetInSec = Number(raw.reset_in_seconds ?? raw.resetInSeconds);
+    if (Number.isFinite(resetInSec) && resetInSec > 0) {
+      parsedResetMs = nowMs + Math.round(resetInSec * 1000);
+    }
+  }
   const resetTimeMs = Number.isFinite(parsedResetMs) ? parsedResetMs : null;
 
   let windowKind = 'other';
+  const lowerBucketId = bucketId.toLowerCase();
   if (
     windowRaw === '5h' ||
     windowRaw.includes('5h') ||
     windowRaw.includes('5-hour') ||
     windowRaw.includes('five_hour') ||
-    bucketId.toLowerCase().includes('5h')
+    lowerBucketId.includes('5h') ||
+    lowerBucketId.includes('5-hour') ||
+    lowerBucketId.includes('five_hour')
   ) {
     windowKind = '5h';
   } else if (
     windowRaw === 'weekly' ||
     windowRaw.includes('week') ||
     windowRaw === '7d' ||
-    bucketId.toLowerCase().includes('weekly')
+    lowerBucketId.includes('weekly') ||
+    lowerBucketId.includes('week') ||
+    lowerBucketId.includes('7d')
   ) {
     windowKind = 'weekly';
   }
@@ -124,7 +147,7 @@ function normalizeBucket(raw, nowMs) {
     remainingFraction,
     remainingPct,
     remainingPctExact,
-    resetTime,
+    resetTime: resetTime || (resetTimeMs ? new Date(resetTimeMs).toISOString() : ''),
     resetTimeMs,
     remainingMs,
     isFull,
@@ -150,11 +173,13 @@ function classifyQuotaGroup(rawGroup, index) {
     lowerName.includes('claude') ||
     lowerName.includes('gpt') ||
     lowerName.includes('3p') ||
-    bucketIds.includes('3p-')
+    bucketIds.includes('3p-') ||
+    bucketIds.includes('claude') ||
+    bucketIds.includes('gpt')
   ) {
     return { key: 'gpt_claude', label: 'GPT&Claude', order: 1 };
   }
-  if (lowerName.includes('gemini') || bucketIds.includes('gemini-')) {
+  if (lowerName.includes('gemini') || bucketIds.includes('gemini')) {
     return { key: 'gemini', label: 'Gemini', order: 0 };
   }
 
@@ -167,7 +192,7 @@ function classifyQuotaGroup(rawGroup, index) {
 /**
  * Normalize raw RetrieveUserQuotaSummaryResponse into compact UI-ready groups.
  */
-export function normalizeQuotaSummary(payload, nowMs = Date.now()) {
+export function normalizeQuotaSummary(payload, nowMs = Date.now(), { source = 'official_local_ls' } = {}) {
   const root =
     payload && typeof payload === 'object' && payload.response && typeof payload.response === 'object'
       ? payload.response
@@ -217,9 +242,330 @@ export function normalizeQuotaSummary(payload, nowMs = Date.now()) {
     ok: true,
     available: cleanGroups.length > 0,
     stale: false,
+    source,
     fetchedAtMs: nowMs,
     description: typeof root.description === 'string' ? root.description.trim() : '',
     groups: cleanGroups,
+  };
+}
+
+/**
+ * Normalize official Antigravity CLI `statusLine` JSON payload into the standard
+ * quota summary shape.
+ *
+ * Official docs schema (`https://antigravity.google/docs/cli/statusline`):
+ * `{ quota: { "gemini-5h": { remaining_fraction, reset_time, reset_in_seconds, disabled }, ... }, email, plan_tier }`
+ */
+export function normalizeStatusLineQuota(payload, nowMs = Date.now()) {
+  if (!payload || typeof payload !== 'object') return null;
+  const quotaMap = payload.quota;
+  if (!quotaMap || typeof quotaMap !== 'object' || Array.isArray(quotaMap)) return null;
+
+  const baseNow = Number.isFinite(Number(payload.updatedAtMs)) && Number(payload.updatedAtMs) > 0
+    ? Number(payload.updatedAtMs)
+    : nowMs;
+
+  const groupedRaw = new Map();
+  for (const [bucketId, entry] of Object.entries(quotaMap)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const idLower = String(bucketId || '').trim().toLowerCase();
+    if (!idLower || idLower.includes('argon')) continue;
+
+    let groupKey = '';
+    let displayName = '';
+    if (idLower.includes('3p') || idLower.includes('claude') || idLower.includes('gpt')) {
+      groupKey = 'gpt_claude';
+      displayName = 'Claude and GPT models';
+    } else if (idLower.includes('gemini')) {
+      groupKey = 'gemini';
+      displayName = 'Gemini Models';
+    } else {
+      groupKey = idLower.replace(/-(5h|weekly|7d|daily)$/i, '') || 'other';
+      displayName = groupKey;
+    }
+
+    if (!groupedRaw.has(groupKey)) {
+      groupedRaw.set(groupKey, { displayName, buckets: [] });
+    }
+    groupedRaw.get(groupKey).buckets.push({
+      bucketId,
+      remainingFraction: entry.remaining_fraction ?? entry.remainingFraction,
+      resetTime: entry.reset_time ?? entry.resetTime ?? '',
+      resetInSeconds: entry.reset_in_seconds ?? entry.resetInSeconds,
+      disabled: Boolean(entry.disabled),
+    });
+  }
+
+  if (groupedRaw.size === 0) return null;
+
+  const normalized = normalizeQuotaSummary(
+    { groups: [...groupedRaw.values()] },
+    baseNow,
+    { source: 'official_statusline' },
+  );
+  if (!normalized.available) return null;
+
+  return {
+    ...normalized,
+    source: 'official_statusline',
+    ...(typeof payload.email === 'string' && payload.email.trim() ? { email: payload.email.trim() } : {}),
+    ...(typeof payload.plan_tier === 'string' && payload.plan_tier.trim()
+      ? { planTier: payload.plan_tier.trim() }
+      : {}),
+  };
+}
+
+/**
+ * Read a fresh official statusLine quota snapshot from disk if available.
+ */
+export function readStatusLineQuotaFile(
+  filePath,
+  { maxAgeMs = DEFAULT_STATUSLINE_MAX_AGE_MS, nowMs = Date.now() } = {},
+) {
+  if (!filePath || typeof filePath !== 'string') return null;
+  try {
+    if (!fsSync.existsSync(filePath)) return null;
+    const stat = fsSync.statSync(filePath);
+    if (!stat.isFile() || stat.size <= 2 || stat.size > MAX_RESPONSE_BYTES) return null;
+    const raw = JSON.parse(fsSync.readFileSync(filePath, 'utf8'));
+    const updatedAtMs = Number(raw?.updatedAtMs || stat.mtimeMs || 0);
+    const ageMs = updatedAtMs > 0 ? Math.max(0, nowMs - updatedAtMs) : Infinity;
+    if (maxAgeMs > 0 && ageMs > maxAgeMs) {
+      return null;
+    }
+    const normalized = normalizeStatusLineQuota({ ...raw, updatedAtMs }, nowMs);
+    if (!normalized) return null;
+    return {
+      ...normalized,
+      fetchedAtMs: updatedAtMs || nowMs,
+      ageMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the lightweight official Antigravity CLI `statusLine` bridge script.
+ * It reads official stdin JSON piped by `agy`, saves ONLY sanitized quota metadata
+ * atomically to `official_statusline_quota.json`, and renders a clean status line.
+ */
+export function buildStatusLineBridgeScript(outputJsonPath) {
+  const safeOutPath = JSON.stringify(path.resolve(outputJsonPath));
+  return [
+    '#!/usr/bin/env node',
+    '// Official Antigravity CLI statusLine bridge for AGY Console (zero extra RPC).',
+    "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    '',
+    `const OUT_FILE = ${safeOutPath};`,
+    '',
+    'function fmtTok(n) {',
+    '  const v = Number(n) || 0;',
+    "  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;",
+    "  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;",
+    '  return String(Math.round(v));',
+    '}',
+    '',
+    'function fmtDur(sec) {',
+    '  const s = Math.max(0, Math.round(Number(sec) || 0));',
+    "  if (s <= 0) return '';",
+    '  const d = Math.floor(s / 86400);',
+    '  const h = Math.floor((s % 86400) / 3600);',
+    '  const m = Math.floor((s % 3600) / 60);',
+    "  if (d > 0) return `${d}d ${h}h`;",
+    "  if (h > 0) return `${h}h ${m}m`;",
+    "  return `${Math.max(1, m)}m`;",
+    '}',
+    '',
+    'let raw = "";',
+    'process.stdin.setEncoding("utf8");',
+    'process.stdin.on("data", (c) => { raw += c; });',
+    'process.stdin.on("end", () => {',
+    '  let data = null;',
+    '  try { data = JSON.parse(raw); } catch { data = null; }',
+    '  if (!data || typeof data !== "object") return;',
+    '  if (data.quota && typeof data.quota === "object") {',
+    '    try {',
+    '      fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });',
+    '      const snap = {',
+    '        updatedAtMs: Date.now(),',
+    '        email: typeof data.email === "string" ? data.email : "",',
+    '        plan_tier: typeof data.plan_tier === "string" ? data.plan_tier : "",',
+    '        quota: data.quota,',
+    '      };',
+    '      const tmp = `${OUT_FILE}.tmp.${process.pid}`;',
+    '      fs.writeFileSync(tmp, JSON.stringify(snap, null, 2) + "\\n", "utf8");',
+    '      fs.renameSync(tmp, OUT_FILE);',
+    '    } catch {}',
+    '  }',
+    '  const cw = data.context_window || {};',
+    '  const inTok = Number(cw.total_input_tokens) || 0;',
+    '  const outTok = Number(cw.total_output_tokens) || 0;',
+    '  const cur = cw.current_usage || {};',
+    '  const cacheRead = Number(cur.cache_read_input_tokens) || 0;',
+    '  const curIn = Number(cur.input_tokens) || 0;',
+    '  const hitPct = curIn + cacheRead > 0 ? Math.round((cacheRead / (curIn + cacheRead)) * 100) : null;',
+    '  const parts = [`Tokens: ${fmtTok(inTok)}↑ ${fmtTok(outTok)}↓`];',
+    '  if (hitPct !== null) parts.push(`Cache: ${hitPct}%`);',
+    '  const q = data.quota && typeof data.quota === "object" ? data.quota : {};',
+    '  const b5 = q["gemini-5h"] || q["3p-5h"];',
+    '  const bw = q["gemini-weekly"] || q["3p-weekly"];',
+    '  if (b5 && typeof b5.remaining_fraction === "number") {',
+    '    const r5 = fmtDur(b5.reset_in_seconds);',
+    '    parts.push(`5h: ${(b5.remaining_fraction * 100).toFixed(1)}%${r5 ? ` (${r5})` : ""}`);',
+    '  }',
+    '  if (bw && typeof bw.remaining_fraction === "number") {',
+    '    const rw = fmtDur(bw.reset_in_seconds);',
+    '    parts.push(`7d: ${(bw.remaining_fraction * 100).toFixed(1)}%${rw ? ` (${rw})` : ""}`);',
+    '  }',
+    '  process.stdout.write(parts.join(" | "));',
+    '});',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Inspect whether the official Antigravity CLI `statusLine` bridge is configured
+ * and whether a fresh official snapshot is currently available on disk.
+ */
+export function inspectOfficialStatusLine(paths = {}, nowMs = Date.now()) {
+  const settingsFile = paths?.antigravityCliSettingsFile || '';
+  const scriptFile = paths?.officialStatusLineScriptFile || '';
+  const quotaFile = paths?.officialStatusLineQuotaFile || '';
+  const commandStr = scriptFile ? `node "${scriptFile}"` : '';
+
+  let cliDirExists = false;
+  let configured = false;
+  let configuredByOther = false;
+  let existingCommand = '';
+
+  if (settingsFile) {
+    try {
+      cliDirExists = fsSync.existsSync(path.dirname(settingsFile));
+      if (fsSync.existsSync(settingsFile)) {
+        const parsed = JSON.parse(fsSync.readFileSync(settingsFile, 'utf8'));
+        const sl = parsed?.statusLine;
+        if (sl && typeof sl === 'object' && typeof sl.command === 'string' && sl.command.trim()) {
+          existingCommand = sl.command.trim();
+          const enabled = sl.enabled !== false;
+          if (enabled && existingCommand.includes(STATUSLINE_BRIDGE_MARKER)) {
+            configured = true;
+          } else if (enabled) {
+            configuredByOther = true;
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed settings file
+    }
+  }
+
+  let lastUpdatedAtMs = 0;
+  let fresh = false;
+  if (quotaFile && fsSync.existsSync(quotaFile)) {
+    try {
+      const stat = fsSync.statSync(quotaFile);
+      const parsed = JSON.parse(fsSync.readFileSync(quotaFile, 'utf8'));
+      lastUpdatedAtMs = Number(parsed?.updatedAtMs || stat.mtimeMs || 0);
+      fresh = Boolean(
+        readStatusLineQuotaFile(quotaFile, { maxAgeMs: DEFAULT_STATUSLINE_MAX_AGE_MS, nowMs }),
+      );
+    } catch {
+      lastUpdatedAtMs = 0;
+      fresh = false;
+    }
+  }
+
+  return {
+    cliDirExists,
+    configured,
+    configuredByOther,
+    existingCommand,
+    scriptFile,
+    quotaFile,
+    settingsFile,
+    command: commandStr,
+    slashCommand: commandStr ? `/statusline ${commandStr}` : '',
+    lastUpdatedAtMs,
+    fresh,
+  };
+}
+
+/**
+ * Write the official statusLine bridge script and safely register it in
+ * `~/.gemini/antigravity-cli/settings.json` while preserving all existing keys.
+ */
+export async function installOfficialStatusLineHook(paths = {}) {
+  const settingsFile = paths?.antigravityCliSettingsFile || '';
+  const scriptFile = paths?.officialStatusLineScriptFile || '';
+  const quotaFile = paths?.officialStatusLineQuotaFile || '';
+  if (!settingsFile || !scriptFile || !quotaFile) {
+    return { ok: false, error: '缺少 statusLine 路径配置' };
+  }
+
+  await atomicWriteText(scriptFile, buildStatusLineBridgeScript(quotaFile));
+
+  let settings = {};
+  try {
+    const raw = await fs.readFile(settingsFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      settings = parsed;
+    }
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      return { ok: false, error: '读取 ~/.gemini/antigravity-cli/settings.json 失败，请检查文件格式' };
+    }
+  }
+
+  const command = `node "${scriptFile}"`;
+  const nextSettings = {
+    ...settings,
+    statusLine: {
+      ...(settings.statusLine && typeof settings.statusLine === 'object' ? settings.statusLine : {}),
+      type: 'command',
+      command,
+      enabled: true,
+    },
+  };
+  await atomicWriteJson(settingsFile, nextSettings);
+
+  return {
+    ok: true,
+    statusLine: inspectOfficialStatusLine(paths),
+  };
+}
+
+/**
+ * Remove our official statusLine bridge entry from `~/.gemini/antigravity-cli/settings.json`
+ * without touching any other CLI configuration.
+ */
+export async function uninstallOfficialStatusLineHook(paths = {}) {
+  const settingsFile = paths?.antigravityCliSettingsFile || '';
+  if (!settingsFile) {
+    return { ok: false, error: '缺少 CLI settings.json 路径' };
+  }
+
+  try {
+    const raw = await fs.readFile(settingsFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const cmd = typeof parsed?.statusLine?.command === 'string' ? parsed.statusLine.command : '';
+      if (cmd.includes(STATUSLINE_BRIDGE_MARKER)) {
+        delete parsed.statusLine;
+        await atomicWriteJson(settingsFile, parsed);
+      }
+    }
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      return { ok: false, error: '更新 ~/.gemini/antigravity-cli/settings.json 失败' };
+    }
+  }
+
+  return {
+    ok: true,
+    statusLine: inspectOfficialStatusLine(paths),
   };
 }
 
@@ -344,22 +690,66 @@ export function callRetrieveUserQuotaSummary({
 }
 
 /**
- * Create a cached, coalesced quota fetcher bound to the current process env.
+ * Create a cached, coalesced official quota reader bound to the current process env
+ * and optional official `statusLine` local snapshot file.
  */
 export function createQuotaClient({
+  paths = null,
   env = process.env,
-  ttlMs = 30_000,
-  minForceIntervalMs = 2_500,
+  ttlMs = 60_000,
+  minForceIntervalMs = 5_000,
+  statusLineMaxAgeMs = DEFAULT_STATUSLINE_MAX_AGE_MS,
   timeoutMs = 3_500,
   fetcher = callRetrieveUserQuotaSummary,
+  isEnabled = null,
   now = () => Date.now(),
 } = {}) {
   let cached = null;
   let lastAttemptAtMs = 0;
   let inFlight = null;
+  let lastSource = '';
+
+  async function checkEnabled() {
+    if (typeof isEnabled !== 'function') return true;
+    try {
+      return (await isEnabled()) !== false;
+    } catch {
+      return true;
+    }
+  }
 
   async function getQuotaSummary({ force = false } = {}) {
     const currentNow = now();
+
+    if (!(await checkEnabled())) {
+      lastSource = 'disabled';
+      return {
+        ok: false,
+        disabled: true,
+        available: false,
+        stale: false,
+        source: 'disabled',
+        code: 'quota_disabled',
+        error: '已在「其他」页关闭额度查看与查询',
+        fetchedAtMs: currentNow,
+        groups: [],
+      };
+    }
+
+    // Priority 1: Passive official Antigravity CLI statusLine snapshot (zero extra RPCs!)
+    const slFile = paths?.officialStatusLineQuotaFile || '';
+    if (slFile) {
+      const slQuota = readStatusLineQuotaFile(slFile, {
+        maxAgeMs: statusLineMaxAgeMs,
+        nowMs: currentNow,
+      });
+      if (slQuota && slQuota.available) {
+        cached = slQuota;
+        lastSource = 'official_statusline';
+        return slQuota;
+      }
+    }
+
     if (cached) {
       const age = currentNow - cached.fetchedAtMs;
       if (!force && age >= 0 && age < ttlMs) {
@@ -382,8 +772,9 @@ export function createQuotaClient({
         ok: false,
         available: false,
         stale: false,
+        source: 'none',
         code: 'env_unavailable',
-        error: '当前运行环境未注入宿主配额服务凭据',
+        error: '当前运行环境未注入宿主官方配额通道（也可在「其他」页接入官方 CLI statusLine）',
         fetchedAtMs: currentNow,
         groups: [],
       };
@@ -393,8 +784,9 @@ export function createQuotaClient({
     inFlight = (async () => {
       try {
         const raw = await fetcher({ address, csrfToken, timeoutMs });
-        const normalized = normalizeQuotaSummary(raw, now());
+        const normalized = normalizeQuotaSummary(raw, now(), { source: 'official_local_ls' });
         cached = normalized;
+        lastSource = 'official_local_ls';
         return normalized;
       } catch (err) {
         const code = typeof err?.code === 'string' ? err.code : 'fetch_failed';
@@ -414,6 +806,7 @@ export function createQuotaClient({
           ok: false,
           available: false,
           stale: false,
+          source: 'official_local_ls',
           code,
           error: message,
           fetchedAtMs: now(),
@@ -432,8 +825,43 @@ export function createQuotaClient({
     lastAttemptAtMs = 0;
   }
 
+  function getComplianceStatus(opts = {}) {
+    let resolvedEnabled;
+    if (typeof opts?.enabled === 'boolean') {
+      resolvedEnabled = opts.enabled;
+    } else if (typeof isEnabled === 'function') {
+      try {
+        const res = isEnabled();
+        resolvedEnabled = typeof res === 'boolean' ? res : lastSource !== 'disabled';
+      } catch {
+        resolvedEnabled = true;
+      }
+    } else {
+      resolvedEnabled = lastSource !== 'disabled';
+    }
+    const sl = inspectOfficialStatusLine(paths, now());
+    const hasLocalLs = Boolean(parseLsAddress(env?.ANTIGRAVITY_LS_ADDRESS || '') && String(env?.ANTIGRAVITY_CSRF_TOKEN || '').trim());
+    const activeSource = !resolvedEnabled
+      ? 'disabled'
+      : sl.fresh
+        ? 'official_statusline'
+        : lastSource && lastSource !== 'disabled'
+          ? lastSource
+          : hasLocalLs
+            ? 'official_local_ls'
+            : 'none';
+    return {
+      quotaQueryEnabled: Boolean(resolvedEnabled),
+      activeSource,
+      hasLocalLs,
+      directCloudCodeBlocked: true,
+      statusLine: sl,
+    };
+  }
+
   return {
     getQuotaSummary,
     clearCache,
+    getComplianceStatus,
   };
 }

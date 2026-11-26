@@ -188,6 +188,21 @@ export function resolvePaths(overrides = {}) {
     themesFile: path.join(pluginDataDir, 'themes.json'),
     customPresetsFile: path.join(pluginDataDir, 'presets_custom.json'),
     quotaAnchorsFile: path.join(pluginDataDir, 'quota_anchors.json'),
+    officialStatusLineQuotaFile: path.resolve(
+      overrides.officialStatusLineQuotaFile ||
+        process.env.AGY_STATUSLINE_QUOTA_FILE ||
+        path.join(pluginDataDir, 'official_statusline_quota.json'),
+    ),
+    officialStatusLineScriptFile: path.resolve(
+      overrides.officialStatusLineScriptFile ||
+        path.join(pluginDataDir, 'agy_statusline_bridge.mjs'),
+    ),
+    antigravityCliSettingsFile: path.resolve(
+      overrides.antigravityCliSettingsFile ||
+        (overrides.appDataDir
+          ? path.join(path.dirname(appDataDir), 'antigravity-cli', 'settings.json')
+          : path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json')),
+    ),
     masteryConfigFile: path.join(pluginDataDir, 'mastery_config.json'),
     masteryHookStateFile: path.join(pluginDataDir, 'mastery_hook_state.json'),
     masterySummariesFile: path.join(pluginDataDir, 'mastery_summaries.json'),

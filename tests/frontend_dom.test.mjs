@@ -137,8 +137,17 @@ function createMiniDom(htmlText) {
       style: makeStyle(),
       _text: '',
       _value: '',
+      _checked: false,
       disabled: false,
       files: [],
+      get checked() {
+        return this._checked || 'checked' in this.attributes;
+      },
+      set checked(v) {
+        this._checked = Boolean(v);
+        if (this._checked) this.attributes.checked = '';
+        else delete this.attributes.checked;
+      },
       get id() {
         return this.attributes.id || '';
       },
@@ -896,4 +905,245 @@ test('buildFrontendBundle compiles valid non-module classic script and mounts cl
   assert.ok(requests.some((u) => u.startsWith('/api/preferences')));
   assert.ok(requests.some((u) => u.startsWith('/api/snapshot')));
   assert.equal(document.getElementById('activeConvName').textContent, 'VM Session');
+});
+
+test('Other tab & quota master toggle: default ON, turning OFF stops all /api/quota calls and adapts general + accounts UI', async (t) => {
+  const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+  const { document } = createMiniDom(html);
+
+  const prevGlobals = {
+    document: globalThis.document,
+    window: globalThis.window,
+  };
+
+  let quotaEnabled = true;
+  const requests = [];
+  const mockAccounts = {
+    ok: true,
+    supported: true,
+    dpapiProtected: true,
+    quotaQueryEnabled: true,
+    officialActiveOnly: true,
+    currentEmail: 'alice@gmail.com',
+    hasLiveCredential: true,
+    groups: ['default', 'pro'],
+    builtinGroups: ['default', 'pro'],
+    settings: {
+      quotaRefreshIntervalMin: 5,
+      autoSwitchTarget: 'gemini',
+      autoSwitchEnabled: false,
+      backgroundRefreshInactive: false,
+      sortBy: 'gemini',
+      sortOrder: 'desc',
+    },
+    accounts: [
+      {
+        id: 'acc-1',
+        email: 'alice@gmail.com',
+        group: 'pro',
+        enabled: true,
+        isCurrent: true,
+        remark: 'Main',
+        quota: {
+          fetchedAtMs: Date.now(),
+          groups: [
+            {
+              key: 'gemini',
+              label: 'Gemini',
+              fiveHour: { remainingPct: 88, isFull: false, disabled: false },
+              weekly: { remainingPct: 60, isFull: false, disabled: false },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const buildCompliance = () => ({
+    quotaQueryEnabled: quotaEnabled,
+    activeSource: quotaEnabled ? 'official_local_ls' : 'disabled',
+    hasLocalLs: true,
+    directCloudCodeBlocked: true,
+    statusLine: { configured: false, configuredByOther: false, fresh: false, slashCommand: '/statusline' },
+  });
+
+  const mockWindow = {
+    location: { search: '?token=tok-other' },
+    sidecar: {
+      conversationId: 'conv-other',
+      async fetch(url, options = {}) {
+        const u = String(url);
+        requests.push({ url: u, method: options.method || 'GET', body: options.body || null });
+        if (u === '/api/preferences/quota-query' && options.method === 'POST') {
+          const body = JSON.parse(String(options.body || '{}'));
+          quotaEnabled = body.enabled !== false;
+          mockAccounts.quotaQueryEnabled = quotaEnabled;
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return { ok: true, quotaQueryEnabled: quotaEnabled, quotaCompliance: buildCompliance() };
+            },
+          };
+        }
+        if (u.startsWith('/api/preferences')) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                language: 'zh-CN',
+                windowCap: 512000,
+                quotaQueryEnabled: quotaEnabled,
+                quotaCompliance: buildCompliance(),
+                prompts: [],
+                themeState: {},
+                availableModels: [],
+              };
+            },
+          };
+        }
+        if (u.startsWith('/api/accounts')) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return { ...mockAccounts, quotaQueryEnabled: quotaEnabled };
+            },
+          };
+        }
+        if (u.startsWith('/api/quota')) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                ok: true,
+                available: true,
+                source: 'official_local_ls',
+                groups: [
+                  {
+                    key: 'gemini',
+                    label: 'Gemini',
+                    fiveHour: { remainingFraction: 0.9, remainingPct: 90, isFull: false, disabled: false },
+                    weekly: { remainingFraction: 0.7, remainingPct: 70, isFull: false, disabled: false },
+                  },
+                ],
+              };
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              unchanged: false,
+              etag: 'e-other',
+              activeConvId: 'conv-other',
+              quotaQueryEnabled: quotaEnabled,
+              contextPie: { windowCap: 512000, totalUsed: 1000, percent: 1, segments: {} },
+              tokenUsage: { scope: 'current', range: 'today', totalTokens: 1000, models: [] },
+              sessionsHub: { active: [], unread: [], recent: [], favorites: [], allSelectable: [] },
+              runtimeTelemetry: { latestTokPerSec: null, upstreamModelId: '', upstreamModelStatus: 'no_baseline' },
+              availableModels: [],
+            };
+          },
+        };
+      },
+      onWorkspaceChange() {
+        return () => {};
+      },
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  globalThis.document = document;
+  globalThis.window = mockWindow;
+
+  const { mountMonitorApp } = await import(`${pathToFileURL(path.join(FRONTEND_DIR, 'app.js')).href}?other=${Date.now()}`);
+  const controller = mountMonitorApp();
+  t.after(() => {
+    controller?.destroy?.();
+    globalThis.document = prevGlobals.document;
+    globalThis.window = prevGlobals.window;
+  });
+
+  await controller.readyPromise;
+  await controller.components.accountsHub.refresh({ silent: true });
+
+  // 1. Default ON state
+  const otherTabBtn = document.querySelector('[data-subnav="other"]');
+  const otherPanel = document.getElementById('panelOther');
+  const toggleEl = document.getElementById('otherQuotaToggle');
+  const usageCard = document.querySelector('.token-usage-card');
+  const quotaStrip = document.getElementById('quotaCardsStrip');
+  const accPanel = document.getElementById('panelAccounts');
+  const accSummaryCard = document.getElementById('accSummaryCard');
+  const accBatchBtn = document.getElementById('accBatchRefreshBtn');
+  const accList = document.getElementById('accList');
+
+  assert.ok(otherTabBtn && otherPanel && toggleEl);
+  assert.equal(toggleEl.checked, true);
+  assert.equal(quotaStrip.hidden, false);
+  assert.equal(usageCard.classList.contains('is-quota-disabled'), false);
+  assert.equal(accPanel.classList.contains('is-quota-disabled'), false);
+  assert.equal(accSummaryCard.hidden, false);
+  assert.equal(accBatchBtn.hidden, false);
+  assert.equal(accList.querySelectorAll('.acc-quota-grid').length, 1);
+
+  // 2. Switch to "其他" tab and turn master toggle OFF
+  otherTabBtn.click();
+  assert.equal(otherPanel.hidden, false);
+
+  const quotaCallsBeforeOff = requests.filter((r) => r.url.startsWith('/api/quota')).length;
+  assert.ok(quotaCallsBeforeOff >= 1);
+
+  toggleEl.checked = false;
+  toggleEl.dispatchEvent({ type: 'change', target: toggleEl });
+  await new Promise((r) => setTimeout(r, 25));
+
+  const postToggle = requests.find((r) => r.url === '/api/preferences/quota-query' && r.method === 'POST');
+  assert.ok(postToggle);
+  assert.equal(JSON.parse(String(postToggle.body)).enabled, false);
+
+  // Verify seamless UI fill across General + Accounts panels
+  assert.equal(quotaStrip.hidden, true);
+  assert.equal(usageCard.classList.contains('is-quota-disabled'), true);
+  assert.equal(accPanel.classList.contains('is-quota-disabled'), true);
+  assert.equal(accSummaryCard.hidden, true);
+  assert.equal(accBatchBtn.hidden, true);
+  assert.equal(accList.querySelectorAll('.acc-quota-grid').length, 0);
+  assert.equal(accList.querySelectorAll('.acc-quota-sync-time').length, 0);
+  assert.equal(accList.textContent.includes('刷新额度'), false);
+  assert.equal(accList.querySelectorAll('.acc-act-btn').length, 5);
+  assert.equal(document.querySelector('[data-sort-by="gemini"]').hidden, true);
+  assert.equal(document.querySelector('[data-sort-by="gpt_claude"]').hidden, true);
+
+  // Clicking manual refresh while OFF must trigger ZERO /api/quota requests
+  const quotaCallsRightAfterOff = requests.filter((r) => r.url.startsWith('/api/quota')).length;
+  document.getElementById('manualRefreshBtn').click();
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(
+    requests.filter((r) => r.url.startsWith('/api/quota')).length,
+    quotaCallsRightAfterOff,
+    'Manual refresh while quota switch is OFF must never call /api/quota',
+  );
+
+  // 3. Turn toggle back ON -> restores strip & resumes /api/quota fetch
+  toggleEl.checked = true;
+  toggleEl.dispatchEvent({ type: 'change', target: toggleEl });
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(quotaStrip.hidden, false);
+  assert.equal(usageCard.classList.contains('is-quota-disabled'), false);
+  assert.equal(accPanel.classList.contains('is-quota-disabled'), false);
+  assert.equal(accSummaryCard.hidden, false);
+  assert.equal(accBatchBtn.hidden, false);
+  assert.equal(accList.querySelectorAll('.acc-quota-grid').length, 1);
+  assert.ok(
+    requests.filter((r) => r.url.startsWith('/api/quota')).length > quotaCallsRightAfterOff,
+    'Turning quota switch back ON must resume /api/quota fetch',
+  );
 });

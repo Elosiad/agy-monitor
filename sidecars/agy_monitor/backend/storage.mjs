@@ -154,6 +154,7 @@ function defaultPrefs() {
     defaultModel: null,
     activePromptId: 'official',
     followLatestSession: true,
+    quotaQueryEnabled: true,
     memoryGuard: {
       autoTrimEnabled: true,
       thresholdMb: 1800,
@@ -547,6 +548,10 @@ export function createStorage(paths) {
         typeof raw.followLatestSession === 'boolean'
           ? raw.followLatestSession
           : base.followLatestSession,
+      quotaQueryEnabled:
+        typeof raw.quotaQueryEnabled === 'boolean'
+          ? raw.quotaQueryEnabled
+          : base.quotaQueryEnabled,
       memoryGuard,
     };
   }

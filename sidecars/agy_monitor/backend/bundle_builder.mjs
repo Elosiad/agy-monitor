@@ -10,6 +10,7 @@ const COMPONENT_EXPORTS = [
   ['runtime_bar.js', 'createRuntimeBar'],
   ['mastery_hub.js', 'createMasteryHub'],
   ['accounts_hub.js', 'createAccountsHub'],
+  ['other_hub.js', 'createOtherHub'],
   ['theme_studio.js', 'createThemeStudio'],
   ['changelog_modal.js', 'createChangelogModal'],
   ['memory_modal.js', 'createMemoryModal'],
@@ -105,6 +106,7 @@ export async function buildFrontendBundle(frontendDir) {
       `  const { createRuntimeBar } = __mods.runtime_bar;\n` +
       `  const { createMasteryHub } = __mods.mastery_hub;\n` +
       `  const { createAccountsHub } = __mods.accounts_hub;\n` +
+      `  const { createOtherHub } = __mods.other_hub;\n` +
       `  const { createThemeStudio } = __mods.theme_studio;\n` +
       `  const { createChangelogModal } = __mods.changelog_modal;\n` +
       `  const { createMemoryModal } = __mods.memory_modal;\n` +

@@ -1,12 +1,22 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
+import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import {
   callRetrieveUserQuotaSummary,
   createQuotaClient,
+  inspectOfficialStatusLine,
+  installOfficialStatusLineHook,
   normalizeQuotaSummary,
+  normalizeStatusLineQuota,
   parseLsAddress,
+  readStatusLineQuotaFile,
+  uninstallOfficialStatusLineHook,
 } from '../sidecars/agy_monitor/backend/quota.mjs';
 
 const OFFICIAL_SAMPLE_PAYLOAD = {
@@ -184,4 +194,121 @@ test('callRetrieveUserQuotaSummary and createQuotaClient handle live HTTP, cachi
   assert.equal(unavail.ok, false);
   assert.equal(unavail.available, false);
   assert.equal(unavail.code, 'env_unavailable');
+});
+
+test('official CLI statusLine bridge, priority over local LS RPC, and hard-stop when disabled', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-quota-sl-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const paths = resolvePaths({
+    pluginRoot: path.join(root, 'plugin'),
+    appDataDir: path.join(root, 'agy'),
+    geminiConfigDir: path.join(root, 'cfg'),
+  });
+
+  // 1. Install official CLI statusLine bridge into isolated settings.json
+  const before = inspectOfficialStatusLine(paths);
+  assert.equal(before.configured, false);
+
+  const installed = await installOfficialStatusLineHook(paths);
+  assert.equal(installed.ok, true);
+  assert.equal(installed.statusLine.configured, true);
+  assert.equal(fs.existsSync(paths.officialStatusLineScriptFile), true);
+  assert.equal(fs.existsSync(paths.antigravityCliSettingsFile), true);
+  const cliSettings = JSON.parse(fs.readFileSync(paths.antigravityCliSettingsFile, 'utf8'));
+  assert.equal(cliSettings.statusLine.type, 'command');
+  assert.ok(cliSettings.statusLine.command.includes('agy_statusline_bridge.mjs'));
+
+  // 2. Execute the real bridge script with official Antigravity CLI statusLine stdin JSON
+  const sampleStatusLineInput = {
+    email: 'official-cli@gmail.com',
+    plan_tier: 'Pro',
+    quota: {
+      'gemini-5h': {
+        remaining_fraction: 0.84,
+        reset_time: '2026-11-26T20:00:00Z',
+        reset_in_seconds: 7200,
+        disabled: false,
+      },
+      'gemini-weekly': {
+        remaining_fraction: 0.62,
+        reset_time: '2026-12-01T12:00:00Z',
+        reset_in_seconds: 400000,
+        disabled: false,
+      },
+      '3p-5h': {
+        remaining_fraction: 1.0,
+        reset_time: '2026-11-26T21:00:00Z',
+        reset_in_seconds: 10800,
+        disabled: false,
+      },
+      '3p-weekly': {
+        remaining_fraction: 0.45,
+        reset_time: '2026-11-30T08:00:00Z',
+        reset_in_seconds: 300000,
+        disabled: false,
+      },
+    },
+  };
+  const stdout = execFileSync(process.execPath, [paths.officialStatusLineScriptFile], {
+    input: JSON.stringify(sampleStatusLineInput),
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  assert.ok(stdout.includes('5h: 84.0%'));
+  assert.ok(stdout.includes('7d: 62.0%'));
+  assert.equal(fs.existsSync(paths.officialStatusLineQuotaFile), true);
+
+  const normalized = normalizeStatusLineQuota(sampleStatusLineInput, Date.now());
+  assert.equal(normalized.ok, true);
+  assert.equal(normalized.source, 'official_statusline');
+  assert.equal(normalized.groups[0].key, 'gemini');
+  assert.equal(normalized.groups[0].fiveHour.remainingPct, 84);
+  assert.equal(normalized.groups[1].key, 'gpt_claude');
+  assert.equal(normalized.groups[1].weekly.remainingPct, 45);
+
+  const snapshot = readStatusLineQuotaFile(paths.officialStatusLineQuotaFile);
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.source, 'official_statusline');
+
+  // 3. When fresh statusLine snapshot exists, createQuotaClient uses it with ZERO RPC calls
+  let rpcCalls = 0;
+  let quotaEnabled = true;
+  const client = createQuotaClient({
+    paths,
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:19998',
+      ANTIGRAVITY_CSRF_TOKEN: 'csrf-unused',
+    },
+    isEnabled: () => quotaEnabled,
+    fetcher: async () => {
+      rpcCalls += 1;
+      return OFFICIAL_SAMPLE_PAYLOAD;
+    },
+  });
+
+  const fromSl = await client.getQuotaSummary({ force: true });
+  assert.equal(fromSl.ok, true);
+  assert.equal(fromSl.source, 'official_statusline');
+  assert.equal(rpcCalls, 0, 'Fresh official statusLine snapshot must avoid extra RPC calls');
+  const compOn = client.getComplianceStatus();
+  assert.equal(compOn.directCloudCodeBlocked, true);
+  assert.equal(compOn.activeSource, 'official_statusline');
+  assert.equal(compOn.statusLine.fresh, true);
+
+  // 4. Hard-stop when disabled: zero RPC calls, zero statusLine reads, disabled=true
+  quotaEnabled = false;
+  const disabledRes = await client.getQuotaSummary({ force: true });
+  assert.equal(disabledRes.ok, false);
+  assert.equal(disabledRes.disabled, true);
+  assert.equal(disabledRes.code, 'quota_disabled');
+  assert.equal(rpcCalls, 0);
+  assert.equal(client.getComplianceStatus().activeSource, 'disabled');
+
+  // 5. Uninstall cleans settings.json cleanly
+  const removed = await uninstallOfficialStatusLineHook(paths);
+  assert.equal(removed.ok, true);
+  assert.equal(removed.statusLine.configured, false);
+  const afterSettings = JSON.parse(fs.readFileSync(paths.antigravityCliSettingsFile, 'utf8'));
+  assert.equal(afterSettings.statusLine, undefined);
 });

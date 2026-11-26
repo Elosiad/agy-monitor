@@ -8,9 +8,9 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 const RING_RADIUS = 10.5;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
-const AUTO_POLL_MS = 45_000;
+const AUTO_POLL_MS = 120_000;
 const COUNTDOWN_TICK_MS = 30_000;
-const ACTIVITY_REFRESH_DEBOUNCE_MS = 2_000;
+const ACTIVITY_REFRESH_DEBOUNCE_MS = 15_000;
 
 const DEFAULT_GROUPS = [
   { key: "gemini", label: "Gemini", displayName: "Gemini Models" },
@@ -152,13 +152,15 @@ async function requestQuotaJson(apiFetch, url) {
 /**
  * Mounts the 3-column official quota strip onto #quotaCardsStrip.
  */
-export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
+export function createQuotaCards({ apiFetch, t, onQuotaUpdate, initialEnabled = true, deferStart = false } = {}) {
   const container = document.getElementById("quotaCardsStrip");
 
   let translator = t;
+  let enabled = initialEnabled !== false;
   let state = {
-    phase: "loading", // loading | ready | unavailable
+    phase: "loading", // loading | ready | unavailable | disabled
     stale: false,
+    source: "",
     error: "",
     fetchedAtMs: 0,
     groups: [],
@@ -172,6 +174,21 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
   const cleanups = [];
 
   const tr = (key, fallback, vars) => translate(translator, key, fallback, vars);
+
+  function stopTimers() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (tickTimer !== null) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+    if (activityTimer !== null) {
+      clearTimeout(activityTimer);
+      activityTimer = null;
+    }
+  }
 
   function buildRowElement(group, bucket, windowKind, nowMs) {
     const isFiveHour = windowKind === "5h";
@@ -268,14 +285,35 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
     if (group.description) {
       tipParts.push(group.description);
     }
+    if (state.source === "official_statusline") {
+      tipParts.push(tr("quota.sourceStatusLine", "数据来源：官方 CLI statusLine 回调（零额外请求）"));
+    } else if (state.source === "official_local_ls") {
+      tipParts.push(tr("quota.sourceLocalLs", "数据来源：Antigravity 官方本机语言服务"));
+    }
     tipParts.push(tr("quota.tipClickRefresh", "点击卡片立即刷新官方配额"));
     row.title = tipParts.join("\n");
 
     return row;
   }
 
+  function syncCardLayoutClass() {
+    const usageCard = container?.closest?.(".token-usage-card") || null;
+    if (usageCard) {
+      usageCard.classList.toggle("is-quota-disabled", !enabled);
+    }
+    if (container) {
+      container.hidden = !enabled;
+    }
+  }
+
   function render() {
     if (!container) return;
+    syncCardLayoutClass();
+    if (!enabled) {
+      container.innerHTML = "";
+      container.classList.remove("is-loading", "is-stale", "is-unavailable", "is-refreshing");
+      return;
+    }
     const nowMs = Date.now();
     const activeGroups =
       state.phase === "ready" && Array.isArray(state.groups)
@@ -333,17 +371,22 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
   }
 
   async function refresh({ force = false } = {}) {
-    if (destroyed || !container || inFlight) return null;
+    if (destroyed || !container || !enabled || inFlight) return null;
     inFlight = true;
     container.classList.add("is-refreshing");
 
     try {
       const data = await requestQuotaJson(apiFetch, `/api/quota${force ? "?force=1" : ""}`);
-      if (destroyed) return null;
+      if (destroyed || !enabled) return null;
+      if (data && data.disabled) {
+        setEnabled(false);
+        return data;
+      }
       if (data && data.ok && Array.isArray(data.groups) && data.groups.length > 0) {
         state = {
           phase: "ready",
           stale: Boolean(data.stale),
+          source: typeof data.source === "string" ? data.source : "",
           error: data.error ? String(data.error) : "",
           fetchedAtMs: Number(data.fetchedAtMs) || Date.now(),
           groups: data.groups,
@@ -359,6 +402,7 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
         state = {
           phase: "unavailable",
           stale: false,
+          source: typeof data?.source === "string" ? data.source : "",
           error: String(data?.error || ""),
           fetchedAtMs: Date.now(),
           groups: [],
@@ -367,7 +411,7 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
       render();
       return data;
     } catch (err) {
-      if (destroyed) return null;
+      if (destroyed || !enabled) return null;
       if (state.phase === "ready" && state.groups.length > 0) {
         state = {
           ...state,
@@ -400,16 +444,17 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
   }
 
   function startTimers() {
+    if (!enabled || destroyed) return;
     if (pollTimer === null) {
       pollTimer = setInterval(() => {
-        if (!destroyed && isVisible()) {
+        if (!destroyed && enabled && isVisible()) {
           void refresh({ force: false });
         }
       }, AUTO_POLL_MS);
     }
     if (tickTimer === null) {
       tickTimer = setInterval(() => {
-        if (destroyed || !isVisible() || state.phase !== "ready") return;
+        if (destroyed || !enabled || !isVisible() || state.phase !== "ready") return;
         const nowMs = Date.now();
         const needsReFetch = state.groups.some((g) => {
           const b5 = g.fiveHour;
@@ -428,7 +473,44 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
     }
   }
 
+  function setEnabled(nextEnabled, { fetchNow = false } = {}) {
+    const target = nextEnabled !== false;
+    const prev = enabled;
+    enabled = target;
+    if (!enabled) {
+      stopTimers();
+      state = {
+        phase: "disabled",
+        stale: false,
+        source: "disabled",
+        error: "",
+        fetchedAtMs: 0,
+        groups: [],
+      };
+      render();
+      onQuotaUpdate?.(null);
+      return Promise.resolve(null);
+    }
+    if (!prev || state.phase === "disabled") {
+      state = {
+        phase: "loading",
+        stale: false,
+        source: "",
+        error: "",
+        fetchedAtMs: 0,
+        groups: [],
+      };
+    }
+    render();
+    startTimers();
+    if (fetchNow) {
+      return refresh({ force: false });
+    }
+    return Promise.resolve(null);
+  }
+
   function notifyTokenActivity(totalTokens) {
+    if (!enabled || destroyed) return;
     const n = Number(totalTokens);
     if (!Number.isFinite(n)) return;
     if (lastNotifiedTokens === null) {
@@ -440,18 +522,22 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
     if (activityTimer) clearTimeout(activityTimer);
     activityTimer = setTimeout(() => {
       activityTimer = null;
-      if (!destroyed && isVisible()) {
+      if (!destroyed && enabled && isVisible()) {
         void refresh({ force: true });
       }
     }, ACTIVITY_REFRESH_DEBOUNCE_MS);
   }
 
-  // Initial skeleton render + immediate background fetch
+  // Initial skeleton render + timers (deferred when app.js gates on /api/preferences first)
   render();
-  startTimers();
+  if (!deferStart && enabled) {
+    startTimers();
+  }
 
   return {
     refresh,
+    setEnabled,
+    isEnabled: () => enabled,
     notifyTokenActivity,
     setTranslator(nextT) {
       translator = nextT;
@@ -459,18 +545,7 @@ export function createQuotaCards({ apiFetch, t, onQuotaUpdate } = {}) {
     },
     destroy() {
       destroyed = true;
-      if (pollTimer !== null) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      if (tickTimer !== null) {
-        clearInterval(tickTimer);
-        tickTimer = null;
-      }
-      if (activityTimer !== null) {
-        clearTimeout(activityTimer);
-        activityTimer = null;
-      }
+      stopTimers();
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
     },

@@ -2267,11 +2267,18 @@ export function mountDesktopPetExtension(ctx = {}) {
   renderAll();
   void refreshFromServer();
 
+  let quotaQueryEnabled = true;
+
   return {
     id: "desktop_pet",
     onSnapshot(snapshot) {
       if (!snapshot || typeof snapshot !== "object") return;
-      const nextQuota = normalizeCompactQuota(snapshot.quota) || state.telemetry.quota;
+      if (typeof snapshot.quotaQueryEnabled === "boolean") {
+        quotaQueryEnabled = snapshot.quotaQueryEnabled;
+      }
+      const nextQuota = quotaQueryEnabled
+        ? (normalizeCompactQuota(snapshot.quota) || state.telemetry.quota)
+        : null;
       state.telemetry = {
         activeCount: Array.isArray(snapshot.sessionsHub?.active) ? snapshot.sessionsHub.active.length : 0,
         unreadCount: Array.isArray(snapshot.sessionsHub?.unread) ? snapshot.sessionsHub.unread.length : 0,
@@ -2324,12 +2331,22 @@ export function mountDesktopPetExtension(ctx = {}) {
       }
     },
     onQuota(quotaData) {
+      if (!quotaQueryEnabled || !quotaData) {
+        state.telemetry.quota = null;
+        return;
+      }
       const compact = normalizeCompactQuota(quotaData);
       if (compact) {
         state.telemetry.quota = compact;
       }
     },
-    onPreferences() {
+    onPreferences(prefs) {
+      if (prefs && typeof prefs.quotaQueryEnabled === "boolean") {
+        quotaQueryEnabled = prefs.quotaQueryEnabled;
+        if (!quotaQueryEnabled) {
+          state.telemetry.quota = null;
+        }
+      }
       if (Date.now() - lastServerPollMs > 1200) {
         void refreshFromServer();
       }
@@ -2340,10 +2357,10 @@ export function mountDesktopPetExtension(ctx = {}) {
         if (!persistInFlight && Date.now() - lastServerPollMs > 1200) {
           void refreshFromServer({ fromPoll: true });
         }
-        if (!state.telemetry.quota) {
+        if (quotaQueryEnabled && !state.telemetry.quota) {
           void fetchExtPetApi(apiFetch, "/api/quota")
             .then((qData) => {
-              if (destroyed) return;
+              if (destroyed || !quotaQueryEnabled || qData?.disabled) return;
               const compact = normalizeCompactQuota(qData);
               if (compact) state.telemetry.quota = compact;
             })

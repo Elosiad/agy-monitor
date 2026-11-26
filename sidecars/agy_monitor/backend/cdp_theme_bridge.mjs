@@ -442,7 +442,10 @@ function buildHudSyncExpr(
         ? clampInt(hudPayload.cacheHitPct, 0, 100, 0)
         : null,
     upstreamModelId: typeof hudPayload?.upstreamModelId === 'string' ? hudPayload.upstreamModelId : '',
-    quota: hudPayload?.quota && typeof hudPayload.quota === 'object' ? hudPayload.quota : null,
+    quota: hudPayload?.quotaQueryEnabled === false
+      ? null
+      : (hudPayload?.quota && typeof hudPayload.quota === 'object' ? hudPayload.quota : null),
+    quotaQueryEnabled: hudPayload?.quotaQueryEnabled !== false,
     sessions: Array.isArray(hudPayload?.sessions) ? hudPayload.sessions : [],
     accent:
       typeof accentColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(accentColor)

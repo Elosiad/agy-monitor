@@ -321,6 +321,7 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
     '/components/sessions_hub.js',
     '/components/runtime_bar.js',
     '/components/mastery_hub.js',
+    '/components/other_hub.js',
     '/components/theme_studio.js',
   ]) {
     const res = await fetch(base + staticPath);
@@ -344,6 +345,8 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
   const prefsRes = await (await fetch(base + '/api/preferences')).json();
   assert.equal(prefsRes.language, 'zh-CN');
   assert.equal(prefsRes.windowCap, 512000);
+  assert.equal(prefsRes.quotaQueryEnabled, true);
+  assert.equal(prefsRes.quotaCompliance?.directCloudCodeBlocked, true);
   assert.equal(prefsRes.themeState.activeWallpaperId, 'wp-1');
   assert.equal(prefsRes.themeState.opacity, 100);
   assert.equal(prefsRes.themeState.blur, 0);
@@ -636,6 +639,30 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
     targetPath: path.join(cfgDir, 'config.json'),
   });
   assert.equal(lbBlockedRes.status, 403);
+
+  // 10. Official quota master switch & CLI statusLine install/uninstall roundtrip
+  const quotaOffRes = await (await jsonPost('/api/preferences/quota-query', { enabled: false })).json();
+  assert.equal(quotaOffRes.ok, true);
+  assert.equal(quotaOffRes.quotaQueryEnabled, false);
+  const quotaDisabledResp = await (await fetch(base + '/api/quota?force=1')).json();
+  assert.equal(quotaDisabledResp.ok, false);
+  assert.equal(quotaDisabledResp.disabled, true);
+  assert.equal(quotaDisabledResp.code, 'quota_disabled');
+  const hudAfterQuotaOff = JSON.parse(fs.readFileSync(handle.paths.hudTelemetryFile, 'utf8'));
+  assert.equal(hudAfterQuotaOff.quotaQueryEnabled, false);
+  assert.equal(hudAfterQuotaOff.quota, null);
+
+  const slInstallRes = await (await jsonPost('/api/quota/statusline/install', {})).json();
+  assert.equal(slInstallRes.ok, true);
+  assert.equal(slInstallRes.statusLine.configured, true);
+  assert.equal(fs.existsSync(handle.paths.antigravityCliSettingsFile), true);
+  const slRemoveRes = await (await jsonPost('/api/quota/statusline/uninstall', {})).json();
+  assert.equal(slRemoveRes.ok, true);
+  assert.equal(slRemoveRes.statusLine.configured, false);
+
+  const quotaBackOnRes = await (await jsonPost('/api/preferences/quota-query', { enabled: true })).json();
+  assert.equal(quotaBackOnRes.ok, true);
+  assert.equal(quotaBackOnRes.quotaQueryEnabled, true);
 
   // Confirm ZERO host_injector.js, ZERO config.json modification, ZERO .pbtxt modification
   assert.equal(fs.existsSync(path.join(handle.paths.pluginDataDir, 'host_injector.js')), false);

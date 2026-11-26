@@ -2383,3 +2383,94 @@ test('account grouping supports default/pro/ultra 5x/ultra 20x, custom groups, i
   assert.equal(typeof handlers.get('POST /api/accounts/group'), 'function');
   assert.equal(typeof handlers.get('POST /api/accounts/groups'), 'function');
 });
+
+test('official compliance blocks direct cloudcode-pa probing in production and hard-stops all quota queries when disabled', async (t) => {
+  const fx = createFixture(t);
+  let quotaClientCalls = 0;
+  let quotaEnabled = true;
+
+  const countedQuotaClient = {
+    async getQuotaSummary(opts) {
+      quotaClientCalls += 1;
+      if (!quotaEnabled) {
+        return { ok: false, available: false, disabled: true, code: 'quota_disabled', groups: [] };
+      }
+      return fx.quotaClient.getQuotaSummary(opts);
+    },
+  };
+
+  fx.driver.setLive({
+    credObj: {
+      token: { refresh_token: '1//0eACTIVE_SAFE_123456', token_type: 'Bearer' },
+      auth_method: 'consumer',
+      id_token_email: 'active-safe@gmail.com',
+    },
+  });
+
+  // Production-like createAccountManager: NO remoteQuotaFetcher injected, allowUnsafeDirectCloudCode omitted (defaults false)
+  const mgr = createAccountManager({
+    paths: fx.paths,
+    storage: fx.storage,
+    quotaClient: countedQuotaClient,
+    sidecarBridge: fx.sidecarBridge,
+    getRunningConversations: async () => [],
+    driver: fx.driver,
+    onBeforeHostClose: async () => {},
+    isQuotaQueryEnabled: () => quotaEnabled,
+  });
+
+  const cap = await mgr.captureCurrentAccount({ remark: 'Active' });
+  assert.equal(cap.ok, true);
+  const imp = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'inactive-safe@gmail.com',
+      refresh_token: '1//0eINACTIVE_SAFE_TOKEN_123456',
+      quota: {
+        fetchedAtMs: Date.now(),
+        groups: [
+          {
+            key: 'gemini',
+            label: 'Gemini',
+            fiveHour: { remainingPct: 70, remainingFraction: 0.7, isFull: false, disabled: false },
+            weekly: { remainingPct: 60, remainingFraction: 0.6, isFull: false, disabled: false },
+          },
+          {
+            key: 'gpt_claude',
+            label: 'GPT&Claude',
+            fiveHour: { remainingPct: 80, remainingFraction: 0.8, isFull: false, disabled: false },
+            weekly: { remainingPct: 50, remainingFraction: 0.5, isFull: false, disabled: false },
+          },
+        ],
+      },
+    }),
+  });
+  assert.equal(imp.ok, true);
+  const inactiveId = imp.accounts[0].id;
+
+  // 1. Default ON + production mode: inactive account refresh MUST NOT hit cloudcode-pa.googleapis.com
+  const listOn = await mgr.listAccounts();
+  assert.equal(listOn.quotaQueryEnabled, true);
+  assert.equal(listOn.officialActiveOnly, true);
+
+  const inactiveRes = await mgr.refreshAccountQuota(inactiveId);
+  assert.equal(inactiveRes.ok, true);
+  assert.equal(inactiveRes.mode, 'official_active_only');
+  assert.equal(inactiveRes.skippedRemote, true);
+  assert.equal(inactiveRes.account.quota.groups[0].fiveHour.remainingPct, 70);
+
+  // 2. Toggle OFF: refreshAccountQuota returns 403 quota_disabled and lifecycle tick makes ZERO quotaClient calls
+  quotaEnabled = false;
+  quotaClientCalls = 0;
+
+  const listOff = await mgr.listAccounts();
+  assert.equal(listOff.quotaQueryEnabled, false);
+
+  const activeAcc = listOff.accounts.find((a) => a.isCurrent);
+  const blockedRefresh = await mgr.refreshAccountQuota(activeAcc.id);
+  assert.equal(blockedRefresh.ok, false);
+  assert.equal(blockedRefresh.status, 403);
+  assert.equal(blockedRefresh.code, 'quota_disabled');
+
+  await mgr.runLifecycleTick();
+  assert.equal(quotaClientCalls, 0, 'Lifecycle tick must make zero quotaClient calls when quotaQueryEnabled is false');
+});
