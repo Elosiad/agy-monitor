@@ -52,6 +52,19 @@ const MAX_BACKUPS_RETAINED = 10;
 const MAX_IMPORT_CHARS = 1024 * 1024;
 const MAX_IMPORT_BATCH = 50;
 const MAX_REMARK_CHARS = 120;
+const MAX_GROUP_NAME_CHARS = 32;
+const MAX_CUSTOM_GROUPS = 40;
+
+export const DEFAULT_ACCOUNT_GROUP = 'default';
+export const BUILTIN_ACCOUNT_GROUPS = Object.freeze([
+  'default',
+  'pro',
+  'ultra 5x',
+  'ultra 20x',
+]);
+const BUILTIN_ACCOUNT_GROUP_BY_LOWER = new Map(
+  BUILTIN_ACCOUNT_GROUPS.map((name) => [name.toLowerCase(), name]),
+);
 
 const VALID_AUTO_SWITCH_TARGETS = new Set(['gemini', 'gpt_claude']);
 const VALID_SORT_BY = new Set(['email', 'gemini', 'gpt_claude', 'lastUsed']);
@@ -1329,19 +1342,32 @@ export function buildAccountStatus(acc, nowMs = Date.now(), isCurrent = false) {
     };
   }
 
-  // Proactive passive check: if AT expiry is already in the past on an inactive account, surface AT_EXPIRED
+  // Passive AT expiry check:
+  // - If the account has NO refresh_token (`hasRefreshToken === false`), AT expiry is genuinely blocking.
+  // - If the account HAS a valid refresh_token, 1-hour AT expiry on an idle account is normal under
+  //   Cockpit's conservative zero-background-polling policy and is auto-renewed silently on switch/refresh,
+  //   so keep status `healthy` (`OK`) with `atAutoRenewPending: true` instead of firing false alarms.
   const expMs = Number(acc?.tokenExpiryMs) || 0;
   if (!isCurrent && expMs > 0 && expMs <= nowMs) {
     const missingRt = acc?.hasRefreshToken === false;
+    if (missingRt) {
+      return {
+        state: 'error',
+        code: 'AT_EXPIRED',
+        badge: 'AT 过期 · 无 RT',
+        blocking: true,
+        message: 'Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入',
+        detectedAtMs: expMs,
+      };
+    }
     return {
-      state: missingRt ? 'error' : 'warning',
-      code: 'AT_EXPIRED',
-      badge: missingRt ? 'AT 过期 · 无 RT' : 'AT 过期',
-      blocking: missingRt,
-      message: missingRt
-        ? 'Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入'
-        : 'Access Token (AT) 已过期，点击「立即续签」或「一键刷新 AT」可自动续签',
-      detectedAtMs: expMs,
+      state: 'healthy',
+      code: 'OK',
+      badge: '正常',
+      blocking: false,
+      message: '',
+      detectedAtMs: 0,
+      atAutoRenewPending: true,
     };
   }
 
@@ -2988,6 +3014,46 @@ function sanitizeRemark(raw) {
     .slice(0, MAX_REMARK_CHARS);
 }
 
+export function sanitizeAccountGroup(raw, fallback = DEFAULT_ACCOUNT_GROUP) {
+  const cleaned = String(raw || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_GROUP_NAME_CHARS);
+  if (!cleaned) return fallback;
+  const builtin = BUILTIN_ACCOUNT_GROUP_BY_LOWER.get(cleaned.toLowerCase());
+  return builtin || cleaned;
+}
+
+export function normalizeAccountGroups(rawGroups = null, accounts = []) {
+  const hasExplicitList = Array.isArray(rawGroups);
+  const out = hasExplicitList ? [DEFAULT_ACCOUNT_GROUP] : [...BUILTIN_ACCOUNT_GROUPS];
+  const seenLower = new Set(out.map((g) => g.toLowerCase()));
+  const maxTotal = BUILTIN_ACCOUNT_GROUPS.length + MAX_CUSTOM_GROUPS;
+
+  const pushGroup = (candidate) => {
+    if (out.length >= maxTotal) return;
+    const clean = sanitizeAccountGroup(candidate, '');
+    if (!clean) return;
+    const lower = clean.toLowerCase();
+    if (seenLower.has(lower)) return;
+    seenLower.add(lower);
+    out.push(clean);
+  };
+
+  if (hasExplicitList) {
+    for (const g of rawGroups) pushGroup(g);
+  }
+  if (Array.isArray(accounts)) {
+    for (const acc of accounts) {
+      if (acc && typeof acc === 'object' && acc.group) {
+        pushGroup(acc.group);
+      }
+    }
+  }
+  return out;
+}
+
 function decodeJwtEmail(idToken) {
   if (typeof idToken !== 'string') return '';
   const parts = idToken.split('.');
@@ -3105,7 +3171,7 @@ export function normalizeCredentialObject(rawObj, fallbackEmail = '') {
  * 3. Flat OAuth JSON (`{ email, refresh_token, access_token, id_token }`)
  * 4. Plain refresh_token lines (optionally `email,refresh_token,remark` or bare `1//0...`)
  */
-export function parseImportPayload(rawInput, { fallbackEmail = '', fallbackRemark = '' } = {}) {
+export function parseImportPayload(rawInput, { fallbackEmail = '', fallbackRemark = '', fallbackGroup = '' } = {}) {
   const text = String(rawInput ?? '').trim();
   if (!text) {
     return { ok: false, status: 400, error: '导入内容不能为空' };
@@ -3116,6 +3182,7 @@ export function parseImportPayload(rawInput, { fallbackEmail = '', fallbackRemar
 
   const cleanFallbackEmail = sanitizeEmail(fallbackEmail);
   const cleanFallbackRemark = sanitizeRemark(fallbackRemark);
+  const cleanFallbackGroup = sanitizeAccountGroup(fallbackGroup, '');
   const parsedEntries = [];
 
   const pushFromObject = (item, idx) => {
@@ -3143,9 +3210,15 @@ export function parseImportPayload(rawInput, { fallbackEmail = '', fallbackRemar
       hintEmail ||
       `imported-${crypto.createHash('sha1').update(norm.refreshToken).digest('hex').slice(0, 8)}@oauth.local`;
 
+    const rawItemGroup = typeof item.group === 'string' ? sanitizeAccountGroup(item.group, '') : '';
+    const hasExplicitGroup = Boolean(rawItemGroup || cleanFallbackGroup);
+    const resolvedGroup = rawItemGroup || cleanFallbackGroup || DEFAULT_ACCOUNT_GROUP;
+
     parsedEntries.push({
       email: finalEmail,
       remark: sanitizeRemark(item.remark ?? item.note ?? (idx === 0 ? cleanFallbackRemark : '')),
+      group: resolvedGroup,
+      hasExplicitGroup,
       enabled: item.enabled !== false,
       credTarget: typeof item.credTarget === 'string' && item.credTarget.trim()
         ? item.credTarget.trim()
@@ -3697,15 +3770,25 @@ export function createAccountManager({
         activeAccountId: '',
         settings: normalizeAccountSettings(),
         autoSwitchState: normalizeAutoSwitchState(),
+        groups: [...BUILTIN_ACCOUNT_GROUPS],
         accounts: [],
       };
     }
+    const rawAccounts = Array.isArray(raw.accounts) ? raw.accounts : [];
+    const normalizedAccounts = rawAccounts.map((acc) => {
+      if (!acc || typeof acc !== 'object') return acc;
+      return {
+        ...acc,
+        group: sanitizeAccountGroup(acc.group, DEFAULT_ACCOUNT_GROUP),
+      };
+    });
     return {
       version: 1,
       activeAccountId: typeof raw.activeAccountId === 'string' ? raw.activeAccountId : '',
       settings: normalizeAccountSettings(raw.settings),
       autoSwitchState: normalizeAutoSwitchState(raw.autoSwitchState),
-      accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
+      groups: normalizeAccountGroups(raw.groups, normalizedAccounts),
+      accounts: normalizedAccounts,
     };
   }
 
@@ -4099,6 +4182,7 @@ export function createAccountManager({
       id: acc.id,
       email: acc.email,
       remark: acc.remark || '',
+      group: sanitizeAccountGroup(acc.group, DEFAULT_ACCOUNT_GROUP),
       enabled: acc.enabled !== false,
       authMethod: acc.authMethod || 'oauth',
       source: acc.source || 'capture',
@@ -4159,6 +4243,7 @@ export function createAccountManager({
         : null;
 
     const accounts = index.accounts.map((acc) => formatPublicAccount(acc, liveInfo.email, nowMs));
+    const groups = normalizeAccountGroups(index.groups, index.accounts);
 
     return {
       ok: true,
@@ -4167,6 +4252,8 @@ export function createAccountManager({
       currentEmail: liveInfo.email || '',
       hasLiveCredential: Boolean(liveInfo.found),
       accounts,
+      groups,
+      builtinGroups: [...BUILTIN_ACCOUNT_GROUPS],
       settings: index.settings || {},
       backupCount: backups.length,
       lastTransaction: tx
@@ -4191,7 +4278,7 @@ export function createAccountManager({
    * Capture the currently logged-in Antigravity account from Windows Credential Manager
    * + current live 3-category quota snapshot, sealed into DPAPI vault.
    */
-  async function captureCurrentAccount({ remark = '', source = 'capture' } = {}) {
+  async function captureCurrentAccount({ remark = '', group = '', source = 'capture' } = {}) {
     if (!activeDriver.isSupported()) {
       return { ok: false, status: 501, error: '当前系统不支持原生凭据捕获（仅支持 Windows）' };
     }
@@ -4221,6 +4308,7 @@ export function createAccountManager({
       `account-${crypto.createHash('sha1').update(norm.refreshToken).digest('hex').slice(0, 8)}@antigravity.local`;
     const liveQuota = await fetchLiveQuotaNormalized();
     const ts = now();
+    const explicitGroup = sanitizeAccountGroup(group, '');
 
     return withStoreLock(async () => {
       const [index, vault] = await Promise.all([readIndex(), readVault()]);
@@ -4234,6 +4322,7 @@ export function createAccountManager({
           id: `acc_${crypto.randomBytes(6).toString('hex')}`,
           email,
           remark: sanitizeRemark(remark),
+          group: explicitGroup || DEFAULT_ACCOUNT_GROUP,
           enabled: true,
           authMethod: norm.credObj.auth_method || 'consumer',
           source,
@@ -4259,11 +4348,17 @@ export function createAccountManager({
         if (remark && sanitizeRemark(remark)) {
           existing.remark = sanitizeRemark(remark);
         }
+        if (explicitGroup) {
+          existing.group = explicitGroup;
+        } else {
+          existing.group = sanitizeAccountGroup(existing.group, DEFAULT_ACCOUNT_GROUP);
+        }
         if (liveQuota) {
           existing.quota = liveQuota;
         }
       }
 
+      index.groups = normalizeAccountGroups(index.groups, index.accounts);
       index.activeAccountId = existing.id;
       vault.secrets[existing.id] = {
         credTarget: live.credTarget || 'gemini:antigravity',
@@ -4281,6 +4376,7 @@ export function createAccountManager({
         ok: true,
         isNew,
         account: formatPublicAccount(existing, email, ts),
+        groups: index.groups,
       };
     });
   }
@@ -4288,13 +4384,14 @@ export function createAccountManager({
   /**
    * Import one or many accounts from Token / JSON text, sealed into DPAPI vault.
    */
-  async function importAccounts({ rawInput, email = '', remark = '' } = {}) {
+  async function importAccounts({ rawInput, email = '', remark = '', group = '' } = {}) {
     if (!activeDriver.isSupported()) {
       return { ok: false, status: 501, error: '当前系统不支持 DPAPI 安全入库（仅支持 Windows）' };
     }
     const parsed = parseImportPayload(rawInput, {
       fallbackEmail: email,
       fallbackRemark: remark,
+      fallbackGroup: group,
     });
     if (!parsed.ok) return parsed;
 
@@ -4324,6 +4421,7 @@ export function createAccountManager({
             id: `acc_${crypto.randomBytes(6).toString('hex')}`,
             email: item.email,
             remark: item.remark || '',
+            group: sanitizeAccountGroup(item.group, DEFAULT_ACCOUNT_GROUP),
             enabled: item.enabled !== false,
             authMethod: item.authMethod || 'consumer',
             source: 'import',
@@ -4346,6 +4444,11 @@ export function createAccountManager({
           existing.hasRefreshToken = itemHasRt;
           clearAccountErrorFields(existing);
           if (item.remark) existing.remark = item.remark;
+          if (item.hasExplicitGroup) {
+            existing.group = sanitizeAccountGroup(item.group, DEFAULT_ACCOUNT_GROUP);
+          } else {
+            existing.group = sanitizeAccountGroup(existing.group, DEFAULT_ACCOUNT_GROUP);
+          }
           if (item.quota && !existing.quota) existing.quota = item.quota;
           updatedCount += 1;
         }
@@ -4361,6 +4464,7 @@ export function createAccountManager({
         imported.push(formatPublicAccount(existing, liveInfo.email, ts));
       }
 
+      index.groups = normalizeAccountGroups(index.groups, index.accounts);
       await writeVault(vault);
       await writeIndex(index);
 
@@ -4370,6 +4474,7 @@ export function createAccountManager({
         updatedCount,
         totalImported: imported.length,
         accounts: imported,
+        groups: index.groups,
       };
     });
   }
@@ -4408,6 +4513,99 @@ export function createAccountManager({
       await writeIndex(index);
       return { ok: true, account: formatPublicAccount(acc, liveInfo.email, ts) };
     });
+  }
+
+  async function updateAccountGroup(accountId, group) {
+    const id = String(accountId || '').trim();
+    if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
+
+    const liveInfo = await readLiveEmailSafe();
+    const ts = now();
+    const nextGroup = sanitizeAccountGroup(group, DEFAULT_ACCOUNT_GROUP);
+
+    return withStoreLock(async () => {
+      const index = await readIndex();
+      const acc = index.accounts.find((a) => a.id === id);
+      if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
+      // Match existing custom group casing if present
+      const existingList = normalizeAccountGroups(index.groups, index.accounts);
+      const matched = existingList.find((g) => g.toLowerCase() === nextGroup.toLowerCase());
+      const finalGroup = matched || nextGroup;
+      acc.group = finalGroup;
+      acc.updatedAtMs = ts;
+      index.groups = normalizeAccountGroups([...existingList, finalGroup], index.accounts);
+      await writeIndex(index);
+      return {
+        ok: true,
+        account: formatPublicAccount(acc, liveInfo.email, ts),
+        groups: index.groups,
+        builtinGroups: [...BUILTIN_ACCOUNT_GROUPS],
+      };
+    });
+  }
+
+  async function manageAccountGroups({ action = '', name = '' } = {}) {
+    const act = String(action || '').trim().toLowerCase();
+    const cleanName = sanitizeAccountGroup(name, '');
+    if (act === 'add') {
+      if (!cleanName) return { ok: false, status: 400, error: '分组名称不能为空' };
+      return withStoreLock(async () => {
+        const index = await readIndex();
+        const current = normalizeAccountGroups(index.groups, index.accounts);
+        if (current.some((g) => g.toLowerCase() === cleanName.toLowerCase())) {
+          return { ok: false, status: 409, error: `分组「${cleanName}」已存在` };
+        }
+        if (current.length >= BUILTIN_ACCOUNT_GROUPS.length + MAX_CUSTOM_GROUPS) {
+          return { ok: false, status: 400, error: `自定义分组数量已达上限（最多 ${MAX_CUSTOM_GROUPS} 个）` };
+        }
+        index.groups = [...current, cleanName];
+        await writeIndex(index);
+        return {
+          ok: true,
+          group: cleanName,
+          groups: index.groups,
+          builtinGroups: [...BUILTIN_ACCOUNT_GROUPS],
+        };
+      });
+    }
+
+    if (act === 'delete') {
+      if (!cleanName) return { ok: false, status: 400, error: '分组名称不能为空' };
+      if (cleanName.toLowerCase() === DEFAULT_ACCOUNT_GROUP) {
+        return { ok: false, status: 400, error: '默认分组「default」不可删除' };
+      }
+      const liveInfo = await readLiveEmailSafe();
+      const ts = now();
+      return withStoreLock(async () => {
+        const index = await readIndex();
+        const current = normalizeAccountGroups(index.groups, index.accounts);
+        const matched = current.find((g) => g.toLowerCase() === cleanName.toLowerCase());
+        if (!matched) {
+          return { ok: false, status: 404, error: `分组「${cleanName}」不存在` };
+        }
+        let movedCount = 0;
+        for (const acc of index.accounts) {
+          if (sanitizeAccountGroup(acc.group).toLowerCase() === matched.toLowerCase()) {
+            acc.group = DEFAULT_ACCOUNT_GROUP;
+            acc.updatedAtMs = ts;
+            movedCount += 1;
+          }
+        }
+        const remaining = current.filter((g) => g.toLowerCase() !== matched.toLowerCase());
+        index.groups = normalizeAccountGroups(remaining, index.accounts);
+        await writeIndex(index);
+        return {
+          ok: true,
+          deletedGroup: matched,
+          movedCount,
+          groups: index.groups,
+          builtinGroups: [...BUILTIN_ACCOUNT_GROUPS],
+          accounts: index.accounts.map((a) => formatPublicAccount(a, liveInfo.email, ts)),
+        };
+      });
+    }
+
+    return { ok: false, status: 400, error: '不支持的分组操作（仅支持 add / delete）' };
   }
 
   async function deleteAccount(accountId) {
@@ -4456,6 +4654,7 @@ export function createAccountManager({
       exportedAt: new Date(now()).toISOString(),
       email: acc.email,
       remark: acc.remark || '',
+      group: sanitizeAccountGroup(acc.group, DEFAULT_ACCOUNT_GROUP),
       enabled: acc.enabled !== false,
       credTarget: secret.credTarget || 'gemini:antigravity',
       credUserName: secret.credUserName || 'antigravity',
@@ -5233,7 +5432,7 @@ export function createAccountManager({
     };
   }
 
-  async function startDirectBrowserOauth({ remark = '' } = {}, deps = {}) {
+  async function startDirectBrowserOauth({ remark = '', group = '' } = {}, deps = {}) {
     if (!activeDriver.isSupported()) {
       return { ok: false, status: 501, error: '当前系统不支持 DPAPI 安全入库（仅支持 Windows）' };
     }
@@ -5263,6 +5462,7 @@ export function createAccountManager({
       state,
       codeVerifier,
       remark: sanitizeRemark(remark),
+      group: sanitizeAccountGroup(group, ''),
       startedAtMs,
       timeoutMs,
       status: 'waiting_user_auth',
@@ -5416,6 +5616,7 @@ export function createAccountManager({
               id: `acc_${crypto.randomBytes(6).toString('hex')}`,
               email,
               remark: sanitizeRemark(session.remark),
+              group: session.group || DEFAULT_ACCOUNT_GROUP,
               enabled: true,
               authMethod: norm.credObj.auth_method || 'consumer',
               source: 'oauth',
@@ -5440,7 +5641,14 @@ export function createAccountManager({
             if (session.remark && sanitizeRemark(session.remark)) {
               existing.remark = sanitizeRemark(session.remark);
             }
+            if (session.group) {
+              existing.group = session.group;
+            } else {
+              existing.group = sanitizeAccountGroup(existing.group, DEFAULT_ACCOUNT_GROUP);
+            }
           }
+
+          index.groups = normalizeAccountGroups(index.groups, index.accounts);
 
           vault.secrets[existing.id] = {
             credTarget: 'gemini:antigravity',
@@ -5728,8 +5936,10 @@ export function createAccountManager({
           for (const acc of indexForSchedule.accounts) {
             if (!acc || acc.enabled === false) continue;
             if (liveInfo.email && sanitizeEmail(acc.email) === liveInfo.email) continue;
-            // NEVER re-poke blocking abnormal accounts (banned / verification / RT expired) in background ticks
+            // NEVER re-poke blocking/RT-invalid abnormal accounts (banned / verification / RT expired / missing RT) in background ticks
+            if (acc.hasRefreshToken === false) continue;
             if (ACCOUNT_ABNORMAL_BACKOFF_CODES.has(String(acc.authErrorCode || '').toUpperCase())) continue;
+            if (buildAccountStatus(acc, nowMs, false).blocking) continue;
             const fetchedAt = Number(acc.quota?.fetchedAtMs || 0);
             const expMs = Number(acc.tokenExpiryMs || 0);
             const tokenExpiringSoon = expMs > 0 && expMs - nowMs <= OAUTH_PROACTIVE_RENEW_WINDOW_MS;
@@ -5748,7 +5958,9 @@ export function createAccountManager({
         // and `quotaRefreshIntervalMin > 0`.
         const dueForProactiveRenew = indexForSchedule.accounts.filter((acc) => {
           if (!acc || acc.enabled === false) return false;
+          if (acc.hasRefreshToken === false) return false;
           if (ACCOUNT_ABNORMAL_BACKOFF_CODES.has(String(acc.authErrorCode || '').toUpperCase())) return false;
+          if (buildAccountStatus(acc, nowMs, false).blocking) return false;
           const expMs = Number(acc.tokenExpiryMs || 0);
           if (!expMs || expMs - nowMs > OAUTH_PROACTIVE_RENEW_WINDOW_MS) return false;
           const lastAttempt = autoTokenAttemptAtMs.get(acc.id) || 0;
@@ -5907,6 +6119,8 @@ export function createAccountManager({
     importAccounts,
     toggleAccountEnabled,
     updateAccountRemark,
+    updateAccountGroup,
+    manageAccountGroups,
     deleteAccount,
     exportAccountJson,
     refreshAccountQuota,

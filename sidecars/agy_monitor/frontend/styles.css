@@ -7815,6 +7815,289 @@ body.host-backdrop-shared .mad-lightbox-img {
   border: 1px solid color-mix(in srgb, var(--accent-danger) 44%, transparent);
 }
 
+/* 账号分组筛选与管理栏 */
+.acc-group-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  border-radius: var(--ui-radius);
+  background: color-mix(in srgb, var(--bg-surface) 74%, transparent);
+  border: 1px solid var(--border-hairline);
+  backdrop-filter: blur(10px);
+}
+
+.acc-group-bar-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  letter-spacing: 0.02em;
+}
+
+.acc-group-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.acc-group-pill-wrap {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+}
+
+.acc-group-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--bg-control) 72%, transparent);
+  color: var(--text-secondary);
+  font-size: 11.2px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.acc-group-pill:hover {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+}
+
+.acc-group-pill.is-active {
+  color: var(--accent-blue);
+  border-color: color-mix(in srgb, var(--accent-blue) 48%, transparent);
+  background: var(--accent-blue-bg);
+  font-weight: 600;
+}
+
+.acc-group-pill.is-group-pro.is-active {
+  color: var(--accent-blue);
+  border-color: color-mix(in srgb, var(--accent-blue) 52%, transparent);
+  background: var(--accent-blue-bg);
+}
+
+.acc-group-pill.is-group-ultra5.is-active {
+  color: var(--accent-amber);
+  border-color: color-mix(in srgb, var(--accent-amber) 52%, transparent);
+  background: var(--accent-amber-bg);
+}
+
+.acc-group-pill.is-group-ultra20.is-active {
+  color: var(--accent-purple);
+  border-color: color-mix(in srgb, var(--accent-purple) 54%, transparent);
+  background: color-mix(in srgb, var(--accent-purple) 16%, transparent);
+}
+
+.acc-group-pill.is-group-custom.is-active {
+  color: var(--accent-teal);
+  border-color: color-mix(in srgb, var(--accent-teal) 52%, transparent);
+  background: var(--accent-teal-bg);
+}
+
+.acc-group-pill-wrap:has(.acc-group-del-btn) .acc-group-pill {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  padding-right: 7px;
+}
+
+.acc-group-del-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  width: 20px;
+  padding: 0;
+  border-top-right-radius: 999px;
+  border-bottom-right-radius: 999px;
+  border: 1px solid var(--border-hairline);
+  border-left: none;
+  background: color-mix(in srgb, var(--bg-control) 72%, transparent);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.acc-group-del-btn:hover {
+  background: var(--accent-danger-bg);
+  color: var(--accent-danger);
+}
+
+.acc-group-add-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.acc-group-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px dashed var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
+}
+
+.acc-group-add-btn:hover {
+  border-color: color-mix(in srgb, var(--accent-blue) 52%, transparent);
+  color: var(--accent-blue);
+  background: var(--accent-blue-bg);
+}
+
+.acc-group-add-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.acc-group-add-form[hidden] {
+  display: none;
+}
+
+.acc-input.acc-group-add-input {
+  width: 132px;
+  min-width: 112px;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  line-height: 24px;
+  border-radius: 6px;
+  flex: 0 0 auto;
+}
+
+.acc-group-add-confirm,
+.acc-group-add-cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  font-size: 11.2px;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.acc-group-add-confirm {
+  padding: 0 10px;
+  background: var(--accent-blue-bg);
+  border-color: color-mix(in srgb, var(--accent-blue) 45%, transparent);
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.acc-group-add-confirm:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-blue) 75%, transparent);
+}
+
+.acc-group-add-cancel {
+  width: 26px;
+  padding: 0;
+  background: var(--bg-control);
+  color: var(--text-secondary);
+}
+
+.acc-group-add-cancel:hover {
+  background: var(--bg-control-hover);
+  color: var(--text-strong);
+}
+
+/* 单张账号卡片上的分组切换标签 */
+.acc-group-select {
+  height: 19px;
+  max-width: 116px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-chrome) 76%, transparent);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  outline: none;
+  flex-shrink: 0;
+  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
+}
+
+.acc-group-select option {
+  background: var(--bg-chrome);
+  color: var(--text-primary);
+}
+
+.acc-group-select:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-blue) 52%, transparent);
+}
+
+.acc-group-select.is-group-pro {
+  color: var(--accent-blue);
+  background: var(--accent-blue-bg);
+  border-color: color-mix(in srgb, var(--accent-blue) 38%, transparent);
+}
+
+.acc-group-select.is-group-ultra5 {
+  color: var(--accent-amber);
+  background: var(--accent-amber-bg);
+  border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
+}
+
+.acc-group-select.is-group-ultra20 {
+  color: var(--accent-purple);
+  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
+  border-color: color-mix(in srgb, var(--accent-purple) 42%, transparent);
+}
+
+.acc-group-select.is-group-custom {
+  color: var(--accent-teal);
+  background: var(--accent-teal-bg);
+  border-color: color-mix(in srgb, var(--accent-teal) 38%, transparent);
+}
+
+.acc-group-modal-select {
+  height: 32px;
+  min-width: 104px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-control);
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.acc-group-modal-select option {
+  background: var(--bg-chrome);
+  color: var(--text-primary);
+}
+
+.acc-group-modal-select:focus {
+  border-color: var(--border-focus);
+}
+
 /* 账号异常状态筛选与批量操作栏 */
 .acc-filter-bar {
   display: flex;
@@ -7933,7 +8216,7 @@ body.host-backdrop-shared .mad-lightbox-img {
   animation: accSpin 0.9s linear infinite;
 }
 
-/* 单张账号卡内的异常详情提示条 */
+/* 单张账号卡内的异常详情提示条（保持静态不闪烁，避免后台同步时视觉跳动） */
 .acc-item-alert {
   display: flex;
   align-items: center;
@@ -7943,18 +8226,6 @@ body.host-backdrop-shared .mad-lightbox-img {
   border-radius: 7px;
   font-size: 11.2px;
   line-height: 1.4;
-  animation: accAlertIn 0.22s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-@keyframes accAlertIn {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 .acc-item-alert.is-warn {

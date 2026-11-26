@@ -1014,6 +1014,29 @@
             <button class="acc-status-action-btn" id="accStatusCancelBtn" type="button" hidden>取消续跑</button>
           </div>
 
+          <!-- 账号分组筛选与管理栏 -->
+          <div class="acc-group-bar" id="accGroupBar" aria-label="账号分组筛选">
+            <span class="acc-group-bar-label">分组</span>
+            <div class="acc-group-pills" id="accGroupPills" role="tablist" aria-label="按分组筛选账号"></div>
+            <div class="acc-group-add-wrap" id="accGroupAddWrap">
+              <button class="acc-group-add-btn" id="accAddGroupToggleBtn" type="button" title="新增自定义账号分组">
+                <span>+ 新建分组</span>
+              </button>
+              <div class="acc-group-add-form" id="accAddGroupForm" hidden>
+                <input
+                  class="acc-input acc-group-add-input"
+                  id="accAddGroupInput"
+                  type="text"
+                  maxlength="32"
+                  placeholder="输入分组名…"
+                  autocomplete="off"
+                />
+                <button class="acc-group-add-confirm" id="accAddGroupSubmitBtn" type="button">添加</button>
+                <button class="acc-group-add-cancel" id="accAddGroupCancelBtn" type="button" aria-label="取消">×</button>
+              </div>
+            </div>
+          </div>
+
           <!-- 状态筛选与异常批量处理栏 -->
           <div class="acc-filter-bar" id="accFilterBar" hidden>
             <div class="acc-filter-group" id="accFilterGroup" role="tablist" aria-label="账号状态筛选">
@@ -1309,6 +1332,7 @@
               自动读取当前 Antigravity 登录凭证与官方实时额度，使用本机 DPAPI 加密入库。
             </p>
             <div class="acc-field-inline">
+              <select class="acc-group-modal-select" id="accCaptureGroupSelect" aria-label="目标分组" title="选择账号分组（默认 default）"></select>
               <input class="acc-input" id="accCaptureRemarkInput" type="text" maxlength="120" placeholder="可选：给该账号写个备注（如 主力 Pro）…" />
               <button class="acc-primary-btn" id="accCaptureCurrentBtn" type="button">立即捕获当前号</button>
             </div>
@@ -1382,6 +1406,10 @@
               <label class="acc-label" for="accImportRemarkInput">备注（可选）</label>
               <input class="acc-input" id="accImportRemarkInput" type="text" maxlength="120" placeholder="例如：备用 Pro 号" autocomplete="off" />
             </div>
+          </div>
+          <div class="acc-form-group">
+            <label class="acc-label" for="accImportGroupSelect">目标分组（可选，JSON 内已有分组则优先保留，默认 default）</label>
+            <select class="acc-input acc-group-modal-select" id="accImportGroupSelect" aria-label="导入账号分组"></select>
           </div>
           <div class="acc-form-error" id="accImportError" role="alert" hidden></div>
         </div>

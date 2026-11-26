@@ -2258,6 +2258,7 @@ export function createMonitorHandlers({
     try {
       const result = await accounts.captureCurrentAccount({
         remark: typeof data.remark === 'string' ? data.remark : '',
+        group: typeof data.group === 'string' ? data.group : '',
         source: 'capture',
       });
       if (!result.ok) {
@@ -2292,7 +2293,8 @@ export function createMonitorHandlers({
   register('POST', '/api/accounts/oauth-direct/start', async (data = {}) => {
     try {
       const remark = typeof data.remark === 'string' ? data.remark : '';
-      const result = await accounts.startDirectBrowserOauth({ remark });
+      const group = typeof data.group === 'string' ? data.group : '';
+      const result = await accounts.startDirectBrowserOauth({ remark, group });
       if (!result.ok) {
         return errorResponse(ResponseCtor, result.status || 400, result.error || '开启浏览器 OAuth 授权失败');
       }
@@ -2324,6 +2326,7 @@ export function createMonitorHandlers({
         rawInput: data.rawInput ?? data.text ?? data.payload ?? '',
         email: typeof data.email === 'string' ? data.email : '',
         remark: typeof data.remark === 'string' ? data.remark : '',
+        group: typeof data.group === 'string' ? data.group : '',
       });
       if (!result.ok) {
         return errorResponse(ResponseCtor, result.status || 400, result.error || '导入账号失败');
@@ -2351,6 +2354,33 @@ export function createMonitorHandlers({
       const result = await accounts.updateAccountRemark(data.accountId, data.remark ?? '');
       if (!result.ok) {
         return errorResponse(ResponseCtor, result.status || 400, result.error || '保存备注失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/group', async (data = {}) => {
+    try {
+      const result = await accounts.updateAccountGroup(data.accountId, data.group ?? 'default');
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '修改账号分组失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
+  register('POST', '/api/accounts/groups', async (data = {}) => {
+    try {
+      const result = await accounts.manageAccountGroups({
+        action: typeof data.action === 'string' ? data.action : '',
+        name: typeof data.name === 'string' ? data.name : '',
+      });
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '管理账号分组失败');
       }
       return result;
     } catch (err) {

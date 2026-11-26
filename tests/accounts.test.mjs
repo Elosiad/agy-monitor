@@ -9,6 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   ACCOUNT_EXPORT_SCHEMA,
   ANTIGRAVITY_OAUTH_SCOPES,
+  BUILTIN_ACCOUNT_GROUPS,
+  DEFAULT_ACCOUNT_GROUP,
   NATIVE_OAUTH_USER_AGENT,
   WINDOWS_CRED_MAX_BLOB_BYTES,
   buildAccountStatus,
@@ -24,6 +26,7 @@ import {
   inspectQuotaExhaustion,
   isFiveHourQuotaExhausted,
   mapModelToQuotaGroup,
+  normalizeAccountGroups,
   normalizeAccountSettings,
   parseGoogleCloudCodeError,
   parseImportPayload,
@@ -32,6 +35,7 @@ import {
   refreshAccessTokenForCredential,
   requestOverProxy,
   resolveSystemProxyUrl,
+  sanitizeAccountGroup,
   sanitizeValidationUrl,
   selectBestAutoSwitchCandidate,
   shouldBypassProxy,
@@ -1903,15 +1907,29 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
     (err) => err.code === 'AT_EXPIRED' && err.status === 401,
   );
 
-  // 4. Passive AT_EXPIRED detection via buildAccountStatus
+  // 4. Passive AT expiry check:
+  // - Idle account WITH valid RT stays healthy (AT auto-renews on switch/refresh, zero false alarms)
+  // - Idle account WITHOUT RT is surfaced as blocking AT_EXPIRED
+  // - Persisted HTTP 401 authErrorCode=AT_EXPIRED still surfaces warning AT_EXPIRED
   const passiveAtWithRt = buildAccountStatus({ tokenExpiryMs: nowMs - 10_000, hasRefreshToken: true }, nowMs, false);
-  assert.equal(passiveAtWithRt.code, 'AT_EXPIRED');
-  assert.equal(passiveAtWithRt.badge, 'AT 过期');
+  assert.equal(passiveAtWithRt.state, 'healthy');
+  assert.equal(passiveAtWithRt.code, 'OK');
   assert.equal(passiveAtWithRt.blocking, false);
+  assert.equal(passiveAtWithRt.atAutoRenewPending, true);
 
   const passiveAtNoRt = buildAccountStatus({ tokenExpiryMs: nowMs - 10_000, hasRefreshToken: false }, nowMs, false);
   assert.equal(passiveAtNoRt.code, 'AT_EXPIRED');
+  assert.equal(passiveAtNoRt.state, 'error');
   assert.equal(passiveAtNoRt.blocking, true);
+
+  const persistedAt401 = buildAccountStatus(
+    { tokenExpiryMs: nowMs - 10_000, hasRefreshToken: true, authErrorCode: 'AT_EXPIRED', authError: 'HTTP 401' },
+    nowMs,
+    false,
+  );
+  assert.equal(persistedAt401.code, 'AT_EXPIRED');
+  assert.equal(persistedAt401.state, 'warning');
+  assert.equal(persistedAt401.blocking, false);
 
   // 5. Auto-switch strictly skips banned / verification-required / RT-expired / missing-RT accounts
   const picked = selectBestAutoSwitchCandidate(
@@ -2110,7 +2128,8 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
   assert.equal(swRt.status, 401);
   assert.equal(driver.launchedTxs.length, 0);
 
-  // One-click AT-only renewal: imports an AT-expired account with valid RT and renews ONLY via OAuth (zero CloudCode calls)
+  // One-click AT-only renewal: imports an idle account with expired AT + valid RT (no false-alarm AT_EXPIRED)
+  // and verifies explicit OAuth-only renewal still refreshes cleanly with zero CloudCode calls
   const impAtExp = await mgr.importAccounts({
     rawInput: JSON.stringify({
       email: 'atexpired@gmail.com',
@@ -2126,7 +2145,8 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
   });
   assert.equal(impAtExp.ok, true);
   const atExpiredId = impAtExp.accounts[0].id;
-  assert.equal(impAtExp.accounts[0].accountStatus.code, 'AT_EXPIRED');
+  assert.equal(impAtExp.accounts[0].accountStatus.code, 'OK');
+  assert.equal(impAtExp.accounts[0].accountStatus.atAutoRenewPending, true);
   assert.equal(impAtExp.accounts[0].accountStatus.blocking, false);
 
   const remoteBeforeAtRenew = remoteQuotaCalls;
@@ -2175,4 +2195,191 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
   assert.equal(rRecovered.ok, true);
   assert.equal(rRecovered.account.accountStatus.code, 'OK');
   assert.equal(rRecovered.account.authError, undefined);
+});
+
+test('account grouping supports default/pro/ultra 5x/ultra 20x, custom groups, import/export roundtrip, and zero background polling on RT-expired accounts', async (t) => {
+  const nowMs = Date.parse('2026-11-26T10:00:00Z');
+  assert.equal(DEFAULT_ACCOUNT_GROUP, 'default');
+  assert.deepEqual([...BUILTIN_ACCOUNT_GROUPS], ['default', 'pro', 'ultra 5x', 'ultra 20x']);
+  assert.equal(sanitizeAccountGroup(''), 'default');
+  assert.equal(sanitizeAccountGroup('  ULTRA   20X '), 'ultra 20x');
+  assert.equal(sanitizeAccountGroup('Pro'), 'pro');
+  assert.deepEqual(normalizeAccountGroups(null, [{ group: 'vip' }]), [
+    'default',
+    'pro',
+    'ultra 5x',
+    'ultra 20x',
+    'vip',
+  ]);
+  assert.deepEqual(normalizeAccountGroups(['PRO', 'custom-team', 'default'], [{ group: 'vip' }]), [
+    'default',
+    'pro',
+    'custom-team',
+    'vip',
+  ]);
+
+  const { paths, storage, driver, quotaClient, sidecarBridge } = createFixture(t, {
+    liveCred: {
+      credObj: {
+        token: {
+          access_token: 'ya29.cur_grp',
+          refresh_token: '1//0eCUR_GRP_RT',
+          expiry: new Date(nowMs + 3600_000).toISOString(),
+        },
+        auth_method: 'consumer',
+        id_token_email: 'cur@gmail.com',
+      },
+    },
+    quotaPayload: makeSampleQuota(90, 95, 100, nowMs + 3600_000),
+  });
+
+  const polledEmails = [];
+  const mgr = createAccountManager({
+    paths,
+    storage,
+    quotaClient,
+    sidecarBridge,
+    driver,
+    now: () => nowMs,
+    remoteQuotaFetcher: async (credObj) => {
+      const rt = String(credObj?.token?.refresh_token || '');
+      polledEmails.push(rt);
+      return {
+        ok: true,
+        quota: makeSampleQuota(80, 90, 100, nowMs + 3600_000),
+        projectId: 'proj-grp',
+        source: 'retrieveUserQuotaSummary',
+        tokenExpiryMs: nowMs + 3600_000,
+        updatedCredObj: credObj,
+        renewed: false,
+      };
+    },
+  });
+
+  // 1. Default capture assigns 'default' group and listAccounts exposes all 4 built-in groups
+  const cap = await mgr.captureCurrentAccount();
+  assert.equal(cap.ok, true);
+  assert.equal(cap.account.group, 'default');
+  const initialList = await mgr.listAccounts();
+  assert.deepEqual(initialList.groups, ['default', 'pro', 'ultra 5x', 'ultra 20x']);
+  assert.deepEqual(initialList.builtinGroups, ['default', 'pro', 'ultra 5x', 'ultra 20x']);
+
+  // 2. Legacy accounts on disk lacking `group` automatically default to 'default'
+  const idxRaw = JSON.parse(fs.readFileSync(paths.accountsIndexFile, 'utf8'));
+  delete idxRaw.accounts[0].group;
+  delete idxRaw.groups;
+  fs.writeFileSync(paths.accountsIndexFile, JSON.stringify(idxRaw, null, 2), 'utf8');
+  const migratedList = await mgr.listAccounts();
+  assert.equal(migratedList.accounts[0].group, 'default');
+  assert.deepEqual(migratedList.groups, ['default', 'pro', 'ultra 5x', 'ultra 20x']);
+
+  // 3. Assign built-in and custom groups + protect built-in groups from deletion
+  const movedPro = await mgr.updateAccountGroup(cap.account.id, 'ULTRA 5X');
+  assert.equal(movedPro.ok, true);
+  assert.equal(movedPro.account.group, 'ultra 5x');
+
+  const addCustom = await mgr.manageAccountGroups({ action: 'add', name: 'team-alpha' });
+  assert.equal(addCustom.ok, true);
+  assert.ok(addCustom.groups.includes('team-alpha'));
+
+  const dupCustom = await mgr.manageAccountGroups({ action: 'add', name: 'TEAM-ALPHA' });
+  assert.equal(dupCustom.ok, false);
+  assert.equal(dupCustom.status, 409);
+
+  // Only 'default' is protected; default presets ('pro', 'ultra 5x', 'ultra 20x') can be deleted and stay deleted
+  const delDefault = await mgr.manageAccountGroups({ action: 'delete', name: 'default' });
+  assert.equal(delDefault.ok, false);
+  assert.equal(delDefault.status, 400);
+
+  const delPresetUltra5 = await mgr.manageAccountGroups({ action: 'delete', name: 'ultra 5x' });
+  assert.equal(delPresetUltra5.ok, true);
+  assert.equal(delPresetUltra5.movedCount, 1);
+  assert.equal(delPresetUltra5.groups.includes('ultra 5x'), false);
+  assert.equal(delPresetUltra5.accounts.find((a) => a.id === cap.account.id).group, 'default');
+  const afterDelPreset = await mgr.listAccounts();
+  assert.equal(afterDelPreset.groups.includes('ultra 5x'), false);
+  assert.equal(afterDelPreset.groups.includes('pro'), true);
+  assert.equal(afterDelPreset.groups.includes('ultra 20x'), true);
+
+  const movedCustom = await mgr.updateAccountGroup(cap.account.id, 'team-alpha');
+  assert.equal(movedCustom.ok, true);
+  assert.equal(movedCustom.account.group, 'team-alpha');
+
+  // 4. Export & import roundtrip preserves group; bare token re-import preserves existing group
+  const exported = await mgr.exportAccountJson(cap.account.id);
+  assert.equal(exported.ok, true);
+  assert.equal(exported.data.group, 'team-alpha');
+
+  const reimpBare = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'cur@gmail.com',
+      refresh_token: '1//0eCUR_GRP_RT_NEW',
+    }),
+  });
+  assert.equal(reimpBare.ok, true);
+  assert.equal(reimpBare.accounts[0].group, 'team-alpha');
+
+  const impUltra20 = await mgr.importAccounts({
+    rawInput: JSON.stringify({
+      email: 'u20@gmail.com',
+      group: 'ultra 20x',
+      refresh_token: '1//0eU20_RT_1234567890',
+    }),
+  });
+  assert.equal(impUltra20.ok, true);
+  assert.equal(impUltra20.accounts[0].group, 'ultra 20x');
+
+  // Deleting custom group reassigns its members back to 'default'
+  const delCustom = await mgr.manageAccountGroups({ action: 'delete', name: 'team-alpha' });
+  assert.equal(delCustom.ok, true);
+  assert.equal(delCustom.movedCount, 1);
+  assert.equal(delCustom.groups.includes('team-alpha'), false);
+  assert.equal(delCustom.accounts.find((a) => a.id === cap.account.id).group, 'default');
+
+  // 5. Anti-ban check: even with backgroundRefreshInactive=true, RT_EXPIRED / missing-RT / disabled accounts are NEVER polled!
+  const impBad = await mgr.importAccounts({
+    rawInput: JSON.stringify([
+      {
+        email: 'rtbad@gmail.com',
+        credential: {
+          token: { access_token: 'ya29.x', refresh_token: '1//0eRTBAD', expiry: new Date(nowMs - 60_000).toISOString() },
+          auth_method: 'consumer',
+        },
+      },
+      {
+        email: 'nort@gmail.com',
+        credential: {
+          token: { access_token: 'ya29.y', refresh_token: '1//0eNORT', expiry: new Date(nowMs - 60_000).toISOString() },
+          auth_method: 'consumer',
+        },
+      },
+      {
+        email: 'healthy-idle@gmail.com',
+        credential: {
+          token: { access_token: 'ya29.z', refresh_token: '1//0eHEALTHY_IDLE', expiry: new Date(nowMs - 60_000).toISOString() },
+          auth_method: 'consumer',
+        },
+      },
+    ]),
+  });
+  assert.equal(impBad.ok, true);
+  const idxForAntiBan = JSON.parse(fs.readFileSync(paths.accountsIndexFile, 'utf8'));
+  const rtBadRow = idxForAntiBan.accounts.find((a) => a.email === 'rtbad@gmail.com');
+  rtBadRow.authErrorCode = 'RT_EXPIRED';
+  rtBadRow.authError = 'Refresh Token 已失效';
+  const noRtRow = idxForAntiBan.accounts.find((a) => a.email === 'nort@gmail.com');
+  noRtRow.hasRefreshToken = false;
+  fs.writeFileSync(paths.accountsIndexFile, JSON.stringify(idxForAntiBan, null, 2), 'utf8');
+
+  await mgr.updateAccountSettings({ backgroundRefreshInactive: true, quotaRefreshIntervalMin: 5 });
+  polledEmails.length = 0;
+  await mgr.runLifecycleTick();
+  assert.equal(polledEmails.includes('1//0eRTBAD'), false, 'RT_EXPIRED account must NEVER be polled');
+  assert.equal(polledEmails.includes('1//0eNORT'), false, 'Missing-RT account must NEVER be polled');
+  assert.equal(polledEmails.includes('1//0eHEALTHY_IDLE'), true, 'Healthy enabled idle account polled when opt-in enabled');
+
+  // 6. Verify HTTP routes POST /api/accounts/group and POST /api/accounts/groups are registered in createMonitorHandlers
+  const handlers = createMonitorHandlers({ paths, storage });
+  assert.equal(typeof handlers.get('POST /api/accounts/group'), 'function');
+  assert.equal(typeof handlers.get('POST /api/accounts/groups'), 'function');
 });

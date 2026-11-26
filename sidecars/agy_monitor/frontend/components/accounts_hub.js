@@ -11,6 +11,33 @@ const DEFAULT_GROUPS = [
   { key: "gpt_claude", label: "GPT&Claude" },
 ];
 
+const DEFAULT_ACCOUNT_GROUP = "default";
+const BUILTIN_ACCOUNT_GROUPS = ["default", "pro", "ultra 5x", "ultra 20x"];
+const BUILTIN_ACCOUNT_GROUP_SET = new Set(BUILTIN_ACCOUNT_GROUPS);
+const ALL_GROUPS_KEY = "__all__";
+const IDLE_POLL_INTERVAL_MS = 30_000;
+const FAST_POLL_INTERVAL_MS = 2_500;
+
+function normalizeAccGroup(raw) {
+  const cleaned = String(raw || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 32);
+  if (!cleaned) return DEFAULT_ACCOUNT_GROUP;
+  const builtin = BUILTIN_ACCOUNT_GROUPS.find((g) => g.toLowerCase() === cleaned.toLowerCase());
+  return builtin || cleaned;
+}
+
+function getGroupToneClass(groupName) {
+  const lower = normalizeAccGroup(groupName).toLowerCase();
+  if (lower === "pro") return "is-group-pro";
+  if (lower === "ultra 5x") return "is-group-ultra5";
+  if (lower === "ultra 20x") return "is-group-ultra20";
+  if (lower === "default") return "is-group-default";
+  return "is-group-custom";
+}
+
 const SORT_FIELDS = [
   { key: "email", shortLabel: "a-z", label: "a-z（邮箱首字母）" },
   { key: "gemini", shortLabel: "Gemini", label: "Gemini 额度" },
@@ -198,15 +225,24 @@ function resolveAccountStatus(acc, nowMs = Date.now()) {
   const expMs = Number(acc?.tokenExpiryMs) || 0;
   if (!acc?.isCurrent && expMs > 0 && expMs <= nowMs) {
     const missingRt = acc?.hasRefreshToken === false;
+    if (missingRt) {
+      return {
+        state: "error",
+        code: "AT_EXPIRED",
+        badge: "AT 过期 · 无 RT",
+        blocking: true,
+        message: "Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入",
+        detectedAtMs: expMs,
+      };
+    }
     return {
-      state: missingRt ? "error" : "warning",
-      code: "AT_EXPIRED",
-      badge: missingRt ? "AT 过期 · 无 RT" : "AT 过期",
-      blocking: missingRt,
-      message: missingRt
-        ? "Access Token (AT) 已过期且缺少 Refresh Token (RT)，请重新授权或导入"
-        : "Access Token (AT) 已过期，点击「刷新额度」可自动续签",
-      detectedAtMs: expMs,
+      state: "healthy",
+      code: "OK",
+      badge: "正常",
+      blocking: false,
+      message: "",
+      detectedAtMs: 0,
+      atAutoRenewPending: true,
     };
   }
   if (!acc?.isCurrent && acc?.hasRefreshToken === false) {
@@ -270,6 +306,13 @@ export function createAccountsHub({
   const statusBannerEl = document.getElementById("accStatusBanner");
   const statusTextEl = document.getElementById("accStatusText");
   const statusCancelBtn = document.getElementById("accStatusCancelBtn");
+  const groupBarEl = document.getElementById("accGroupBar");
+  const groupPillsEl = document.getElementById("accGroupPills");
+  const addGroupToggleBtn = document.getElementById("accAddGroupToggleBtn");
+  const addGroupForm = document.getElementById("accAddGroupForm");
+  const addGroupInput = document.getElementById("accAddGroupInput");
+  const addGroupSubmitBtn = document.getElementById("accAddGroupSubmitBtn");
+  const addGroupCancelBtn = document.getElementById("accAddGroupCancelBtn");
   const filterBarEl = document.getElementById("accFilterBar");
   const filterGroupEl = document.getElementById("accFilterGroup");
   const filterCountAllEl = document.getElementById("accFilterCountAll");
@@ -312,6 +355,7 @@ export function createAccountsHub({
 
   // OAuth modal controls
   const oauthCurrentHintEl = document.getElementById("accOauthCurrentHint");
+  const captureGroupSelect = document.getElementById("accCaptureGroupSelect");
   const captureRemarkInput = document.getElementById("accCaptureRemarkInput");
   const captureCurrentBtn = document.getElementById("accCaptureCurrentBtn");
   const startOfficialOauthBtn = document.getElementById("accStartOfficialOauthBtn");
@@ -326,6 +370,7 @@ export function createAccountsHub({
   const importTextarea = document.getElementById("accImportTextarea");
   const importEmailInput = document.getElementById("accImportEmailInput");
   const importRemarkInput = document.getElementById("accImportRemarkInput");
+  const importGroupSelect = document.getElementById("accImportGroupSelect");
   const importFileBtn = document.getElementById("accImportFileBtn");
   const importFileInput = document.getElementById("accImportFileInput");
   const importErrorEl = document.getElementById("accImportError");
@@ -348,6 +393,7 @@ export function createAccountsHub({
   let destroyed = false;
   let tabActive = false;
   let pollTimer = null;
+  let pollIntervalMs = 0;
   let directOauthPollTimer = null;
   let loading = false;
   let switchingAccountId = "";
@@ -359,7 +405,10 @@ export function createAccountsHub({
   let activeRemarkAccount = null;
   let activeDeleteAccount = null;
   let activeExportPayload = { filename: "agy-account.json", jsonText: "" };
+  let activeGroup = ALL_GROUPS_KEY;
   let activeFilter = "all";
+  let lastListRenderSig = "";
+  let lastSummaryRenderSig = "";
   let batchRefreshing = false;
   let batchProgressText = "";
   let batchRenewingAt = false;
@@ -367,6 +416,7 @@ export function createAccountsHub({
   const refreshingIds = new Set();
   const renewingAtIds = new Set();
   const togglingIds = new Set();
+  const updatingGroupIds = new Set();
   const openingValidationIds = new Set();
   const openedValidationIds = new Set();
   const copiedValidationIds = new Set();
@@ -379,6 +429,8 @@ export function createAccountsHub({
     currentEmail: "",
     hasLiveCredential: false,
     accounts: [],
+    groups: [...BUILTIN_ACCOUNT_GROUPS],
+    builtinGroups: [...BUILTIN_ACCOUNT_GROUPS],
     settings: {
       quotaRefreshIntervalMin: 5,
       autoSwitchTarget: "gemini",
@@ -587,9 +639,225 @@ export function createAccountsHub({
     }
   }
 
-  function renderAccountList() {
+  function getEffectiveGroups() {
+    const out = [DEFAULT_ACCOUNT_GROUP];
+    const seen = new Set([DEFAULT_ACCOUNT_GROUP]);
+    const push = (raw) => {
+      const clean = normalizeAccGroup(raw);
+      const lower = clean.toLowerCase();
+      if (seen.has(lower)) return;
+      seen.add(lower);
+      out.push(clean);
+    };
+    const sourceGroups = Array.isArray(state.groups) && state.groups.length > 0
+      ? state.groups
+      : BUILTIN_ACCOUNT_GROUPS;
+    sourceGroups.forEach((g) => push(g));
+    if (Array.isArray(state.accounts)) {
+      state.accounts.forEach((acc) => {
+        if (acc && acc.group) push(acc.group);
+      });
+    }
+    return out;
+  }
+
+  function getGroupFilteredAccounts() {
+    const allAccounts = Array.isArray(state.accounts) ? state.accounts : [];
+    if (activeGroup === ALL_GROUPS_KEY) return allAccounts;
+    const targetLower = activeGroup.toLowerCase();
+    return allAccounts.filter((acc) => normalizeAccGroup(acc?.group).toLowerCase() === targetLower);
+  }
+
+  function populateGroupSelect(selectEl, selectedValue) {
+    if (!selectEl) return;
+    const groups = getEffectiveGroups();
+    const targetVal = normalizeAccGroup(selectedValue || DEFAULT_ACCOUNT_GROUP);
+    selectEl.innerHTML = "";
+    groups.forEach((g) => {
+      const opt = document.createElement("option");
+      opt.value = g;
+      opt.textContent = g;
+      if (g.toLowerCase() === targetVal.toLowerCase()) {
+        opt.selected = true;
+      }
+      selectEl.appendChild(opt);
+    });
+    selectEl.value = groups.find((g) => g.toLowerCase() === targetVal.toLowerCase()) || DEFAULT_ACCOUNT_GROUP;
+  }
+
+  function syncModalGroupSelects() {
+    const preferred = activeGroup !== ALL_GROUPS_KEY ? activeGroup : DEFAULT_ACCOUNT_GROUP;
+    populateGroupSelect(captureGroupSelect, captureGroupSelect?.value || preferred);
+    populateGroupSelect(importGroupSelect, importGroupSelect?.value || preferred);
+  }
+
+  function renderGroupBar() {
+    if (!groupBarEl || !groupPillsEl) return;
+    const groups = getEffectiveGroups();
+    if (
+      activeGroup !== ALL_GROUPS_KEY &&
+      !groups.some((g) => g.toLowerCase() === activeGroup.toLowerCase())
+    ) {
+      activeGroup = ALL_GROUPS_KEY;
+    }
+
+    const allAccounts = Array.isArray(state.accounts) ? state.accounts : [];
+    const countByGroup = new Map();
+    for (const acc of allAccounts) {
+      const key = normalizeAccGroup(acc?.group).toLowerCase();
+      countByGroup.set(key, (countByGroup.get(key) || 0) + 1);
+    }
+
+    groupPillsEl.innerHTML = "";
+
+    const makePill = ({ key, label, count, isProtected, toneClass }) => {
+      const isActive =
+        key === ALL_GROUPS_KEY
+          ? activeGroup === ALL_GROUPS_KEY
+          : activeGroup !== ALL_GROUPS_KEY && activeGroup.toLowerCase() === key.toLowerCase();
+
+      const wrap = document.createElement("div");
+      wrap.className = `acc-group-pill-wrap${isActive ? " is-active" : ""}`;
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `acc-group-pill ${toneClass}${isActive ? " is-active" : ""}`;
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("aria-selected", String(isActive));
+      btn.setAttribute("data-acc-group", key);
+
+      const textEl = document.createElement("span");
+      textEl.className = "acc-group-pill-name";
+      textEl.textContent = label;
+      btn.appendChild(textEl);
+
+      const cntEl = document.createElement("span");
+      cntEl.className = "acc-filter-count";
+      cntEl.textContent = String(count);
+      btn.appendChild(cntEl);
+
+      btn.addEventListener("click", () => {
+        if (activeGroup === key) return;
+        activeGroup = key;
+        renderGroupBar();
+        renderQuotaSummaryCard({ force: true });
+        renderFilterBar();
+        renderAccountList({ force: true });
+      });
+
+      wrap.appendChild(btn);
+
+      if (!isProtected && key !== ALL_GROUPS_KEY) {
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "acc-group-del-btn";
+        delBtn.textContent = "×";
+        delBtn.title = `删除分组「${label}」（该组账号将自动移回 default）`;
+        delBtn.setAttribute("aria-label", `删除分组 ${label}`);
+        delBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          void handleDeleteGroup(label);
+        });
+        wrap.appendChild(delBtn);
+      }
+
+      return wrap;
+    };
+
+    groupPillsEl.appendChild(
+      makePill({
+        key: ALL_GROUPS_KEY,
+        label: "全部",
+        count: allAccounts.length,
+        isProtected: true,
+        toneClass: "is-group-all",
+      }),
+    );
+
+    groups.forEach((g) => {
+      const isProtected = g.toLowerCase() === DEFAULT_ACCOUNT_GROUP;
+      groupPillsEl.appendChild(
+        makePill({
+          key: g,
+          label: g,
+          count: countByGroup.get(g.toLowerCase()) || 0,
+          isProtected,
+          toneClass: getGroupToneClass(g),
+        }),
+      );
+    });
+  }
+
+  function buildListRenderSignature(nowMs) {
+    const groups = getEffectiveGroups();
+    const list = Array.isArray(state.accounts) ? state.accounts : [];
+    const compactAccounts = list.map((acc) => {
+      const st = resolveAccountStatus(acc, nowMs);
+      const qGroups = Array.isArray(acc?.quota?.groups)
+        ? acc.quota.groups.map((g) => [
+            g?.key || "",
+            g?.fiveHour?.remainingPct ?? null,
+            Boolean(g?.fiveHour?.resetPassed),
+            Boolean(g?.fiveHour?.disabled),
+            g?.weekly?.remainingPct ?? null,
+            Boolean(g?.weekly?.resetPassed),
+            Boolean(g?.weekly?.disabled),
+          ])
+        : null;
+      return [
+        acc?.id || "",
+        acc?.email || "",
+        acc?.remark || "",
+        normalizeAccGroup(acc?.group),
+        acc?.enabled !== false,
+        Boolean(acc?.isCurrent),
+        Number(acc?.lastUsedAtMs || 0),
+        Number(acc?.updatedAtMs || 0),
+        st.code || "",
+        st.state || "",
+        st.badge || "",
+        st.message || "",
+        st.validationUrl || "",
+        Number(acc?.quota?.fetchedAtMs || 0),
+        qGroups,
+      ];
+    });
+    return JSON.stringify({
+      supported: state.supported,
+      currentEmail: state.currentEmail,
+      activeGroup,
+      activeFilter,
+      sortBy: state.settings.sortBy,
+      sortOrder: state.settings.sortOrder,
+      groups,
+      switchingAccountId,
+      refreshing: [...refreshingIds].sort(),
+      renewingAt: [...renewingAtIds].sort(),
+      toggling: [...togglingIds].sort(),
+      updatingGroup: [...updatingGroupIds].sort(),
+      openingValidation: [...openingValidationIds].sort(),
+      openedValidation: [...openedValidationIds].sort(),
+      copiedValidation: [...copiedValidationIds].sort(),
+      pulsing: [...pulsingCardIds].sort(),
+      accounts: compactAccounts,
+    });
+  }
+
+  function isUserInteractingInsideList() {
+    if (typeof document === "undefined" || !listEl) return false;
+    const active = document.activeElement;
+    if (!active || !listEl.contains(active)) return false;
+    const tag = String(active.tagName || "").toUpperCase();
+    return tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA";
+  }
+
+  function renderAccountList({ force = false } = {}) {
     if (!listEl) return;
+    if (!force && isUserInteractingInsideList()) return;
     const nowMs = Date.now();
+    const renderSig = buildListRenderSignature(nowMs);
+    if (!force && renderSig === lastListRenderSig) return;
+    lastListRenderSig = renderSig;
     listEl.innerHTML = "";
 
     if (!Array.isArray(state.accounts) || state.accounts.length === 0) {
@@ -625,8 +893,9 @@ export function createAccountsHub({
       return;
     }
 
+    const groupScoped = getGroupFilteredAccounts();
     const sortedAccounts = sortAccountsList(
-      state.accounts,
+      groupScoped,
       state.settings.sortBy,
       state.settings.sortOrder,
       nowMs,
@@ -644,27 +913,53 @@ export function createAccountsHub({
       empty.className = "acc-empty-card";
       const title = document.createElement("div");
       title.className = "acc-empty-title";
-      title.textContent = activeFilter === "abnormal" ? "当前没有异常账号" : "当前筛选条件下无账号";
+      const inSpecificGroup = activeGroup !== ALL_GROUPS_KEY;
+      title.textContent =
+        activeFilter === "abnormal"
+          ? inSpecificGroup
+            ? `分组「${activeGroup}」没有异常账号`
+            : "当前没有异常账号"
+          : inSpecificGroup && groupScoped.length === 0
+            ? `分组「${activeGroup}」暂无账号`
+            : "当前筛选条件下无账号";
       const desc = document.createElement("div");
       desc.className = "acc-empty-desc";
       desc.textContent =
         activeFilter === "abnormal"
-          ? "所有已检测账号状态良好，如需重新核验可点击上方「一键检测全部」。"
-          : "点击「全部」查看所有已保存账号。";
+          ? "当前范围已检测账号状态良好，如需重新核验可点击上方「一键检测全部」。"
+          : inSpecificGroup
+            ? "可在账号卡片顶部切换分组将其移入此处，或点击下方按钮查看全部分组。"
+            : "点击「全部」查看所有已保存账号。";
       empty.appendChild(title);
       empty.appendChild(desc);
+      if (inSpecificGroup) {
+        const showAllBtn = document.createElement("button");
+        showAllBtn.type = "button";
+        showAllBtn.className = "acc-secondary-btn";
+        showAllBtn.textContent = "查看全部分组";
+        showAllBtn.addEventListener("click", () => {
+          activeGroup = ALL_GROUPS_KEY;
+          activeFilter = "all";
+          renderAll({ force: true });
+        });
+        empty.appendChild(showAllBtn);
+      }
       listEl.appendChild(empty);
       return;
     }
 
+    const allGroupOptions = getEffectiveGroups();
+
     visibleAccounts.forEach((acc) => {
       const accStatus = resolveAccountStatus(acc, nowMs);
       const isAbnormal = accStatus.state !== "healthy";
+      const accGroup = normalizeAccGroup(acc.group);
 
       const card = document.createElement("article");
       card.className = "acc-item-card";
       card.setAttribute("role", "listitem");
       card.setAttribute("data-account-id", acc.id);
+      card.setAttribute("data-account-group", accGroup);
       if (accStatus.code && accStatus.code !== "OK") {
         card.setAttribute("data-account-status", accStatus.code);
       }
@@ -674,7 +969,7 @@ export function createAccountsHub({
       else if (accStatus.state === "warning") card.classList.add("is-abnormal-warn");
       if (pulsingCardIds.has(acc.id)) card.classList.add("is-trigger-pulse");
 
-      // Row 1: Identity (Email + Status badges + Remark)
+      // Row 1: Identity (Email + Status badges + Group selector + Remark)
       const topRow = document.createElement("div");
       topRow.className = "acc-item-head";
 
@@ -722,6 +1017,31 @@ export function createAccountsHub({
         disBadge.textContent = "已禁用";
         idLeft.appendChild(disBadge);
       }
+
+      // Inline account group selector pill
+      const groupSelect = document.createElement("select");
+      groupSelect.className = `acc-group-select ${getGroupToneClass(accGroup)}`;
+      groupSelect.setAttribute("aria-label", `切换 ${acc.email} 的分组`);
+      groupSelect.title = `当前分组：${accGroup}（点击切换分组）`;
+      groupSelect.disabled = updatingGroupIds.has(acc.id);
+      allGroupOptions.forEach((g) => {
+        const opt = document.createElement("option");
+        opt.value = g;
+        opt.textContent = g;
+        if (g.toLowerCase() === accGroup.toLowerCase()) {
+          opt.selected = true;
+        }
+        groupSelect.appendChild(opt);
+      });
+      groupSelect.value =
+        allGroupOptions.find((g) => g.toLowerCase() === accGroup.toLowerCase()) || DEFAULT_ACCOUNT_GROUP;
+      groupSelect.addEventListener("change", () => {
+        const nextGroup = groupSelect.value;
+        if (normalizeAccGroup(nextGroup).toLowerCase() === accGroup.toLowerCase()) return;
+        void handleChangeAccountGroup(acc, nextGroup);
+      });
+      idLeft.appendChild(groupSelect);
+
       if (acc.remark) {
         const remarkChip = document.createElement("span");
         remarkChip.className = "acc-remark-chip";
@@ -994,12 +1314,13 @@ export function createAccountsHub({
     }
   }
 
-  function renderQuotaSummaryCard() {
+  function renderQuotaSummaryCard({ force = false } = {}) {
     if (!summaryCardEl || !summaryGridEl) return;
-    const allAccounts = Array.isArray(state.accounts) ? state.accounts : [];
+    const allAccounts = getGroupFilteredAccounts();
     if (allAccounts.length === 0) {
       summaryCardEl.hidden = true;
       summaryGridEl.innerHTML = "";
+      lastSummaryRenderSig = "";
       return;
     }
 
@@ -1009,11 +1330,12 @@ export function createAccountsHub({
     const pool = enabledAccounts.filter((acc) => !resolveAccountStatus(acc, nowMs).blocking);
     summaryCardEl.hidden = false;
 
+    const groupPrefix = activeGroup !== ALL_GROUPS_KEY ? `分组「${activeGroup}」 · ` : "";
     if (summaryMetaEl) {
       const baseText =
         enabledAccounts.length === allAccounts.length
-          ? `共 ${allAccounts.length} 个账号`
-          : `已启用 ${enabledAccounts.length} / ${allAccounts.length} 个账号`;
+          ? `${groupPrefix}共 ${allAccounts.length} 个账号`
+          : `${groupPrefix}已启用 ${enabledAccounts.length} / ${allAccounts.length} 个账号`;
       summaryMetaEl.textContent = abnormalCount > 0 ? `${baseText} · 异常 ${abnormalCount} 个` : baseText;
     }
     if (summaryHintEl) {
@@ -1083,10 +1405,24 @@ export function createAccountsHub({
       return "is-healthy";
     };
 
+    const aggByKey = DEFAULT_GROUPS.map((def) => ({
+      def,
+      agg5h: aggregateBucket(def.key, "fiveHour"),
+      aggWeekly: aggregateBucket(def.key, "weekly"),
+    }));
+    const summarySig = JSON.stringify({
+      activeGroup,
+      total: allAccounts.length,
+      enabled: enabledAccounts.length,
+      abnormal: abnormalCount,
+      pool: pool.length,
+      aggs: aggByKey.map((x) => [x.agg5h, x.aggWeekly]),
+    });
+    if (!force && summarySig === lastSummaryRenderSig) return;
+    lastSummaryRenderSig = summarySig;
+
     summaryGridEl.innerHTML = "";
-    DEFAULT_GROUPS.forEach((def) => {
-      const agg5h = aggregateBucket(def.key, "fiveHour");
-      const aggWeekly = aggregateBucket(def.key, "weekly");
+    aggByKey.forEach(({ def, agg5h, aggWeekly }) => {
 
       const cell = document.createElement("div");
       cell.className = "acc-quota-cell acc-summary-cell";
@@ -1153,12 +1489,13 @@ export function createAccountsHub({
 
   function renderFilterBar() {
     if (!filterBarEl) return;
-    const allAccounts = Array.isArray(state.accounts) ? state.accounts : [];
-    if (allAccounts.length === 0) {
+    const totalAccounts = Array.isArray(state.accounts) ? state.accounts : [];
+    if (totalAccounts.length === 0) {
       filterBarEl.hidden = true;
       return;
     }
     filterBarEl.hidden = false;
+    const allAccounts = getGroupFilteredAccounts();
     const nowMs = Date.now();
     let healthyCount = 0;
     let abnormalCount = 0;
@@ -1219,13 +1556,14 @@ export function createAccountsHub({
     }
   }
 
-  function renderAll() {
+  function renderAll({ force = true } = {}) {
     renderHeaderMeta();
     renderSortControls();
-    renderQuotaSummaryCard();
+    renderGroupBar();
+    renderQuotaSummaryCard({ force });
     renderStatusBanner();
     renderFilterBar();
-    renderAccountList();
+    renderAccountList({ force });
   }
 
   async function persistSettingsPatch(patch, { silent = true } = {}) {
@@ -1257,6 +1595,12 @@ export function createAccountsHub({
       state.currentEmail = String(data.currentEmail || "");
       state.hasLiveCredential = Boolean(data.hasLiveCredential);
       state.accounts = Array.isArray(data.accounts) ? data.accounts : [];
+      if (Array.isArray(data.groups) && data.groups.length > 0) {
+        state.groups = data.groups;
+      }
+      if (Array.isArray(data.builtinGroups) && data.builtinGroups.length > 0) {
+        state.builtinGroups = data.builtinGroups;
+      }
       if (data.settings && typeof data.settings === "object") {
         state.settings = {
           quotaRefreshIntervalMin:
@@ -1308,7 +1652,7 @@ export function createAccountsHub({
         }
       }
 
-      renderAll();
+      renderAll({ force: !silent });
       syncPolling();
       return data;
     } catch (err) {
@@ -1323,17 +1667,28 @@ export function createAccountsHub({
 
   function syncPolling() {
     const needFastPoll = Boolean(state.pendingResume || state.pendingOauth);
-    if ((tabActive || needFastPoll) && !pollTimer && !destroyed) {
-      pollTimer = setInterval(() => {
-        if (destroyed) return;
-        if (tabActive || state.pendingResume || state.pendingOauth) {
-          void refresh({ silent: true });
-        }
-      }, needFastPoll ? 2500 : 12_000);
-    } else if (!tabActive && !needFastPoll && pollTimer) {
+    const shouldPoll = (tabActive || needFastPoll) && !destroyed;
+    const targetMs = needFastPoll ? FAST_POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS;
+    if (!shouldPoll) {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        pollIntervalMs = 0;
+      }
+      return;
+    }
+    if (pollTimer && pollIntervalMs === targetMs) return;
+    if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
+    pollIntervalMs = targetMs;
+    pollTimer = setInterval(() => {
+      if (destroyed) return;
+      if (tabActive || state.pendingResume || state.pendingOauth) {
+        void refresh({ silent: true });
+      }
+    }, targetMs);
   }
 
   function openOauthModal() {
@@ -1344,6 +1699,10 @@ export function createAccountsHub({
         : "未检测到活跃登录凭据。请先登录 Antigravity，或使用下方「打开浏览器授权新号」。";
     }
     if (captureRemarkInput) captureRemarkInput.value = "";
+    populateGroupSelect(
+      captureGroupSelect,
+      activeGroup !== ALL_GROUPS_KEY ? activeGroup : DEFAULT_ACCOUNT_GROUP,
+    );
     openModal("oauth");
   }
 
@@ -1351,9 +1710,10 @@ export function createAccountsHub({
     if (captureCurrentBtn) captureCurrentBtn.disabled = true;
     try {
       const remark = captureRemarkInput ? captureRemarkInput.value.trim() : "";
+      const group = captureGroupSelect ? captureGroupSelect.value : DEFAULT_ACCOUNT_GROUP;
       const res = await requestJson("/api/accounts/capture", {
         method: "POST",
-        body: JSON.stringify({ remark }),
+        body: JSON.stringify({ remark, group }),
       });
       closeModal("oauth");
       onToast?.(
@@ -1362,7 +1722,7 @@ export function createAccountsHub({
           : `已更新账号凭证与额度：${res.account?.email || ""}`,
         "success",
       );
-      await refresh({ silent: true });
+      await refresh({ silent: false });
     } catch (err) {
       onToast?.(err?.message || "捕获当前账号失败", "error");
     } finally {
@@ -1374,9 +1734,10 @@ export function createAccountsHub({
     if (startDirectOauthBtn) startDirectOauthBtn.disabled = true;
     try {
       const remark = captureRemarkInput ? captureRemarkInput.value.trim() : "";
+      const group = captureGroupSelect ? captureGroupSelect.value : DEFAULT_ACCOUNT_GROUP;
       const res = await requestJson("/api/accounts/oauth-direct/start", {
         method: "POST",
-        body: JSON.stringify({ remark }),
+        body: JSON.stringify({ remark, group }),
       });
       if (directOauthInitialRow) directOauthInitialRow.hidden = true;
       if (directOauthProgress) directOauthProgress.hidden = false;
@@ -1438,6 +1799,10 @@ export function createAccountsHub({
     if (importTextarea) importTextarea.value = "";
     if (importEmailInput) importEmailInput.value = "";
     if (importRemarkInput) importRemarkInput.value = "";
+    populateGroupSelect(
+      importGroupSelect,
+      activeGroup !== ALL_GROUPS_KEY ? activeGroup : DEFAULT_ACCOUNT_GROUP,
+    );
     if (importErrorEl) {
       importErrorEl.textContent = "";
       importErrorEl.hidden = true;
@@ -1458,12 +1823,14 @@ export function createAccountsHub({
     if (importErrorEl) importErrorEl.hidden = true;
     if (importSubmitBtn) importSubmitBtn.disabled = true;
     try {
+      const selectedGroup = importGroupSelect ? importGroupSelect.value : DEFAULT_ACCOUNT_GROUP;
       const res = await requestJson("/api/accounts/import", {
         method: "POST",
         body: JSON.stringify({
           rawInput,
           email: importEmailInput ? importEmailInput.value.trim() : "",
           remark: importRemarkInput ? importRemarkInput.value.trim() : "",
+          group: selectedGroup !== DEFAULT_ACCOUNT_GROUP ? selectedGroup : "",
         }),
       });
       closeModal("import");
@@ -1471,7 +1838,7 @@ export function createAccountsHub({
         `导入完成：新增 ${res.addedCount || 0} 个，更新 ${res.updatedCount || 0} 个`,
         "success",
       );
-      await refresh({ silent: true });
+      await refresh({ silent: false });
     } catch (err) {
       if (importErrorEl) {
         importErrorEl.textContent = err?.message || "导入失败";
@@ -1557,12 +1924,109 @@ export function createAccountsHub({
         state.accounts[idx] = res.account;
       }
       closeModal("remark");
-      renderAccountList();
+      renderAccountList({ force: true });
       onToast?.("账号备注已保存", "success");
     } catch (err) {
       onToast?.(err?.message || "保存备注失败", "error");
     } finally {
       if (remarkSaveBtn) remarkSaveBtn.disabled = false;
+    }
+  }
+
+  async function handleChangeAccountGroup(acc, nextGroup) {
+    if (!acc || !acc.id || updatingGroupIds.has(acc.id)) return;
+    updatingGroupIds.add(acc.id);
+    try {
+      const res = await requestJson("/api/accounts/group", {
+        method: "POST",
+        body: JSON.stringify({ accountId: acc.id, group: nextGroup }),
+      });
+      const idx = state.accounts.findIndex((a) => a.id === acc.id);
+      if (idx >= 0 && res.account) {
+        state.accounts[idx] = res.account;
+      }
+      if (Array.isArray(res.groups) && res.groups.length > 0) {
+        state.groups = res.groups;
+      }
+      onToast?.(`已将 ${acc.email} 移至分组「${res.account?.group || nextGroup}」`, "success");
+    } catch (err) {
+      onToast?.(err?.message || "修改账号分组失败", "error");
+    } finally {
+      updatingGroupIds.delete(acc.id);
+      renderAll({ force: true });
+    }
+  }
+
+  function closeAddGroupForm() {
+    if (addGroupForm) addGroupForm.hidden = true;
+    if (addGroupToggleBtn) addGroupToggleBtn.hidden = false;
+    if (addGroupInput) addGroupInput.value = "";
+  }
+
+  function openAddGroupForm() {
+    if (addGroupToggleBtn) addGroupToggleBtn.hidden = true;
+    if (addGroupForm) addGroupForm.hidden = false;
+    if (addGroupInput) {
+      addGroupInput.value = "";
+      addGroupInput.focus?.();
+    }
+  }
+
+  async function handleAddGroupSubmit() {
+    const rawName = addGroupInput ? addGroupInput.value.trim() : "";
+    if (!rawName) {
+      onToast?.("请输入分组名称", "error");
+      addGroupInput?.focus?.();
+      return;
+    }
+    if (addGroupSubmitBtn) addGroupSubmitBtn.disabled = true;
+    try {
+      const res = await requestJson("/api/accounts/groups", {
+        method: "POST",
+        body: JSON.stringify({ action: "add", name: rawName }),
+      });
+      if (Array.isArray(res.groups) && res.groups.length > 0) {
+        state.groups = res.groups;
+      }
+      closeAddGroupForm();
+      syncModalGroupSelects();
+      renderGroupBar();
+      renderAccountList({ force: true });
+      onToast?.(`已新建分组「${res.group || rawName}」`, "success");
+    } catch (err) {
+      onToast?.(err?.message || "新建分组失败", "error");
+    } finally {
+      if (addGroupSubmitBtn) addGroupSubmitBtn.disabled = false;
+    }
+  }
+
+  async function handleDeleteGroup(groupName) {
+    if (!groupName || groupName.toLowerCase() === DEFAULT_ACCOUNT_GROUP) return;
+    try {
+      const res = await requestJson("/api/accounts/groups", {
+        method: "POST",
+        body: JSON.stringify({ action: "delete", name: groupName }),
+      });
+      if (Array.isArray(res.groups) && res.groups.length > 0) {
+        state.groups = res.groups;
+      }
+      if (Array.isArray(res.accounts)) {
+        state.accounts = res.accounts;
+      }
+      if (activeGroup !== ALL_GROUPS_KEY && activeGroup.toLowerCase() === groupName.toLowerCase()) {
+        activeGroup = ALL_GROUPS_KEY;
+      }
+      syncModalGroupSelects();
+      renderAll({ force: true });
+      const moved = Number(res.movedCount || 0);
+      onToast?.(
+        moved > 0
+          ? `已删除分组「${groupName}」，其中 ${moved} 个账号已移回 default`
+          : `已删除分组「${groupName}」`,
+        "success",
+      );
+    } catch (err) {
+      onToast?.(err?.message || "删除分组失败", "error");
     }
   }
 
@@ -1791,7 +2255,7 @@ export function createAccountsHub({
   async function handleBatchRenewAt() {
     if (batchRenewingAt || batchRefreshing) return;
     const nowMs = Date.now();
-    const targets = state.accounts.filter((a) => {
+    const targets = getGroupFilteredAccounts().filter((a) => {
       if (!a || a.enabled === false) return false;
       const st = resolveAccountStatus(a, nowMs);
       return st.code === "AT_EXPIRED" && !st.blocking;
@@ -1838,7 +2302,7 @@ export function createAccountsHub({
     if (batchRefreshing || batchRenewingAt) return;
     const nowMs = Date.now();
     // Skip blocking abnormal accounts (banned / verification / RT expired) to avoid triggering Google risk control
-    const targets = state.accounts.filter(
+    const targets = getGroupFilteredAccounts().filter(
       (a) => a && a.enabled !== false && !resolveAccountStatus(a, nowMs).blocking,
     );
     if (targets.length === 0) {
@@ -2071,6 +2535,23 @@ export function createAccountsHub({
   bindClick(renewAtBtn, () => void handleBatchRenewAt());
   bindClick(batchRefreshBtn, () => void handleBatchRefreshAll());
   bindClick(disableAbnormalBtn, () => void handleDisableAbnormal());
+  bindClick(addGroupToggleBtn, openAddGroupForm);
+  bindClick(addGroupSubmitBtn, () => void handleAddGroupSubmit());
+  bindClick(addGroupCancelBtn, closeAddGroupForm);
+
+  if (addGroupInput) {
+    const onGroupInputKey = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void handleAddGroupSubmit();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeAddGroupForm();
+      }
+    };
+    addGroupInput.addEventListener("keydown", onGroupInputKey);
+    cleanups.push(() => addGroupInput.removeEventListener("keydown", onGroupInputKey));
+  }
 
   if (filterGroupEl) {
     const onFilterClick = (e) => {
@@ -2080,7 +2561,7 @@ export function createAccountsHub({
       if (nextFilter === activeFilter) return;
       activeFilter = nextFilter;
       renderFilterBar();
-      renderAccountList();
+      renderAccountList({ force: true });
     };
     filterGroupEl.addEventListener("click", onFilterClick);
     cleanups.push(() => filterGroupEl.removeEventListener("click", onFilterClick));
@@ -2199,7 +2680,7 @@ export function createAccountsHub({
 
   // Render empty skeleton immediately; initial fetch runs on tab activation or post-ready idle check
   if (panelEl) {
-    renderAll();
+    renderAll({ force: true });
   }
 
   return {
@@ -2216,6 +2697,7 @@ export function createAccountsHub({
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
+        pollIntervalMs = 0;
       }
       if (directOauthPollTimer) {
         clearInterval(directOauthPollTimer);
