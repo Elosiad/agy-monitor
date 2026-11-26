@@ -51,6 +51,19 @@
 
 ## 版本更新日志（Changelog）
 
+### `v1.1.6`（2026-11-26）— 异常账号全链路处理与低风控一键刷新 AT（PR #5）、修复无壁纸模式侧栏项目消失（PR #6）& 全站吸顶栏无缝壁纸遮罩
+
+- **多账号异常识别、验证引导与低风控一键续签 AT（PR #5 `@GreenNa717`）**：
+  - 精细化识别并展示 `需验证 / 已封禁 / RT 过期 / AT 过期 / 缺少 RT / 无订阅 / 客户端异常 / 网络异常` 状态徽章与异常条，优先识别封禁态（防止带申诉链接的封禁号误判为需验证），过滤非验证文档链接，主号恢复正常时自动清旧异常字段。
+  - 新增 `POST /api/accounts/renew-at` 纯 OAuth 续签与 **「一键刷新 AT」**（1s 顺序节流、零 CloudCode / `loadCodeAssist` 探测），新增状态筛选栏（全部 / 正常 / 异常）、1.2s 节流 **「一键检测全部」**、**「禁用异常账号」**、以及通过 `AccountChooser` 预填邮箱的 **「去验证」 / 「复制验证链接」**。
+  - 强化防风控保护：`cachedProjectId` 命中跳过重复资格检查，封禁/验证/无订阅立即短路，后台任务、自动切号与手动切号严格阻断异常阻断态账号，并在主客户端 `invalid_grant` 后停止跨客户端试探。
+- **修复未开壁纸时 Antigravity 2.35.2 侧栏 Projects 列表消失（PR #6 `@Elosiad`）**：
+  - 将 [hud_injector.mjs](sidecars/agy_monitor/backend/hud_injector.mjs) 主进程钩子中的壁纸清理表达式包裹在 IIFE 中并使用块级 `const el`，彻底杜绝顶层 `var el` 覆写宿主 Redux 全局函数 `window.el` 导致侧栏项目同步崩溃的问题，并新增 `vm` 沙箱回归测试。
+- **全站吸顶栏无缝同源壁纸遮罩（`v2.2.7`）**：
+  - 为左侧 `Projects` 吸顶栏以及 `Customizations / Automations / Settings / Diff` 等全站主区吸顶栏（`.sticky.bg-background` / `.sticky.bg-shell` / `div.sticky.bg-secondary` 及图层引擎 v5 自动识别的 `sticky-main` / `sticky-sidebar`）加入 `background-attachment: fixed` 像素级同视口壁纸遮罩，彻底消除滚动内容穿透重叠文字且肉眼零边缝。
+
+---
+
 ### `v1.1.5`（2026-11-25）— 修复 Electron 宿主环境下持久注入 `app.asar` 报 `ENOENT` 异常
 
 - **修复持久化注入 / 方案三壁纸在 Windows 桌面端报 `ENOENT, not found in ...\resources\app.asar`**：

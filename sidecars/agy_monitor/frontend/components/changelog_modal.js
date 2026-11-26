@@ -13,6 +13,16 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.1.6",
+    date: "2026-11-26",
+    title: "异常账号识别与一键刷新 AT（PR #5）、修复无壁纸侧栏项目消失（PR #6）& 全站吸顶栏无缝壁纸遮罩",
+    items: [
+      "合入 PR #5（@GreenNa717）：多账号新增精细化异常状态识别（需验证 / 已封禁 / RT 过期 / AT 过期 / 无订阅等）、筛选栏、低风控纯 OAuth「一键刷新 AT」（零 CloudCode 探测）、节流「一键检测全部」、一键禁用异常号及 AccountChooser 预填邮箱「去验证 / 复制链接」，并在后台与切号链路全面强化防风控阻断。",
+      "合入 PR #6（@Elosiad）：将主进程钩子的壁纸清理脚本改用 IIFE 与块级 const el，彻底修复未开壁纸时覆写宿主全局 window.el 导致 Antigravity 2.35.2 侧栏 Projects 列表全部消失的严重问题。",
+      "全站吸顶栏无缝壁纸遮罩（v2.2.7）：为侧栏 Projects 及 Customizations / Automations / Settings / Diff 等全部吸顶栏加上与整窗像素 1:1 对齐的同源壁纸遮罩（图层引擎升至 v5），彻底消除滚动时文字穿透重叠且无任何黑条色差。",
+    ],
+  },
+  {
     version: "1.1.5",
     date: "2026-11-25",
     title: "修复 Electron 运行时持久注入 app.asar 报 ENOENT 的热修复",

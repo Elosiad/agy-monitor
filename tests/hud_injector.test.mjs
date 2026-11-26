@@ -192,6 +192,10 @@ test('hud_injector: embedded scripts are valid JS, support Scheme 3 persistent w
   assert.match(cssSample, /--card:/);
   assert.match(cssSample, /--shell-canvas:\s*transparent/);
   assert.match(cssSample, /\.bg-card/);
+  assert.match(cssSample, /bg-sidebar\[style\*="sticky"\]/);
+  assert.match(cssSample, /\.sticky\.bg-background/);
+  assert.match(cssSample, /sticky-main/);
+  assert.match(cssSample, /background-attachment:\s*fixed/);
   assert.match(cssSample, /html::before/);
   const injectorSource = fs.readFileSync(
     path.resolve(process.cwd(), 'sidecars/agy_monitor/backend/hud_injector.mjs'),

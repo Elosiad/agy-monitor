@@ -668,6 +668,78 @@ div:has(> div > div > iframe[src*="agy-monitor"]) {
   background-image: none !important;
 }
 
+/* Seamless viewport-aligned wallpaper occlusion for ALL sticky headers (Projects sidebar, Customizations, Automations, Settings, Diff):
+   completely blocks scrolled items underneath while aligning 1:1 pixel-for-pixel with the continuous full-window wallpaper! */
+.sticky.bg-background:not(.pointer-events-none),
+.sticky.bg-shell:not(.pointer-events-none),
+div.sticky.bg-secondary:not(.pointer-events-none),
+.bg-background[style*="sticky"]:not(.pointer-events-none),
+[data-agy-mon-layer="sticky-main"],
+[role="navigation"] .bg-sidebar[style*="sticky"],
+[role="navigation"] .sticky.bg-sidebar,
+[role="navigation"] .sticky.bg-background,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"] {
+  background-color: rgb(${cr}, ${cg}, ${cb}) !important;
+  ${blur > 0 ? 'overflow: clip !important;' : ''}
+  isolation: isolate !important;
+}
+
+.sticky.bg-background:not(.pointer-events-none)::before,
+.sticky.bg-shell:not(.pointer-events-none)::before,
+div.sticky.bg-secondary:not(.pointer-events-none)::before,
+.bg-background[style*="sticky"]:not(.pointer-events-none)::before,
+[data-agy-mon-layer="sticky-main"]::before,
+[role="navigation"] .bg-sidebar[style*="sticky"]::before,
+[role="navigation"] .sticky.bg-sidebar::before,
+[role="navigation"] .sticky.bg-background::before,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::before {
+  content: "" !important;
+  position: absolute !important;
+  inset: ${blur > 0 ? '-16px' : '0'} !important;
+  z-index: -2 !important;
+  pointer-events: none !important;
+  background-image: ${safeUrl} !important;
+  background-position: center center !important;
+  background-repeat: no-repeat !important;
+  background-size: ${fit} !important;
+  background-attachment: fixed !important;
+  opacity: ${wpOpacity} !important;
+  filter: ${blur > 0 ? `blur(${blur}px)` : 'none'} !important;
+}
+
+.sticky.bg-background:not(.pointer-events-none)::after,
+.sticky.bg-shell:not(.pointer-events-none)::after,
+div.sticky.bg-secondary:not(.pointer-events-none)::after,
+.bg-background[style*="sticky"]:not(.pointer-events-none)::after,
+[data-agy-mon-layer="sticky-main"]::after {
+  content: "" !important;
+  position: absolute !important;
+  inset: 0 !important;
+  z-index: -1 !important;
+  pointer-events: none !important;
+  background: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+}
+
+[role="navigation"] .bg-sidebar[style*="sticky"]::after,
+[role="navigation"] .sticky.bg-sidebar::after,
+[role="navigation"] .sticky.bg-background::after,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::after {
+  content: "" !important;
+  position: absolute !important;
+  inset: 0 !important;
+  z-index: -1 !important;
+  pointer-events: none !important;
+  background:
+    linear-gradient(rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}), rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha})),
+    rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+}
+
+thead.sticky,
+thead.sticky th,
+th.sticky {
+  background-color: rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha}) !important;
+}
+
 /* Translucent frosted-glass popups, dropdowns, dialogs, menus, hover widgets, and tooltips (matches Scheme 1 depth with 100% crisp text) */
 [role="dialog"],
 [role="alertdialog"],
@@ -700,7 +772,7 @@ export function buildNativeWallpaperEngineScript() {
   }
 
   function ensureLayerEngine() {
-    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 4) {
+    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 5) {
       try { window.__agyMonLayerEngine.stop(); } catch (e) {}
     }
     if (!window.__agyMonLayerEngine) {
@@ -753,7 +825,7 @@ export function buildNativeWallpaperEngineScript() {
         BUTTON: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, A: 1
       };
       var PROTECT_SEL = '[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"],[role="tooltip"],[data-radix-popper-content-wrapper],[data-sonner-toast],.monaco-hover,.suggest-widget,.quick-input-widget,.context-view,.surface-composer,.surface-composer-card,.agy-user-bubble,pre,code,#agy-monitor-native-hud,#agy-monitor-native-hud-portal,#agy-monitor-cdp-hud';
-      var LANDMARK_SEL = 'header,nav,aside,main,footer,[role="main"],[role="navigation"],[role="complementary"],[role="banner"],[role="contentinfo"],.part,.pane-body,.editor-group-container,.tabs-and-actions-container,.breadcrumbs-control,.pointer-events-none';
+      var LANDMARK_SEL = 'header,nav,aside,main,footer,[role="main"],[role="navigation"],[role="complementary"],[role="banner"],[role="contentinfo"],.part,.pane-body,.editor-group-container,.tabs-and-actions-container,.breadcrumbs-control,.pointer-events-none,.sticky,[style*="sticky"]';
 
       function evaluateNode(node, vw, vh) {
         if (!node || node.nodeType !== 1) return 0;
@@ -765,6 +837,14 @@ export function buildNativeWallpaperEngineScript() {
         if (!rect || rect.width < 44 || rect.height < 10) return 0;
 
         var st = window.getComputedStyle(node);
+        // Protect sticky headers from being turned transparent & auto-apply viewport-aligned wallpaper mask
+        if (st.position === 'sticky') {
+          if (st.pointerEvents === 'none' || rect.width < 100 || rect.height < 18 || rect.height > 260) return 0;
+          if (node.tagName === 'THEAD' || node.tagName === 'TH' || node.tagName === 'TR') return 0;
+          if (node.parentElement && node.parentElement.closest('[data-agy-mon-layer="sticky-main"], [data-agy-mon-layer="sticky-sidebar"]')) return 0;
+          node.setAttribute('data-agy-mon-layer', (node.closest && node.closest('[role="navigation"]')) ? 'sticky-sidebar' : 'sticky-main');
+          return 1;
+        }
         var bg = parseBgRgba(st.backgroundColor);
         var hasGradientBg = Boolean(st.backgroundImage && st.backgroundImage.indexOf('gradient(') >= 0);
 
@@ -894,7 +974,7 @@ export function buildNativeWallpaperEngineScript() {
       }
 
       window.__agyMonLayerEngine = {
-        version: 4,
+        version: 5,
         scan: scanLayers,
         stop: function () {
           clearInterval(timer);

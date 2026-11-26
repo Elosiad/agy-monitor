@@ -1657,7 +1657,7 @@ export function createAccountsHub({
         return;
       }
       const targetUrl = res?.validationUrl || fallbackUrl || "";
-      if (res?.opened === false && targetUrl) {
+      if (res?.opened === false && /^https:\/\//i.test(targetUrl)) {
         try {
           window.open(targetUrl, "_blank", "noopener,noreferrer");
         } catch {}
@@ -1682,7 +1682,7 @@ export function createAccountsHub({
       }, 1800);
     } catch (err) {
       const urlToTry = err?.data?.validationUrl || fallbackUrl || acc.accountStatus?.validationUrl || "";
-      if (urlToTry) {
+      if (/^https:\/\//i.test(urlToTry)) {
         try {
           window.open(urlToTry, "_blank", "noopener,noreferrer");
           const copied = await copyTextToClipboard(urlToTry);
