@@ -319,8 +319,13 @@ function normalizePetConfig(raw) {
           }
         }
         seenIds.add(id);
+        const cleanCatalogId =
+          typeof item.catalogId === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(item.catalogId.trim())
+            ? item.catalogId.trim()
+            : '';
         customPets.push({
           id,
+          ...(cleanCatalogId ? { catalogId: cleanCatalogId } : {}),
           name: sanitizeDisplayName(item.name, id),
           kind: 'frames',
           fps: clampInt(item.fps, 1, 30, 8),
@@ -500,18 +505,24 @@ export function createPetStorage(petPaths) {
       });
     },
 
-    async saveCustomPetFrameAnimation({ id, name, fps = 8, frames = [], stateFrames = {} } = {}) {
+    async saveCustomPetFrameAnimation({ id, catalogId = '', name, fps = 8, frames = [], stateFrames = {} } = {}) {
       return enqueue(async () => {
         const { data } = await readJsonSafe(petPaths.petConfigFile, { throwOnIoError: true });
         const current = normalizePetConfig(data);
 
         const requestedId = typeof id === 'string' ? id.trim() : '';
+        const cleanCatalogId =
+          typeof catalogId === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(catalogId.trim())
+            ? catalogId.trim()
+            : '';
         if (requestedId && BUILTIN_PET_IDS.has(requestedId)) {
           throw Object.assign(new Error('Cannot overwrite built-in pet'), { code: 'BUILTIN_PALETTE' });
         }
         const existingEntry = requestedId
           ? current.customPets.find((p) => p.id === requestedId) || null
-          : null;
+          : cleanCatalogId
+            ? current.customPets.find((p) => p.catalogId === cleanCatalogId) || null
+            : null;
         const allowedExistingFiles = existingEntry ? collectCustomPetFilenames(existingEntry) : new Set();
         const existingMimeByFile = new Map();
         if (existingEntry) {
@@ -601,8 +612,10 @@ export function createPetStorage(petPaths) {
           throw err;
         }
 
+        const resolvedCatalogId = cleanCatalogId || existingEntry?.catalogId || '';
         const entry = {
           id: petId,
+          ...(resolvedCatalogId ? { catalogId: resolvedCatalogId } : {}),
           name: sanitizeDisplayName(name, '自定义帧动画'),
           kind: 'frames',
           fps: resolvedFps,

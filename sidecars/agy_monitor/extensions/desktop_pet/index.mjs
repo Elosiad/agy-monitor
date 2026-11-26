@@ -19,6 +19,11 @@ import {
   getPetCompanionStatus,
   syncPetCompanion,
 } from './pet_companion.mjs';
+import {
+  downloadAndInstallCatalogPet,
+  listCatalogWithStatus,
+  readCatalogPreviewAsset,
+} from './pet_catalog.mjs';
 import { importPetFrameAnimation } from './mcp_tools.mjs';
 import {
   buildInteractivePreviewHtml,
@@ -32,9 +37,14 @@ const FRONTEND_DIR = path.join(__dirname, 'frontend');
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
 function mapPetErrorStatus(err) {
+  if (Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599) return err.status;
   const code = err?.code;
   if (code === 'UNSUPPORTED_MEDIA_TYPE' || code === 'INVALID_IMAGE_MAGIC') return 415;
   if (code === 'PAYLOAD_TOO_LARGE') return 413;
+  if (code === 'CHECKSUM_MISMATCH' || code === 'INVALID_ARCHIVE') return 422;
+  if (code === 'FORBIDDEN_URL') return 403;
+  if (code === 'DOWNLOAD_TIMEOUT') return 504;
+  if (code === 'DOWNLOAD_FAILED') return 502;
   if (code === 'NOT_FOUND') return 404;
   if (
     code === 'INVALID_ID' ||
@@ -112,11 +122,62 @@ export const desktopPetExtension = {
       }
     });
 
+    // Serve bundled lightweight preview placeholder image for downloadable cloud pets
+    register('GET', '/api/ext/pet/catalog-preview', async (data = {}) => {
+      try {
+        const id = String(data.id || '').trim();
+        if (!SAFE_ID_RE.test(id)) {
+          return errorResponse(400, '非法桌宠预览 ID');
+        }
+        const res = await readCatalogPreviewAsset(id);
+        if (!res?.buf) {
+          return errorResponse(404, '未找到桌宠预览图');
+        }
+        return makeResponse(res.buf, {
+          status: 200,
+          contentType: res.mime,
+          headers: {
+            'Cache-Control': 'public, max-age=86400',
+            'X-Content-Type-Options': 'nosniff',
+          },
+        });
+      } catch (err) {
+        return errorResponse(mapPetErrorStatus(err), err);
+      }
+    });
+
+    // On-demand download & SHA-256 verified install for downloadable cloud pet packs
+    register('POST', '/api/pet/catalog/download', async (data = {}) => {
+      const catalogId = typeof data.catalogId === 'string' ? data.catalogId.trim() : '';
+      if (!SAFE_ID_RE.test(catalogId)) {
+        return errorResponse(400, 'catalogId 无效');
+      }
+      try {
+        const res = await downloadAndInstallCatalogPet({ catalogId, petStore });
+        let petCompanion = await getPetCompanionStatus(petPaths, res.petState);
+        if (res.petState.enabled) {
+          const syncRes = await syncPetCompanion(petPaths, res.petState, 'sync').catch(() => null);
+          if (syncRes?.status) petCompanion = syncRes.status;
+        }
+        return {
+          ok: true,
+          catalogId: res.catalogId,
+          pet: res.pet,
+          petState: res.petState,
+          petCompanion,
+          petCatalog: listCatalogWithStatus(res.petState.customPets),
+        };
+      } catch (err) {
+        return errorResponse(mapPetErrorStatus(err), err);
+      }
+    });
+
     register('GET', '/api/pet', async () => {
       try {
         const petState = await petStore.getPetConfig();
         const petCompanion = await getPetCompanionStatus(petPaths, petState);
-        return { ok: true, petState, petCompanion };
+        const petCatalog = listCatalogWithStatus(petState.customPets);
+        return { ok: true, petState, petCompanion, petCatalog };
       } catch (err) {
         return errorResponse(mapPetErrorStatus(err), err);
       }
@@ -133,7 +194,8 @@ export const desktopPetExtension = {
         const petState = await petStore.savePetConfig(incoming);
         const syncRes = await syncPetCompanion(petPaths, petState, 'sync').catch(() => null);
         const petCompanion = syncRes?.status || (await getPetCompanionStatus(petPaths, petState));
-        return { ok: true, petState, petCompanion };
+        const petCatalog = listCatalogWithStatus(petState.customPets);
+        return { ok: true, petState, petCompanion, petCatalog };
       } catch (err) {
         return errorResponse(mapPetErrorStatus(err), err);
       }
@@ -273,7 +335,12 @@ export const desktopPetExtension = {
           const syncRes = await syncPetCompanion(petPaths, res.petState, 'sync').catch(() => null);
           if (syncRes?.status) petCompanion = syncRes.status;
         }
-        return { ok: true, petState: res.petState, petCompanion };
+        return {
+          ok: true,
+          petState: res.petState,
+          petCompanion,
+          petCatalog: listCatalogWithStatus(res.petState.customPets),
+        };
       } catch (err) {
         return errorResponse(mapPetErrorStatus(err), err);
       }

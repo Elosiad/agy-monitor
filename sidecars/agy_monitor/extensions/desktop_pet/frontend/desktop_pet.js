@@ -53,6 +53,24 @@ function getExtPetAssetUrl(id, file = "") {
   return `${resolveExtUrl("api/ext/pet/asset")}?${params.toString()}`;
 }
 
+function getExtCatalogPreviewUrl(id) {
+  const params = new URLSearchParams({ id: String(id) });
+  return `${resolveExtUrl("api/ext/pet/catalog-preview")}?${params.toString()}`;
+}
+
+function formatPetPackSize(sizeBytes) {
+  const n = Number(sizeBytes) || 0;
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+function createDownloadSvg() {
+  return makeIconSvg(11, 11, "0 0 16 16", [
+    ["path", { d: "M8 2.5v7.5M5 7.2 8 10.2l3-3M2.8 12.2h10.4", stroke: "currentColor", "stroke-width": "1.6", "stroke-linecap": "round", "stroke-linejoin": "round" }],
+  ]);
+}
+
 async function fetchExtPetApi(apiFetch, url, options = {}) {
   const fetcher = apiFetch || (typeof window !== "undefined" ? window.sidecar?.fetch : null);
   if (typeof fetcher !== "function") throw new Error("window.sidecar.fetch unavailable");
@@ -718,6 +736,7 @@ export function mountDesktopPetExtension(ctx = {}) {
   let renderedPanelVisualKey = "";
   let renderedPreviewVisualKey = "";
   let patCounter = 0;
+  const downloadingCatalogIds = new Set();
   const cleanups = [];
 
   const formatTokenCount = (n) => {
@@ -732,6 +751,7 @@ export function mountDesktopPetExtension(ctx = {}) {
     enabled: false,
     activePetId: "neko",
     customPets: [],
+    petCatalog: [],
     displayMode: "auto",
     size: 100,
     opacity: 95,
@@ -1387,6 +1407,56 @@ export function mountDesktopPetExtension(ctx = {}) {
       dom.galleryRow.appendChild(card);
     });
 
+    (state.petCatalog || [])
+      .filter((item) => item && !item.installed)
+      .forEach((item) => {
+        const isDownloading = downloadingCatalogIds.has(item.id) || Boolean(item.downloading);
+        const displayName = tr.getLang() === "en" && item.nameEn ? item.nameEn : item.name;
+        const sizeStr = formatPetPackSize(item.sizeBytes);
+        const card = el(
+          "button",
+          {
+            type: "button",
+            class: isDownloading ? "pet-choice-card is-cloud is-downloading" : "pet-choice-card is-cloud",
+            "data-catalog-pet-id": item.id,
+            disabled: isDownloading,
+            title: tr("pet.cloudDownloadTitle", {
+              name: displayName,
+              tracks: item.trackCount || 6,
+              frames: item.frameCount || 144,
+              size: sizeStr,
+            }),
+          },
+          [
+            el("span", {
+              class: "pet-choice-cloud-badge",
+              text: isDownloading ? tr("pet.cloudDownloading") : tr("pet.cloudBadge"),
+            }),
+            el("div", { class: "pet-choice-preview" }, [
+              el("img", {
+                class: "pet-choice-img",
+                src: getExtCatalogPreviewUrl(item.id),
+                alt: displayName,
+                draggable: "false",
+              }),
+            ]),
+            el("span", { class: "pet-choice-name", text: displayName }),
+            el("span", { class: "pet-choice-cloud-pill" }, [
+              createDownloadSvg(),
+              el("span", {
+                text: isDownloading
+                  ? tr("pet.cloudDownloading")
+                  : tr("pet.cloudDownloadBtn", { size: sizeStr }),
+              }),
+            ]),
+          ]
+        );
+        card.addEventListener("click", () => {
+          void handleDownloadCatalogPet(item);
+        });
+        dom.galleryRow.appendChild(card);
+      });
+
     state.customPets.forEach((cp) => {
       const isSelected = state.activePetId === cp.id;
       const cardChildren = [
@@ -1617,6 +1687,9 @@ export function mountDesktopPetExtension(ctx = {}) {
       const incomingSignalTs = Number(resp.petState.previewSignal?.ts) || 0;
       const changed = !fromPoll || incomingUpdatedAt !== lastKnownUpdatedAt || incomingSignalTs > lastHandledPreviewTs;
       if (incomingUpdatedAt > 0) lastKnownUpdatedAt = incomingUpdatedAt;
+      if (Array.isArray(resp?.petCatalog)) {
+        state.petCatalog = resp.petCatalog.map((c) => ({ ...c }));
+      }
       if (changed) {
         applyServerPetState(resp.petState);
         if (resp?.petCompanion) state.petCompanion = resp.petCompanion;
@@ -1650,6 +1723,7 @@ export function mountDesktopPetExtension(ctx = {}) {
         body: JSON.stringify({ petState: payload }),
       });
       if (destroyed) return;
+      if (Array.isArray(resp?.petCatalog)) state.petCatalog = resp.petCatalog.map((c) => ({ ...c }));
       if (resp?.petState) applyServerPetState(resp.petState);
       if (resp?.petCompanion) state.petCompanion = resp.petCompanion;
       renderAll();
@@ -1722,12 +1796,55 @@ export function mountDesktopPetExtension(ctx = {}) {
         body: JSON.stringify({ name: cleanName, mime, base64 }),
       });
       if (destroyed) return;
+      if (Array.isArray(resp?.petCatalog)) state.petCatalog = resp.petCatalog.map((c) => ({ ...c }));
       if (resp?.petState) applyServerPetState(resp.petState);
       if (resp?.petCompanion) state.petCompanion = resp.petCompanion;
       renderAll();
       showToast?.(tr("pet.uploadedToast", { name: resp?.pet?.name || cleanName }), "success");
     } catch (err) {
       showToast?.(err?.message || tr("pet.uploadFailed"), "error");
+    }
+  };
+
+  const handleDownloadCatalogPet = async (item) => {
+    if (!item || !item.id || downloadingCatalogIds.has(item.id)) return;
+    downloadingCatalogIds.add(item.id);
+    renderGallery();
+    const sizeStr = formatPetPackSize(item.sizeBytes);
+    const displayName = tr.getLang() === "en" && item.nameEn ? item.nameEn : item.name;
+    showToast?.(
+      tr("pet.cloudDownloadingToast", {
+        name: displayName,
+        frames: item.frameCount || 144,
+        size: sizeStr,
+      }),
+      "info"
+    );
+    try {
+      const resp = await fetchExtPetApi(apiFetch, "/api/pet/catalog/download", {
+        method: "POST",
+        body: JSON.stringify({ catalogId: item.id }),
+      });
+      if (destroyed) return;
+      if (Array.isArray(resp?.petCatalog)) state.petCatalog = resp.petCatalog.map((c) => ({ ...c }));
+      if (resp?.petState) applyServerPetState(resp.petState);
+      if (resp?.petCompanion) state.petCompanion = resp.petCompanion;
+      renderedPreviewVisualKey = "";
+      renderedPanelVisualKey = "";
+      stageFrameKey = "";
+      renderAll();
+      showToast?.(
+        tr("pet.cloudDownloadSuccessToast", {
+          name: resp?.pet?.name || displayName,
+          frames: item.frameCount || 144,
+        }),
+        "success"
+      );
+    } catch (err) {
+      showToast?.(err?.message || tr("pet.cloudDownloadFailedToast"), "error");
+    } finally {
+      downloadingCatalogIds.delete(item.id);
+      if (!destroyed) renderGallery();
     }
   };
 
@@ -1738,6 +1855,7 @@ export function mountDesktopPetExtension(ctx = {}) {
         body: JSON.stringify({ petId }),
       });
       if (destroyed) return;
+      if (Array.isArray(resp?.petCatalog)) state.petCatalog = resp.petCatalog.map((c) => ({ ...c }));
       if (resp?.petState) applyServerPetState(resp.petState);
       if (resp?.petCompanion) state.petCompanion = resp.petCompanion;
       renderAll();

@@ -12,6 +12,12 @@ import { buildFrontendBundle } from '../sidecars/agy_monitor/backend/bundle_buil
 import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 import { createPetStorage, resolvePetPaths } from '../sidecars/agy_monitor/extensions/desktop_pet/pet_storage.mjs';
+import {
+  DOWNLOADABLE_PET_CATALOG,
+  downloadAndInstallCatalogPet,
+  extractZipEntries,
+  listCatalogWithStatus,
+} from '../sidecars/agy_monitor/extensions/desktop_pet/pet_catalog.mjs';
 import { getPetCompanionStatus } from '../sidecars/agy_monitor/extensions/desktop_pet/pet_companion.mjs';
 import {
   buildContactSheetPng,
@@ -550,4 +556,195 @@ test('desktop_pet bubble template supports {quota5h}/{quota7d} & session progres
   assert.match(cs, /ListBlockRegex/);
   assert.match(cs, /SessionProgressItem/);
   assert.match(cs, /SetBubbleExtraHeight/);
+});
+
+function buildStoredZip(filesMap) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  const crcTable = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    crcTable[i] = c >>> 0;
+  }
+  const crc32 = (buf) => {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i += 1) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+
+  const entries = Object.entries(filesMap);
+  for (const [name, rawVal] of entries) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const dataBuf = Buffer.isBuffer(rawVal) ? rawVal : Buffer.from(String(rawVal), 'utf8');
+    const crc = crc32(dataBuf);
+
+    const local = Buffer.alloc(30 + nameBuf.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(dataBuf.length, 18);
+    local.writeUInt32LE(dataBuf.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    nameBuf.copy(local, 30);
+    localParts.push(local, dataBuf);
+
+    const central = Buffer.alloc(46 + nameBuf.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(dataBuf.length, 20);
+    central.writeUInt32LE(dataBuf.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42);
+    nameBuf.copy(central, 46);
+    centralParts.push(central);
+
+    offset += local.length + dataBuf.length;
+  }
+
+  const centralBuf = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...localParts, centralBuf, eocd]);
+}
+
+test('desktop_pet downloadable catalog: lightweight preview placeholder, SHA-256 verification, zip extraction & delete restore', async (t) => {
+  const prevSkip = process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE;
+  process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE = '1';
+  t.after(() => {
+    if (prevSkip === undefined) delete process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE;
+    else process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE = prevSkip;
+  });
+
+  const paths = makeTempPaths(t);
+  const petPaths = resolvePetPaths(paths);
+  const petStore = createPetStorage(petPaths);
+  const store = createStorage(paths);
+  const routes = createMonitorHandlers({ paths, storage: store });
+
+  // 1. GET /api/pet exposes Gemini Neko as downloadable placeholder before install
+  const initialRes = await routes.get('GET /api/pet')({});
+  assert.equal(initialRes.ok, true);
+  assert.ok(Array.isArray(initialRes.petCatalog));
+  const gemEntry = initialRes.petCatalog.find((c) => c.id === 'gemini-neko');
+  assert.ok(gemEntry);
+  assert.equal(gemEntry.installed, false);
+  assert.equal(gemEntry.frameCount, 144);
+  assert.equal(gemEntry.trackCount, 6);
+
+  // 2. Preview placeholder route serves real lightweight PNG (<150 KB)
+  const previewRes = await routes.get('GET /api/ext/pet/catalog-preview')({ id: 'gemini-neko' });
+  assert.equal(previewRes.status, 200);
+  assert.equal(previewRes.contentType, 'image/png');
+  assert.equal(previewRes.headers['X-Content-Type-Options'], 'nosniff');
+  assert.ok(Buffer.isBuffer(previewRes.body) && previewRes.body.length > 1024 && previewRes.body.length < 150_000);
+  assert.equal(previewRes.body[0], 0x89);
+  assert.equal(previewRes.body[1], 0x50);
+
+  // 3. Zip Slip guard rejects traversal entries
+  const badZip = buildStoredZip({ '../evil.png': Buffer.from(VALID_PNG_BASE64, 'base64') });
+  assert.throws(() => extractZipEntries(badZip), (err) => err?.code === 'PATH_TRAVERSAL');
+
+  // 4. Checksum mismatch is strictly rejected before extraction
+  const pngBuf = Buffer.from(VALID_PNG_BASE64, 'base64');
+  const synthZip = buildStoredZip({
+    'manifest.json': JSON.stringify({
+      schema: 'agy-pet-pack/v1',
+      catalogId: 'gemini-neko',
+      name: 'Gemini 猫娘',
+      fps: 18,
+      tracks: {
+        idle: ['idle/00.png', 'idle/01.png'],
+        running: ['running/00.png'],
+      },
+    }),
+    'idle/00.png': pngBuf,
+    'idle/01.png': pngBuf,
+    'running/00.png': pngBuf,
+  });
+  const fakeFetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    async arrayBuffer() {
+      return synthZip.buffer.slice(synthZip.byteOffset, synthZip.byteOffset + synthZip.byteLength);
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      downloadAndInstallCatalogPet({
+        catalogId: 'gemini-neko',
+        petStore,
+        fetchImpl: fakeFetch,
+        overrideUrl: 'https://example.test/pack.zip',
+        skipChecksum: false,
+      }),
+    (err) => err?.code === 'CHECKSUM_MISMATCH',
+  );
+
+  // 5. Valid pack installs into petStore, flips catalog to installed=true, and deleting restores placeholder
+  const installed = await downloadAndInstallCatalogPet({
+    catalogId: 'gemini-neko',
+    petStore,
+    fetchImpl: fakeFetch,
+    overrideUrl: 'https://example.test/pack.zip',
+    skipChecksum: true,
+  });
+  assert.equal(installed.ok, true);
+  assert.equal(installed.pet.catalogId, 'gemini-neko');
+  assert.equal(installed.pet.fps, 18);
+  assert.equal(installed.pet.frames.length, 2);
+  assert.equal(installed.pet.stateFrames.running.length, 1);
+  assert.equal(installed.petState.activePetId, installed.pet.id);
+
+  const catalogAfterInstall = listCatalogWithStatus(installed.petState.customPets);
+  assert.equal(catalogAfterInstall.find((c) => c.id === 'gemini-neko').installed, true);
+
+  const delRes = await routes.get('POST /api/pet/delete')({ petId: installed.pet.id });
+  assert.equal(delRes.ok, true);
+  assert.equal(delRes.petCatalog.find((c) => c.id === 'gemini-neko').installed, false);
+
+  // 6. If the real release pack exists in dist/, verify exact SHA-256 and 144-frame Deflate extraction
+  const realPackPath = path.join(ROOT, 'dist', DOWNLOADABLE_PET_CATALOG[0].assetName);
+  if (fs.existsSync(realPackPath)) {
+    const realBuf = fs.readFileSync(realPackPath);
+    const realFetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      async arrayBuffer() {
+        return realBuf.buffer.slice(realBuf.byteOffset, realBuf.byteOffset + realBuf.byteLength);
+      },
+    });
+    const realInstalled = await downloadAndInstallCatalogPet({
+      catalogId: 'gemini-neko',
+      petStore,
+      fetchImpl: realFetch,
+      overrideUrl: 'https://example.test/real.zip',
+      skipChecksum: false,
+    });
+    assert.equal(realInstalled.ok, true);
+    assert.equal(realInstalled.pet.frames.length, 24);
+    assert.equal(realInstalled.pet.stateFrames.running.length, 24);
+    assert.equal(realInstalled.pet.stateFrames.drag.length, 24);
+  }
+
+  // 7. Bundled frontend includes downloadable catalog preview & download handler
+  const bundle = await buildFrontendBundle(FRONTEND_DIR);
+  assert.equal(bundle.includes('api/ext/pet/catalog-preview'), true);
+  assert.equal(bundle.includes('/api/pet/catalog/download'), true);
 });
