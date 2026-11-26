@@ -28,7 +28,7 @@ function loadRawFs() {
 
 const { fs, fsp } = loadRawFs();
 
-export const NATIVE_HUD_VERSION = '2.2.6';
+export const NATIVE_HUD_VERSION = '2.2.7';
 export const NATIVE_HUD_HEARTBEAT_TTL_MS = 14_000;
 export const HOST_WALLPAPER_STYLE_ID = 'agy-monitor-cdp-theme';
 
@@ -2492,7 +2492,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
           } else if (hostThemeMode !== 'cdp' && (wcOwnedWallpaper.has(wc) || forceStatus)) {
             await wc
               .executeJavaScript(
-                'try { if (window.__agyMonitorWallpaper) { window.__agyMonitorWallpaper.remove(); } else { if (window.__agyMonLayerEngine) window.__agyMonLayerEngine.stop(); var el = document.getElementById("agy-monitor-cdp-theme"); if (el && el.parentNode) el.parentNode.removeChild(el); } } catch {}',
+                '(() => { try { if (window.__agyMonitorWallpaper) { window.__agyMonitorWallpaper.remove(); } else { if (window.__agyMonLayerEngine) window.__agyMonLayerEngine.stop(); const el = document.getElementById("agy-monitor-cdp-theme"); if (el && el.parentNode) el.parentNode.removeChild(el); } } catch {} })()',
                 false,
               )
               .catch(() => {});

@@ -322,3 +322,25 @@ test('hud_injector: embedded scripts are valid JS, support Scheme 3 persistent w
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('hud_injector: main hook wallpaper cleanup does not leak global window.el', () => {
+  const mainSrc = buildMainHookScript();
+  assert.doesNotMatch(mainSrc, /var el = document\.getElementById\("agy-monitor-cdp-theme"\)/);
+
+  const match = mainSrc.match(
+    /\.executeJavaScript\(\s*'([^']*agy-monitor-cdp-theme[^']*)'/,
+  );
+  assert.ok(match, 'expected wallpaper cleanup executeJavaScript expression in buildMainHookScript');
+
+  const sentinelFn = () => 'host-el-intact';
+  const ctx = {
+    el: sentinelFn,
+    document: { getElementById: () => null },
+  };
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(match[1], ctx);
+
+  assert.equal(ctx.window.el, sentinelFn);
+  assert.equal(ctx.el, sentinelFn);
+});
