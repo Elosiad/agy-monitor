@@ -129,7 +129,14 @@ export async function installPlugin({
       const exts = await extLoader.loadInstalledExtensions();
       for (const ext of exts) {
         if (typeof ext?.onInstall === 'function') {
-          await ext.onInstall(paths).catch(() => {});
+          const extRes = await ext.onInstall(paths).catch(() => null);
+          if (process.platform === 'darwin' && ext?.id === 'desktop_pet' && extRes) {
+            if (extRes.compiled) {
+              log('      ✓ macOS 原生桌面桌宠伴侣已预编译就绪');
+            } else if (extRes.reason || extRes.error) {
+              log(`      ! macOS 桌宠伴侣跳过预编译（${extRes.reason || extRes.error}）`);
+            }
+          }
         }
       }
     } catch {

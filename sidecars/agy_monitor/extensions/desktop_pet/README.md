@@ -2,8 +2,8 @@
 
 `sidecars/agy_monitor/extensions/desktop_pet/` 是为 **AGY 控制台 (`agy-monitor`)** 打造的高内聚、低耦合可插拔桌宠扩展。
 
-- **即插即用、删除无痕**：全部后端路由、独立存储、前端页面、多语言词典、帧动画工作室、精灵表抠图切帧引擎、MCP 工具集与 Windows 独立桌宠进程均收拢在本目录中。删除本目录或设置环境变量 `AGY_DISABLE_EXTENSIONS=1` 后，主分支核心功能与测试仍 100% 正常运行。
-- **默认关闭、零额外开销**：桌宠默认关闭；关闭状态下不启动任何 Windows 伴侣进程。
+- **即插即用、删除无痕**：全部后端路由、独立存储、前端页面、多语言词典、帧动画工作室、精灵表抠图切帧引擎、MCP 工具集与 Windows / macOS 独立桌宠伴侣均收拢在本目录中。删除本目录或设置环境变量 `AGY_DISABLE_EXTENSIONS=1` 后，主分支核心功能与测试仍 100% 正常运行。
+- **默认关闭、零额外开销**：桌宠默认关闭；关闭状态下不启动任何桌面伴侣进程。
 
 ---
 
@@ -28,13 +28,14 @@
     - `drag`（鼠标拖拽中）
   - 留空的可选轨道会自动回退至 `idle` 轨道；编辑与删除时自动清理孤儿帧文件。
 
-### 3. Windows 原生透明桌面宠 & 丰富物理动效（`AgyDesktopPet.cs`）
-- 独立于壁纸伴侣的轻量 WPF 透明进程（`agy_desktop_pet.exe`），使用系统自带 `.NET Framework` 零 SDK 编译：
+### 3. Windows / macOS 原生透明桌面宠 & 丰富物理动效（`AgyDesktopPet.cs` / `AgyDesktopPetMac.swift`）
+- **Windows 原生伴侣（`AgyDesktopPet.cs`）**：独立于壁纸伴侣的轻量 WPF 透明进程（`agy_desktop_pet.exe`），使用系统自带 `.NET Framework` 零 SDK 编译：
   - **拖拽动画**：按住左键拖拽时播放 `drag` 轨道，叠加实时速度驱动的钟摆晃动（`-24° ~ +24°`）与悬垂拉伸，松手落地触发弹性压扁回弹。
   - **自主移动动画**：待机空闲时自动在屏幕工作区内匀速散步并左右镜像朝向，播放 `walk` 轨道与轻快步伐起伏；支持一键开关「自主桌面漫步」。
   - **自定义弹出气泡内容 & 硬件加速 60fps 动效**：支持内置 6 套快捷预设（`输入输出 Token`、`实时 TPS`、`Token + TPS`、`模型 + 上下文`、`完整遥测`、`可爱台词`）及自由编辑任意文案与动态占位符（`{in}`、`{out}`、`{tps}`、`{pct}`、`{model}`、`{cache}`、`{unread}`）；原生弹窗气泡启用 `BitmapCache` 纹理缓存 + WPF 硬件合成 `BackEase / CubicEase` 原生动画与 60fps 渲染计时，彻底消除卡顿。
   - **互动动画**：单击摸头触发 `interact` 轨道、弹性蹦跳与向上飘散的 `✨ / ♥ / ★` 互动粒子；双击查看本次输入/输出 Token 与上下文占比。
   - **超大尺寸调节（`60% ~ 500%`）**：支持在控制台滑块、右键菜单或 MCP 工具中自由缩放，位图解码针对大尺寸优化保持清晰。
+- **macOS 原生伴侣（`AgyDesktopPetMac.swift`）**：基于 AppKit `NSPanel`（`.nonactivatingPanel` 无边框透明悬浮窗、全桌面空间 `.canJoinAllSpaces`），零外部依赖，使用系统自带 `swiftc` 按需编译为 `bin/agy_desktop_pet_mac`；完整支持 3 款内置矢量宠（主题联动配色）、单图 / GIF 动图、6 轨道帧动画、拖拽钟摆物理与落地回弹、2D 自主桌面漫步、气泡模板 DSL、`NSMenu` 右键菜单及鼠标穿透（`ignoresMouseEvents`）悬停 `🔒 解锁` 浮标。
 
 ### 4. 主题联动自定义右键菜单
 - 彻底替换系统默认灰白菜单，实时读取 `themes.json` 的 `chrome / bubble / accent / tertiary / radius` 并自动适配深浅主题：
@@ -87,7 +88,7 @@ Gemini 会自动调用 `image-generator` 生成纯色背景规范精灵表 → �
   - `pet_config.json` / `pet_status.json` — 扩展独立配置与伴侣心跳状态（不污染核心 `user_prefs.json` 与 `themes.json`）
   - `pets/` — 已保存的自定义桌宠图片与动画帧
   - `pet_previews/` — AI 切帧输出、接触表 PNG 与离线交互 HTML 预览文件
-  - `bin/agy_desktop_pet.exe` — 独立预编译桌面宠程序
+  - `bin/agy_desktop_pet.exe` / `bin/agy_desktop_pet_mac` — 独立预编译桌面宠程序（分别用于 Windows / macOS）
 - **安全策略**：所有位图均进行真实文件头魔数校验（仅允许 PNG/JPEG/WEBP/GIF），严格拦截 SVG/XML 注入、路径穿越与 UNC 网络路径（`\\server\share`）。
 
 ---
