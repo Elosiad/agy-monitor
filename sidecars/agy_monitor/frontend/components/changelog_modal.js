@@ -13,6 +13,18 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.2.2",
+    date: "2026-11-27",
+    title: "主窗口深度中文汉化 v2、新增「增强」加速分页与「免 TUN 代理」、多账号跨平台加固 & app.asar 安全防护",
+    items: [
+      "主窗口深度中文汉化 v2：全新词典驱动的 host_i18n 引擎大幅扩展 Antigravity 宿主界面中文覆盖率（菜单、侧栏、设置、项目与操作提示），通过原生钩子与 CDP 实时热同步，切回 English 时可无损还原。",
+      "新增「增强」加速分页（全部默认关闭 · 按需启用）：内嵌零依赖 boost_mcp 服务，提供「合并工具批处理（并发检索/原子多文件改写/并发检查）」「大文件先看目录再精读」「长日志自动压缩首尾折叠」三项独立开关与顶部一键全开/全关，附悬停小窗与点击全屏功能说明弹窗。",
+      "「其他」分页顶部新增「免 TUN 代理」（默认开启）：支持自动识别 Windows/macOS 系统代理或自定义 HTTP/HTTPS/SOCKS5 代理（含鉴权与绕过列表），通过主进程钩子同时接管 Electron 与 language_server 流量，支持强制 HTTP/1.1 与连通测速。",
+      "多账号跨平台安全与可靠性升级：新增 macOS Keychain / Linux Secret Service 原生凭据存储驱动、静态纯 Node 切号守护进程 switch_worker.mjs（告别临时脚本），并补齐切号前引导状态同步与串号自愈防线。",
+      "app.asar 写入安全与侧栏/卸载全面加固：彻底移除运行期危险的 .agy_stale 热替换，改为先探锁再原子替换且运行中延迟覆盖旧版 app.asar；主进程钩子增加卸载自休眠检测，卸载脚本自动还原原版 app.asar 并清理运行时缓存；移除侧栏吸顶容器 overflow: clip、收紧侧栏扫描范围、补齐普通毛玻璃浅色主题自适应，并修复 mcp_bridge.mjs 未定义 ERR_PARSE 报错。",
+    ],
+  },
+  {
     version: "1.2.1",
     date: "2026-11-27",
     title: "新增 macOS 原生透明桌宠伴侣（PR #8 及安全节能加固）、全界面精简整顿 & 账号订阅层级识别与加权总余量",
