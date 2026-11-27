@@ -65,9 +65,10 @@ export function uninstallPlugin({
   log('   AGY 控制台 (agy-monitor) 卸载程序');
   log('========================================================');
 
-  // Stop Windows companions cleanly before removing files
+  // Stop Windows or macOS companions cleanly before removing files
   const backdropExe = path.join(pluginDataDir, 'bin', 'agy_backdrop.exe');
   const petExe = path.join(pluginDataDir, 'bin', 'agy_desktop_pet.exe');
+  const petMacBin = path.join(pluginDataDir, 'bin', 'agy_desktop_pet_mac');
   if (process.platform === 'win32' && (fs.existsSync(backdropExe) || fs.existsSync(petExe))) {
     if (fs.existsSync(backdropExe)) {
       try {
@@ -84,6 +85,13 @@ export function uninstallPlugin({
       } catch {
         log('[1/3] 桌宠伴侣当前未运行');
       }
+    }
+  } else if (process.platform === 'darwin' && fs.existsSync(petMacBin)) {
+    try {
+      execFileSync(petMacBin, ['--stop', '--data-dir', pluginDataDir], { timeout: 4000, stdio: 'ignore' });
+      log('[1/3] 已停止 macOS 桌宠伴侣进程');
+    } catch {
+      log('[1/3] macOS 桌宠伴侣当前未运行');
     }
   } else {
     log('[1/3] 无需停止外部伴侣进程');

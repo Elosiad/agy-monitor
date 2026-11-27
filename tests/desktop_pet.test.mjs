@@ -18,7 +18,10 @@ import {
   extractZipEntries,
   listCatalogWithStatus,
 } from '../sidecars/agy_monitor/extensions/desktop_pet/pet_catalog.mjs';
-import { getPetCompanionStatus } from '../sidecars/agy_monitor/extensions/desktop_pet/pet_companion.mjs';
+import {
+  ensurePetCompanionAssets,
+  getPetCompanionStatus,
+} from '../sidecars/agy_monitor/extensions/desktop_pet/pet_companion.mjs';
 import {
   buildContactSheetPng,
   decodePng,
@@ -34,6 +37,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const FRONTEND_DIR = path.join(ROOT, 'sidecars', 'agy_monitor', 'frontend');
 const PET_CS = path.join(ROOT, 'sidecars', 'agy_monitor', 'extensions', 'desktop_pet', 'AgyDesktopPet.cs');
+const PET_SWIFT = path.join(ROOT, 'sidecars', 'agy_monitor', 'extensions', 'desktop_pet', 'AgyDesktopPetMac.swift');
 const MCP_BRIDGE_PATH = path.join(ROOT, 'sidecars', 'agy_monitor', 'extensions', 'mcp_bridge.mjs');
 
 const VALID_PNG_BASE64 =
@@ -784,4 +788,48 @@ test('AgyDesktopPet.cs Issue #7 RAM, lazy track LRU, timer throttling & frozen b
   assert.doesNotMatch(src, /RenderAtScale\s*=\s*2\.0/, 'Speech bubble BitmapCache must NOT waste 4x VRAM at RenderAtScale = 2.0');
   assert.match(src, /RenderAtScale\s*=\s*1\.0/, 'Speech bubble BitmapCache must use RenderAtScale = 1.0');
   assert.match(src, /_bubbleBorder\.CacheMode\s*=\s*null;/, 'Collapsed speech bubble must release BitmapCache offscreen surface');
+});
+
+test('desktop_pet macOS native Swift companion integrity, compilation, and status check', async (t) => {
+  const swiftSrc = fs.readFileSync(PET_SWIFT, 'utf8');
+  assert.match(swiftSrc, /class\s+PetHostController/);
+  assert.match(swiftSrc, /NSPanel/);
+  assert.match(swiftSrc, /ignoresMouseEvents/);
+  assert.match(swiftSrc, /--probe-desktop/);
+  assert.match(swiftSrc, /--stop/);
+  assert.match(swiftSrc, /--parent-pid/);
+  assert.match(swiftSrc, /--data-dir/);
+  assert.match(swiftSrc, /pet_status\.json/);
+  assert.match(swiftSrc, /\{quota5h\}/);
+  assert.match(swiftSrc, /sessionProgress/);
+
+  if (process.platform === 'darwin') {
+    const prevSkip = process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE;
+    process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE = '1';
+    t.after(() => {
+      if (prevSkip === undefined) delete process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE;
+      else process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE = prevSkip;
+    });
+
+    const paths = makeTempPaths(t);
+    const petPaths = resolvePetPaths(paths);
+    const prep = await ensurePetCompanionAssets(petPaths);
+    assert.equal(prep.supported, true);
+    assert.equal(prep.compiled, true);
+    assert.equal(fs.existsSync(petPaths.petMacBinFile), true);
+
+    const probeOut = await new Promise((resolve, reject) => {
+      execFile(petPaths.petMacBinFile, ['--probe-desktop'], { timeout: 3000 }, (err, stdout) => {
+        if (err) reject(err);
+        else resolve(String(stdout || '').trim());
+      });
+    });
+    assert.ok(probeOut === 'default' || probeOut === 'isolated');
+
+    const status = await getPetCompanionStatus(petPaths, { enabled: false });
+    assert.equal(status.supported, true);
+    assert.equal(status.isMacOS, true);
+    assert.equal(status.compiled, true);
+    assert.equal(status.supportsPet, true);
+  }
 });

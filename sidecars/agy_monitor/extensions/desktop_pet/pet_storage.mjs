@@ -52,6 +52,9 @@ export function resolvePetPaths(corePaths) {
     petExeFile: path.join(petBinDir, 'agy_desktop_pet.exe'),
     petHashFile: path.join(petBinDir, 'agy_desktop_pet.sha1'),
     petLauncherVbs: path.join(pluginDataDir, 'launch_desktop_pet.vbs'),
+    petMacBinFile: path.join(petBinDir, 'agy_desktop_pet_mac'),
+    petMacHashFile: path.join(petBinDir, 'agy_desktop_pet_mac.sha1'),
+    petMacPidFile: path.join(petBinDir, 'agy_desktop_pet_mac.pid'),
     hudTelemetryFile: corePaths?.hudTelemetryFile || path.join(pluginDataDir, 'hud_telemetry.json'),
     themesFile: corePaths?.themesFile || path.join(pluginDataDir, 'themes.json'),
   };
