@@ -28,6 +28,9 @@
             <button class="subnav-tab" type="button" role="tab" data-subnav="accounts" aria-selected="false">
               <span data-i18n="nav.accounts">账号</span>
             </button>
+            <button class="subnav-tab" type="button" role="tab" data-subnav="boost" aria-selected="false">
+              <span data-i18n="nav.boost">增强</span>
+            </button>
             <button class="subnav-tab" type="button" role="tab" data-subnav="other" aria-selected="false">
               <span data-i18n="nav.other">其他</span>
             </button>
@@ -1048,6 +1051,54 @@
 
         <!-- 其他面板：紧凑设置项 -->
         <div class="monitor-tab-panel monitor-other-panel" id="panelOther" data-subnav-panel="other" aria-label="其他设置" data-i18n-aria="other.ariaLabel" hidden>
+          <!-- 选项零（顶部，默认开启）：免 TUN 代理 -->
+          <section class="other-card is-proxy-active" id="otherProxyCard" aria-label="免 TUN 独立代理" data-i18n-aria="other.proxyAriaLabel">
+            <div class="other-card-head">
+              <div class="other-card-title-group">
+                <span class="other-card-title" data-i18n="other.proxyTitle">免 TUN 代理</span>
+                <span class="other-card-sub" data-i18n="other.proxySub">独立代理 Antigravity，无需开启全局 TUN</span>
+              </div>
+              <div class="other-card-controls">
+                <span class="other-status-pill is-on" id="otherProxyBadge" data-i18n="other.proxyBadgeOn">已开启</span>
+                <label class="other-switch">
+                  <input
+                    type="checkbox"
+                    id="otherProxyToggle"
+                    checked
+                    aria-checked="true"
+                    aria-label="开启或关闭免 TUN 代理"
+                    data-i18n-aria="other.proxyToggleAria"
+                  />
+                  <span class="other-switch-slider" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="other-proxy-body" id="otherProxyBody">
+              <div class="other-proxy-input-row">
+                <input
+                  class="other-cmd-input other-proxy-input"
+                  id="otherProxyUrlInput"
+                  type="text"
+                  placeholder="留空自动读系统代理，或填 http://127.0.0.1:7897"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="独立代理地址"
+                  data-i18n-aria="other.proxyUrlAria"
+                />
+                <button class="theme-pill-btn is-primary" id="otherProxySaveBtn" type="button" data-i18n="other.proxySaveBtn">保存</button>
+                <button class="theme-pill-btn" id="otherProxyTestBtn" type="button" data-i18n="other.proxyTestBtn">测速</button>
+              </div>
+              <div class="other-proxy-foot">
+                <label class="other-proxy-check" title="开启 GODEBUG=http2client=0，修复部分本地代理下 Go 语言服务 HTTP/2 EOF 断连">
+                  <input type="checkbox" id="otherProxyHttp1Toggle" aria-label="强制 HTTP/1.1" />
+                  <span data-i18n="other.proxyHttp1Label">强制 HTTP/1.1</span>
+                </label>
+                <span class="other-proxy-hint" id="otherProxyHint" data-i18n="other.proxyHintAuto">自动跟随系统代理</span>
+              </div>
+            </div>
+          </section>
+
           <!-- 选项一：额度显示 -->
           <section class="other-card" id="otherQuotaMasterCard" aria-label="额度查看与查询开关">
             <div class="other-card-head">
@@ -1131,7 +1182,131 @@
             />
           </section>
         </div>
+
+        <!-- 增强面板主体：默认全部关闭，按需勾选 -->
+        <div class="monitor-tab-panel boost-panel" id="panelBoost" data-subnav-panel="boost" hidden>
+          <div class="boost-toolbar">
+            <div class="boost-toolbar-left">
+              <span class="boost-toolbar-title">增强</span>
+              <span class="other-status-pill is-muted" id="boostCountBadge">0/3</span>
+            </div>
+            <div class="boost-toolbar-actions">
+              <button class="theme-pill-btn is-primary" id="boostEnableAllBtn" type="button">全部启用</button>
+              <button class="theme-pill-btn" id="boostDisableAllBtn" type="button">全部关闭</button>
+            </div>
+          </div>
+
+          <div class="boost-list" role="list">
+            <div class="boost-row" role="listitem" data-boost-row="batchOps">
+              <div class="boost-row-text">
+                <span class="boost-row-title">打包合并做</span>
+                <span class="boost-row-desc">批量搜代码、改文件并顺手跑测试</span>
+              </div>
+              <div class="boost-row-controls">
+                <button
+                  class="boost-info-btn"
+                  type="button"
+                  data-boost-info="batchOps"
+                  aria-label="查看「打包合并做」介绍"
+                  title="移入预览，点击全屏查看"
+                >?</button>
+                <label class="other-switch">
+                  <input
+                    type="checkbox"
+                    id="boostToggleBatchOps"
+                    data-boost-toggle="batchOps"
+                    aria-checked="false"
+                    aria-label="启用打包合并做"
+                  />
+                  <span class="other-switch-slider" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="boost-row" role="listitem" data-boost-row="compactOutput">
+              <div class="boost-row-text">
+                <span class="boost-row-title">压输出砍废话</span>
+                <span class="boost-row-desc">折叠日志限 8.8KB，只留报错重点</span>
+              </div>
+              <div class="boost-row-controls">
+                <button
+                  class="boost-info-btn"
+                  type="button"
+                  data-boost-info="compactOutput"
+                  aria-label="查看「压输出砍废话」介绍"
+                  title="移入预览，点击全屏查看"
+                >?</button>
+                <label class="other-switch">
+                  <input
+                    type="checkbox"
+                    id="boostToggleCompactOutput"
+                    data-boost-toggle="compactOutput"
+                    aria-checked="false"
+                    aria-label="启用压输出砍废话"
+                  />
+                  <span class="other-switch-slider" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="boost-row" role="listitem" data-boost-row="outlineFirst">
+              <div class="boost-row-text">
+                <span class="boost-row-title">先目录再精读</span>
+                <span class="boost-row-desc">先扫函数大纲，不硬塞整文件</span>
+              </div>
+              <div class="boost-row-controls">
+                <button
+                  class="boost-info-btn"
+                  type="button"
+                  data-boost-info="outlineFirst"
+                  aria-label="查看「先目录再精读」介绍"
+                  title="移入预览，点击全屏查看"
+                >?</button>
+                <label class="other-switch">
+                  <input
+                    type="checkbox"
+                    id="boostToggleOutlineFirst"
+                    data-boost-toggle="outlineFirst"
+                    aria-checked="false"
+                    aria-label="启用先目录再精读"
+                  />
+                  <span class="other-switch-slider" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
       </main>
+    </div>
+
+    <!-- 增强功能：悬停旁侧小窗 -->
+    <div class="boost-hover-card" id="boostHoverCard" role="tooltip" hidden>
+      <div class="boost-hover-title" id="boostHoverTitle"></div>
+      <p class="boost-hover-text" id="boostHoverText"></p>
+      <div class="boost-hover-hint">点击展开全屏介绍</div>
+    </div>
+
+    <!-- 增强功能：点击后整屏弹窗 -->
+    <div class="boost-detail-modal" id="boostDetailModal" role="dialog" aria-modal="true" aria-labelledby="boostDetailTitle" hidden>
+      <div class="boost-detail-sheet">
+        <div class="boost-detail-head">
+          <div class="boost-detail-head-left">
+            <h3 class="boost-detail-title" id="boostDetailTitle"></h3>
+            <span class="other-status-pill is-muted" id="boostDetailStatus">已关闭</span>
+          </div>
+          <button class="modal-close-btn" id="boostDetailCloseBtn" type="button" aria-label="关闭">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="boost-detail-body">
+          <p class="boost-detail-text" id="boostDetailText"></p>
+        </div>
+        <div class="boost-detail-foot">
+          <button class="theme-pill-btn is-primary" id="boostDetailToggleBtn" type="button">立即启用</button>
+        </div>
+      </div>
     </div>
 
     <!-- 弹窗一：系统提示词导入说明与安全警告 -->

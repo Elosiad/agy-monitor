@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import { atomicWriteText } from './paths.mjs';
+import { mergeBoostRulesIntoContent } from './boost_tools.mjs';
 import { BUILTIN_PRESETS, RULES_MAX_BYTES, estimateTokens, getBuiltinPresetById } from './presets_builtin.mjs';
 import { HEX_COLOR_RE } from './storage.mjs';
 
@@ -173,13 +174,18 @@ export function inspectMarkdownSecurity(rawContent) {
  * Validate and atomically write rules/AGENTS.md for the active preset.
  * Note: official preset writes an empty rules/AGENTS.md (+0 tokens).
  */
-export async function applyRulesPreset(paths, presetInput) {
+export async function applyRulesPreset(paths, presetInput, options = {}) {
   const preset =
     typeof presetInput === 'string'
       ? getBuiltinPresetById(presetInput) || { id: presetInput, content: '' }
       : presetInput || BUILTIN_PRESETS[0];
 
-  const inspection = inspectMarkdownSecurity(preset.content ?? '');
+  const mergedRaw =
+    options && Object.prototype.hasOwnProperty.call(options, 'boost')
+      ? mergeBoostRulesIntoContent(preset.content ?? '', options.boost)
+      : (preset.content ?? '');
+
+  const inspection = inspectMarkdownSecurity(mergedRaw);
   if (!inspection.safe || inspection.blocked) {
     return {
       ok: false,
@@ -218,6 +224,39 @@ export async function applyRulesPreset(paths, presetInput) {
     bytes: inspection.bytes,
     tokens: estimateTokens(inspection.sanitized),
     warnings: inspection.warnings,
+  };
+}
+
+/**
+ * Update only the managed Boost rules block inside rules/AGENTS.md while preserving
+ * whatever user/preset rules currently exist.
+ */
+export async function syncBoostRules(paths, boost) {
+  let existing = '';
+  try {
+    existing = await fs.readFile(paths.rulesFile, 'utf8');
+  } catch {
+    existing = '';
+  }
+  const merged = mergeBoostRulesIntoContent(existing, boost);
+  const inspection = inspectMarkdownSecurity(merged);
+  if (!inspection.safe || inspection.blocked) {
+    return {
+      ok: false,
+      blocked: true,
+      rulesFile: paths.rulesFile,
+      bytes: inspection.bytes,
+      tokens: 0,
+      reason: inspection.reason,
+    };
+  }
+  await atomicWriteText(paths.rulesFile, inspection.sanitized);
+  return {
+    ok: true,
+    blocked: false,
+    rulesFile: paths.rulesFile,
+    bytes: inspection.bytes,
+    tokens: estimateTokens(inspection.sanitized),
   };
 }
 

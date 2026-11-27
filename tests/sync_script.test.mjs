@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url';
 import { syncPluginToConfig } from '../scripts/sync_to_plugins.mjs';
 import { installPlugin } from '../scripts/install.mjs';
 import { uninstallPlugin } from '../scripts/uninstall.mjs';
+import {
+  computeAsarIntegrity,
+  inspectNativeHudState,
+  installNativeHud,
+} from '../sidecars/agy_monitor/backend/hud_injector.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SYNC_SCRIPT = path.resolve(__dirname, '../scripts/sync_to_plugins.mjs');
@@ -181,4 +186,81 @@ test('installPlugin seeds pinned defaults on fresh install, preserves modified u
   const un2 = uninstallPlugin({ targetDir, pluginDataDir, sidecarDataDir, purgeData: true, silent: true });
   assert.equal(un2.purgedData, true);
   assert.equal(fs.existsSync(pluginDataDir), false);
+});
+
+test('uninstallPlugin: restores patched host app.asar, cleans runtime staged files, and preserves user config', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-uninstall-asar-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const targetDir = path.join(root, 'plugins', 'agy-monitor');
+  const pluginDataDir = path.join(root, 'plugin_data', 'agy-monitor');
+  const sidecarDataDir = path.join(root, 'sidecar_data', 'agy-monitor');
+  const asarPath = path.join(root, 'app.asar');
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.mkdirSync(pluginDataDir, { recursive: true });
+  fs.writeFileSync(path.join(targetDir, 'plugin.json'), '{"name":"agy-monitor"}\n', 'utf8');
+  fs.writeFileSync(path.join(pluginDataDir, 'user_prefs.json'), '{"language":"zh-CN"}\n', 'utf8');
+  fs.writeFileSync(path.join(pluginDataDir, 'themes.json'), '{"activeWallpaperId":"wp-1"}\n', 'utf8');
+
+  // Build minimal synthetic stock app.asar
+  const pkgBuf = Buffer.from(JSON.stringify({ name: 'antigravity', version: '2.39.0', main: 'dist/main.js' }), 'utf8');
+  const mainBuf = Buffer.from('"use strict";\nconsole.log("stock 2.39.0");\n', 'utf8');
+  const asarRoot = {
+    files: {
+      'package.json': { size: pkgBuf.length, offset: '0', integrity: computeAsarIntegrity(pkgBuf) },
+      dist: {
+        files: {
+          'main.js': { size: mainBuf.length, offset: String(pkgBuf.length), integrity: computeAsarIntegrity(mainBuf) },
+        },
+      },
+    },
+  };
+  const jsonBuf = Buffer.from(JSON.stringify(asarRoot), 'utf8');
+  const alignedLen = (jsonBuf.length + 3) & ~3;
+  const headerBuf = Buffer.alloc(16 + alignedLen);
+  headerBuf.writeUInt32LE(4, 0);
+  headerBuf.writeUInt32LE(alignedLen + 8, 4);
+  headerBuf.writeUInt32LE(alignedLen + 4, 8);
+  headerBuf.writeUInt32LE(jsonBuf.length, 12);
+  jsonBuf.copy(headerBuf, 16);
+  fs.writeFileSync(asarPath, Buffer.concat([headerBuf, pkgBuf, mainBuf]));
+
+  // Patch app.asar + stage runtime live assets
+  const inst = await installNativeHud({
+    pluginDataDir,
+    hostAsarPath: asarPath,
+    devToolsActivePortFile: path.join(root, 'missing_dt'),
+    nativeHudStatusFile: path.join(pluginDataDir, 'native_hud_status.json'),
+  });
+  assert.equal(inst.ok, true);
+  assert.equal(inst.status.state, 'installed');
+  fs.writeFileSync(path.join(pluginDataDir, 'native_wallpaper.css'), 'html{}', 'utf8');
+  fs.writeFileSync(path.join(pluginDataDir, 'native_hud_status.json'), '{}', 'utf8');
+
+  // Run synchronous uninstall targeting synthetic hostAsarPath
+  const res = uninstallPlugin({
+    targetDir,
+    pluginDataDir,
+    sidecarDataDir,
+    hostAsarPath: asarPath,
+    purgeData: false,
+    silent: true,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.removedPlugin, true);
+  assert.equal(res.asarRestored, true);
+  assert.equal(res.purgedData, false);
+
+  const after = await inspectNativeHudState({
+    pluginDataDir,
+    hostAsarPath: asarPath,
+    devToolsActivePortFile: path.join(root, 'missing_dt'),
+  });
+  assert.equal(after.state, 'stock');
+  assert.equal(fs.existsSync(path.join(pluginDataDir, 'native_wallpaper.css')), false);
+  assert.equal(fs.existsSync(path.join(pluginDataDir, 'native_hud_renderer.js')), false);
+  assert.equal(fs.existsSync(path.join(pluginDataDir, 'native_host_i18n.js')), false);
+  assert.equal(fs.existsSync(path.join(pluginDataDir, 'native_hud_status.json')), false);
+  assert.equal(fs.existsSync(path.join(pluginDataDir, 'user_prefs.json')), true);
+  assert.equal(fs.existsSync(path.join(pluginDataDir, 'themes.json')), true);
 });

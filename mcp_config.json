@@ -5,6 +5,12 @@
       "args": [
         "sidecars/agy_monitor/extensions/mcp_bridge.mjs"
       ]
+    },
+    "boost_mcp": {
+      "command": "agy-node",
+      "args": [
+        "sidecars/agy_monitor/backend/boost_mcp.mjs"
+      ]
     }
   }
 }

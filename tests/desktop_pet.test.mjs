@@ -407,14 +407,15 @@ test('MCP bridge & desktop_pet MCP tools: slice, create animation, preview HTML,
   assert.equal(delRes.isError, false);
   assert.equal(delRes.data.activePetId, 'neko');
 
-  // 8. Real stdio subprocess roundtrip (matching Antigravity MCP launcher)
+  // 8. Real stdio subprocess roundtrip (matching Antigravity MCP launcher, including malformed JSON error handling)
   const stdioOut = await new Promise((resolve, reject) => {
     const child = execFile(process.execPath, [MCP_BRIDGE_PATH], { timeout: 8000 }, (err, stdout) => {
       if (err) reject(err);
       else resolve(stdout);
     });
     child.stdin.write(
-      JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) +
+      '{malformed-json\n' +
+        JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'initialize', params: { protocolVersion: '2024-11-05' } }) +
         '\n' +
         JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/list' }) +
         '\n',
@@ -426,10 +427,11 @@ test('MCP bridge & desktop_pet MCP tools: slice, create animation, preview HTML,
     .map((l) => l.trim())
     .filter(Boolean)
     .map((l) => JSON.parse(l));
-  assert.equal(lines.length, 2);
-  assert.equal(lines[0].id, 10);
-  assert.equal(lines[1].id, 11);
-  assert.ok(lines[1].result.tools.some((x) => x.name === 'pet_create_frame_animation'));
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0].error.code, -32700);
+  assert.equal(lines[1].id, 10);
+  assert.equal(lines[2].id, 11);
+  assert.ok(lines[2].result.tools.some((x) => x.name === 'pet_create_frame_animation'));
 });
 
 test('desktop_pet security hardening: PNG bomb guard, output_dir confinement, customPets overwrite block & CSP headers', async (t) => {

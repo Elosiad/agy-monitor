@@ -29,13 +29,23 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import tls from 'node:tls';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { atomicWriteBuffer, atomicWriteJson, atomicWriteText } from './paths.mjs';
+import {
+  createPosixAccountDriver,
+  readAppStorageOnboarding,
+  unwrapGoKeyringPayload,
+} from './account_driver_posix.mjs';
 import { findAntigravityExePath } from './cdp_theme_bridge.mjs';
 import { restoreHostOpacityFallback } from './backdrop_manager.mjs';
 import { lookupAsarNode } from './hud_injector.mjs';
 import { normalizeQuotaSummary } from './quota.mjs';
 import { detectWindowsHostEnv } from './wsl_bridge.mjs';
+
+const __accountsFilename = fileURLToPath(import.meta.url);
+const __accountsDirname = path.dirname(__accountsFilename);
+const STATIC_SWITCH_WORKER_PATH = path.resolve(__accountsDirname, '..', 'accounts', 'switch_worker.mjs');
 
 export const ACCOUNT_EXPORT_SCHEMA = 'agy-monitor.account.v1';
 export const DEFAULT_RESUME_PROMPT =
@@ -1448,6 +1458,7 @@ export const ACCOUNT_ABNORMAL_BACKOFF_CODES = Object.freeze(
     'ACCOUNT_BANNED',
     'VALIDATION_REQUIRED',
     'SUBSCRIPTION_REQUIRED',
+    'CREDENTIAL_MISMATCH',
   ]),
 );
 
@@ -1459,6 +1470,7 @@ export const ACCOUNT_AUTO_SWITCH_BLOCKED_CODES = Object.freeze(
     'ACCOUNT_BANNED',
     'VALIDATION_REQUIRED',
     'SUBSCRIPTION_REQUIRED',
+    'CREDENTIAL_MISMATCH',
   ]),
 );
 
@@ -1469,12 +1481,69 @@ const ACCOUNT_STATUS_META = Object.freeze({
   RT_EXPIRED: { state: 'error', badge: 'RT 过期', blocking: true },
   INVALID_GRANT: { state: 'error', badge: 'RT 过期', blocking: true },
   MISSING_REFRESH_TOKEN: { state: 'error', badge: '缺少 RT', blocking: true },
+  CREDENTIAL_MISMATCH: { state: 'error', badge: '需重登', blocking: true },
   AT_EXPIRED: { state: 'warning', badge: 'AT 过期', blocking: false },
   SUBSCRIPTION_REQUIRED: { state: 'warning', badge: '无订阅', blocking: true },
   CLIENT_MISMATCH: { state: 'error', badge: '客户端异常', blocking: false },
   NETWORK_ERROR: { state: 'warning', badge: '网络异常', blocking: false },
   API_ERROR: { state: 'warning', badge: '接口异常', blocking: false },
 });
+
+/**
+ * Guard against cross-account credential contamination ("串号") before saving or switching.
+ * Verifies embedded `id_token_email`, prior `invalidRefreshHash` poisoning, and duplicate
+ * `refreshTokenHash` ownership across accounts.
+ */
+export function checkCrossAccountCollision(
+  accounts = [],
+  { targetId = '', targetEmail = '', targetCredObj = null, targetRefreshHash = '', targetAccount = null } = {},
+) {
+  const normTargetEmail = sanitizeEmail(targetEmail);
+  const normRtHash = String(targetRefreshHash || '').trim().toLowerCase();
+
+  if (
+    targetAccount?.invalidRefreshHash &&
+    normRtHash &&
+    String(targetAccount.invalidRefreshHash).trim().toLowerCase() === normRtHash
+  ) {
+    return {
+      ok: false,
+      code: 'CREDENTIAL_MISMATCH',
+      reason: '该账号的本地凭据曾发生切号串号或已失效，请重新授权后再切换',
+    };
+  }
+
+  if (targetCredObj && typeof targetCredObj === 'object' && normTargetEmail) {
+    const embeddedEmail = sanitizeEmail(extractEmailFromCred(targetCredObj));
+    if (embeddedEmail && embeddedEmail !== normTargetEmail) {
+      return {
+        ok: false,
+        code: 'CREDENTIAL_MISMATCH',
+        actualEmail: embeddedEmail,
+        reason: `防串号拦截：目标槽位凭据实际属于 ${embeddedEmail}，与 ${normTargetEmail} 不一致，请重新授权`,
+      };
+    }
+  }
+
+  if (normRtHash && Array.isArray(accounts)) {
+    const colliding = accounts.find((other) => {
+      if (!other || (targetId && other.id === targetId)) return false;
+      if (normTargetEmail && sanitizeEmail(other.email) === normTargetEmail) return false;
+      const otherHash = String(other.refreshTokenHash || '').trim().toLowerCase();
+      return Boolean(otherHash && otherHash === normRtHash);
+    });
+    if (colliding) {
+      return {
+        ok: false,
+        code: 'CREDENTIAL_MISMATCH',
+        collidingEmail: colliding.email,
+        reason: `防串号拦截：目标账号刷新令牌与 ${colliding.email} 重复，请重新授权以获取独立凭据`,
+      };
+    }
+  }
+
+  return { ok: true };
+}
 
 export function sanitizeValidationUrl(rawUrl) {
   const s = typeof rawUrl === 'string' ? rawUrl.trim() : '';
@@ -1581,6 +1650,7 @@ export function classifyAccountError(err) {
     ACCOUNT_BANNED: '该账号已被 Google 封禁或停用，无法继续使用',
     RT_EXPIRED: 'Refresh Token (RT) 已过期或被撤销，请重新通过 OAuth 授权',
     MISSING_REFRESH_TOKEN: '缺少 Refresh Token (RT)，无法续签，请重新授权或导入',
+    CREDENTIAL_MISMATCH: '检测到本地凭据串号或所属邮箱不匹配，请重新授权该账号',
     AT_EXPIRED: 'Access Token (AT) 已过期或失效，请刷新续签或重新授权',
     SUBSCRIPTION_REQUIRED: '该账号暂无有效 Antigravity 订阅权限',
     CLIENT_MISMATCH: 'Google OAuth 客户端校验失败 (HTTP 401)',
@@ -3829,59 +3899,31 @@ export async function ensureAccountTool(paths) {
 }
 
 /**
- * Detect current running Antigravity.exe path and non-internal launch flags
- * (preserving `--remote-debugging-port=<port>` so CDP wallpaper & HUD stay intact).
+ * Locate Antigravity.exe and preserve CDP launch arguments in pure Node.js
+ * (zero PowerShell / WMI calls to avoid AV heuristics and console flicker).
  */
 async function detectRunningAntigravityLaunch(storage) {
-  const fallbackExe = findAntigravityExePath();
-  let exePath = fallbackExe;
-  let launchArgs = '';
-
-  const hostInfo = detectWindowsHostEnv();
-  if (hostInfo.isNativeWindows) {
-    try {
-      const ps =
-        "Get-CimInstance Win32_Process -Filter \"Name='Antigravity.exe'\" | Select-Object ExecutablePath, CommandLine | ConvertTo-Json -Compress";
-      const { stdout } = await execFileWithStdin('powershell.exe', ['-NoProfile', '-Command', ps], {
-        timeout: 4000,
-      });
-      const parsed = JSON.parse(String(stdout || '[]').trim() || '[]');
-      const procs = Array.isArray(parsed) ? parsed : [parsed];
-      // Primary Electron main process does not have `--type=` or `sidecars/`
-      const mainProc = procs.find(
-        (p) =>
-          p &&
-          typeof p.CommandLine === 'string' &&
-          !p.CommandLine.includes('--type=') &&
-          !p.CommandLine.includes('sidecar_sdk') &&
-          !p.CommandLine.includes('mcp_entry'),
-      );
-      if (mainProc) {
-        if (mainProc.ExecutablePath && fs.existsSync(mainProc.ExecutablePath)) {
-          exePath = mainProc.ExecutablePath;
-        }
-        const cmd = String(mainProc.CommandLine || '').trim();
-        // Strip leading quoted or unquoted executable path
-        const stripped = cmd.replace(/^(?:"[^"]+"|\S+)\s*/, '').trim();
-        if (stripped) {
-          launchArgs = stripped;
-        }
-      }
-    } catch {
-      // Fallback to exe discovery + theme CDP flag
+  let exePath = findAntigravityExePath();
+  if (!exePath) {
+    const agentExe = String(process.env.ANTIGRAVITY_AGENTAPI_EXE || '').trim();
+    if (agentExe) {
+      const candidate = path.join(path.dirname(path.dirname(path.dirname(agentExe))), 'Antigravity.exe');
+      if (fs.existsSync(candidate)) exePath = candidate;
     }
   }
+  if (!exePath && process.execPath && /^antigravity\.exe$/i.test(path.basename(process.execPath)) && fs.existsSync(process.execPath)) {
+    exePath = process.execPath;
+  }
 
+  let launchArgs = '';
   // If CDP wallpaper mode was enabled in themes, ensure `--remote-debugging-port` is preserved
-  if (!launchArgs.includes('--remote-debugging-port') && storage?.getThemes) {
+  if (storage?.getThemes) {
     try {
       const themes = await storage.getThemes();
       const cdpPort = Number(themes?.cdpPort || 9229);
       const wantCdp = Boolean(themes?.backdropEnabled && themes?.activeWallpaperId);
       if (wantCdp && Number.isInteger(cdpPort) && cdpPort >= 1024 && cdpPort <= 65535) {
-        launchArgs = launchArgs
-          ? `${launchArgs} --remote-debugging-port=${cdpPort}`
-          : `--remote-debugging-port=${cdpPort}`;
+        launchArgs = `--remote-debugging-port=${cdpPort}`;
       }
     } catch {
       // Non-fatal
@@ -3955,6 +3997,7 @@ export function createWindowsAccountDriver(paths, storage) {
   }
 
   return {
+    backend: 'win32-credman',
     isSupported() {
       return detectWindowsHostEnv().isNativeWindows;
     },
@@ -4009,26 +4052,54 @@ export function createWindowsAccountDriver(paths, storage) {
     },
     async launchSwitchDaemon(txPath) {
       const exePath = await requireToolExe();
-      // Launch via wscript.exe with window style 0 for zero console flash and full process-tree detachment
-      const vbsPath = path.join(paths.accountsDir, 'run_switch_daemon.vbs');
-      const cmd = `"${escapeVbsString(exePath)}" --switch-daemon "${escapeVbsString(txPath)}"`;
-      const vbsContent = [
-        'Set sh = CreateObject("WScript.Shell")',
-        `sh.Run "${escapeVbsString(cmd)}", 0, False`,
-        '',
-      ].join('\r\n');
-      await writeUtf16LeBom(vbsPath, vbsContent);
+      // Remove any legacy VBS script left over from older versions (zero wscript.exe / zero AV flags)
+      const legacyVbs = path.join(paths.accountsDir, 'run_switch_daemon.vbs');
+      await fsp.rm(legacyVbs, { force: true }).catch(() => {});
 
-      const child = spawn('wscript.exe', ['//Nologo', vbsPath], {
+      // Ensure transaction file references the compiled AgyAccountTool.exe for atomic DPAPI + CredWriteW
+      try {
+        const txObj = JSON.parse(await fsp.readFile(txPath, 'utf8'));
+        if (txObj && typeof txObj === 'object' && !txObj.accountToolExe) {
+          txObj.accountToolExe = exePath;
+          await atomicWriteJson(txPath, txObj);
+        }
+      } catch {
+        // non-fatal
+      }
+
+      // Launch static pure-Node switch_worker.mjs detached with windowsHide=true (zero console flash, zero VBS/PS)
+      const workerEnv = {
+        ...buildCleanLaunchEnv(process.env),
+        ELECTRON_RUN_AS_NODE: '1',
+      };
+      const child = spawn(process.execPath, [STATIC_SWITCH_WORKER_PATH, txPath], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
-        env: buildCleanLaunchEnv(process.env),
+        env: workerEnv,
       });
       child.unref();
-      return { ok: true, launched: true };
+      return { ok: true, launched: true, method: 'static-node-worker', backend: 'win32-credman' };
     },
   };
+}
+
+/**
+ * Automatically select the native OS credential driver:
+ * - Windows -> DPAPI + Windows Credential Manager (`win32-credman`)
+ * - macOS   -> macOS Keychain via stdin / JXA (`darwin-keychain`)
+ * - Linux   -> Linux Secret Service via `secret-tool` stdin (`linux-secret-service`)
+ */
+export function createPlatformAccountDriver(paths, storage, opts = {}) {
+  const platform = opts.platform || process.platform;
+  if (platform === 'win32') {
+    return createWindowsAccountDriver(paths, storage);
+  }
+  return createPosixAccountDriver(paths, storage, {
+    ...opts,
+    platform,
+    cleanLaunchEnvFn: buildCleanLaunchEnv,
+  });
 }
 
 /**
@@ -4048,7 +4119,7 @@ export function createAccountManager({
   now = () => Date.now(),
   onBeforeHostClose,
 } = {}) {
-  const activeDriver = driver || createWindowsAccountDriver(paths, storage);
+  const activeDriver = driver || createPlatformAccountDriver(paths, storage);
   const allowDirectCloudCodeProbe =
     typeof remoteQuotaFetcher === 'function' || allowUnsafeDirectCloudCode === true;
   const activeRemoteQuotaFetcher =
@@ -4059,6 +4130,14 @@ export function createAccountManager({
   const allowPreSwitchTokenRefresh =
     !driver || typeof tokenRefresher === 'function';
   let storeLock = Promise.resolve();
+
+  function getUnsupportedDriverMessage() {
+    if (typeof activeDriver.getUnsupportedReason === 'function') {
+      const r = activeDriver.getUnsupportedReason();
+      if (r) return r;
+    }
+    return '当前系统凭据库不可用（Windows 需 .NET，macOS 需钥匙串，Linux 需安装 secret-tool）';
+  }
 
   async function checkQuotaQueryEnabled() {
     if (typeof isQuotaQueryEnabled === 'function') {
@@ -4081,6 +4160,7 @@ export function createAccountManager({
   let lastResumeResult = null;
   let lastOauthCaptureResult = null;
   let lastAutoSwitchResult = null;
+  let lastSwitchMismatch = null;
   let lastAutoRefreshAtMs = 0;
   let lastAutoSwitchAtMs = 0;
   let lastAutoSwitchFromEmail = '';
@@ -4115,12 +4195,29 @@ export function createAccountManager({
     };
   }
 
+  function sanitizePendingSwitch(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const targetAccountId = String(raw.targetAccountId || '').trim();
+    const targetEmail = sanitizeEmail(raw.targetEmail || '');
+    const atMs = Number(raw.atMs);
+    if (!targetAccountId || !targetEmail || !Number.isFinite(atMs) || atMs <= 0) return null;
+    return {
+      targetAccountId,
+      targetEmail,
+      targetRefreshHash: String(raw.targetRefreshHash || '').trim().toLowerCase(),
+      fromLsAddress: String(raw.fromLsAddress || '').trim(),
+      transactionId: String(raw.transactionId || '').trim(),
+      atMs,
+    };
+  }
+
   async function readIndex() {
     const raw = readJsonFileSafe(paths.accountsIndexFile, null);
     if (!raw || typeof raw !== 'object') {
       return {
         version: 1,
         activeAccountId: '',
+        pendingSwitch: null,
         settings: normalizeAccountSettings(),
         autoSwitchState: normalizeAutoSwitchState(),
         groups: [...BUILTIN_ACCOUNT_GROUPS],
@@ -4138,6 +4235,7 @@ export function createAccountManager({
     return {
       version: 1,
       activeAccountId: typeof raw.activeAccountId === 'string' ? raw.activeAccountId : '',
+      pendingSwitch: sanitizePendingSwitch(raw.pendingSwitch),
       settings: normalizeAccountSettings(raw.settings),
       autoSwitchState: normalizeAutoSwitchState(raw.autoSwitchState),
       groups: normalizeAccountGroups(raw.groups, normalizedAccounts),
@@ -4227,31 +4325,130 @@ export function createAccountManager({
 
   async function readLiveEmailSafe() {
     if (!activeDriver.isSupported()) {
-      return { supported: false, email: '', found: false };
+      return { supported: false, email: '', found: false, refreshTokenHash: '' };
     }
     try {
       const live = await activeDriver.readLiveCredential();
       if (!live?.found || !live.credJson) {
-        return { supported: true, email: '', found: false };
+        return { supported: true, email: '', found: false, refreshTokenHash: '' };
       }
-      const parsed = JSON.parse(live.credJson);
+      const cleanJson = unwrapGoKeyringPayload(live.credJson);
+      const parsed = JSON.parse(cleanJson);
+      const refreshTokenHash = computeRefreshTokenHash(extractRefreshToken(parsed));
       let email = extractEmailFromCred(parsed);
-      if (!email) {
+      if (!email && refreshTokenHash) {
         // Pure Cockpit credential payloads omit non-standard id_token_email;
         // match by non-reversible SHA-256 refreshTokenHash in accounts_index.json.
-        const rtHash = computeRefreshTokenHash(extractRefreshToken(parsed));
-        if (rtHash) {
-          const idx = await readIndex().catch(() => null);
-          const matched = idx?.accounts?.find((a) => a && a.refreshTokenHash === rtHash);
-          if (matched?.email) {
-            email = sanitizeEmail(matched.email);
-          }
+        const idx = await readIndex().catch(() => null);
+        const matched = idx?.accounts?.find((a) => a && a.refreshTokenHash === refreshTokenHash);
+        if (matched?.email) {
+          email = sanitizeEmail(matched.email);
         }
       }
-      return { supported: true, email, found: true, live, parsed };
+      return {
+        supported: true,
+        email,
+        found: true,
+        refreshTokenHash,
+        live: { ...live, credJson: cleanJson },
+        parsed,
+      };
     } catch {
-      return { supported: true, email: '', found: false };
+      return { supported: true, email: '', found: false, refreshTokenHash: '' };
     }
+  }
+
+  /**
+   * Reconcile a pending switch after restart:
+   * - If the live credential matches the target email or refreshTokenHash, confirm success & mark onboarded.
+   * - If Antigravity restarted into a DIFFERENT account, detect `switchMismatch`, poison the failed slot's
+   *   `invalidRefreshHash`, record `CREDENTIAL_MISMATCH` to prevent auto-switch loops, and re-align activeAccountId.
+   */
+  async function reconcilePendingSwitch(nowMs, liveInfo) {
+    const idxPreview = await readIndex().catch(() => null);
+    const pending = idxPreview?.pendingSwitch;
+    if (!pending) return null;
+
+    const age = nowMs - pending.atMs;
+    if (age >= PENDING_RESUME_TTL_MS) {
+      await withStoreLock(async () => {
+        const idx = await readIndex();
+        if (idx.pendingSwitch && idx.pendingSwitch.atMs === pending.atMs) {
+          idx.pendingSwitch = null;
+          await writeIndex(idx);
+        }
+      }).catch(() => {});
+      return null;
+    }
+
+    const liveEmail = sanitizeEmail(liveInfo?.email || '');
+    const liveRtHash = String(liveInfo?.refreshTokenHash || '').trim().toLowerCase();
+    const matchedTarget =
+      (liveEmail && liveEmail === pending.targetEmail) ||
+      (liveRtHash && pending.targetRefreshHash && liveRtHash === pending.targetRefreshHash);
+
+    if (matchedTarget) {
+      await withStoreLock(async () => {
+        const idx = await readIndex();
+        const target = idx.accounts.find((a) => a.id === pending.targetAccountId);
+        if (target) {
+          target.onboardingAccepted = true;
+          const ob = readAppStorageOnboarding(activeDriver.getRoamingDir?.() || '');
+          if (ob && ob.email === sanitizeEmail(target.email) && typeof ob.isGcpTos === 'boolean') {
+            target.isGcpTos = ob.isGcpTos;
+          }
+          if (target.authErrorCode === 'CREDENTIAL_MISMATCH') {
+            clearAccountErrorFields(target);
+          }
+          target.invalidRefreshHash = '';
+          idx.activeAccountId = target.id;
+        }
+        idx.pendingSwitch = null;
+        await writeIndex(idx);
+      }).catch(() => {});
+      lastSwitchMismatch = null;
+      return { matched: true };
+    }
+
+    // Only declare mismatch once Antigravity has demonstrably restarted (LS address rotated OR switch tx completed)
+    const tx = readJsonFileSafe(paths.accountSwitchTxFile, null);
+    const txFinished = Boolean(
+      tx &&
+        (!pending.transactionId || tx.id === pending.transactionId) &&
+        tx.stage === 'done' &&
+        nowMs >= Number(tx.updatedAtMs || 0),
+    );
+    const liveLs = String(process.env.ANTIGRAVITY_LS_ADDRESS || '').trim();
+    const lsChanged = Boolean(liveLs && pending.fromLsAddress && liveLs !== pending.fromLsAddress);
+    if ((txFinished || lsChanged) && liveInfo?.found && liveEmail && liveEmail !== pending.targetEmail) {
+      const mismatch = {
+        expectedEmail: pending.targetEmail,
+        actualEmail: liveEmail,
+        targetAccountId: pending.targetAccountId,
+        detectedAtMs: nowMs,
+      };
+      await withStoreLock(async () => {
+        const idx = await readIndex();
+        const failedTarget = idx.accounts.find(
+          (a) => a.id === pending.targetAccountId || sanitizeEmail(a.email) === pending.targetEmail,
+        );
+        if (failedTarget) {
+          failedTarget.invalidRefreshHash = pending.targetRefreshHash || failedTarget.refreshTokenHash || '';
+          failedTarget.authErrorCode = 'CREDENTIAL_MISMATCH';
+          failedTarget.authError = `检测到切号串号（期望 ${pending.targetEmail}，实际登录为 ${liveEmail}），已锁定该槽位，请重新授权`;
+          failedTarget.authErrorAtMs = nowMs;
+        }
+        const actualAcc = idx.accounts.find((a) => sanitizeEmail(a.email) === liveEmail);
+        if (actualAcc) {
+          idx.activeAccountId = actualAcc.id;
+        }
+        idx.pendingSwitch = null;
+        await writeIndex(idx);
+      }).catch(() => {});
+      lastSwitchMismatch = mismatch;
+      return { mismatch };
+    }
+    return null;
   }
 
   async function fetchLiveQuotaNormalized() {
@@ -4423,13 +4620,24 @@ export function createAccountManager({
     }
   }
 
-  function syncLiveCredentialIntoVaultLocked(acc, vault, liveInfo, ts) {
+  function syncLiveCredentialIntoVaultLocked(acc, vault, liveInfo, ts, allAccounts = null) {
     if (!acc || !vault || !liveInfo?.found || !liveInfo.live?.credJson || !liveInfo.parsed) {
       return false;
     }
     if (sanitizeEmail(acc.email) !== sanitizeEmail(liveInfo.email)) return false;
     const liveRefresh = extractRefreshToken(liveInfo.parsed);
     if (!liveRefresh) return false;
+    const liveRtHash = computeRefreshTokenHash(liveRefresh);
+    // Anti-cross-account guard: never overwrite acc's vault slot if live credential belongs to another account
+    if (Array.isArray(allAccounts)) {
+      const collision = checkCrossAccountCollision(allAccounts, {
+        targetId: acc.id,
+        targetEmail: acc.email,
+        targetCredObj: liveInfo.parsed,
+        targetRefreshHash: liveRtHash,
+      });
+      if (!collision.ok) return false;
+    }
     const liveExpiryMs = extractTokenExpiryMs(liveInfo.parsed);
     const liveClientId = extractPreferredClientIdFromCred(liveInfo.parsed, acc.oauthClientId || '');
 
@@ -4455,7 +4663,6 @@ export function createAccountManager({
     if (liveClientId && !acc.oauthClientId) {
       acc.oauthClientId = liveClientId;
     }
-    const liveRtHash = computeRefreshTokenHash(liveRefresh);
     if (liveRtHash && acc.refreshTokenHash !== liveRtHash) {
       acc.refreshTokenHash = liveRtHash;
     }
@@ -4469,6 +4676,7 @@ export function createAccountManager({
         capturedAtMs: ts,
       };
       clearAccountErrorFields(acc);
+      acc.invalidRefreshHash = '';
       acc.hasRefreshToken = Boolean(liveRefresh);
       return true;
     }
@@ -4502,9 +4710,14 @@ export function createAccountManager({
         rawQuotaSummary?.rawTierName || normalized?.rawTierName || '',
       );
       target.updatedAtMs = nowMs;
+      target.onboardingAccepted = true;
+      const obState = readAppStorageOnboarding(activeDriver.getRoamingDir?.() || '');
+      if (obState && obState.email === sanitizeEmail(target.email) && typeof obState.isGcpTos === 'boolean') {
+        target.isGcpTos = obState.isGcpTos;
+      }
       clearAccountErrorFields(target);
       index.activeAccountId = target.id;
-      const vaultUpdated = syncLiveCredentialIntoVaultLocked(target, vault, liveInfo, nowMs);
+      const vaultUpdated = syncLiveCredentialIntoVaultLocked(target, vault, liveInfo, nowMs, index.accounts);
       if (vaultUpdated) {
         await writeVault(vault);
       }
@@ -4568,9 +4781,10 @@ export function createAccountManager({
 
   async function listAccounts() {
     const nowMs = now();
-    const [index, liveInfo, backups] = await Promise.all([
+    const liveInfo = await readLiveEmailSafe();
+    await reconcilePendingSwitch(nowMs, liveInfo);
+    const [index, backups] = await Promise.all([
       readIndex(),
-      readLiveEmailSafe(),
       listBackups(),
     ]);
 
@@ -4615,6 +4829,7 @@ export function createAccountManager({
       ok: true,
       supported: activeDriver.isSupported(),
       dpapiProtected: activeDriver.isSupported(),
+      driverBackend: activeDriver.backend || 'win32-credman',
       quotaQueryEnabled,
       officialActiveOnly: !allowDirectCloudCodeProbe,
       currentEmail: liveInfo.email || '',
@@ -4639,6 +4854,7 @@ export function createAccountManager({
       lastResumeResult,
       lastOauthCaptureResult,
       lastAutoSwitchResult,
+      lastSwitchMismatch,
     };
   }
 
@@ -4648,7 +4864,7 @@ export function createAccountManager({
    */
   async function captureCurrentAccount({ remark = '', group = '', source = 'capture' } = {}) {
     if (!activeDriver.isSupported()) {
-      return { ok: false, status: 501, error: '当前系统不支持原生凭据捕获（仅支持 Windows）' };
+      return { ok: false, status: 501, error: getUnsupportedDriverMessage() };
     }
     const live = await activeDriver.readLiveCredential();
     if (!live?.found || !live.credJson) {
@@ -4659,9 +4875,10 @@ export function createAccountManager({
       };
     }
 
+    const cleanLiveJson = unwrapGoKeyringPayload(live.credJson);
     let parsedCred;
     try {
-      parsedCred = JSON.parse(live.credJson);
+      parsedCred = JSON.parse(cleanLiveJson);
     } catch {
       return { ok: false, status: 422, error: '当前系统凭据格式异常，无法解析 JSON' };
     }
@@ -4675,6 +4892,11 @@ export function createAccountManager({
       norm.email ||
       `account-${crypto.createHash('sha1').update(norm.refreshToken).digest('hex').slice(0, 8)}@antigravity.local`;
     const liveQuota = await fetchLiveQuotaNormalized();
+    const obState = readAppStorageOnboarding(activeDriver.getRoamingDir?.() || '');
+    const obIsGcpTos =
+      obState && obState.email === email && typeof obState.isGcpTos === 'boolean'
+        ? obState.isGcpTos
+        : null;
     const ts = now();
     const explicitGroup = sanitizeAccountGroup(group, '');
 
@@ -4700,6 +4922,8 @@ export function createAccountManager({
           tokenExpiryMs: credExpiryMs,
           ...(rtHash ? { refreshTokenHash: rtHash } : {}),
           hasRefreshToken: Boolean(extractRefreshToken(norm.credObj)),
+          onboardingAccepted: true,
+          ...(typeof obIsGcpTos === 'boolean' ? { isGcpTos: obIsGcpTos } : {}),
           ...(credClientId ? { oauthClientId: credClientId } : {}),
           quota: liveQuota,
         };
@@ -4711,6 +4935,9 @@ export function createAccountManager({
         existing.authMethod = norm.credObj.auth_method || existing.authMethod || 'consumer';
         if (credExpiryMs > 0) existing.tokenExpiryMs = credExpiryMs;
         if (rtHash) existing.refreshTokenHash = rtHash;
+        existing.invalidRefreshHash = '';
+        existing.onboardingAccepted = true;
+        if (typeof obIsGcpTos === 'boolean') existing.isGcpTos = obIsGcpTos;
         if (credClientId) existing.oauthClientId = credClientId;
         existing.hasRefreshToken = Boolean(extractRefreshToken(norm.credObj));
         clearAccountErrorFields(existing);
@@ -4734,7 +4961,7 @@ export function createAccountManager({
         credTarget: live.credTarget || 'gemini:antigravity',
         credUserName: live.credUserName || 'antigravity',
         credPersist: Number(live.credPersist) || 2,
-        credJson: live.credJson,
+        credJson: cleanLiveJson,
         credentialUserScope: live.credentialUserScope || '',
         capturedAtMs: ts,
       };
@@ -4756,7 +4983,7 @@ export function createAccountManager({
    */
   async function importAccounts({ rawInput, email = '', remark = '', group = '' } = {}) {
     if (!activeDriver.isSupported()) {
-      return { ok: false, status: 501, error: '当前系统不支持 DPAPI 安全入库（仅支持 Windows）' };
+      return { ok: false, status: 501, error: getUnsupportedDriverMessage() };
     }
     const parsed = parseImportPayload(rawInput, {
       fallbackEmail: email,
@@ -4810,7 +5037,12 @@ export function createAccountManager({
         } else {
           existing.updatedAtMs = ts;
           if (itemExpiryMs > 0) existing.tokenExpiryMs = itemExpiryMs;
-          if (itemRtHash) existing.refreshTokenHash = itemRtHash;
+          if (itemRtHash) {
+            existing.refreshTokenHash = itemRtHash;
+            if (existing.invalidRefreshHash && existing.invalidRefreshHash !== itemRtHash) {
+              existing.invalidRefreshHash = '';
+            }
+          }
           if (itemClientId) existing.oauthClientId = itemClientId;
           existing.hasRefreshToken = itemHasRt;
           clearAccountErrorFields(existing);
@@ -5533,7 +5765,7 @@ export function createAccountManager({
     extraResumeConversations = [],
   } = {}) {
     if (!activeDriver.isSupported()) {
-      return { ok: false, status: 501, error: '当前系统不支持自动切号重启（仅支持 Windows）' };
+      return { ok: false, status: 501, error: getUnsupportedDriverMessage() };
     }
     const id = String(accountId || '').trim();
     if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
@@ -5607,6 +5839,25 @@ export function createAccountManager({
       }
       if (!extractRefreshToken(parsedTargetCred)) {
         return { ok: false, status: 422, error: '目标账号缺少有效的 refresh_token，已中止切换' };
+      }
+
+      // Anti-cross-account guard ("防串号"): verify embedded email, poisoned invalidRefreshHash,
+      // and duplicate refreshTokenHash ownership BEFORE closing Antigravity.
+      const preSwitchRtHash = computeRefreshTokenHash(extractRefreshToken(parsedTargetCred));
+      const collisionCheck = checkCrossAccountCollision(index.accounts, {
+        targetId: target.id,
+        targetEmail: target.email,
+        targetCredObj: parsedTargetCred,
+        targetRefreshHash: preSwitchRtHash,
+        targetAccount: target,
+      });
+      if (!collisionCheck.ok) {
+        return {
+          ok: false,
+          status: 409,
+          code: collisionCheck.code || 'CREDENTIAL_MISMATCH',
+          error: collisionCheck.reason || '检测到目标账号凭据串号，已中止切换，请重新授权',
+        };
       }
 
       // Cockpit prepare_account_for_injection: ensure access_token is fresh (15-min skew) BEFORE
@@ -5748,8 +5999,22 @@ export function createAccountManager({
         await fsp.rm(paths.accountPendingResumeFile, { force: true }).catch(() => {});
       }
 
-      // Update target lastUsedAtMs & refreshTokenHash
+      // Update target lastUsedAtMs, refreshTokenHash & pendingSwitch anti-mismatch tracker
       const finalRtHash = computeRefreshTokenHash(extractRefreshToken(targetCredForInjection));
+      const toolReady = await activeDriver.ensureReady?.().catch(() => null);
+      const shouldSyncOnboarding = Boolean(
+        target.onboardingAccepted === true ||
+          target.source === 'capture' ||
+          target.source === 'oauth' ||
+          Number(target.quota?.fetchedAtMs || 0) > 0,
+      );
+      const onboardingSync = shouldSyncOnboarding
+        ? {
+            email: target.email,
+            isGcpTos: typeof target.isGcpTos === 'boolean' ? target.isGcpTos : null,
+          }
+        : null;
+
       await withStoreLock(async () => {
         const freshIndex = await readIndex();
         const item = freshIndex.accounts.find((a) => a.id === id);
@@ -5758,6 +6023,14 @@ export function createAccountManager({
           item.updatedAtMs = ts;
           if (finalRtHash) item.refreshTokenHash = finalRtHash;
           freshIndex.activeAccountId = id;
+          freshIndex.pendingSwitch = {
+            targetAccountId: target.id,
+            targetEmail: sanitizeEmail(target.email),
+            targetRefreshHash: finalRtHash,
+            fromLsAddress: String(process.env.ANTIGRAVITY_LS_ADDRESS || '').trim(),
+            transactionId: txId,
+            atMs: ts,
+          };
           await writeIndex(freshIndex);
         }
       });
@@ -5773,6 +6046,8 @@ export function createAccountManager({
         antigravityExe: launchCfg.exePath,
         launchArgs: launchCfg.launchArgs || '',
         workDir: launchCfg.workDir || '',
+        ...(toolReady?.exePath ? { accountToolExe: toolReady.exePath } : {}),
+        ...(onboardingSync ? { onboardingSync } : {}),
         payloadFile,
         backupFile,
         startedAtMs: ts,
@@ -5812,7 +6087,7 @@ export function createAccountManager({
    */
   async function startOauthWatch() {
     if (!activeDriver.isSupported()) {
-      return { ok: false, status: 501, error: '当前系统不支持原生 OAuth 凭据捕获（仅支持 Windows）' };
+      return { ok: false, status: 501, error: getUnsupportedDriverMessage() };
     }
 
     const ts = now();
@@ -6173,7 +6448,7 @@ export function createAccountManager({
    */
   async function rollbackLatestBackup() {
     if (!activeDriver.isSupported()) {
-      return { ok: false, status: 501, error: '当前系统不支持原生回滚（仅支持 Windows）' };
+      return { ok: false, status: 501, error: getUnsupportedDriverMessage() };
     }
     const backups = await listBackups();
     if (backups.length === 0) {
@@ -6181,11 +6456,12 @@ export function createAccountManager({
     }
     const launchCfg = await activeDriver.detectAntigravityLaunchConfig();
     if (!launchCfg?.exePath) {
-      return { ok: false, status: 500, error: '未定位到 Antigravity.exe 路径' };
+      return { ok: false, status: 500, error: '未定位到 Antigravity 启动路径' };
     }
 
     const ts = now();
     const txId = `rb_${ts}_${crypto.randomBytes(4).toString('hex')}`;
+    const toolReady = await activeDriver.ensureReady?.().catch(() => null);
     await fsp.rm(paths.accountPendingResumeFile, { force: true }).catch(() => {});
 
     const txData = {
@@ -6198,6 +6474,7 @@ export function createAccountManager({
       antigravityExe: launchCfg.exePath,
       launchArgs: launchCfg.launchArgs || '',
       workDir: launchCfg.workDir || '',
+      ...(toolReady?.exePath ? { accountToolExe: toolReady.exePath } : {}),
       restoreBackupFile: backups[0].path,
       startedAtMs: ts,
       updatedAtMs: ts,
@@ -6229,6 +6506,10 @@ export function createAccountManager({
     watcherBusy = true;
     try {
       const nowMs = now();
+
+      // 0. Reconcile any pending account switch & self-heal on cross-account switchMismatch
+      const liveForReconcile = await readLiveEmailSafe();
+      await reconcilePendingSwitch(nowMs, liveForReconcile);
 
       // 1. Live non-destructive OAuth credential watcher (supports capturing multiple new logins continuously)
       const pendingOauth = readJsonFileSafe(paths.accountPendingOauthFile, null);
@@ -6432,7 +6713,7 @@ export function createAccountManager({
               await withStoreLock(async () => {
                 const [idx, vlt] = await Promise.all([readIndex(), readVault()]);
                 const target = idx.accounts.find((a) => a.id === acc.id);
-                if (target && syncLiveCredentialIntoVaultLocked(target, vlt, liveInfo, nowMs)) {
+                if (target && syncLiveCredentialIntoVaultLocked(target, vlt, liveInfo, nowMs, idx.accounts)) {
                   await writeVault(vlt);
                   await writeIndex(idx);
                 }

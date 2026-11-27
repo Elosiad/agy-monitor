@@ -5,6 +5,12 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { atomicWriteJson, atomicWriteText } from './paths.mjs';
+import {
+  buildHostI18nRestoreExpr,
+  buildHostI18nSelfContainedScript,
+  clearHostI18nCache,
+  HOST_I18N_VERSION,
+} from './host_i18n.mjs';
 import { detectWindowsHostEnv, resolveWindowsHostDirs } from './wsl_bridge.mjs';
 
 const _require = createRequire(import.meta.url);
@@ -28,7 +34,7 @@ function loadRawFs() {
 
 const { fs, fsp } = loadRawFs();
 
-export const NATIVE_HUD_VERSION = '2.2.8';
+export const NATIVE_HUD_VERSION = '2.3.0';
 export const NATIVE_HUD_HEARTBEAT_TTL_MS = 14_000;
 export const HOST_WALLPAPER_STYLE_ID = 'agy-monitor-cdp-theme';
 
@@ -87,6 +93,7 @@ function clearWallpaperBase64Cache() {
 
 export function clearHudInjectorCaches() {
   clearWallpaperBase64Cache();
+  clearHostI18nCache();
   cachedGuidePath = '';
   cachedGuideMtime = -1;
   cachedGuideSize = -1;
@@ -419,6 +426,37 @@ export function repackAsarInMemory(sourceRaw, overrides = new Map(), removals = 
 // Host Path Resolution & DevToolsActivePort Discovery
 // ============================================================================
 
+export function resolveHostAsarPathSync(paths = {}) {
+  if (typeof paths?.hostAsarPath === 'string') {
+    return paths.hostAsarPath;
+  }
+  const hostInfo = detectWindowsHostEnv();
+  if (!hostInfo.hasWindowsHost) {
+    return '';
+  }
+  if (hostInfo.isNativeWindows) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+    const candidates = [
+      path.join(localAppData, 'Programs', 'antigravity', 'resources', 'app.asar'),
+      path.join(localAppData, 'Programs', 'Antigravity', 'resources', 'app.asar'),
+      path.join(programFiles, 'Antigravity', 'resources', 'app.asar'),
+    ];
+    for (const c of candidates) {
+      try {
+        if (fs.existsSync(c)) return c;
+      } catch {
+        // ignore
+      }
+    }
+    return candidates[0];
+  }
+  if (cachedResolvedAsarPosix && fs.existsSync(cachedResolvedAsarPosix)) {
+    return cachedResolvedAsarPosix;
+  }
+  return '';
+}
+
 export async function resolveHostAsarPath(paths = {}) {
   if (typeof paths?.hostAsarPath === 'string') {
     return paths.hostAsarPath;
@@ -515,69 +553,66 @@ export async function readDevToolsActivePort(paths = {}) {
 }
 
 export function readNativeHudHeartbeat(paths = {}, nowMs = Date.now()) {
+  const emptyHeartbeat = {
+    alive: false,
+    hookAlive: false,
+    wallpaperAlive: false,
+    i18nAlive: false,
+    mountedCount: 0,
+    wallpaperCount: 0,
+    i18nCount: 0,
+    version: '',
+    pid: 0,
+    activeConvId: '',
+    proxyActive: false,
+    proxyEnabled: true,
+    proxyDisplayUrl: '',
+    proxySpecKey: '',
+    proxyStartupSpecKey: '',
+    proxyForceHttp1: false,
+    updatedAtMs: 0,
+    ageMs: Infinity,
+  };
   const file = paths?.nativeHudStatusFile;
   if (!file) {
-    return {
-      alive: false,
-      hookAlive: false,
-      wallpaperAlive: false,
-      mountedCount: 0,
-      wallpaperCount: 0,
-      version: '',
-      pid: 0,
-      activeConvId: '',
-      updatedAtMs: 0,
-      ageMs: Infinity,
-    };
+    return emptyHeartbeat;
   }
   try {
     if (!fs.existsSync(file)) {
-      return {
-        alive: false,
-        hookAlive: false,
-        wallpaperAlive: false,
-        mountedCount: 0,
-        wallpaperCount: 0,
-        version: '',
-        pid: 0,
-        activeConvId: '',
-        updatedAtMs: 0,
-        ageMs: Infinity,
-      };
+      return emptyHeartbeat;
     }
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     const updatedAtMs = Number(raw?.updatedAtMs || 0);
     const ageMs = updatedAtMs > 0 ? Math.max(0, nowMs - updatedAtMs) : Infinity;
     const mountedCount = Math.max(0, Number(raw?.mountedCount || 0));
     const wallpaperCount = Math.max(0, Number(raw?.wallpaperCount || 0));
+    const i18nCount = Math.max(0, Number(raw?.i18nCount || 0));
     const hookAlive = ageMs <= NATIVE_HUD_HEARTBEAT_TTL_MS;
     const alive = hookAlive && mountedCount > 0;
     const wallpaperAlive = hookAlive && wallpaperCount > 0;
+    const i18nAlive = hookAlive && i18nCount > 0;
     return {
       alive,
       hookAlive,
       wallpaperAlive,
+      i18nAlive,
       mountedCount,
       wallpaperCount,
+      i18nCount,
       version: String(raw?.version || ''),
       pid: Number(raw?.pid || 0),
       activeConvId: String(raw?.activeConvId || ''),
+      proxyActive: Boolean(hookAlive && raw?.proxyActive),
+      proxyEnabled: typeof raw?.proxyEnabled === 'boolean' ? raw.proxyEnabled : true,
+      proxyDisplayUrl: String(raw?.proxyDisplayUrl || ''),
+      proxySpecKey: String(raw?.proxySpecKey || ''),
+      proxyStartupSpecKey: String(raw?.proxyStartupSpecKey || ''),
+      proxyForceHttp1: Boolean(raw?.proxyForceHttp1),
       updatedAtMs,
       ageMs,
     };
   } catch {
-    return {
-      alive: false,
-      hookAlive: false,
-      wallpaperAlive: false,
-      mountedCount: 0,
-      wallpaperCount: 0,
-      version: '',
-      pid: 0,
-      activeConvId: '',
-      updatedAtMs: 0,
-      ageMs: Infinity,
-    };
+    return emptyHeartbeat;
   }
 }
 
@@ -641,6 +676,10 @@ export function buildHostWallpaperCss(themes = {}, wallpaperDataUri = '', option
     ? `
 :root {
   --agy-wp-url: ${safeUrl};
+  --agy-host-canvas-bg: rgb(${cr}, ${cg}, ${cb});
+  --agy-host-veil-bg: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha});
+  --agy-host-sidebar-bg: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha});
+  --agy-host-soft-bg: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha});
   --agy-lite-card-bg: rgba(${br}, ${bg}, ${bb}, ${liteCardAlpha});
   --agy-lite-bubble-bg: rgba(${br}, ${bg}, ${bb}, ${liteBubbleAlpha});
   --agy-lite-popup-bg: rgba(${chr}, ${chg}, ${chb}, ${litePopupAlpha});
@@ -657,6 +696,10 @@ html[data-theme="dark"],
 body.dark,
 body[data-theme="dark"],
 body[data-agy-theme].dark {
+  --agy-host-canvas-bg: rgb(16, 18, 24);
+  --agy-host-veil-bg: rgba(16, 18, 24, ${totalVeilAlpha});
+  --agy-host-sidebar-bg: rgba(20, 22, 29, ${sidebarTintAlpha});
+  --agy-host-soft-bg: rgba(30, 33, 44, ${softSurfaceAlpha});
   --agy-lite-card-bg: rgba(24, 26, 34, 0.90);
   --agy-lite-bubble-bg: rgba(30, 33, 44, 0.92);
   --agy-lite-popup-bg: rgba(20, 22, 29, 0.95);
@@ -670,6 +713,10 @@ html[data-theme="light"],
 body.light,
 body[data-theme="light"],
 body[data-agy-theme="light"] {
+  --agy-host-canvas-bg: rgb(248, 250, 252);
+  --agy-host-veil-bg: rgba(248, 250, 252, ${totalVeilAlpha});
+  --agy-host-sidebar-bg: rgba(241, 245, 249, ${sidebarTintAlpha});
+  --agy-host-soft-bg: rgba(226, 232, 240, ${softSurfaceAlpha});
   --agy-lite-card-bg: rgba(248, 250, 252, 0.92);
   --agy-lite-bubble-bg: rgba(241, 245, 249, 0.94);
   --agy-lite-popup-bg: rgba(255, 255, 255, 0.95);
@@ -683,12 +730,52 @@ body[data-agy-theme="light"] {
     : `
 :root {
   --agy-wp-url: ${safeUrl};
+  --agy-host-canvas-bg: rgb(${cr}, ${cg}, ${cb});
+  --agy-host-veil-bg: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha});
+  --agy-host-sidebar-bg: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha});
+  --agy-host-soft-bg: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha});
+  --agy-host-card-bg: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha});
+  --agy-host-bubble-bg: rgba(${br}, ${bg}, ${bb}, ${bubbleGlassAlpha});
+  --agy-host-popup-bg: rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha});
+  --agy-host-sticky-sidebar-veil: linear-gradient(rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}), rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha})), rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha});
+}
+
+${
+  isLightPalette
+    ? `html.dark,
+html[data-theme="dark"],
+body.dark,
+body[data-theme="dark"],
+body[data-agy-theme].dark {
+  --agy-host-canvas-bg: rgb(16, 18, 24);
+  --agy-host-veil-bg: rgba(16, 18, 24, ${totalVeilAlpha});
+  --agy-host-sidebar-bg: rgba(20, 22, 29, ${sidebarTintAlpha});
+  --agy-host-soft-bg: rgba(30, 33, 44, ${softSurfaceAlpha});
+  --agy-host-card-bg: rgba(24, 26, 34, ${composerGlassAlpha});
+  --agy-host-bubble-bg: rgba(30, 33, 44, ${bubbleGlassAlpha});
+  --agy-host-popup-bg: rgba(20, 22, 29, ${popupGlassAlpha});
+  --agy-host-sticky-sidebar-veil: linear-gradient(rgba(20, 22, 29, ${sidebarTintAlpha}), rgba(20, 22, 29, ${sidebarTintAlpha})), rgba(16, 18, 24, ${totalVeilAlpha});
+}`
+    : `html.light,
+html[data-theme="light"],
+body.light,
+body[data-theme="light"],
+body[data-agy-theme="light"] {
+  --agy-host-canvas-bg: rgb(248, 250, 252);
+  --agy-host-veil-bg: rgba(248, 250, 252, ${totalVeilAlpha});
+  --agy-host-sidebar-bg: rgba(241, 245, 249, ${sidebarTintAlpha});
+  --agy-host-soft-bg: rgba(226, 232, 240, ${softSurfaceAlpha});
+  --agy-host-card-bg: rgba(248, 250, 252, ${composerGlassAlpha});
+  --agy-host-bubble-bg: rgba(241, 245, 249, ${bubbleGlassAlpha});
+  --agy-host-popup-bg: rgba(255, 255, 255, ${popupGlassAlpha});
+  --agy-host-sticky-sidebar-veil: linear-gradient(rgba(241, 245, 249, ${sidebarTintAlpha}), rgba(241, 245, 249, ${sidebarTintAlpha})), rgba(248, 250, 252, ${totalVeilAlpha});
+}`
 }
 `;
 
-  const cardSurfaceBg = liteMode ? 'var(--agy-lite-card-bg)' : `rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha})`;
-  const bubbleSurfaceBg = liteMode ? 'var(--agy-lite-bubble-bg)' : `rgba(${br}, ${bg}, ${bb}, ${bubbleGlassAlpha})`;
-  const popupSurfaceBg = liteMode ? 'var(--agy-lite-popup-bg)' : `rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha})`;
+  const cardSurfaceBg = liteMode ? 'var(--agy-lite-card-bg)' : 'var(--agy-host-card-bg)';
+  const bubbleSurfaceBg = liteMode ? 'var(--agy-lite-bubble-bg)' : 'var(--agy-host-bubble-bg)';
+  const popupSurfaceBg = liteMode ? 'var(--agy-lite-popup-bg)' : 'var(--agy-host-popup-bg)';
 
   const composerSurfaceBlock = liteMode
     ? `.surface-composer-card,
@@ -797,7 +884,8 @@ div.sticky.bg-secondary:not(.pointer-events-none)::after,
   filter: none !important;
 }`
     : `/* Seamless viewport-aligned wallpaper occlusion for ALL sticky headers (Projects sidebar, Customizations, Automations, Settings, Diff):
-   completely blocks scrolled items underneath while aligning 1:1 pixel-for-pixel with the continuous full-window wallpaper! */
+   completely blocks scrolled items underneath while aligning 1:1 pixel-for-pixel with the continuous full-window wallpaper
+   without clipping host containers (blur bleed is trimmed strictly on ::before via clip-path)! */
 .sticky.bg-background:not(.pointer-events-none),
 .sticky.bg-shell:not(.pointer-events-none),
 div.sticky.bg-secondary:not(.pointer-events-none),
@@ -807,8 +895,7 @@ div.sticky.bg-secondary:not(.pointer-events-none),
 [role="navigation"] .sticky.bg-sidebar,
 [role="navigation"] .sticky.bg-background,
 [role="navigation"] [data-agy-mon-layer="sticky-sidebar"] {
-  background-color: rgb(${cr}, ${cg}, ${cb}) !important;
-  ${blur > 0 ? 'overflow: clip !important;' : ''}
+  background-color: var(--agy-host-canvas-bg) !important;
   isolation: isolate !important;
 }
 
@@ -824,6 +911,7 @@ div.sticky.bg-secondary:not(.pointer-events-none)::before,
   content: "" !important;
   position: absolute !important;
   inset: ${blur > 0 ? '-16px' : '0'} !important;
+  ${blur > 0 ? 'clip-path: inset(16px) !important;' : ''}
   z-index: -2 !important;
   pointer-events: none !important;
   background-image: var(--agy-wp-url) !important;
@@ -845,7 +933,7 @@ div.sticky.bg-secondary:not(.pointer-events-none)::after,
   inset: 0 !important;
   z-index: -1 !important;
   pointer-events: none !important;
-  background: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+  background: var(--agy-host-veil-bg) !important;
 }
 
 [role="navigation"] .bg-sidebar[style*="sticky"]::after,
@@ -857,9 +945,7 @@ div.sticky.bg-secondary:not(.pointer-events-none)::after,
   inset: 0 !important;
   z-index: -1 !important;
   pointer-events: none !important;
-  background:
-    linear-gradient(rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}), rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha})),
-    rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+  background: var(--agy-host-sticky-sidebar-veil) !important;
 }`;
 
   const popupSurfaceBlock = liteMode
@@ -922,13 +1008,13 @@ body[data-agy-theme] .agy-inset-shell {
   --color-card: ${cardSurfaceBg} !important;
   --glass: ${cardSurfaceBg} !important;
   --onyx-raised: ${cardSurfaceBg} !important;
-  --onyx-selected: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
+  --onyx-selected: var(--agy-host-soft-bg) !important;
   --popover: ${popupSurfaceBg} !important;
   --color-popover: ${popupSurfaceBg} !important;
 }
 
 html {
-  background-color: rgb(${cr}, ${cg}, ${cb}) !important;
+  background-color: var(--agy-host-canvas-bg) !important;
   --agy-mon-accent: ${accent};
 }
 
@@ -954,7 +1040,7 @@ html::after {
   inset: 0 !important;
   z-index: 0 !important;
   pointer-events: none !important;
-  background: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+  background: var(--agy-host-veil-bg) !important;
 }
 
 body {
@@ -997,11 +1083,11 @@ body > div:first-of-type {
 
 .monaco-workbench .part.sidebar,
 .monaco-workbench .part.auxiliarybar {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
+  background-color: var(--agy-host-sidebar-bg) !important;
 }
 
 .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container > .tab.active {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
+  background-color: var(--agy-host-soft-bg) !important;
 }
 
 /* Antigravity 2.0 Sidebar, Top Bar, File Tree & Project List Rows (zero opaque black panels/items) */
@@ -1014,7 +1100,7 @@ body > div:first-of-type {
 }
 
 [role="navigation"].bg-sidebar {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
+  background-color: var(--agy-host-sidebar-bg) !important;
 }
 
 [role="navigation"] .bg-sidebar button,
@@ -1061,12 +1147,12 @@ div:has(> div > div > iframe[src*="agy-monitor"]) {
 }
 
 [data-agy-mon-layer="sidebar"] {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}) !important;
+  background-color: var(--agy-host-sidebar-bg) !important;
   background-image: none !important;
 }
 
 [data-agy-mon-layer="surface-soft"] {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
+  background-color: var(--agy-host-soft-bg) !important;
   background-image: none !important;
 }
 
@@ -1162,10 +1248,13 @@ export function buildNativeWallpaperEngineScript() {
         var st = window.getComputedStyle(node);
         // Protect sticky headers from being turned transparent & auto-apply viewport-aligned wallpaper mask
         if (st.position === 'sticky') {
-          if (st.pointerEvents === 'none' || rect.width < 100 || rect.height < 18 || rect.height > 260) return 0;
+          var inSidebarNav = Boolean(node.closest && node.closest('[role="navigation"]'));
+          var maxStickyH = inSidebarNav ? 96 : 260;
+          if (st.pointerEvents === 'none' || rect.width < 100 || rect.height < 18 || rect.height > maxStickyH) return 0;
           if (node.tagName === 'THEAD' || node.tagName === 'TH' || node.tagName === 'TR') return 0;
+          if (inSidebarNav && node.querySelector && node.querySelector('[data-testid="project-header"], [role="tree"], [role="list"]')) return 0;
           if (node.parentElement && node.parentElement.closest('[data-agy-mon-layer="sticky-main"], [data-agy-mon-layer="sticky-sidebar"]')) return 0;
-          node.setAttribute('data-agy-mon-layer', (node.closest && node.closest('[role="navigation"]')) ? 'sticky-sidebar' : 'sticky-main');
+          node.setAttribute('data-agy-mon-layer', inSidebarNav ? 'sticky-sidebar' : 'sticky-main');
           return 1;
         }
         var bg = parseBgRgba(st.backgroundColor);
@@ -2791,6 +2880,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
   module.exports = { version: ${JSON.stringify(NATIVE_HUD_VERSION)} };
 } else {
   globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__ = true;
+  const { execFileSync } = require('child_process');
   const fs = require('fs');
   const os = require('os');
   const path = require('path');
@@ -2799,6 +2889,10 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
   const PLUGIN_DATA_DIR =
     process.env.AGY_MONITOR_PLUGIN_DATA_DIR ||
     path.join(os.homedir(), '.gemini', 'antigravity', 'plugin_data', 'agy-monitor');
+  const PLUGIN_ROOT_DIR =
+    process.env.AGY_MONITOR_PLUGIN_ROOT ||
+    path.join(os.homedir(), '.gemini', 'config', 'plugins', 'agy-monitor');
+  const PLUGIN_MANIFEST_FILE = path.join(PLUGIN_ROOT_DIR, 'plugin.json');
   const TELEMETRY_FILE = path.join(PLUGIN_DATA_DIR, 'hud_telemetry.json');
   const DISPLAY_FILE = path.join(PLUGIN_DATA_DIR, 'hud_display.json');
   const THEMES_FILE = path.join(PLUGIN_DATA_DIR, 'themes.json');
@@ -2808,18 +2902,25 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
   const LIVE_RENDERER_FILE = path.join(PLUGIN_DATA_DIR, 'native_hud_renderer.js');
   const LIVE_WALLPAPER_ENGINE_FILE = path.join(PLUGIN_DATA_DIR, 'native_wallpaper_engine.js');
   const LIVE_WALLPAPER_CSS_FILE = path.join(PLUGIN_DATA_DIR, 'native_wallpaper.css');
+  const LIVE_HOST_I18N_FILE = path.join(PLUGIN_DATA_DIR, 'native_host_i18n.js');
   const GUIDE_DATA_URI_FILE = path.join(PLUGIN_DATA_DIR, 'native_hud_guide.txt');
+  const HOST_I18N_VER = ${JSON.stringify(HOST_I18N_VERSION)};
 
-  let electronMod = null;
-  try {
-    electronMod = require('electron');
-    const { app } = electronMod;
-    if (app && typeof app.isReady === 'function' && !app.isReady()) {
-      if (!app.commandLine || !app.commandLine.hasSwitch('remote-debugging-port')) {
-        app.commandLine.appendSwitch('remote-debugging-port', '0');
-      }
+  function isPluginInstalled() {
+    if (process.env.AGY_MONITOR_ALLOW_UNINSTALLED_HOOK === '1') return true;
+    try {
+      return fs.existsSync(PLUGIN_MANIFEST_FILE);
+    } catch {
+      return false;
     }
-  } catch {}
+  }
+
+  if (!isPluginInstalled()) {
+    try {
+      if (fs.existsSync(STATUS_FILE)) fs.unlinkSync(STATUS_FILE);
+    } catch {}
+    module.exports = { version: VERSION, dormant: true };
+  } else {
 
   function readJsonSafe(filePath, fallback) {
     try {
@@ -2829,6 +2930,230 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
       return fallback;
     }
   }
+
+  // ---- Standalone TUN-Free Proxy Helpers (runs before app.whenReady & language_server spawn) ----
+  const ALLOWED_PROXY_PROTOS = new Set(['http:', 'https:', 'socks5:', 'socks5h:']);
+  const UNSAFE_PROXY_RE = /[\\r\\n\\t\\0"'\\x60<>;|&\\s]/;
+
+  function normalizeProxyUrlInline(raw) {
+    const input = typeof raw === 'string' ? raw.trim() : '';
+    if (!input || input.length > 512 || UNSAFE_PROXY_RE.test(input)) return null;
+    let candidate = input;
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\//.test(candidate)) {
+      if (/^(?:\\[[0-9a-fA-F:]+\\]|[^/\\s:]+):\\d{1,5}$/.test(candidate)) {
+        candidate = 'http://' + candidate;
+      } else {
+        return null;
+      }
+    }
+    try {
+      const u = new URL(candidate);
+      const proto = String(u.protocol || '').toLowerCase();
+      if (!ALLOWED_PROXY_PROTOS.has(proto) || !u.hostname) return null;
+      if ((u.pathname && u.pathname !== '/') || u.search || u.hash) return null;
+      const defaultPort = proto === 'https:' ? 443 : proto === 'http:' ? 80 : 1080;
+      const port = u.port ? Number(u.port) : defaultPort;
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+      const host = u.hostname.includes(':') && !u.hostname.startsWith('[')
+        ? '[' + u.hostname + ']:' + port
+        : u.hostname + ':' + port;
+      const hasAuth = Boolean(u.username || u.password);
+      const authPrefix = hasAuth ? u.username + (u.password ? ':' + u.password : '') + '@' : '';
+      let username = '';
+      let password = '';
+      try {
+        username = u.username ? decodeURIComponent(u.username) : '';
+        password = u.password ? decodeURIComponent(u.password) : '';
+      } catch {
+        username = u.username || '';
+        password = u.password || '';
+      }
+      const chromiumProto = proto === 'socks5h:' ? 'socks5:' : proto;
+      return {
+        url: proto + '//' + authPrefix + host,
+        displayUrl: proto + '//' + (hasAuth ? '***@' : '') + host,
+        chromiumServer: chromiumProto + '//' + host,
+        username,
+        password,
+        hasAuth,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function normalizeProxyBypassInline(raw) {
+    const seen = new Set();
+    const list = [];
+    const push = (t) => {
+      const c = String(t || '').trim().replace(/^\\[(::1)\\]$/, '$1');
+      if (!c || c.length > 160 || UNSAFE_PROXY_RE.test(c)) return;
+      const k = c.toLowerCase();
+      if (seen.has(k)) return;
+      seen.add(k);
+      list.push(c);
+    };
+    push('localhost');
+    push('127.0.0.1');
+    push('::1');
+    if (typeof raw === 'string' && raw.trim()) {
+      for (const p of raw.split(/[,;\\s]+/)) push(p);
+    }
+    const bypassCsv = list.slice(0, 64).join(',');
+    const chromiumBypass = list.slice(0, 64).map((e) => (e === '::1' ? '[::1]' : e)).join(';');
+    return { bypassCsv, chromiumBypass };
+  }
+
+  let cachedSysProxy = '';
+  let cachedSysProxyAt = 0;
+  function detectSystemProxyInline(force) {
+    const now = Date.now();
+    if (!force && cachedSysProxyAt > 0 && now - cachedSysProxyAt < 10000) {
+      return cachedSysProxy;
+    }
+    let found = '';
+    const injectedSelf = String(process.env.AGY_MONITOR_INJECTED_PROXY || '').trim();
+    const envKeys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'];
+    for (const k of envKeys) {
+      const v = typeof process.env[k] === 'string' ? process.env[k].trim() : '';
+      if (!v || (injectedSelf && v === injectedSelf)) continue;
+      const p = normalizeProxyUrlInline(v);
+      if (p) { found = p.url; break; }
+    }
+    if (!found && process.platform === 'win32') {
+      try {
+        const out = execFileSync(
+          'reg.exe',
+          ['query', 'HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Internet Settings'],
+          { encoding: 'utf8', timeout: 1200, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+        );
+        const en = /^\\s*ProxyEnable\\s+REG_DWORD\\s+0x([0-9a-fA-F]+)/m.exec(out);
+        if (en && parseInt(en[1], 16) === 1) {
+          const sv = /^\\s*ProxyServer\\s+REG_SZ\\s+(.+)$/m.exec(out);
+          const rawVal = sv && sv[1] ? sv[1].trim() : '';
+          if (rawVal) {
+            if (!rawVal.includes('=')) {
+              const p = normalizeProxyUrlInline(rawVal);
+              if (p) found = p.url;
+            } else {
+              const map = new Map();
+              for (const seg of rawVal.split(';')) {
+                const idx = seg.indexOf('=');
+                if (idx > 0) map.set(seg.slice(0, idx).trim().toLowerCase(), seg.slice(idx + 1).trim());
+              }
+              for (const pair of [['https', 'http://'], ['http', 'http://'], ['socks', 'socks5://'], ['socks5', 'socks5://']]) {
+                const val = map.get(pair[0]);
+                if (!val) continue;
+                const cand = /^[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\//.test(val) ? val : pair[1] + val;
+                const p = normalizeProxyUrlInline(cand);
+                if (p) { found = p.url; break; }
+              }
+            }
+          }
+        }
+      } catch {}
+    } else if (!found && process.platform === 'darwin') {
+      try {
+        const out = execFileSync('scutil', ['--proxy'], {
+          encoding: 'utf8',
+          timeout: 1200,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const readVal = (k) => {
+          const m = new RegExp('^\\\\s*' + k + '\\\\s*:\\\\s*(.+)$', 'm').exec(out);
+          return m ? m[1].trim() : '';
+        };
+        if (readVal('HTTPSEnable') === '1' && readVal('HTTPSProxy') && readVal('HTTPSPort')) {
+          const p = normalizeProxyUrlInline('http://' + readVal('HTTPSProxy') + ':' + readVal('HTTPSPort'));
+          if (p) found = p.url;
+        } else if (readVal('HTTPEnable') === '1' && readVal('HTTPProxy') && readVal('HTTPPort')) {
+          const p = normalizeProxyUrlInline('http://' + readVal('HTTPProxy') + ':' + readVal('HTTPPort'));
+          if (p) found = p.url;
+        } else if (readVal('SOCKSEnable') === '1' && readVal('SOCKSProxy') && readVal('SOCKSPort')) {
+          const p = normalizeProxyUrlInline('socks5://' + readVal('SOCKSProxy') + ':' + readVal('SOCKSPort'));
+          if (p) found = p.url;
+        }
+      } catch {}
+    }
+    cachedSysProxy = found;
+    cachedSysProxyAt = now;
+    return found;
+  }
+
+  function resolveProxySpecInline(rawProxy, forceSysDetect) {
+    const cfg = rawProxy && typeof rawProxy === 'object' ? rawProxy : {};
+    const enabled = typeof cfg.enabled === 'boolean' ? cfg.enabled : true;
+    const forceHttp1 = cfg.forceHttp1 === true;
+    const { bypassCsv, chromiumBypass } = normalizeProxyBypassInline(cfg.bypass);
+    let parsed = null;
+    if (enabled) {
+      if (typeof cfg.url === 'string' && cfg.url.trim()) {
+        parsed = normalizeProxyUrlInline(cfg.url);
+      } else {
+        const sysUrl = detectSystemProxyInline(forceSysDetect);
+        if (sysUrl) parsed = normalizeProxyUrlInline(sysUrl);
+      }
+    }
+    const url = parsed ? parsed.url : '';
+    const specKey = enabled && url ? url + '|' + bypassCsv + '|' + (forceHttp1 ? 'h1' : 'h2') : 'direct';
+    return {
+      enabled,
+      url,
+      displayUrl: parsed ? parsed.displayUrl : '',
+      chromiumServer: parsed ? parsed.chromiumServer : '',
+      username: parsed ? parsed.username : '',
+      password: parsed ? parsed.password : '',
+      bypassCsv,
+      chromiumBypass,
+      forceHttp1,
+      specKey,
+    };
+  }
+
+  const startupPrefs = readJsonSafe(USER_PREFS_FILE, {}) || {};
+  const startupProxy = resolveProxySpecInline(startupPrefs.proxy, true);
+  const STARTUP_PROXY_SPEC_KEY = startupProxy.specKey;
+  let lastAppliedSessionProxyKey = STARTUP_PROXY_SPEC_KEY;
+  let activeProxyAuth = { username: startupProxy.username || '', password: startupProxy.password || '' };
+
+  if (startupProxy.enabled && startupProxy.url) {
+    try {
+      process.env.AGY_MONITOR_INJECTED_PROXY = startupProxy.url;
+      process.env.HTTP_PROXY = startupProxy.url;
+      process.env.HTTPS_PROXY = startupProxy.url;
+      process.env.ALL_PROXY = startupProxy.url;
+      process.env.http_proxy = startupProxy.url;
+      process.env.https_proxy = startupProxy.url;
+      process.env.all_proxy = startupProxy.url;
+      process.env.NO_PROXY = startupProxy.bypassCsv;
+      process.env.no_proxy = startupProxy.bypassCsv;
+      if (startupProxy.forceHttp1) {
+        const existingGodebug = String(process.env.GODEBUG || '').trim();
+        if (!/(?:^|,)http2client=0(?:,|$)/.test(existingGodebug)) {
+          process.env.GODEBUG = existingGodebug ? existingGodebug + ',http2client=0' : 'http2client=0';
+        }
+      }
+    } catch {}
+  }
+
+  let electronMod = null;
+  try {
+    electronMod = require('electron');
+    const { app } = electronMod;
+    if (app && typeof app.isReady === 'function' && !app.isReady()) {
+      if (app.commandLine && !app.commandLine.hasSwitch('remote-debugging-port')) {
+        app.commandLine.appendSwitch('remote-debugging-port', '0');
+      }
+      if (startupProxy.enabled && startupProxy.chromiumServer && app.commandLine) {
+        if (!app.commandLine.hasSwitch('proxy-server')) {
+          app.commandLine.appendSwitch('proxy-server', startupProxy.chromiumServer);
+        }
+        if (!app.commandLine.hasSwitch('proxy-bypass-list')) {
+          app.commandLine.appendSwitch('proxy-bypass-list', startupProxy.chromiumBypass);
+        }
+      }
+    }
+  } catch {}
 
   function atomicWriteJsonSafe(filePath, obj) {
     try {
@@ -2921,6 +3246,27 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
     }
   }
 
+  let cachedHostI18nSrc = '';
+  let cachedHostI18nTag = '';
+  function getHostI18nInfo() {
+    try {
+      if (!fs.existsSync(LIVE_HOST_I18N_FILE)) {
+        cachedHostI18nSrc = '';
+        cachedHostI18nTag = '';
+        return { src: '', tag: '' };
+      }
+      const st = fs.statSync(LIVE_HOST_I18N_FILE);
+      const tag = st.mtimeMs + ':' + st.size;
+      if (tag !== cachedHostI18nTag) {
+        cachedHostI18nSrc = st.size > 0 ? fs.readFileSync(LIVE_HOST_I18N_FILE, 'utf8') : '';
+        cachedHostI18nTag = tag;
+      }
+      return { src: cachedHostI18nSrc, tag: cachedHostI18nTag };
+    } catch {
+      return { src: '', tag: '' };
+    }
+  }
+
   function isHubWebContents(wc) {
     if (!wc || typeof wc.isDestroyed !== 'function' || wc.isDestroyed()) return false;
     try {
@@ -2940,13 +3286,39 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
   const trackedContents = new Set();
   const wcAppliedCssTag = new WeakMap();
   const wcOwnedWallpaper = new WeakSet();
+  const wcAppliedI18nTag = new WeakMap();
+  const wcOwnedI18n = new WeakSet();
   let lastViewSig = '';
   let lastStatusWriteAt = 0;
   let syncInFlight = false;
   let syncQueued = false;
 
   function buildPayload() {
+    if (!isPluginInstalled()) {
+      return {
+        installed: false,
+        wantNative: false,
+        payload: null,
+        hostThemeMode: 'backdrop',
+        wantNativeWallpaper: false,
+        wantHostI18n: false,
+        liveProxy: {
+          enabled: false,
+          url: '',
+          displayUrl: '',
+          chromiumServer: '',
+          username: '',
+          password: '',
+          bypassCsv: 'localhost,127.0.0.1,::1',
+          chromiumBypass: 'localhost;127.0.0.1;[::1]',
+          forceHttp1: false,
+          specKey: 'direct',
+        },
+      };
+    }
     const themes = readJsonSafe(THEMES_FILE, {}) || {};
+    const prefs = readJsonSafe(USER_PREFS_FILE, {}) || {};
+    const wantHostI18n = prefs.language !== 'en';
     const hudEnabled = themes.hudEnabled !== false;
     const mode = themes.hudInjectionMode || 'asar';
     const wantNative = hudEnabled && mode !== 'uia';
@@ -2961,7 +3333,6 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
 
     let payload = null;
     if (wantNative) {
-      const prefs = readJsonSafe(USER_PREFS_FILE, {}) || {};
       const liteMode = Boolean(prefs.liteMode ?? themes.liteMode);
       const telemetry = readJsonSafe(TELEMETRY_FILE, {}) || {};
       const display = readJsonSafe(DISPLAY_FILE, {
@@ -3001,11 +3372,16 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
       };
     }
 
+    const liveProxy = resolveProxySpecInline(prefs.proxy, false);
+
     return {
+      installed: true,
       wantNative,
       payload,
       hostThemeMode,
       wantNativeWallpaper,
+      wantHostI18n,
+      liveProxy,
     };
   }
 
@@ -3016,12 +3392,34 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
     }
     syncInFlight = true;
     try {
-      const { wantNative, payload, hostThemeMode, wantNativeWallpaper } = buildPayload();
+      const { installed, wantNative, payload, hostThemeMode, wantNativeWallpaper, wantHostI18n, liveProxy } = buildPayload();
+      activeProxyAuth = { username: liveProxy.username || '', password: liveProxy.password || '' };
+      if (
+        liveProxy.specKey !== lastAppliedSessionProxyKey &&
+        electronMod &&
+        electronMod.session &&
+        electronMod.session.defaultSession &&
+        typeof electronMod.session.defaultSession.setProxy === 'function'
+      ) {
+        try {
+          if (liveProxy.enabled && liveProxy.chromiumServer) {
+            await electronMod.session.defaultSession.setProxy({
+              proxyRules: liveProxy.chromiumServer,
+              proxyBypassRules: liveProxy.chromiumBypass,
+            });
+          } else {
+            await electronMod.session.defaultSession.setProxy({ mode: 'system' });
+          }
+          lastAppliedSessionProxyKey = liveProxy.specKey;
+        } catch {}
+      }
       const rendererSrc = wantNative ? getRendererSource() : '';
       const wpEngineSrc = wantNativeWallpaper ? getWallpaperEngineSource() : '';
       const wpCss = wantNativeWallpaper ? getWallpaperCssInfo() : { cssText: '', cssTag: '' };
+      const hostI18n = wantHostI18n ? getHostI18nInfo() : { src: '', tag: '' };
       let mountedCount = 0;
       let wallpaperCount = 0;
+      let i18nCount = 0;
       let focusedConvId = '';
       let latestPatch = null;
 
@@ -3101,7 +3499,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
             } else {
               wallpaperCount += 1;
             }
-          } else if (hostThemeMode !== 'cdp' && (wcOwnedWallpaper.has(wc) || forceStatus)) {
+          } else if (!installed || (hostThemeMode !== 'cdp' && (wcOwnedWallpaper.has(wc) || forceStatus))) {
             await wc
               .executeJavaScript(
                 '(() => { try { if (window.__agyMonitorWallpaper) { window.__agyMonitorWallpaper.remove(); } else { if (window.__agyMonLayerEngine) window.__agyMonLayerEngine.stop(); const el = document.getElementById("agy-monitor-cdp-theme"); if (el && el.parentNode) el.parentNode.removeChild(el); } } catch {} })()',
@@ -3111,10 +3509,50 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
             wcAppliedCssTag.delete(wc);
             wcOwnedWallpaper.delete(wc);
           }
+
+          // 3. Persistent Host UI Chinese Localization (differential push by mtime:size tag)
+          if (wantHostI18n && hostI18n.src) {
+            let needI18nApply = wcAppliedI18nTag.get(wc) !== hostI18n.tag;
+            if (!needI18nApply) {
+              const i18nAlive = await wc
+                .executeJavaScript(
+                  'Boolean(window.__agyHostI18nApplied && window.__agyMonitorHostI18n && window.__agyMonitorHostI18n.version === ' +
+                    JSON.stringify(HOST_I18N_VER) +
+                    ' && window.__agyMonitorHostI18n.isApplied())',
+                  false,
+                )
+                .catch(() => false);
+              if (!i18nAlive) needI18nApply = true;
+            }
+            if (needI18nApply) {
+              const i18nExpr =
+                '(() => {' +
+                ' try { (0, eval)(' + JSON.stringify(hostI18n.src) + '); } catch (e) { return false; }' +
+                ' return Boolean(window.__agyHostI18nApplied);' +
+                '})()';
+              const applied = await wc.executeJavaScript(i18nExpr, false).catch(() => false);
+              if (applied) {
+                wcAppliedI18nTag.set(wc, hostI18n.tag);
+                wcOwnedI18n.add(wc);
+                i18nCount += 1;
+              }
+            } else {
+              i18nCount += 1;
+            }
+          } else if (!installed || wcOwnedI18n.has(wc) || forceStatus) {
+            await wc
+              .executeJavaScript(
+                ${JSON.stringify(buildHostI18nRestoreExpr())},
+                false,
+              )
+              .catch(() => {});
+            wcAppliedI18nTag.delete(wc);
+            wcOwnedI18n.delete(wc);
+          }
         } catch {}
       }
 
-      if (latestPatch) {
+      if (installed && latestPatch) {
         atomicWriteJsonSafe(DISPLAY_FILE, {
           showSpeed: latestPatch.showSpeed !== false,
           showCacheHit: latestPatch.showCacheHit !== false,
@@ -3125,16 +3563,28 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
       }
 
       const now = Date.now();
-      if (forceStatus || now - lastStatusWriteAt >= 2000) {
+      if (!installed) {
+        try {
+          if (fs.existsSync(STATUS_FILE)) fs.unlinkSync(STATUS_FILE);
+        } catch {}
+      } else if (forceStatus || now - lastStatusWriteAt >= 2000) {
         lastStatusWriteAt = now;
         atomicWriteJsonSafe(STATUS_FILE, {
           version: VERSION,
           pid: process.pid,
           mountedCount,
           wallpaperCount,
+          i18nCount,
           activeConvId: focusedConvId,
           wantNative,
           wantNativeWallpaper,
+          wantHostI18n,
+          proxyActive: Boolean(liveProxy.enabled && liveProxy.url),
+          proxyEnabled: Boolean(liveProxy.enabled),
+          proxyDisplayUrl: liveProxy.displayUrl || '',
+          proxySpecKey: lastAppliedSessionProxyKey || liveProxy.specKey || '',
+          proxyStartupSpecKey: STARTUP_PROXY_SPEC_KEY || '',
+          proxyForceHttp1: Boolean(liveProxy.forceHttp1),
           updatedAtMs: now,
         });
       }
@@ -3152,6 +3602,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
     trackedContents.add(wc);
     const onLoad = () => {
       wcAppliedCssTag.delete(wc);
+      wcAppliedI18nTag.delete(wc);
       if (isHubWebContents(wc)) {
         void syncAllContents(true);
       }
@@ -3163,6 +3614,8 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
         trackedContents.delete(wc);
         wcAppliedCssTag.delete(wc);
         wcOwnedWallpaper.delete(wc);
+        wcAppliedI18nTag.delete(wc);
+        wcOwnedI18n.delete(wc);
       });
     } catch {}
     if (isHubWebContents(wc)) {
@@ -3181,6 +3634,14 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
 
   if (electronMod && electronMod.app) {
     const { app, webContents } = electronMod;
+    app.on('login', (event, _wc, _req, authInfo, callback) => {
+      try {
+        if (authInfo && authInfo.isProxy && activeProxyAuth.username) {
+          event.preventDefault();
+          callback(activeProxyAuth.username, activeProxyAuth.password);
+        }
+      } catch {}
+    });
     app.on('web-contents-created', (_ev, wc) => attachWebContents(wc));
     app.whenReady().then(() => {
       try {
@@ -3201,7 +3662,8 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
               n === 'user_prefs.json' ||
               n === 'native_hud_renderer.js' ||
               n === 'native_wallpaper.css' ||
-              n === 'native_wallpaper_engine.js'
+              n === 'native_wallpaper_engine.js' ||
+              n === 'native_host_i18n.js'
             ) {
               scheduleSync();
             }
@@ -3216,7 +3678,8 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
     }).catch(() => {});
   }
 
-  module.exports = { version: VERSION };
+  module.exports = { version: VERSION, dormant: false };
+  }
 }
 `;
 }
@@ -3275,27 +3738,108 @@ function buildCleanStockAsar(sourceBuf) {
   return repackAsarInMemory(sourceBuf, overrides, removals);
 }
 
-async function writeAsarWithRenameFallback(targetPath, dataBuf) {
+function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
   try {
-    await fsp.writeFile(targetPath, dataBuf);
-    return { ok: true, method: 'direct' };
-  } catch (directErr) {
-    // On Windows, Electron often holds app.asar open with FILE_SHARE_DELETE, allowing rename-swap!
-    const staleTmp = `${targetPath}.agy_stale`;
-    await fsp.rm(staleTmp, { force: true }).catch(() => {});
-    try {
-      await fsp.rename(targetPath, staleTmp);
-      try {
-        await fsp.writeFile(targetPath, dataBuf);
-        await fsp.rm(staleTmp, { force: true }).catch(() => {});
-        return { ok: true, method: 'rename_swap' };
-      } catch (writeErr) {
-        await fsp.rename(staleTmp, targetPath).catch(() => {});
-        return { ok: false, error: writeErr?.message || String(writeErr) };
-      }
-    } catch {
-      return { ok: false, error: directErr?.message || String(directErr) };
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+function isAsarLockError(err) {
+  const code = String(err?.code || '').toUpperCase();
+  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'ETXTBSY';
+}
+
+// Safely replace app.asar ONLY when unlocked: probe write access first, stage to a sibling
+// temp file, verify byte length, then atomically rename into place. Never rename-swap a locked
+// live app.asar to .agy_stale under a running Electron process.
+export async function writeAsarSafely(targetPath, dataBuf) {
+  const staleTmp = `${targetPath}.agy_stale`;
+  let targetExists = false;
+  try {
+    const fh = await fsp.open(targetPath, 'r+');
+    targetExists = true;
+    await fh.close().catch(() => {});
+  } catch (probeErr) {
+    if (probeErr?.code !== 'ENOENT') {
+      return {
+        ok: false,
+        locked: isAsarLockError(probeErr),
+        error: probeErr?.message || String(probeErr),
+      };
     }
+  }
+
+  const tmpPath = `${targetPath}.agy_tmp.${process.pid}.${Date.now()}`;
+  try {
+    await fsp.writeFile(tmpPath, dataBuf);
+    const st = await fsp.stat(tmpPath);
+    if (st.size !== dataBuf.length) {
+      throw new Error(`临时 ASAR 写入不完整 (${st.size}/${dataBuf.length})`);
+    }
+    await fsp.rename(tmpPath, targetPath);
+    await fsp.rm(staleTmp, { force: true }).catch(() => {});
+    return { ok: true, method: targetExists ? 'atomic_replace' : 'atomic_create' };
+  } catch (err) {
+    await fsp.rm(tmpPath, { force: true }).catch(() => {});
+    return {
+      ok: false,
+      locked: isAsarLockError(err),
+      error: err?.message || String(err),
+    };
+  }
+}
+
+function writeAsarSafelySync(targetPath, dataBuf) {
+  const staleTmp = `${targetPath}.agy_stale`;
+  let targetExists = false;
+  try {
+    const fd = fs.openSync(targetPath, 'r+');
+    targetExists = true;
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // ignore
+    }
+  } catch (probeErr) {
+    if (probeErr?.code !== 'ENOENT') {
+      return {
+        ok: false,
+        locked: isAsarLockError(probeErr),
+        error: probeErr?.message || String(probeErr),
+      };
+    }
+  }
+
+  const tmpPath = `${targetPath}.agy_tmp.${process.pid}.${Date.now()}`;
+  try {
+    fs.writeFileSync(tmpPath, dataBuf);
+    const st = fs.statSync(tmpPath);
+    if (st.size !== dataBuf.length) {
+      throw new Error(`临时 ASAR 写入不完整 (${st.size}/${dataBuf.length})`);
+    }
+    fs.renameSync(tmpPath, targetPath);
+    try {
+      fs.rmSync(staleTmp, { force: true });
+    } catch {
+      // ignore
+    }
+    return { ok: true, method: targetExists ? 'atomic_replace' : 'atomic_create' };
+  } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // ignore
+    }
+    return {
+      ok: false,
+      locked: isAsarLockError(err),
+      error: err?.message || String(err),
+    };
   }
 }
 
@@ -3356,6 +3900,7 @@ export async function stageLiveHudAssets(paths, themes = null, options = {}) {
   const liteMode = Boolean(options?.liteMode ?? themes?.liteMode);
   const rendererFile = paths.nativeHudRendererFile || path.join(paths.pluginDataDir, 'native_hud_renderer.js');
   const wpEngineFile = paths.nativeWallpaperEngineFile || path.join(paths.pluginDataDir, 'native_wallpaper_engine.js');
+  const hostI18nFile = paths.nativeHostI18nFile || path.join(paths.pluginDataDir, 'native_host_i18n.js');
   const guideFile = paths.nativeHudGuideFile || path.join(paths.pluginDataDir, 'native_hud_guide.txt');
 
   let writtenFiles = 0;
@@ -3370,6 +3915,12 @@ export async function stageLiveHudAssets(paths, themes = null, options = {}) {
     written: false,
   }));
   if (eRes.written) writtenFiles += 1;
+
+  const hostI18nSrc = buildHostI18nSelfContainedScript();
+  const iRes = await writeTextIfChanged(hostI18nFile, hostI18nSrc, { sig: sha256Text(hostI18nSrc) }).catch(() => ({
+    written: false,
+  }));
+  if (iRes.written) writtenFiles += 1;
 
   const guideSrcPath = paths?.assetsDir ? path.join(paths.assetsDir, 'open_console_guide.jpg') : '';
   if (guideSrcPath) {
@@ -3558,6 +4109,21 @@ export async function installNativeHud(paths = {}, { force = false, liteMode, th
       status: before,
     };
   }
+  if (
+    !force &&
+    before.state === 'outdated' &&
+    before.heartbeat?.hookAlive &&
+    isPidAlive(before.heartbeat.pid)
+  ) {
+    return {
+      ok: false,
+      diskWritten: false,
+      pendingRestart: true,
+      deferredWhileRunning: true,
+      error: 'Antigravity 正在运行，已通过实时脚本热更新；关闭客户端后将自动完成 app.asar 持久化升级',
+      status: before,
+    };
+  }
 
   try {
     const curRaw = await fsp.readFile(before.asarPath);
@@ -3584,7 +4150,7 @@ export async function installNativeHud(paths = {}, { force = false, liteMode, th
     ]);
 
     const newAsarBuf = repackAsarInMemory(cleanStockBuf, overrides, new Set());
-    const writeRes = await writeAsarWithRenameFallback(before.asarPath, newAsarBuf);
+    const writeRes = await writeAsarSafely(before.asarPath, newAsarBuf);
     asarInspectCache.delete(before.asarPath);
     const after = await inspectNativeHudState(paths);
 
@@ -3643,6 +4209,7 @@ export async function restoreStockAsar(paths = {}) {
     const { cleanStockBuf } = await ensureCleanBackupForCurrentVersion(paths, curRaw, appVersion);
 
     if (before.state === 'stock') {
+      await fsp.rm(`${before.asarPath}.agy_stale`, { force: true }).catch(() => {});
       return {
         ok: true,
         alreadyStock: true,
@@ -3652,7 +4219,7 @@ export async function restoreStockAsar(paths = {}) {
       };
     }
 
-    const writeRes = await writeAsarWithRenameFallback(before.asarPath, cleanStockBuf);
+    const writeRes = await writeAsarSafely(before.asarPath, cleanStockBuf);
     asarInspectCache.delete(before.asarPath);
     const after = await inspectNativeHudState(paths);
     if (!writeRes.ok) {
@@ -3680,6 +4247,110 @@ export async function restoreStockAsar(paths = {}) {
       pendingRestart: false,
       error: err?.message || '还原 app.asar 失败',
       status: after,
+    };
+  }
+}
+
+export function restoreStockAsarSync(paths = {}) {
+  const statusFile =
+    paths?.nativeHudStatusFile ||
+    (paths?.pluginDataDir ? path.join(paths.pluginDataDir, 'native_hud_status.json') : '');
+  if (statusFile) {
+    try {
+      fs.rmSync(statusFile, { force: true });
+    } catch {
+      // ignore
+    }
+  }
+  const asarPath = resolveHostAsarPathSync(paths);
+  if (!asarPath) {
+    return { ok: true, asarPath: '', alreadyStock: false, diskWritten: false, pendingRestart: false, notFound: true };
+  }
+  let stat = null;
+  try {
+    stat = fs.statSync(asarPath);
+  } catch {
+    stat = null;
+  }
+  if (!stat || !stat.isFile()) {
+    return { ok: true, asarPath, alreadyStock: false, diskWritten: false, pendingRestart: false, notFound: true };
+  }
+
+  try {
+    const curRaw = fs.readFileSync(asarPath);
+    const curParsed = parseAsar(curRaw);
+    const { entryRel, appVersion } = resolveEntryRelPath(curParsed);
+    const hasHookInEntry = lookupAsarNode(curParsed.root, entryRel)
+      ? extractAsarFile(curParsed, entryRel).toString('utf8').includes(MAIN_HOOK_MARKER)
+      : false;
+    const hasOurArtifacts = Boolean(
+      lookupAsarNode(curParsed.root, ASAR_MAIN_REL) ||
+        lookupAsarNode(curParsed.root, ASAR_RENDERER_REL) ||
+        lookupAsarNode(curParsed.root, ASAR_WALLPAPER_REL) ||
+        lookupAsarNode(curParsed.root, ASAR_META_REL),
+    );
+    if (!hasHookInEntry && !hasOurArtifacts) {
+      try {
+        fs.rmSync(`${asarPath}.agy_stale`, { force: true });
+      } catch {
+        // ignore
+      }
+      return { ok: true, asarPath, alreadyStock: true, diskWritten: false, pendingRestart: false };
+    }
+
+    let cleanStockBuf = null;
+    if (paths?.pluginDataDir) {
+      const { bakPath, metaPath } = resolveBackupPaths(paths);
+      try {
+        if (fs.existsSync(bakPath) && fs.existsSync(metaPath)) {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          if (meta?.appVersion === appVersion) {
+            const bakRaw = fs.readFileSync(bakPath);
+            const bakParsed = parseAsar(bakRaw);
+            const { appVersion: bakVer } = resolveEntryRelPath(bakParsed);
+            if (bakVer === appVersion) {
+              cleanStockBuf = buildCleanStockAsar(bakRaw);
+            }
+          }
+        }
+      } catch {
+        cleanStockBuf = null;
+      }
+    }
+    if (!cleanStockBuf) {
+      cleanStockBuf = buildCleanStockAsar(curRaw);
+    }
+
+    const writeRes = writeAsarSafelySync(asarPath, cleanStockBuf);
+    asarInspectCache.delete(asarPath);
+    if (!writeRes.ok) {
+      return {
+        ok: false,
+        asarPath,
+        alreadyStock: false,
+        diskWritten: false,
+        pendingRestart: true,
+        locked: Boolean(writeRes.locked),
+        error: writeRes.error || 'app.asar 当前被占用',
+      };
+    }
+    return {
+      ok: true,
+      asarPath,
+      alreadyStock: false,
+      diskWritten: true,
+      writeMethod: writeRes.method,
+      pendingRestart: true,
+    };
+  } catch (err) {
+    asarInspectCache.delete(asarPath);
+    return {
+      ok: false,
+      asarPath,
+      alreadyStock: false,
+      diskWritten: false,
+      pendingRestart: false,
+      error: err?.message || '还原 app.asar 失败',
     };
   }
 }

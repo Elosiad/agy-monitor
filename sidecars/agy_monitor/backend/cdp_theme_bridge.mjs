@@ -16,6 +16,12 @@ import {
   readNativeHudHeartbeat,
 } from './hud_injector.mjs';
 import {
+  buildHostI18nApplyExpr,
+  buildHostI18nRescanExpr,
+  buildHostI18nRestoreExpr,
+  HOST_I18N_VERSION,
+} from './host_i18n.mjs';
+import {
   createWslCdpLocalProxy,
   detectWindowsHostEnv,
   resolveWindowsHostDirs,
@@ -601,341 +607,7 @@ function buildRemoveHudExpr() {
   })()`;
 }
 
-const HOST_UI_ZH_DICT = Object.freeze({
-  // Left Sidebar & Navigation
-  'New Conversation': '新建对话',
-  'New conversation': '新建对话',
-  Automations: '自动化',
-  Customizations: '自定义配置',
-  Projects: '项目',
-  Settings: '设置',
-  Plugins: '插件',
-  Skills: '技能',
-  Rules: '规则',
-  Workflows: '工作流',
-  'MCP Servers': 'MCP 服务',
-  Marketplace: '插件市场',
-  Search: '搜索',
-  History: '历史记录',
-  Archived: '已归档',
-  'Open Folder': '打开文件夹',
-  'Add Project': '添加项目',
-  'Open Project': '打开项目',
-
-  // Composer, Model & Usage Popups
-  'Ask anything, @ to mention, / for actions': '输入任意内容，@ 引用上下文，/ 唤起操作',
-  'Ask anything...': '输入任意内容…',
-  Model: '模型',
-  Models: '模型',
-  'View Usage': '查看额度',
-  Usage: '额度用量',
-  'Gemini Models': 'Gemini 模型',
-  'Claude and GPT models': 'Claude 与 GPT 模型',
-  'Weekly limit': '每周限额',
-  '5h limit': '5小时限额',
-  'Daily limit': '每日限额',
-  New: '新',
-  Notice: '提示',
-  Unavailable: '不可用',
-  Turbo: '极速',
-  Planning: '规划',
-  Fast: '快速',
-  Auto: '自动',
-  Strict: '严格',
-  'Request review': '请求审查',
-  'Request Review': '请求审查',
-  'Always Proceed': '始终继续',
-  'Review Policy': '审查策略',
-  Review: '审查',
-
-  // Common Buttons, Tabs & Dialogs
-  Accept: '接受',
-  'Accept All': '全部接受',
-  'Accept all': '全部接受',
-  Reject: '拒绝',
-  'Reject All': '全部拒绝',
-  'Reject all': '全部拒绝',
-  Approve: '批准',
-  Allow: '允许',
-  'Allow Once': '仅允许一次',
-  'Always Allow': '始终允许',
-  Deny: '拒绝',
-  Cancel: '取消',
-  Continue: '继续',
-  Retry: '重试',
-  Copy: '复制',
-  Copied: '已复制',
-  Edit: '编辑',
-  Delete: '删除',
-  Rename: '重命名',
-  Save: '保存',
-  Close: '关闭',
-  Done: '完成',
-  Apply: '应用',
-  Reset: '重置',
-  Refresh: '刷新',
-  Install: '安装',
-  Installed: '已安装',
-  Uninstall: '卸载',
-  Enable: '启用',
-  Disable: '禁用',
-  Enabled: '已启用',
-  Disabled: '已禁用',
-  Restart: '重启',
-  Reload: '重新加载',
-  Open: '打开',
-  Show: '显示',
-  Hide: '隐藏',
-  More: '更多',
-  Clear: '清除',
-  Stop: '停止',
-  Send: '发送',
-  Submit: '提交',
-  Confirm: '确认',
-  Back: '返回',
-  Next: '下一步',
-  'Files Changed': '已修改文件',
-  'No files changed': '暂无文件变更',
-  'View diff': '查看差异',
-  Terminal: '终端',
-  Output: '输出',
-  Problems: '问题',
-  Browser: '浏览器',
-  Preview: '预览',
-  Artifacts: '产物',
-  Swarm: '蜂群协作',
-  Thinking: '思考中',
-  Working: '执行中',
-  Running: '运行中',
-  Waiting: '等待中',
-  Completed: '已完成',
-  Failed: '已失败',
-  Cancelled: '已取消',
-
-  // Settings View
-  General: '通用',
-  Appearance: '外观',
-  Theme: '主题',
-  Dark: '深色',
-  Light: '浅色',
-  System: '跟随系统',
-  Account: '账号',
-  'Sign out': '退出登录',
-  'Sign Out': '退出登录',
-  'Sign in': '登录',
-  'Sign In': '登录',
-  Permissions: '权限',
-  Security: '安全',
-  Sandbox: '沙箱',
-  Notifications: '通知',
-  Sound: '提示音',
-  'Keyboard Shortcuts': '快捷键',
-  About: '关于',
-  'Check for Updates': '检查更新',
-  Updates: '更新',
-  Privacy: '隐私',
-  Advanced: '高级',
-  Agent: '智能体',
-  Editor: '编辑器',
-  Workspace: '工作区',
-  Extensions: '扩展',
-  Tools: '工具',
-  Network: '网络',
-  Proxy: '代理',
-  Logs: '日志',
-  Diagnostics: '诊断',
-});
-
-function buildHostI18nApplyExpr() {
-  return `(function(dict){
-    if (!window.__agyMonI18n) {
-      var origText = new Map();
-      var origAttr = new Map();
-      var hudId = ${JSON.stringify(HUD_ELEMENT_ID)};
-      var SKIP_ANC = 'pre,code,textarea,input,script,style,svg,[contenteditable="true"],#' + hudId;
-
-      function fmtDur(s) {
-        return String(s || '')
-          .replace(/(\\d+)\\s*d\\b/gi, '$1天')
-          .replace(/(\\d+)\\s*h\\b/gi, '$1小时')
-          .replace(/(\\d+)\\s*m\\b/gi, '$1分')
-          .replace(/(\\d+)\\s*s\\b/gi, '$1秒')
-          .replace(/\\s+/g, '');
-      }
-
-      function translateExact(raw) {
-        if (!raw || raw.length > 96) return null;
-        var trimmed = raw.trim();
-        if (!trimmed) return null;
-        if (Object.prototype.hasOwnProperty.call(dict, trimmed)) {
-          return raw.replace(trimmed, dict[trimmed]);
-        }
-        var m;
-        if ((m = /^(\\d+)\\s+files?\\s+changed$/i.exec(trimmed))) {
-          return raw.replace(trimmed, m[1] + ' 个文件已变更');
-        }
-        if ((m = /^Thought for\\s+([\\d\\w\\s]+)$/i.exec(trimmed))) {
-          return raw.replace(trimmed, '已思考 ' + fmtDur(m[1]));
-        }
-        if ((m = /^Worked for\\s+([\\d\\w\\s]+)$/i.exec(trimmed))) {
-          return raw.replace(trimmed, '已工作 ' + fmtDur(m[1]));
-        }
-        if ((m = /^(\\d+)%\\s+left$/i.exec(trimmed))) {
-          return raw.replace(trimmed, '剩余 ' + m[1] + '%');
-        }
-        if ((m = /^Resets in\\s+([\\d\\w\\s]+)$/i.exec(trimmed))) {
-          return raw.replace(trimmed, fmtDur(m[1]) + ' 后重置');
-        }
-        if ((m = /^(\\d+)\\s*(?:secs?|s)\\s+ago$/i.exec(trimmed))) {
-          return raw.replace(trimmed, m[1] + ' 秒前');
-        }
-        if ((m = /^(\\d+)\\s*(?:mins?|m)\\s+ago$/i.exec(trimmed))) {
-          return raw.replace(trimmed, m[1] + ' 分钟前');
-        }
-        if ((m = /^(\\d+)\\s*(?:hours?|h)\\s+ago$/i.exec(trimmed))) {
-          return raw.replace(trimmed, m[1] + ' 小时前');
-        }
-        if ((m = /^(\\d+)\\s*(?:days?|d)\\s+ago$/i.exec(trimmed))) {
-          return raw.replace(trimmed, m[1] + ' 天前');
-        }
-        return null;
-      }
-
-      function processTextNode(node) {
-        if (!node || node.nodeType !== 3) return;
-        var parent = node.parentElement;
-        if (!parent) return;
-        if (parent.closest && parent.closest(SKIP_ANC)) return;
-        var cur = node.nodeValue;
-        var translated = translateExact(cur);
-        if (translated && translated !== cur) {
-          if (!origText.has(node)) origText.set(node, cur);
-          node.nodeValue = translated;
-        }
-      }
-
-      function processElementAttrs(el) {
-        if (!el || el.nodeType !== 1) return;
-        if (el.id === hudId || (el.closest && el.closest('#' + hudId))) return;
-        var attrs = ['placeholder', 'aria-label', 'title'];
-        for (var i = 0; i < attrs.length; i++) {
-          var k = attrs[i];
-          var val = el.getAttribute(k);
-          if (!val) continue;
-          var tr = translateExact(val);
-          if (tr && tr !== val) {
-            var rec = origAttr.get(el);
-            if (!rec) {
-              rec = {};
-              origAttr.set(el, rec);
-            }
-            if (!Object.prototype.hasOwnProperty.call(rec, k)) rec[k] = val;
-            el.setAttribute(k, tr);
-          }
-        }
-      }
-
-      function scanRoot(root) {
-        if (!root) return;
-        if (root.nodeType === 3) {
-          processTextNode(root);
-          return;
-        }
-        if (root.nodeType !== 1) return;
-        if (root.id === hudId || (root.closest && root.closest('#' + hudId))) return;
-        processElementAttrs(root);
-        var phs = root.querySelectorAll ? root.querySelectorAll('[placeholder],[aria-label],[title]') : [];
-        for (var i = 0; i < phs.length; i++) processElementAttrs(phs[i]);
-        var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-        var tn;
-        while ((tn = walker.nextNode())) {
-          processTextNode(tn);
-        }
-      }
-
-      var pending = new Set();
-      var flushTimer = null;
-      function pruneDisconnected() {
-        if (origText.size > 400) {
-          origText.forEach(function(_, node) {
-            if (!node || !node.isConnected) origText.delete(node);
-          });
-        }
-        if (origAttr.size > 200) {
-          origAttr.forEach(function(_, el) {
-            if (!el || !el.isConnected) origAttr.delete(el);
-          });
-        }
-      }
-      function flushPending() {
-        flushTimer = null;
-        var list = Array.from(pending);
-        pending.clear();
-        for (var i = 0; i < list.length; i++) {
-          scanRoot(list[i]);
-        }
-        pruneDisconnected();
-      }
-
-      var observer = new MutationObserver(function(muts) {
-        for (var i = 0; i < muts.length; i++) {
-          var m = muts[i];
-          if (m.type === 'characterData' && m.target) {
-            pending.add(m.target);
-          } else if (m.type === 'childList' && m.addedNodes) {
-            for (var j = 0; j < m.addedNodes.length; j++) {
-              pending.add(m.addedNodes[j]);
-            }
-          }
-        }
-        if (pending.size > 0 && !flushTimer) {
-          flushTimer = setTimeout(flushPending, 60);
-        }
-      });
-
-      if (document.body) {
-        scanRoot(document.body);
-        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      }
-
-      window.__agyHostI18nApplied = true;
-      window.__agyMonI18n = {
-        rescan: function() { if (document.body) scanRoot(document.body); },
-        stop: function() {
-          observer.disconnect();
-          if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-          pending.clear();
-          origText.forEach(function(val, node) {
-            try { if (node && node.isConnected) node.nodeValue = val; } catch (e) {}
-          });
-          origText.clear();
-          origAttr.forEach(function(rec, el) {
-            try {
-              if (!el || !el.isConnected) return;
-              Object.keys(rec).forEach(function(k) { el.setAttribute(k, rec[k]); });
-            } catch (e) {}
-          });
-          origAttr.clear();
-          delete window.__agyHostI18nApplied;
-          delete window.__agyMonI18n;
-        }
-      };
-    } else {
-      window.__agyHostI18nApplied = true;
-      window.__agyMonI18n.rescan();
-    }
-    return true;
-  })(${JSON.stringify(HOST_UI_ZH_DICT)})`;
-}
-
-function buildHostI18nRestoreExpr() {
-  return `(function(){
-    if (window.__agyMonI18n && typeof window.__agyMonI18n.stop === 'function') {
-      window.__agyMonI18n.stop();
-    }
-    return true;
-  })()`;
-}
+// Host UI Chinese localization is now unified in ./host_i18n.mjs (MIT curated dictionary + protected DOM engine).
 
 /**
  * Create a lightweight multi-target CDP bridge that:
@@ -1696,15 +1368,23 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   };
 
   const applyHostI18nAll = async () => {
-    const expr = buildHostI18nApplyExpr();
+    const rescanExpr = buildHostI18nRescanExpr();
+    let fullExpr = '';
     await Promise.allSettled(
       [...sessions.values()].map(async (entry) => {
         if (entry.ws.readyState !== 1) return;
         try {
-          await sendEvaluateOn(entry, expr);
+          if (entry.hostLocalized && entry.hostI18nVersion === HOST_I18N_VERSION) {
+            const res = await sendEvaluateOn(entry, rescanExpr);
+            if (res?.result?.value === true) return;
+          }
+          if (!fullExpr) fullExpr = buildHostI18nApplyExpr();
+          await sendEvaluateOn(entry, fullExpr);
           entry.hostLocalized = true;
+          entry.hostI18nVersion = HOST_I18N_VERSION;
         } catch {
           entry.hostLocalized = false;
+          entry.hostI18nVersion = '';
         }
       }),
     );
@@ -1718,6 +1398,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
           await sendEvaluateOn(entry, expr).catch(() => {});
         }
         entry.hostLocalized = false;
+        entry.hostI18nVersion = '';
       }),
     );
   };
@@ -1758,7 +1439,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   };
 
   const probeSessionMarkers = async (needCss, needI18n, needHud) => {
-    const probeExpr = `(function(){ return { hasCss: Boolean(document.getElementById(${JSON.stringify(STYLE_ELEMENT_ID)})), hasI18n: Boolean(window.__agyHostI18nApplied), hasHud: Boolean(window.__agyMonitorNativeHud && document.getElementById('agy-monitor-native-hud')) }; })()`;
+    const probeExpr = `(function(){ return { hasCss: Boolean(document.getElementById(${JSON.stringify(STYLE_ELEMENT_ID)})), hasI18n: Boolean(window.__agyHostI18nApplied && window.__agyMonitorHostI18n && window.__agyMonitorHostI18n.version === ${JSON.stringify(HOST_I18N_VERSION)}), hasHud: Boolean(window.__agyMonitorNativeHud && document.getElementById('agy-monitor-native-hud')) }; })()`;
     let needsResync = false;
     await Promise.allSettled(
       [...sessions.values()].map(async (entry) => {
@@ -1772,6 +1453,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         }
         if (needI18n && !val.hasI18n) {
           entry.hostLocalized = false;
+          entry.hostI18nVersion = '';
           needsResync = true;
         }
         if (needHud && !val.hasHud) {

@@ -18,6 +18,7 @@ import { createSessionsHub } from "./components/sessions_hub.js";
 import { createRuntimeBar } from "./components/runtime_bar.js";
 import { createMasteryHub } from "./components/mastery_hub.js";
 import { createAccountsHub } from "./components/accounts_hub.js";
+import { createBoostHub } from "./components/boost_hub.js";
 import { createOtherHub } from "./components/other_hub.js";
 import { createThemeStudio } from "./components/theme_studio.js";
 import { createChangelogModal } from "./components/changelog_modal.js";
@@ -235,9 +236,10 @@ export function mountMonitorApp() {
   const subnav = initSubnavTabs(cleanups, (tabKey) => {
     components.masteryHub?.setTabActive?.(tabKey === "mastery");
     components.accountsHub?.setTabActive?.(tabKey === "accounts");
+    components.boostHub?.setTabActive?.(tabKey === "boost");
     if (tabKey === "theme") {
       components.themeStudio?.refreshBackdropStatus?.();
-    } else if (tabKey === "other") {
+    } else if (tabKey === "other" || tabKey === "boost") {
       void refreshPreferences();
     }
     mountedExtensions.forEach((ext) => ext?.onTabChange?.(tabKey));
@@ -318,6 +320,7 @@ export function mountMonitorApp() {
       // AGY Console UI stays fixed in zh-CN; language setting exclusively controls Antigravity host UI via CDP.
       components.themeStudio?.update(prefs);
       components.modelAndPrompt?.update(prefs);
+      components.boostHub?.updateFromPreferences?.(prefs);
       components.otherHub?.updateFromPreferences?.(prefs);
       components.accountsHub?.setQuotaEnabled?.(qEnabled);
       components.quotaCards?.setEnabled?.(qEnabled, { fetchNow: false });
@@ -562,6 +565,17 @@ export function mountMonitorApp() {
 
   components.accountsHub = createAccountsHub({
     apiFetch,
+    onToast: showToast,
+  });
+
+  components.boostHub = createBoostHub({
+    apiFetch,
+    onBoostChange: (_nextBoost, res) => {
+      if (typeof res?.rulesTokens === "number") {
+        state.configuredRulesTokens = res.rulesTokens;
+        components.contextPie?.setConfiguredRulesTokens?.(res.rulesTokens);
+      }
+    },
     onToast: showToast,
   });
 

@@ -47,6 +47,16 @@ async function copyTextSafe(text) {
 }
 
 export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeChange, onToast } = {}) {
+  const proxyCardEl = document.getElementById("otherProxyCard");
+  const proxyToggleInput = document.getElementById("otherProxyToggle");
+  const proxyBadgeEl = document.getElementById("otherProxyBadge");
+  const proxyBodyEl = document.getElementById("otherProxyBody");
+  const proxyUrlInput = document.getElementById("otherProxyUrlInput");
+  const proxySaveBtn = document.getElementById("otherProxySaveBtn");
+  const proxyTestBtn = document.getElementById("otherProxyTestBtn");
+  const proxyHttp1Input = document.getElementById("otherProxyHttp1Toggle");
+  const proxyHintEl = document.getElementById("otherProxyHint");
+
   const toggleInput = document.getElementById("otherQuotaToggle");
   const statusBadgeEl = document.getElementById("otherQuotaStatusBadge");
   const channelValEl = document.getElementById("otherQuotaChannelVal");
@@ -64,6 +74,9 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
   const liteCostValEl = document.getElementById("otherLiteCostVal");
 
   let translator = t;
+  let busyProxy = false;
+  let busyProxyTest = false;
+  let proxyUrlDirty = false;
   let busyToggle = false;
   let busyLite = false;
   let busySl = false;
@@ -71,6 +84,15 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
   const cleanups = [];
 
   const state = {
+    proxy: {
+      enabled: true,
+      mode: "auto",
+      url: "",
+      bypass: "localhost,127.0.0.1,::1",
+      forceHttp1: false,
+    },
+    proxyStatus: null,
+    proxyTest: null,
     quotaQueryEnabled: true,
     liteMode: false,
     compliance: {
@@ -102,7 +124,111 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
     return data;
   }
 
+  function renderProxy() {
+    const proxy = state.proxy || {};
+    const ps = state.proxyStatus || {};
+    const enabled = proxy.enabled !== false;
+
+    if (proxyToggleInput) {
+      proxyToggleInput.checked = enabled;
+      proxyToggleInput.disabled = busyProxy;
+      proxyToggleInput.setAttribute("aria-checked", String(enabled));
+    }
+    if (proxyCardEl) {
+      proxyCardEl.classList.toggle("is-proxy-active", enabled);
+      proxyCardEl.classList.toggle("is-disabled", !enabled);
+    }
+    if (proxyBodyEl) {
+      proxyBodyEl.hidden = !enabled;
+    }
+    if (proxyUrlInput && !proxyUrlDirty && document.activeElement !== proxyUrlInput) {
+      proxyUrlInput.value = typeof proxy.url === "string" ? proxy.url : "";
+    }
+    if (proxyUrlInput) {
+      proxyUrlInput.disabled = busyProxy;
+    }
+    if (proxyHttp1Input) {
+      proxyHttp1Input.checked = Boolean(proxy.forceHttp1);
+      proxyHttp1Input.disabled = busyProxy;
+    }
+    if (proxySaveBtn) {
+      proxySaveBtn.disabled = busyProxy;
+      proxySaveBtn.textContent = busyProxy
+        ? tr("other.slWorking", "处理中…")
+        : tr("other.proxySaveBtn", "保存");
+    }
+    if (proxyTestBtn) {
+      proxyTestBtn.disabled = busyProxyTest || busyProxy;
+      proxyTestBtn.textContent = busyProxyTest
+        ? tr("other.proxyTesting", "测速中…")
+        : tr("other.proxyTestBtn", "测速");
+    }
+
+    if (proxyBadgeEl) {
+      const runtimeState = ps.state || (enabled ? "on" : "disabled");
+      if (!enabled || runtimeState === "disabled") {
+        proxyBadgeEl.className = "other-status-pill is-off";
+        proxyBadgeEl.textContent = tr("other.proxyBadgeOff", "已关闭");
+        proxyBadgeEl.title = "";
+      } else if (runtimeState === "active") {
+        proxyBadgeEl.className = "other-status-pill is-on";
+        proxyBadgeEl.textContent = tr("other.proxyBadgeLive", "已生效");
+        proxyBadgeEl.title = ps.effectiveUrl || "";
+      } else if (runtimeState === "partial_restart") {
+        proxyBadgeEl.className = "other-status-pill is-info";
+        proxyBadgeEl.textContent = tr("other.proxyBadgeRestart", "重启全生效");
+        proxyBadgeEl.title = "窗口流量已热切换，重启 Antigravity 后语言服务同步生效";
+      } else if (runtimeState === "needs_restart") {
+        proxyBadgeEl.className = "other-status-pill is-warn";
+        proxyBadgeEl.textContent = tr("other.proxyBadgeNeedsRestart", "重启生效");
+        proxyBadgeEl.title = "配置已写入，重启 Antigravity 后生效";
+      } else if (runtimeState === "auto_direct") {
+        proxyBadgeEl.className = "other-status-pill is-muted";
+        proxyBadgeEl.textContent = tr("other.proxyBadgeDirect", "自动直连");
+        proxyBadgeEl.title = "未检测到系统代理，当前直连";
+      } else {
+        proxyBadgeEl.className = "other-status-pill is-on";
+        proxyBadgeEl.textContent = tr("other.proxyBadgeOn", "已开启");
+        proxyBadgeEl.title = "";
+      }
+    }
+
+    if (proxyHintEl) {
+      proxyHintEl.classList.remove("is-ok", "is-err", "is-warn");
+      if (state.proxyTest) {
+        const res = state.proxyTest;
+        if (res.ok) {
+          proxyHintEl.classList.add("is-ok");
+          const ms = Number(res.latencyMs) || 0;
+          proxyHintEl.textContent = `✓ 隧道正常 · ${ms}ms`;
+          proxyHintEl.title = `${res.url || ""} → ${res.target || ""}`;
+        } else {
+          proxyHintEl.classList.add("is-err");
+          proxyHintEl.textContent = `✕ ${res.error || "连接失败"}`;
+          proxyHintEl.title = res.error || "";
+        }
+      } else if (!enabled) {
+        proxyHintEl.textContent = tr("other.proxyHintOff", "已关闭免 TUN 代理");
+        proxyHintEl.title = "";
+      } else if (ps.source === "custom" && ps.effectiveUrl) {
+        const suffix = ps.needsRestart ? " · 重启生效" : "";
+        if (ps.needsRestart) proxyHintEl.classList.add("is-warn");
+        proxyHintEl.textContent = `${ps.effectiveUrl}${suffix}`;
+        proxyHintEl.title = proxyHintEl.textContent;
+      } else if (ps.source === "system" && ps.effectiveUrl) {
+        const suffix = ps.needsRestart ? " · 重启生效" : "";
+        if (ps.needsRestart) proxyHintEl.classList.add("is-warn");
+        proxyHintEl.textContent = `系统代理 ${ps.effectiveUrl}${suffix}`;
+        proxyHintEl.title = proxyHintEl.textContent;
+      } else {
+        proxyHintEl.textContent = tr("other.proxyHintDirect", "未开系统代理，当前直连");
+        proxyHintEl.title = "留空将自动跟随系统代理；也可手动填写 http:// 或 socks5:// 地址实现纯独立代理";
+      }
+    }
+  }
+
   function render() {
+    renderProxy();
     const enabled = state.quotaQueryEnabled !== false;
     const comp = state.compliance || {};
     const sl = comp.statusLine || {};
@@ -318,6 +444,149 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
     }
   }
 
+  async function saveProxyPatch(patch, { successToast = "" } = {}) {
+    if (busyProxy || destroyed) return false;
+    busyProxy = true;
+    state.proxyTest = null;
+    render();
+    try {
+      const res = await requestJson("/api/preferences/proxy", {
+        method: "POST",
+        body: JSON.stringify(patch),
+      });
+      if (destroyed) return false;
+      if (res?.proxy && typeof res.proxy === "object") {
+        state.proxy = { ...state.proxy, ...res.proxy };
+      }
+      if (res?.proxyStatus && typeof res.proxyStatus === "object") {
+        state.proxyStatus = res.proxyStatus;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "url")) {
+        proxyUrlDirty = false;
+      }
+      const needRestartSuffix = state.proxyStatus?.needsRestart ? "（重启 Antigravity 后完全生效）" : "";
+      if (successToast) {
+        onToast?.(`${successToast}${needRestartSuffix}`, "success");
+      }
+      return true;
+    } catch (err) {
+      if (destroyed) return false;
+      render();
+      onToast?.(err?.message || tr("other.toastProxyFailed", "保存免 TUN 代理设置失败"), "error");
+      return false;
+    } finally {
+      busyProxy = false;
+      render();
+    }
+  }
+
+  async function handleToggleProxy() {
+    if (!proxyToggleInput || busyProxy || destroyed) return;
+    const nextEnabled = Boolean(proxyToggleInput.checked);
+    await saveProxyPatch(
+      { enabled: nextEnabled },
+      {
+        successToast: nextEnabled
+          ? tr("other.toastProxyEnabled", "已开启免 TUN 代理")
+          : tr("other.toastProxyDisabled", "已关闭免 TUN 代理"),
+      }
+    );
+  }
+
+  async function handleSaveProxyUrl() {
+    if (busyProxy || destroyed) return;
+    const rawUrl = proxyUrlInput ? proxyUrlInput.value.trim() : "";
+    const forceHttp1 = proxyHttp1Input ? Boolean(proxyHttp1Input.checked) : Boolean(state.proxy?.forceHttp1);
+    await saveProxyPatch(
+      { enabled: true, url: rawUrl, forceHttp1 },
+      {
+        successToast: rawUrl
+          ? tr("other.toastProxySavedCustom", "已保存独立代理地址")
+          : tr("other.toastProxySavedAuto", "已切换为自动识别系统代理"),
+      }
+    );
+  }
+
+  async function handleToggleProxyHttp1() {
+    if (!proxyHttp1Input || busyProxy || destroyed) return;
+    const nextHttp1 = Boolean(proxyHttp1Input.checked);
+    await saveProxyPatch(
+      { forceHttp1: nextHttp1 },
+      {
+        successToast: nextHttp1
+          ? tr("other.toastProxyHttp1On", "已开启强制 HTTP/1.1（修复 Go HTTP/2 EOF）")
+          : tr("other.toastProxyHttp1Off", "已恢复默认 HTTP/2"),
+      }
+    );
+  }
+
+  async function handleTestProxy() {
+    if (busyProxyTest || busyProxy || destroyed) return;
+    busyProxyTest = true;
+    state.proxyTest = null;
+    render();
+    try {
+      const rawUrl = proxyUrlInput ? proxyUrlInput.value.trim() : "";
+      const res = await requestJson("/api/proxy/test", {
+        method: "POST",
+        body: JSON.stringify({ url: rawUrl }),
+      });
+      if (destroyed) return;
+      state.proxyTest = res;
+      if (res?.ok) {
+        onToast?.(`代理隧道畅通（${res.latencyMs || 0}ms）`, "success");
+      } else {
+        onToast?.(res?.error || tr("other.toastProxyTestFailed", "代理连通测试失败"), "error");
+      }
+    } catch (err) {
+      if (destroyed) return;
+      state.proxyTest = { ok: false, error: err?.message || "代理连通测试失败" };
+      onToast?.(err?.message || tr("other.toastProxyTestFailed", "代理连通测试失败"), "error");
+    } finally {
+      busyProxyTest = false;
+      render();
+    }
+  }
+
+  if (proxyToggleInput) {
+    const onProxyToggle = () => void handleToggleProxy();
+    proxyToggleInput.addEventListener("change", onProxyToggle);
+    cleanups.push(() => proxyToggleInput.removeEventListener("change", onProxyToggle));
+  }
+  if (proxyUrlInput) {
+    const onUrlInput = () => {
+      proxyUrlDirty = true;
+      state.proxyTest = null;
+    };
+    const onUrlKeyDown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void handleSaveProxyUrl();
+      }
+    };
+    proxyUrlInput.addEventListener("input", onUrlInput);
+    proxyUrlInput.addEventListener("keydown", onUrlKeyDown);
+    cleanups.push(() => {
+      proxyUrlInput.removeEventListener("input", onUrlInput);
+      proxyUrlInput.removeEventListener("keydown", onUrlKeyDown);
+    });
+  }
+  if (proxySaveBtn) {
+    const onSaveClick = () => void handleSaveProxyUrl();
+    proxySaveBtn.addEventListener("click", onSaveClick);
+    cleanups.push(() => proxySaveBtn.removeEventListener("click", onSaveClick));
+  }
+  if (proxyTestBtn) {
+    const onTestClick = () => void handleTestProxy();
+    proxyTestBtn.addEventListener("click", onTestClick);
+    cleanups.push(() => proxyTestBtn.removeEventListener("click", onTestClick));
+  }
+  if (proxyHttp1Input) {
+    const onHttp1Change = () => void handleToggleProxyHttp1();
+    proxyHttp1Input.addEventListener("change", onHttp1Change);
+    cleanups.push(() => proxyHttp1Input.removeEventListener("change", onHttp1Change));
+  }
+
   if (toggleInput) {
     const onChange = () => void handleToggleQuota();
     toggleInput.addEventListener("change", onChange);
@@ -344,6 +613,12 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
   return {
     updateFromPreferences(prefs) {
       if (!prefs || typeof prefs !== "object") return;
+      if (prefs.proxy && typeof prefs.proxy === "object") {
+        state.proxy = { ...state.proxy, ...prefs.proxy };
+      }
+      if (prefs.proxyStatus && typeof prefs.proxyStatus === "object") {
+        state.proxyStatus = prefs.proxyStatus;
+      }
       if (typeof prefs.quotaQueryEnabled === "boolean") {
         state.quotaQueryEnabled = prefs.quotaQueryEnabled;
       }

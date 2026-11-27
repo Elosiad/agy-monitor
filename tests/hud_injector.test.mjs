@@ -23,8 +23,10 @@ import {
   repackAsarInMemory,
   resolveWallpaperDataUriForThemes,
   restoreStockAsar,
+  restoreStockAsarSync,
   stageLiveHudAssets,
   stageLiveWallpaperCss,
+  writeAsarSafely,
 } from '../sidecars/agy_monitor/backend/hud_injector.mjs';
 import {
   buildCdpThemeCss,
@@ -784,4 +786,275 @@ test('hud_injector: scanLayers pauses when document.hidden, rescans on visibilit
   assert.equal((docListeners.get('visibilitychange') || new Set()).size, 0);
   assert.equal(intervals.size, 0);
   assert.equal(timeouts.size, 0);
+});
+
+test('hud_injector: non-lite sticky CSS avoids overflow:clip, uses clip-path on ::before, and adapts to html.light / html.dark', () => {
+  const marker = 'data:image/webp;base64,LIGHT_ADAPT_TOKEN_123';
+  const darkThemes = {
+    opacity: 80,
+    blur: 10,
+    dim: 20,
+    hostBlendPct: 25,
+    fit: 'cover',
+    colors: { canvas: '#12131a', chrome: '#181a24', bubble: '#202330', accent: '#5b8cff' },
+  };
+  const lightThemes = {
+    ...darkThemes,
+    colors: { canvas: '#f4f6fb', chrome: '#ffffff', bubble: '#eaedf6', accent: '#3570e4' },
+  };
+  const darkCss = buildHostWallpaperCss(darkThemes, marker, { liteMode: false });
+  assert.doesNotMatch(darkCss, /overflow:\s*clip/, 'sticky containers must not force overflow:clip');
+  assert.match(darkCss, /clip-path:\s*inset\(16px\)\s*!important/, 'blurred sticky ::before must clip blur bleed via clip-path');
+  assert.match(darkCss, /html\.light[\s\S]*?--agy-host-canvas-bg:/);
+  assert.match(darkCss, /html\.light[\s\S]*?--agy-host-sidebar-bg:/);
+  assert.match(darkCss, /html\.light[\s\S]*?--agy-host-sticky-sidebar-veil:/);
+
+  const lightCss = buildHostWallpaperCss(lightThemes, marker, { liteMode: false });
+  assert.doesNotMatch(lightCss, /overflow:\s*clip/);
+  assert.match(lightCss, /html\.dark[\s\S]*?--agy-host-canvas-bg:/);
+});
+
+test('hud_injector: layer engine skips oversized sidebar sticky nodes and project-header/tree containers', () => {
+  const scriptSrc = buildNativeWallpaperEngineScript();
+  const styleEl = { id: 'agy-monitor-cdp-theme', textContent: '', parentNode: null };
+  const headEl = { appendChild(el) { el.parentNode = headEl; } };
+
+  function makeFakeNode({ rect, classes = '', inSidebar = true, hasProjectChild = false }) {
+    const attrs = new Map();
+    return {
+      nodeType: 1,
+      tagName: 'DIV',
+      className: classes,
+      style: {},
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 220, height: 40, ...rect }),
+      closest: (sel) => {
+        if (sel.includes('navigation') || sel.includes('sidebar')) return inSidebar ? {} : null;
+        return null;
+      },
+      querySelector: (sel) => {
+        if (hasProjectChild && sel.includes('project-header')) return {};
+        return null;
+      },
+      getAttribute: (k) => (attrs.has(k) ? attrs.get(k) : null),
+      setAttribute: (k, v) => attrs.set(k, String(v)),
+      removeAttribute: (k) => attrs.delete(k),
+      matches: () => false,
+    };
+  }
+
+  const tallSidebarSticky = makeFakeNode({ rect: { height: 140 }, classes: 'sticky top-0' });
+  const projectListSticky = makeFakeNode({ rect: { height: 52 }, classes: 'sticky top-0', hasProjectChild: true });
+  const compactSidebarHeader = makeFakeNode({ rect: { height: 40 }, classes: 'sticky top-0' });
+
+  const fakeDoc = {
+    hidden: false,
+    head: headEl,
+    body: { tagName: 'BODY' },
+    documentElement: headEl,
+    getElementById: (id) => (id === styleEl.id && styleEl.parentNode ? styleEl : null),
+    createElement: () => styleEl,
+    elementsFromPoint: () => [tallSidebarSticky, projectListSticky, compactSidebarHeader],
+    querySelectorAll: (sel) => {
+      if (sel.includes('sticky')) return [tallSidebarSticky, projectListSticky, compactSidebarHeader];
+      return [];
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  class FakeMutationObserver {
+    observe() {}
+    disconnect() {}
+  }
+
+  const fakeWin = {
+    innerWidth: 1280,
+    innerHeight: 800,
+    document: fakeDoc,
+    MutationObserver: FakeMutationObserver,
+    Set,
+    Math,
+    Date,
+    getComputedStyle: () => ({
+      position: 'sticky',
+      backgroundColor: 'rgb(20, 22, 30)',
+      display: 'block',
+      visibility: 'visible',
+      opacity: '1',
+      zIndex: '10',
+    }),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    setInterval: () => 1,
+    clearInterval: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+  fakeWin.window = fakeWin;
+  vm.createContext(fakeWin);
+  vm.runInContext(scriptSrc, fakeWin);
+  fakeWin.__agyMonitorWallpaper.apply('html { color: #fff; }');
+
+  assert.equal(tallSidebarSticky.getAttribute('data-agy-mon-layer'), null, 'tall sidebar sticky node must be skipped');
+  assert.equal(projectListSticky.getAttribute('data-agy-mon-layer'), null, 'sidebar sticky containing project-header must be skipped');
+  assert.equal(compactSidebarHeader.getAttribute('data-agy-mon-layer'), 'sticky-sidebar', 'compact sidebar sticky header should still be tagged');
+  fakeWin.__agyMonLayerEngine.stop();
+});
+
+test('hud_injector: main hook goes dormant immediately when plugin.json is absent', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-dormant-'));
+  try {
+    const emptyPluginRoot = path.join(tmpDir, 'missing-plugin');
+    const dataDir = path.join(tmpDir, 'data');
+    fs.mkdirSync(dataDir, { recursive: true });
+    const statusFile = path.join(dataDir, 'native_hud_status.json');
+    fs.writeFileSync(statusFile, JSON.stringify({ version: NATIVE_HUD_VERSION, pid: 1 }), 'utf8');
+    fs.writeFileSync(
+      path.join(dataDir, 'user_prefs.json'),
+      JSON.stringify({ proxy: { enabled: true, url: 'http://127.0.0.1:7897', forceHttp1: true } }),
+      'utf8',
+    );
+
+    let appendSwitchCalls = 0;
+    const fakeEnv = {
+      AGY_MONITOR_PLUGIN_ROOT: emptyPluginRoot,
+      AGY_MONITOR_PLUGIN_DATA_DIR: dataDir,
+    };
+    const fakeModule = { exports: {} };
+    const fakeRequire = (name) => {
+      if (name === 'fs') return fs;
+      if (name === 'os') return os;
+      if (name === 'path') return path;
+      if (name === 'child_process') return { execFileSync: () => '' };
+      if (name === 'electron') {
+        return {
+          app: {
+            isReady: () => false,
+            commandLine: {
+              hasSwitch: () => false,
+              appendSwitch: () => { appendSwitchCalls += 1; },
+            },
+            on: () => {},
+            whenReady: () => Promise.resolve(),
+          },
+        };
+      }
+      throw new Error(`unexpected require: ${name}`);
+    };
+
+    const ctx = {
+      globalThis: {},
+      process: { env: fakeEnv, platform: process.platform, pid: process.pid },
+      module: fakeModule,
+      require: fakeRequire,
+      URL,
+      Set,
+      Map,
+      Date,
+      Math,
+      Number,
+      Boolean,
+      String,
+      Array,
+      Object,
+      RegExp,
+      JSON,
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+    };
+    ctx.globalThis = ctx;
+    vm.createContext(ctx);
+    vm.runInContext(buildMainHookScript(), ctx);
+
+    assert.equal(fakeModule.exports.dormant, true);
+    assert.equal(appendSwitchCalls, 0, 'dormant hook must not touch Electron commandLine');
+    assert.equal(fakeEnv.HTTP_PROXY, undefined, 'dormant hook must not inject proxy env vars');
+    assert.equal(fs.existsSync(statusFile), false, 'dormant hook must clear stale status heartbeat');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('hud_injector: defers live outdated app.asar rewrite, never creates .agy_stale on lock, and restores synchronously', async () => {
+  clearHudInjectorCaches();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-safe-write-'));
+  const origOpen = fsp.open;
+  try {
+    const asarPath = path.join(tmpDir, 'app.asar');
+    const stockAsar = buildSyntheticAsar({
+      'package.json': JSON.stringify({ name: 'antigravity', version: '2.38.0', main: 'dist/main.js' }),
+      'dist/main.js': '"use strict";\nconsole.log("stock main 2.38.0");\n',
+    });
+    // Build an outdated patched ASAR (version 2.1.0)
+    const outdatedAsar = repackAsarInMemory(
+      stockAsar,
+      new Map([
+        ['dist/main.js', Buffer.from('"use strict";\ntry { require("./agy-monitor-hud-main"); } catch {}\nconsole.log("stock main 2.38.0");\n', 'utf8')],
+        ['dist/agy-monitor-hud-main.js', Buffer.from('// old hook\n', 'utf8')],
+        ['dist/agy-monitor-hud.meta.json', Buffer.from(JSON.stringify({ version: '2.1.0', appVersion: '2.38.0' }), 'utf8')],
+      ]),
+      new Set(),
+    );
+    fs.writeFileSync(asarPath, outdatedAsar);
+
+    const paths = resolvePaths({
+      appDataDir: path.join(tmpDir, 'appdata'),
+      geminiConfigDir: path.join(tmpDir, 'config'),
+      hostAsarPath: asarPath,
+      devToolsActivePortFile: path.join(tmpDir, 'missing_dt'),
+    });
+    fs.mkdirSync(paths.pluginDataDir, { recursive: true });
+    fs.writeFileSync(
+      paths.nativeHudStatusFile,
+      JSON.stringify({ version: '2.1.0', pid: process.pid, mountedCount: 1, updatedAtMs: Date.now() }),
+      'utf8',
+    );
+
+    // 1. Background auto-reinject (force: false) defers when live hook PID is running
+    const deferred = await installNativeHud(paths);
+    assert.equal(deferred.ok, false);
+    assert.equal(deferred.diskWritten, false);
+    assert.equal(deferred.deferredWhileRunning, true);
+    assert.equal(deferred.pendingRestart, true);
+    assert.equal((await inspectNativeHudState(paths)).installedVersion, '2.1.0');
+    assert.equal(fs.existsSync(`${asarPath}.agy_stale`), false);
+
+    // 2. writeAsarSafely fails cleanly on EBUSY lock without creating .agy_stale or corrupting target
+    fsp.open = async (p, flags) => {
+      if (p === asarPath && flags === 'r+') {
+        const err = new Error('EBUSY: resource busy or locked');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return origOpen.call(fsp, p, flags);
+    };
+    const lockedRes = await writeAsarSafely(asarPath, stockAsar);
+    fsp.open = origOpen;
+    assert.equal(lockedRes.ok, false);
+    assert.equal(lockedRes.locked, true);
+    assert.equal(fs.existsSync(`${asarPath}.agy_stale`), false);
+    assert.equal(fs.readFileSync(asarPath).equals(outdatedAsar), true);
+
+    // 3. Explicit force install upgrades atomically when unlocked and cleans any stale leftover
+    fs.writeFileSync(`${asarPath}.agy_stale`, Buffer.from('legacy stale'));
+    const forced = await installNativeHud(paths, { force: true });
+    assert.equal(forced.ok, true);
+    assert.equal(forced.diskWritten, true);
+    assert.equal(forced.writeMethod, 'atomic_replace');
+    assert.equal(forced.status.state, 'installed');
+    assert.equal(fs.existsSync(`${asarPath}.agy_stale`), false);
+
+    // 4. Synchronous stock restore brings app.asar cleanly back to stock
+    const syncRestored = restoreStockAsarSync(paths);
+    assert.equal(syncRestored.ok, true);
+    assert.equal(syncRestored.diskWritten, true);
+    const afterSync = await inspectNativeHudState(paths);
+    assert.equal(afterSync.state, 'stock');
+    assert.equal(afterSync.appVersion, '2.38.0');
+  } finally {
+    fsp.open = origOpen;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

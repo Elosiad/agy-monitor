@@ -81,7 +81,7 @@ namespace AgyAccountTool
             {
                 if (cmd == "--version")
                 {
-                    WriteJson(new Dictionary<string, object> { { "ok", true }, { "version", "2.0.0" } });
+                    WriteJson(new Dictionary<string, object> { { "ok", true }, { "version", "2.1.0" } });
                     return 0;
                 }
                 if (cmd == "--cred-read")
@@ -113,6 +113,15 @@ namespace AgyAccountTool
                         return 2;
                     }
                     return HandleSwitchDaemon(args[1]);
+                }
+                if (cmd == "--apply-switch-tx")
+                {
+                    if (args.Length < 2 || string.IsNullOrEmpty(args[1]))
+                    {
+                        WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", "missing txPath" } });
+                        return 2;
+                    }
+                    return HandleApplySwitchTx(args[1]);
                 }
 
                 WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", "unknown command: " + cmd } });
@@ -1096,6 +1105,159 @@ namespace AgyAccountTool
 
                 // Always bring Antigravity back up even on failure so the user is never stranded
                 try { RelaunchAntigravity(antigravityExe, launchArgs, workDir); } catch { }
+                return 1;
+            }
+        }
+
+        // Pure atomic credential-apply mode invoked by static Node switch_worker.mjs AFTER host exit.
+        // Handles DPAPI decrypt, encrypted pre-switch backup, CredWriteW + read-back verify,
+        // Cockpit dual-writes, and automatic rollback on failure — with zero process kill/relaunch.
+        private static int HandleApplySwitchTx(string txPath)
+        {
+            JavaScriptSerializer ser = CreateSerializer();
+            Dictionary<string, object> tx;
+            try
+            {
+                string txRaw = File.ReadAllText(txPath, new UTF8Encoding(false));
+                tx = ser.Deserialize<Dictionary<string, object>>(txRaw);
+            }
+            catch (Exception ex)
+            {
+                WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", "Failed to read tx: " + ex.Message } });
+                return 2;
+            }
+            if (tx == null)
+            {
+                WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", "Invalid tx JSON" } });
+                return 2;
+            }
+
+            string mode = GetString(tx, "mode", "switch");
+            string roamingDir = GetString(tx, "roamingDir", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Antigravity"));
+            string geminiDir = GetGeminiDir(GetString(tx, "geminiDir", null));
+            string payloadFile = GetString(tx, "payloadFile", "");
+            string backupFile = GetString(tx, "backupFile", "");
+            string targetEmail = (GetString(tx, "targetEmail", "") ?? "").Trim().ToLowerInvariant();
+            Dictionary<string, object> preSwitchSnapshot = null;
+
+            try
+            {
+                preSwitchSnapshot = CaptureLiveHostSnapshot(roamingDir, geminiDir);
+                if (!string.IsNullOrEmpty(backupFile))
+                {
+                    try
+                    {
+                        byte[] snapBytes = Encoding.UTF8.GetBytes(ser.Serialize(preSwitchSnapshot));
+                        byte[] cipher = ProtectedData.Protect(snapBytes, DpapiEntropy, DataProtectionScope.CurrentUser);
+                        AtomicWriteUtf8(backupFile, Convert.ToBase64String(cipher));
+                    }
+                    catch { }
+                }
+
+                string fallbackPath = GetDesktopFallbackPath(geminiDir);
+                string cliSessionPath = GetInitializedCliSessionPath(geminiDir);
+
+                if (mode == "rollback")
+                {
+                    string restoreFrom = GetString(tx, "restoreBackupFile", "");
+                    if (string.IsNullOrEmpty(restoreFrom) || !File.Exists(restoreFrom))
+                    {
+                        throw new Exception("Backup snapshot file not found");
+                    }
+                    string b64 = File.ReadAllText(restoreFrom, new UTF8Encoding(false)).Trim();
+                    byte[] plain = ProtectedData.Unprotect(Convert.FromBase64String(b64), DpapiEntropy, DataProtectionScope.CurrentUser);
+                    Dictionary<string, object> snap = ser.Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(plain));
+                    if (snap == null)
+                    {
+                        throw new Exception("Invalid backup snapshot");
+                    }
+                    RestoreSnapshot(roamingDir, geminiDir, snap);
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(payloadFile) || !File.Exists(payloadFile))
+                    {
+                        throw new Exception("Missing encrypted switch payload");
+                    }
+                    string cipherText = File.ReadAllText(payloadFile, new UTF8Encoding(false)).Trim();
+                    byte[] plainBytes = ProtectedData.Unprotect(Convert.FromBase64String(cipherText), DpapiEntropy, DataProtectionScope.CurrentUser);
+                    Dictionary<string, object> payload = ser.Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(plainBytes));
+                    if (payload == null)
+                    {
+                        throw new Exception("Invalid decrypted switch payload");
+                    }
+
+                    string credTarget = GetString(payload, "credTarget", "gemini:antigravity");
+                    string credUserName = GetString(payload, "credUserName", "antigravity");
+                    int credPersist = GetInt(payload, "credPersist", CRED_PERSIST_LOCAL_MACHINE);
+                    string credJson = GetString(payload, "credJson", "");
+                    if (string.IsNullOrEmpty(credJson))
+                    {
+                        throw new Exception("Target credential JSON is empty");
+                    }
+
+                    // Anti-cross-account check on decrypted payload right before CredWriteW
+                    if (!string.IsNullOrEmpty(targetEmail))
+                    {
+                        try
+                        {
+                            Dictionary<string, object> parsedCred = ser.Deserialize<Dictionary<string, object>>(credJson);
+                            string embeddedEmail = (GetString(parsedCred, "id_token_email", "") ?? "").Trim().ToLowerInvariant();
+                            if (!string.IsNullOrEmpty(embeddedEmail) && embeddedEmail != targetEmail)
+                            {
+                                throw new Exception("CREDENTIAL_MISMATCH: payload email " + embeddedEmail + " != " + targetEmail);
+                            }
+                        }
+                        catch (Exception emailEx)
+                        {
+                            if (emailEx.Message != null && emailEx.Message.StartsWith("CREDENTIAL_MISMATCH:"))
+                            {
+                                throw;
+                            }
+                        }
+                    }
+
+                    byte[] credBlob = new UTF8Encoding(false).GetBytes(credJson);
+                    string writeErr;
+                    bool written = WriteCredentialInternal(credTarget, credUserName, credPersist, credBlob, out writeErr);
+                    if (!written)
+                    {
+                        throw new Exception(writeErr ?? ("CredWriteW failed: Win32=" + Marshal.GetLastWin32Error()));
+                    }
+
+                    Dictionary<string, object> verify = ReadSystemCredentialInternal(credTarget);
+                    string verifyB64 = GetString(verify, "blobBase64", "");
+                    if (!Convert.ToBoolean(verify["found"]) || verifyB64 != Convert.ToBase64String(credBlob))
+                    {
+                        throw new Exception("Credential read-back verification mismatch");
+                    }
+                    tx["verifiedCredBytes"] = credBlob.Length;
+
+                    AtomicWriteUtf8(fallbackPath, credJson);
+                    tx["desktopFallbackSynced"] = true;
+
+                    if (!string.IsNullOrEmpty(cliSessionPath))
+                    {
+                        AtomicWriteUtf8(cliSessionPath, credJson);
+                        tx["cliSessionSynced"] = true;
+                    }
+                }
+
+                UpdateTxFile(txPath, tx, "applied", null);
+                WriteJson(new Dictionary<string, object> { { "ok", true }, { "mode", mode } });
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    if (preSwitchSnapshot != null)
+                    {
+                        RestoreSnapshot(roamingDir, geminiDir, preSwitchSnapshot);
+                    }
+                }
+                catch { }
+                WriteJson(new Dictionary<string, object> { { "ok", false }, { "error", ex.Message } });
                 return 1;
             }
         }

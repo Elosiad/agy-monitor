@@ -2408,7 +2408,7 @@ export function createThemeStudio({
             };
             renderBackdropCompanion();
           }
-          if (res?.cdp?.connected) {
+          if (res?.cdp?.connected || res?.nativeHud?.hookAlive || res?.nativeHud?.alive) {
             onToast?.(
               tr("theme.languageSaved", "已切换 Antigravity 宿主界面为：{lang}", "Switched Antigravity host UI language to: {lang}", {
                 lang: langLabel,
@@ -2419,8 +2419,8 @@ export function createThemeStudio({
             onToast?.(
               tr(
                 "theme.languageSavedWaitCdp",
-                "已保存宿主语言为「{lang}」（使用方案二 CDP 启动 Antigravity 后自动生效）",
-                "Saved host language \"{lang}\" (auto-applies once Antigravity runs with CDP Mode 2)",
+                "已保存主窗口语言为「{lang}」（启用原生注入或 CDP 后自动生效）",
+                "Saved host language \"{lang}\" (auto-applies with native injection or CDP)",
                 { lang: langLabel }
               ),
               "info"

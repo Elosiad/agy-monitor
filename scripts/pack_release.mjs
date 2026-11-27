@@ -23,6 +23,7 @@ const RELEASE_ROOT_FILES = [
   'mcp_config.json',
   'README.md',
   'LICENSE',
+  'THIRD_PARTY_NOTICES.md',
   'install.cmd',
   'uninstall.cmd',
   'install.sh',

@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { atomicWriteBuffer, atomicWriteJson } from './paths.mjs';
+import { DEFAULT_PROXY_CONFIG, normalizeProxyConfig } from './proxy_manager.mjs';
 
 export const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 export const VALID_LANGUAGES = new Set(['zh-CN', 'en']);
@@ -156,6 +157,12 @@ function defaultPrefs() {
     followLatestSession: true,
     quotaQueryEnabled: true,
     liteMode: false,
+    boost: {
+      batchOps: false,
+      compactOutput: false,
+      outlineFirst: false,
+    },
+    proxy: { ...DEFAULT_PROXY_CONFIG },
     memoryGuard: {
       autoTrimEnabled: true,
       thresholdMb: 1800,
@@ -525,6 +532,15 @@ export function createStorage(paths) {
       };
     }
 
+    const rawBoost = raw.boost && typeof raw.boost === 'object' ? raw.boost : {};
+    const boost = {
+      batchOps: rawBoost.batchOps === true,
+      compactOutput: rawBoost.compactOutput === true,
+      outlineFirst: rawBoost.outlineFirst === true,
+    };
+
+    const proxy = normalizeProxyConfig(raw.proxy);
+
     const rawGuard = raw.memoryGuard && typeof raw.memoryGuard === 'object' ? raw.memoryGuard : {};
     const memoryGuard = {
       autoTrimEnabled:
@@ -557,6 +573,8 @@ export function createStorage(paths) {
         typeof raw.liteMode === 'boolean'
           ? raw.liteMode
           : base.liteMode,
+      boost,
+      proxy,
       memoryGuard,
     };
   }
@@ -843,11 +861,21 @@ export function createStorage(paths) {
           patch.memoryGuard && typeof patch.memoryGuard === 'object'
             ? { ...current.memoryGuard, ...patch.memoryGuard }
             : current.memoryGuard;
+        const mergedBoost =
+          patch.boost && typeof patch.boost === 'object'
+            ? { ...current.boost, ...patch.boost }
+            : current.boost;
+        const mergedProxy =
+          patch.proxy && typeof patch.proxy === 'object'
+            ? { ...current.proxy, ...patch.proxy }
+            : current.proxy;
         const next = normalizePrefs({
           ...current,
           ...patch,
           windowCap: resolvedCap,
           contextWindowCap: resolvedCap,
+          boost: mergedBoost,
+          proxy: mergedProxy,
           memoryGuard: mergedGuard,
         });
         await atomicWriteJson(paths.userPrefsFile, next);

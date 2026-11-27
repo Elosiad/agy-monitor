@@ -19,7 +19,17 @@ import {
   buildHostThemeSeedsPreview,
   inspectMarkdownSecurity,
   listKnownModels,
+  syncBoostRules,
 } from './backend/config_sync.mjs';
+import { normalizeBoostConfig } from './backend/boost_tools.mjs';
+import {
+  inspectProxyRuntimeStatus,
+  normalizeProxyBypass,
+  normalizeProxyConfig,
+  normalizeProxyUrl,
+  probeProxyConnectivity,
+  resolveEffectiveProxySpec,
+} from './backend/proxy_manager.mjs';
 import {
   controlBackdropCompanion,
   ensureBackdropAssets,
@@ -1512,6 +1522,145 @@ export function createMonitorHandlers({
     };
   });
 
+  register('POST', '/api/preferences/boost', async (data = {}) => {
+    const current = await store.getPrefs();
+    let patch;
+    if (typeof data.all === 'boolean') {
+      patch = {
+        batchOps: data.all,
+        compactOutput: data.all,
+        outlineFirst: data.all,
+      };
+    } else {
+      const src = data.boost && typeof data.boost === 'object' ? data.boost : data;
+      patch = { ...normalizeBoostConfig(current.boost) };
+      for (const k of ['batchOps', 'compactOutput', 'outlineFirst']) {
+        if (typeof src[k] === 'boolean') {
+          patch[k] = src[k];
+        }
+      }
+    }
+    const updatedPrefs = await store.updatePrefs({ boost: patch });
+    const rulesRes = await syncBoostRules(resolvedPaths, updatedPrefs.boost).catch(() => ({
+      ok: false,
+      tokens: 0,
+    }));
+    return {
+      ok: true,
+      boost: updatedPrefs.boost,
+      rulesSynced: Boolean(rulesRes?.ok),
+      rulesTokens: Number(rulesRes?.tokens || 0),
+    };
+  });
+
+  register('POST', '/api/preferences/proxy', async (data = {}) => {
+    const current = await store.getPrefs();
+    const curProxy = normalizeProxyConfig(current.proxy);
+    const src = data.proxy && typeof data.proxy === 'object' ? data.proxy : data;
+
+    let nextUrl = curProxy.url;
+    if (src.url !== undefined) {
+      const check = normalizeProxyUrl(src.url);
+      if (!check.ok) {
+        return errorResponse(ResponseCtor, 400, check.error || '代理地址格式无效');
+      }
+      nextUrl = check.url;
+    }
+
+    const nextEnabled = typeof src.enabled === 'boolean' ? src.enabled : curProxy.enabled;
+    const nextForceHttp1 = typeof src.forceHttp1 === 'boolean' ? src.forceHttp1 : curProxy.forceHttp1;
+    const nextBypass = src.bypass !== undefined ? normalizeProxyBypass(src.bypass) : curProxy.bypass;
+
+    const updatedPrefs = await store.updatePrefs({
+      proxy: {
+        enabled: nextEnabled,
+        mode: nextUrl ? 'custom' : 'auto',
+        url: nextUrl,
+        bypass: nextBypass,
+        forceHttp1: nextForceHttp1,
+      },
+    });
+
+    let nativeHud = await inspectNativeHudState(resolvedPaths).catch(() => null);
+    if (
+      updatedPrefs.proxy?.enabled &&
+      nativeHud &&
+      nativeHud.supported &&
+      nativeHud.asarExists &&
+      (nativeHud.state === 'stock' || nativeHud.state === 'outdated')
+    ) {
+      const themes = await store.getThemes().catch(() => ({}));
+      if (themes.hudAutoReinject !== false) {
+        const liteMode = Boolean(updatedPrefs.liteMode);
+        const inst = await installNativeHud(resolvedPaths, {
+          liteMode,
+          themes: { ...themes, liteMode },
+        }).catch(() => null);
+        if (inst?.status) {
+          nativeHud = inst.status;
+        }
+      }
+    }
+
+    const proxyStatus = inspectProxyRuntimeStatus(
+      updatedPrefs.proxy,
+      nativeHud?.heartbeat || readNativeHudHeartbeat(resolvedPaths),
+      { fresh: true, asarState: nativeHud?.state || '' },
+    );
+
+    return {
+      ok: true,
+      proxy: updatedPrefs.proxy,
+      proxyStatus,
+    };
+  });
+
+  register('POST', '/api/proxy/test', async (data = {}) => {
+    const rawUrl = typeof data.url === 'string' ? data.url.trim() : '';
+    let targetUrl = '';
+    if (rawUrl) {
+      const check = normalizeProxyUrl(rawUrl);
+      if (!check.ok) {
+        return errorResponse(ResponseCtor, 400, check.error || '代理地址格式无效');
+      }
+      targetUrl = check.url;
+    } else {
+      const prefs = await store.getPrefs();
+      const effective = resolveEffectiveProxySpec(
+        { ...normalizeProxyConfig(prefs.proxy), enabled: true },
+        { fresh: true },
+      );
+      targetUrl = effective.url;
+    }
+
+    if (!targetUrl) {
+      return {
+        ok: false,
+        reachable: false,
+        tunnelOk: false,
+        latencyMs: 0,
+        url: '',
+        error: '未填自定义地址且未检测到已开启的系统代理（当前为直连）',
+      };
+    }
+
+    const timeoutMs = Number.isFinite(Number(data.timeoutMs)) ? Number(data.timeoutMs) : 4500;
+    const targetHost =
+      typeof data.targetHost === 'string' && data.targetHost.trim()
+        ? data.targetHost.trim().slice(0, 160)
+        : undefined;
+    const targetPort =
+      Number.isInteger(Number(data.targetPort)) && Number(data.targetPort) >= 1 && Number(data.targetPort) <= 65535
+        ? Number(data.targetPort)
+        : undefined;
+
+    return probeProxyConnectivity(targetUrl, {
+      timeoutMs,
+      ...(targetHost ? { targetHost } : {}),
+      ...(targetPort ? { targetPort } : {}),
+    });
+  });
+
   register('POST', '/api/quota/statusline/install', async () => {
     const res = await installOfficialStatusLineHook(resolvedPaths);
     if (!res.ok) {
@@ -1594,12 +1743,22 @@ export function createMonitorHandlers({
             statusLine: inspectOfficialStatusLine(resolvedPaths),
           };
 
+    const proxy = normalizeProxyConfig(prefs.proxy);
+    const proxyStatus = inspectProxyRuntimeStatus(
+      proxy,
+      nativeHud?.heartbeat || readNativeHudHeartbeat(resolvedPaths),
+      { asarState: nativeHud?.state || '' },
+    );
+
     return {
       language: prefs.language,
       windowCap: prefs.windowCap,
       activePromptId: prefs.activePromptId,
       quotaQueryEnabled,
       liteMode: Boolean(prefs.liteMode),
+      boost: normalizeBoostConfig(prefs.boost),
+      proxy,
+      proxyStatus,
       quotaCompliance,
       prompts: [...BUILTIN_PRESETS, ...customPresets],
       themeState: {
@@ -1625,7 +1784,8 @@ export function createMonitorHandlers({
       return errorResponse(ResponseCtor, 404, '未找到指定的系统规则预设');
     }
 
-    const applied = await applyRulesPreset(resolvedPaths, target);
+    const currentPrefs = await store.getPrefs();
+    const applied = await applyRulesPreset(resolvedPaths, target, { boost: currentPrefs.boost });
     if (!applied.ok || applied.blocked) {
       return {
         ok: false,
@@ -1680,7 +1840,8 @@ export function createMonitorHandlers({
       tokens,
     });
 
-    const applied = await applyRulesPreset(resolvedPaths, saved);
+    const currentPrefs = await store.getPrefs();
+    const applied = await applyRulesPreset(resolvedPaths, saved, { boost: currentPrefs.boost });
     if (!applied.ok || applied.blocked) {
       return {
         ok: false,
@@ -2479,10 +2640,12 @@ export function createMonitorHandlers({
     const themes = await store.getThemes();
     const liteMode = Boolean(updatedPrefs?.liteMode);
     const themesWithLite = { ...themes, liteMode };
+    await stageLiveHudAssets(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
     const cdpStatus = await cdp
       .syncHostLanguage(language, themesWithLite, { liteMode })
       .catch(() => cdp.getStatus(themesWithLite));
-    return { ok: true, language, cdp: cdpStatus };
+    const nativeHud = readNativeHudHeartbeat(resolvedPaths);
+    return { ok: true, language, cdp: cdpStatus, nativeHud };
   });
 
   register('GET', '/api/update/status', async (data = {}) => {
@@ -3152,13 +3315,14 @@ export async function startSidecarServer({
           themes.activeWallpaperId &&
           (themes.hostThemeMode === 'inject' || !themes.hostThemeMode),
       );
+      const wantNativeProxy = prefs.proxy?.enabled !== false;
 
       await stageLiveHudAssets(paths, themesWithLite, { liteMode }).catch(() => {});
-      if (!wantNativeHud && !wantNativeWallpaper) {
+      if (!wantNativeHud && !wantNativeWallpaper && !wantNativeProxy) {
         return;
       }
 
-      if (autoReinject && ((wantNativeHud && mode === 'asar') || wantNativeWallpaper)) {
+      if (autoReinject && ((wantNativeHud && mode === 'asar') || wantNativeWallpaper || wantNativeProxy)) {
         const st = await inspectNativeHudState(paths).catch(() => null);
         if (st && st.supported && st.asarExists && (st.state === 'stock' || st.state === 'outdated')) {
           const now = Date.now();

@@ -17,6 +17,7 @@ import { resolvePaths } from '../backend/paths.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const ERR_PARSE = -32700;
 const ERR_METHOD_NOT_FOUND = -32601;
 const ERR_INVALID_PARAMS = -32602;
 const ERR_INTERNAL = -32603;
