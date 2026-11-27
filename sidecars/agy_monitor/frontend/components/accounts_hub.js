@@ -38,6 +38,71 @@ function getGroupToneClass(groupName) {
   return "is-group-custom";
 }
 
+const ACCOUNT_TIER_OPTIONS = [
+  { value: "", label: "层级" },
+  { value: "free", label: "Free" },
+  { value: "plus", label: "Plus" },
+  { value: "free_pro", label: "Free Pro" },
+  { value: "paid_pro", label: "Paid Pro" },
+  { value: "pro", label: "Pro" },
+  { value: "ultra_5x", label: "Ultra 5x" },
+  { value: "ultra_20x", label: "Ultra 20x" },
+];
+
+const ACCOUNT_TIER_LABELS = {
+  "": "自动",
+  free: "Free",
+  plus: "Plus",
+  free_pro: "Free Pro",
+  paid_pro: "Paid Pro",
+  pro: "Pro",
+  ultra: "Ultra",
+  ultra_5x: "Ultra 5x",
+  ultra_20x: "Ultra 20x",
+};
+
+function normalizeAccTier(raw) {
+  const clean = String(raw ?? "").trim().toLowerCase();
+  if (!clean) return "";
+  if (Object.prototype.hasOwnProperty.call(ACCOUNT_TIER_LABELS, clean)) return clean;
+  const compact = clean.replace(/[\s_-]+/g, " ").trim();
+  if (compact.includes("20x") || /ultra\s*20\b/.test(compact)) return "ultra_20x";
+  if (compact.includes("5x") || /ultra\s*5\b/.test(compact)) return "ultra_5x";
+  if (compact.includes("ultra")) return "ultra";
+  if ((compact.includes("free") || compact.includes("student") || compact.includes("trial")) && compact.includes("pro")) {
+    return "free_pro";
+  }
+  if (compact.includes("paid") && compact.includes("pro")) return "paid_pro";
+  if (compact.includes("plus")) return "plus";
+  if (/\bpro\b/.test(compact) || compact.includes("g1 pro") || compact.includes("teams tier pro")) return "pro";
+  if (compact.includes("free") || compact.includes("standard") || compact.includes("individual")) return "free";
+  return "";
+}
+
+function getTierToneClass(tier) {
+  const t = normalizeAccTier(tier);
+  if (t === "ultra_20x") return "is-tier-ultra20";
+  if (t === "ultra_5x" || t === "ultra") return "is-tier-ultra5";
+  if (t === "paid_pro" || t === "pro") return "is-tier-pro";
+  if (t === "free_pro" || t === "plus") return "is-tier-plus";
+  if (t === "free") return "is-tier-free";
+  return "is-tier-unset";
+}
+
+function resolveAccQuotaWeight(acc) {
+  const t = normalizeAccTier(acc?.tier);
+  const groupLower = normalizeAccGroup(acc?.group).toLowerCase().replace(/[\s_-]+/g, " ");
+  if (t === "ultra_20x") return 20;
+  if (t === "ultra_5x") return 5;
+  if (t === "ultra") return groupLower === "ultra 20x" ? 20 : 5;
+  if (!t) {
+    if (groupLower === "ultra 20x") return 20;
+    if (groupLower === "ultra 5x") return 5;
+    return 1;
+  }
+  return 1;
+}
+
 const SORT_FIELDS = [
   { key: "email", shortLabel: "a-z", label: "a-z（邮箱首字母）" },
   { key: "gemini", shortLabel: "Gemini", label: "Gemini 额度" },
@@ -420,6 +485,7 @@ export function createAccountsHub({
   const renewingAtIds = new Set();
   const togglingIds = new Set();
   const updatingGroupIds = new Set();
+  const updatingTierIds = new Set();
   const openingValidationIds = new Set();
   const openedValidationIds = new Set();
   const copiedValidationIds = new Set();
@@ -635,7 +701,7 @@ export function createAccountsHub({
     }
     if (vaultBadgeEl && vaultTextEl) {
       vaultBadgeEl.classList.toggle("is-unsupported", !state.supported);
-      vaultTextEl.textContent = state.supported ? "DPAPI 加密保护" : "仅支持 Windows";
+      vaultTextEl.textContent = state.supported ? "本地加密" : "仅支持 Windows";
     }
     if (rollbackBtn) {
       rollbackBtn.hidden = !(state.supported && state.backupCount > 0);
@@ -812,6 +878,9 @@ export function createAccountsHub({
         acc?.email || "",
         acc?.remark || "",
         normalizeAccGroup(acc?.group),
+        normalizeAccTier(acc?.tier),
+        acc?.tierSource || "",
+        resolveAccQuotaWeight(acc),
         acc?.enabled !== false,
         Boolean(acc?.isCurrent),
         Number(acc?.lastUsedAtMs || 0),
@@ -840,6 +909,7 @@ export function createAccountsHub({
       renewingAt: [...renewingAtIds].sort(),
       toggling: [...togglingIds].sort(),
       updatingGroup: [...updatingGroupIds].sort(),
+      updatingTier: [...updatingTierIds].sort(),
       openingValidation: [...openingValidationIds].sort(),
       openedValidation: [...openedValidationIds].sort(),
       copiedValidation: [...copiedValidationIds].sort(),
@@ -1022,6 +1092,46 @@ export function createAccountsHub({
         disBadge.textContent = "已禁用";
         idLeft.appendChild(disBadge);
       }
+
+      // Inline account tier badge / selector pill (auto-detected + manual refinement)
+      const accTier = normalizeAccTier(acc.tier);
+      const tierWeight = resolveAccQuotaWeight(acc);
+      const tierSelect = document.createElement("select");
+      tierSelect.className = `acc-tier-select ${getTierToneClass(accTier)}`;
+      tierSelect.setAttribute("aria-label", `设置 ${acc.email} 的账号层级`);
+      const tierSourceText =
+        accTier && acc.tierSource === "manual"
+          ? "手动标注"
+          : accTier
+            ? "自动识别"
+            : "点击标注";
+      const tierRawHint = acc.tierRaw ? ` (${acc.tierRaw})` : "";
+      tierSelect.title = `层级：${ACCOUNT_TIER_LABELS[accTier] || "未标注"}${tierRawHint} · ${tierSourceText} · 计入总容量 ${tierWeight * 100}%`;
+      tierSelect.disabled = updatingTierIds.has(acc.id);
+      const tierOptions =
+        accTier === "ultra"
+          ? [
+              ...ACCOUNT_TIER_OPTIONS.slice(0, 6),
+              { value: "ultra", label: "Ultra" },
+              ...ACCOUNT_TIER_OPTIONS.slice(6),
+            ]
+          : ACCOUNT_TIER_OPTIONS;
+      tierOptions.forEach((item) => {
+        const opt = document.createElement("option");
+        opt.value = item.value;
+        opt.textContent = item.label;
+        if (item.value === accTier) {
+          opt.selected = true;
+        }
+        tierSelect.appendChild(opt);
+      });
+      tierSelect.value = accTier;
+      tierSelect.addEventListener("change", () => {
+        const nextTier = tierSelect.value;
+        if (nextTier === accTier) return;
+        void handleChangeAccountTier(acc, nextTier);
+      });
+      idLeft.appendChild(tierSelect);
 
       // Inline account group selector pill
       const groupSelect = document.createElement("select");
@@ -1238,10 +1348,10 @@ export function createAccountsHub({
         refreshLabel.textContent = isRefreshing ? "刷新中" : "刷新额度";
         refreshBtn.appendChild(refreshLabel);
         refreshBtn.title = acc.isCurrent
-          ? "立即通过官方通道同步当前账号实时额度"
+          ? "刷新当前账号额度"
           : officialActiveOnly
-            ? "官方合规模式：已禁绝直连 cloudcode-pa，未激活账号切入后自动同步官方额度"
-            : "自动续签凭证并实时同步该账号官方额度";
+            ? "切入该账号后自动同步额度"
+            : "刷新该账号额度";
         refreshBtn.addEventListener("click", () => void handleRefreshQuota(acc));
         actionsRow.appendChild(refreshBtn);
       }
@@ -1373,8 +1483,9 @@ export function createAccountsHub({
           : `${groupPrefix}已启用 ${enabledAccounts.length} / ${allAccounts.length} 个账号`;
       summaryMetaEl.textContent = abnormalCount > 0 ? `${baseText} · 异常 ${abnormalCount} 个` : baseText;
     }
+    const totalPoolCapPct = pool.reduce((sum, item) => sum + resolveAccQuotaWeight(item) * 100, 0);
     if (summaryHintEl) {
-      summaryHintEl.textContent = `可用总容量 ${pool.length * 100}%`;
+      summaryHintEl.textContent = `可用总容量 ${totalPoolCapPct}%`;
     }
 
     const aggregateBucket = (groupKey, field) => {
@@ -1405,8 +1516,9 @@ export function createAccountsHub({
         }
 
         if (pct !== null) {
-          sumPct += pct;
-          totalCapPct += 100;
+          const weight = resolveAccQuotaWeight(acc);
+          sumPct += pct * weight;
+          totalCapPct += 100 * weight;
           counted += 1;
         }
       }
@@ -1451,6 +1563,7 @@ export function createAccountsHub({
       enabled: enabledAccounts.length,
       abnormal: abnormalCount,
       pool: pool.length,
+      totalPoolCapPct,
       aggs: aggByKey.map((x) => [x.agg5h, x.aggWeekly]),
     });
     if (!force && summarySig === lastSummaryRenderSig) return;
@@ -1580,7 +1693,7 @@ export function createAccountsHub({
       batchRefreshBtn.disabled = batchRefreshing || batchRenewingAt;
       batchRefreshBtn.classList.toggle("is-spinning", batchRefreshing);
       if (officialActiveOnly) {
-        batchRefreshBtn.title = "官方合规模式：仅通过官方通道刷新当前登录账号额度（不直连 cloudcode-pa 探测未激活账号）";
+        batchRefreshBtn.title = "刷新当前登录账号额度";
       }
     }
     if (batchRefreshLabelEl) {
@@ -2005,6 +2118,29 @@ export function createAccountsHub({
       onToast?.(err?.message || "修改账号分组失败", "error");
     } finally {
       updatingGroupIds.delete(acc.id);
+      renderAll({ force: true });
+    }
+  }
+
+  async function handleChangeAccountTier(acc, nextTier) {
+    if (!acc || !acc.id || updatingTierIds.has(acc.id)) return;
+    updatingTierIds.add(acc.id);
+    try {
+      const res = await requestJson("/api/accounts/tier", {
+        method: "POST",
+        body: JSON.stringify({ accountId: acc.id, tier: nextTier }),
+      });
+      const idx = state.accounts.findIndex((a) => a.id === acc.id);
+      if (idx >= 0 && res.account) {
+        state.accounts[idx] = res.account;
+      }
+      const savedTier = normalizeAccTier(res.account?.tier ?? nextTier);
+      const label = savedTier ? ACCOUNT_TIER_LABELS[savedTier] || savedTier : "自动识别";
+      onToast?.(`已更新 ${acc.email} 层级：${label}`, "success");
+    } catch (err) {
+      onToast?.(err?.message || "修改账号层级失败", "error");
+    } finally {
+      updatingTierIds.delete(acc.id);
       renderAll({ force: true });
     }
   }

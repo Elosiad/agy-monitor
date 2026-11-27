@@ -13,6 +13,16 @@
 
 const BUILTIN_CHANGELOG_ENTRIES = Object.freeze([
   {
+    version: "1.2.1",
+    date: "2026-11-27",
+    title: "新增 macOS 原生透明桌宠伴侣（PR #8 及安全节能加固）、全界面精简整顿 & 账号订阅层级识别与加权总余量",
+    items: [
+      "合入 PR #8（@WhiteNorth）新增 macOS 原生 Swift / AppKit 透明桌面桌宠伴侣（零外部依赖，支持矢量萌宠、单图/GIF、6 轨帧动画、物理拖拽、自主漫步、气泡模板与点击穿透解锁），并顺手完成 5 项安全与节能加固：停止前双校验 flock 与 proc_pidpath 杜绝 PID 复用误杀、移除 NSScreen.screens.first! 强解包防休眠切屏闪退、改用 xcode-select -p 检测 CLT 防未装环境误弹安装框、补齐 GIF 90 帧封顶/ImageIO 缩略图降采样与 6 轨 LRU 懒加载，以及按活跃/睡眠态动态降频与 timer.tolerance 省电。",
+      "全界面 UI 精简整顿：大幅删减各分页偏开发说明的冗余文案与长段落卡片，保留直观易懂的功能提示；收紧「其他」分页选项卡片尺寸与留白，操作更紧凑清爽。",
+      "多账号订阅层级自动识别与加权总余量统计：通过本机官方 GetUserStatus 与 CLI statusLine 自动识别 Free / Free Pro / Paid Pro / Plus / Ultra 5x / Ultra 20x 并在账号卡片支持点击微调；总余量按 Ultra 20x = 2000%、Ultra 5x = 500%、Plus/Pro/Free = 100% 精确加权汇总。",
+    ],
+  },
+  {
     version: "1.2.0",
     date: "2026-11-27",
     title: "全链路内存与显存（RAM/VRAM）深度优化（Issue #7）& 「其他」分页新增可选「轻量省显存模式」",

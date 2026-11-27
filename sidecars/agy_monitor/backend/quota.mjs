@@ -23,6 +23,8 @@ import { atomicWriteJson, atomicWriteText } from './paths.mjs';
 
 const QUOTA_RPC_PATH =
   '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary';
+const USER_STATUS_RPC_PATH =
+  '/exa.language_server_pb.LanguageServerService/GetUserStatus';
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const ALLOWED_LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const DEFAULT_STATUSLINE_MAX_AGE_MS = 180_000;
@@ -570,11 +572,71 @@ export async function uninstallOfficialStatusLineHook(paths = {}) {
 }
 
 /**
- * Perform the local Connect-RPC HTTP(S) call to Antigravity Language Server.
+ * Extract subscription tier metadata from official local Language Server
+ * `GetUserStatus` payload. Prefers `userTier` over `planInfo.planName` because
+ * `planInfo.planName` often falls back to generic "Pro" even on Ultra plans.
  */
-export function callRetrieveUserQuotaSummary({
+export function extractTierFromUserStatus(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const userStatus =
+    payload.userStatus && typeof payload.userStatus === 'object'
+      ? payload.userStatus
+      : payload.user_status && typeof payload.user_status === 'object'
+        ? payload.user_status
+        : payload;
+  const userTier =
+    userStatus?.userTier && typeof userStatus.userTier === 'object'
+      ? userStatus.userTier
+      : userStatus?.user_tier && typeof userStatus.user_tier === 'object'
+        ? userStatus.user_tier
+        : null;
+  const planStatus =
+    userStatus?.planStatus && typeof userStatus.planStatus === 'object'
+      ? userStatus.planStatus
+      : userStatus?.plan_status && typeof userStatus.plan_status === 'object'
+        ? userStatus.plan_status
+        : null;
+  const planInfo =
+    planStatus?.planInfo && typeof planStatus.planInfo === 'object'
+      ? planStatus.planInfo
+      : planStatus?.plan_info && typeof planStatus.plan_info === 'object'
+        ? planStatus.plan_info
+        : null;
+
+  const pickStr = (...vals) => {
+    for (const v of vals) {
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return '';
+  };
+
+  const rawTierId = pickStr(userTier?.id, planInfo?.tierId, planInfo?.tier_id, planInfo?.teamsTier, planInfo?.teams_tier);
+  const rawTierName = pickStr(
+    userTier?.preferredName,
+    userTier?.preferred_name,
+    userTier?.name,
+    userTier?.description,
+    planInfo?.planDisplayName,
+    planInfo?.plan_display_name,
+    planInfo?.planName,
+    planInfo?.plan_name,
+  );
+  const planTier = rawTierName || rawTierId;
+  if (!planTier) return null;
+  return {
+    planTier,
+    rawTierId,
+    rawTierName: rawTierName || rawTierId,
+  };
+}
+
+/**
+ * Perform a local Connect-RPC HTTP(S) call to Antigravity Language Server.
+ */
+function callLocalLsConnectRpc({
   address,
   csrfToken,
+  rpcPath,
   timeoutMs = 3500,
 } = {}) {
   return new Promise((resolve, reject) => {
@@ -606,7 +668,7 @@ export function callRetrieveUserQuotaSummary({
     const reqOptions = {
       hostname: parsed.hostname,
       port: parsed.port,
-      path: QUOTA_RPC_PATH,
+      path: rpcPath,
       method: 'POST',
       timeout: timeoutMs,
       headers: {
@@ -689,6 +751,32 @@ export function callRetrieveUserQuotaSummary({
   });
 }
 
+export function callRetrieveUserQuotaSummary({
+  address,
+  csrfToken,
+  timeoutMs = 3500,
+} = {}) {
+  return callLocalLsConnectRpc({
+    address,
+    csrfToken,
+    rpcPath: QUOTA_RPC_PATH,
+    timeoutMs,
+  });
+}
+
+export function callGetUserStatus({
+  address,
+  csrfToken,
+  timeoutMs = 2500,
+} = {}) {
+  return callLocalLsConnectRpc({
+    address,
+    csrfToken,
+    rpcPath: USER_STATUS_RPC_PATH,
+    timeoutMs,
+  });
+}
+
 /**
  * Create a cached, coalesced official quota reader bound to the current process env
  * and optional official `statusLine` local snapshot file.
@@ -701,9 +789,18 @@ export function createQuotaClient({
   statusLineMaxAgeMs = DEFAULT_STATUSLINE_MAX_AGE_MS,
   timeoutMs = 3_500,
   fetcher = callRetrieveUserQuotaSummary,
+  userStatusFetcher = undefined,
   isEnabled = null,
   now = () => Date.now(),
 } = {}) {
+  const effectiveUserStatusFetcher =
+    typeof userStatusFetcher === 'function'
+      ? userStatusFetcher
+      : userStatusFetcher === null
+        ? null
+        : fetcher === callRetrieveUserQuotaSummary
+          ? callGetUserStatus
+          : null;
   let cached = null;
   let lastAttemptAtMs = 0;
   let inFlight = null;
@@ -785,6 +882,23 @@ export function createQuotaClient({
       try {
         const raw = await fetcher({ address, csrfToken, timeoutMs });
         const normalized = normalizeQuotaSummary(raw, now(), { source: 'official_local_ls' });
+        if (effectiveUserStatusFetcher) {
+          try {
+            const statusPayload = await effectiveUserStatusFetcher({
+              address,
+              csrfToken,
+              timeoutMs: Math.min(timeoutMs, 2500),
+            });
+            const tierMeta = extractTierFromUserStatus(statusPayload);
+            if (tierMeta?.planTier) {
+              normalized.planTier = tierMeta.planTier;
+              normalized.rawTierName = tierMeta.rawTierName;
+              if (tierMeta.rawTierId) normalized.rawTierId = tierMeta.rawTierId;
+            }
+          } catch {
+            // Optional tier lookup must never fail quota summary
+          }
+        }
         cached = normalized;
         lastSource = 'official_local_ls';
         return normalized;

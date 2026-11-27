@@ -921,42 +921,42 @@ export function createThemeStudio({
       if (!enabled) {
         backdropStatusHint.textContent = tr(
           "backdrop.descAuto",
-          "方案一：在 Antigravity 窗口正后方贴合壁纸并微透主窗（零侵入、无需重启 AGY）。",
-          "Mode 1 renders the active wallpaper behind Antigravity with soft translucency (no restart needed)."
+          "在窗口后方贴合壁纸，无需重启软件。",
+          "Renders wallpaper behind the window without restarting."
         );
       } else if (!hasWp) {
         backdropStatusHint.textContent = tr(
           "backdrop.descNoWallpaper",
-          "请先在上方选择或上传一张壁纸，即可点亮整机背景。",
-          "Select or upload a wallpaper above to light up the whole-window background."
+          "请先在上方选一张壁纸。",
+          "Select or upload a wallpaper above first."
         );
       } else if (isInject) {
         if (nativeWpAlive) {
           backdropStatusHint.textContent = tr(
             "backdrop.descInjectLive",
-            "方案三持久纯 CSS 壁纸已原生激活（v{ver} · 免快捷方式 · 文字 100% 锐利 · 滑块秒级热同步），官方更新后将自动补注。",
-            "Mode 3 persistent pure-CSS wallpaper is live (v{ver} · no shortcut needed · 100% crisp text · instant live sync); auto-reinjects after updates.",
+            "原生壁纸已生效，调节滑块实时同步，更新后自动恢复。",
+            "Native wallpaper active; sliders sync live.",
             { ver: asarVerWp }
           );
         } else if (cdpStyleLive) {
           backdropStatusHint.textContent = tr(
             "backdrop.descInjectHotLive",
-            "当前已通过 CDP 热注入立即生效，且已写入 app.asar（v{ver}）；下次重启 Antigravity 后将完全免快捷方式原生加载。",
-            "Wallpaper is live immediately via CDP hot-inject and persisted into app.asar (v{ver}); next Antigravity restart loads natively with no shortcut.",
+            "壁纸已生效，下次重启后直接自动加载。",
+            "Wallpaper active; auto-loads after next restart.",
             { ver: asarVerWp }
           );
         } else if (asarInstalledWp) {
           backdropStatusHint.textContent = tr(
             "backdrop.descInjectPending",
-            "已将持久壁纸钩子写入 app.asar（v{ver} · 原版已备份）；重启 Antigravity 即可无感加载全窗纯 CSS 壁纸，文字 100% 锐利。",
-            "Persistent wallpaper hook written to app.asar (v{ver} · clean backup saved); restart Antigravity for automatic crisp pure-CSS wallpaper.",
+            "已写入配置并保留备份，重启软件后自动生效。",
+            "Saved with backup; restart to apply.",
             { ver: asarVerWp }
           );
         } else {
           backdropStatusHint.textContent = tr(
             "backdrop.descInjectNeed",
-            "方案三默认持久注入已启用，检测到 app.asar 待补注时将自动写入并保留原版备份（也可在下方点「立即注入 / 补注」或「还原原版」）。",
-            "Mode 3 persistent injection is enabled; watchdog auto-patches app.asar with a clean backup (or use Inject / Restore below)."
+            "已启用原生壁纸，调节上方参数实时生效，随时可一键还原。",
+            "Native wallpaper enabled; adjustable live with one-click restore."
           );
         }
       } else if (isCdp) {
@@ -964,8 +964,8 @@ export function createThemeStudio({
           backdropStatusHint.textContent = isWsl
             ? tr(
                 "backdrop.descCdpConnectedWsl",
-                "方案二已通过 WSL2 跨端通道连通 Windows CDP (:{port} · {mode})：纯 CSS 注入底层壁纸，文字/代码 100% 锐利。",
-                "Mode 2 linked across WSL2 to Windows CDP (:{port} · {mode}): pure-CSS wallpaper keeps text 100% sharp.",
+                "WSL 跨端壁纸已生效，拖动滑块实时调节。",
+                "WSL wallpaper active; sliders sync live.",
                 {
                   port: cdpPort,
                   mode: cdpTransport === "wsl_tunnel" ? "NAT 隧道" : cdpTransport === "wsl_gateway" ? "网关" : "直连",
@@ -973,22 +973,22 @@ export function createThemeStudio({
               )
             : tr(
                 "backdrop.descCdpConnected",
-                "方案二已连通本地 CDP (:{port})：纯 CSS 注入底层壁纸，文字/代码/图标 100% 实心锐利，滑块实时生效。",
-                "Mode 2 linked via localhost CDP (:{port}): pure-CSS wallpaper keeps text & code 100% sharp and syncs live.",
+                "整机壁纸已生效，拖动滑块实时调节。",
+                "Whole-window wallpaper active; sliders sync live.",
                 { port: cdpPort }
               );
         } else {
           backdropStatusHint.textContent = isWsl
             ? tr(
                 "backdrop.descCdpWaitWsl",
-                "WSL2 NAT 模式已内置免转发隧道：在 Windows 端完全退出 AGY 后运行「{path}」（或为 AGY 快捷方式追加 --remote-debugging-port={port}），即可自动连通。",
-                "WSL2 NAT tunnel ready: fully quit AGY on Windows and run \"{path}\" (or append --remote-debugging-port={port} to your AGY shortcut) to connect automatically.",
+                "在 Windows 端退出软件后，运行「{path}」即可生效。",
+                "Quit on Windows and run \"{path}\" to activate.",
                 { path: launcherCmdPath || quickCmd, port: cdpPort }
               )
             : tr(
                 "backdrop.descCdpWait",
-                "方案二需带调试参数启动：完全退出 AGY 后双击无黑窗快捷方式「{path}」（可固定到任务栏，或给原有 AGY 快捷方式目标追加 --remote-debugging-port={port}）。",
-                "Mode 2 requires remote-debugging launch: fully quit AGY, then double-click the console-free shortcut \"{path}\" (or append --remote-debugging-port={port} to your existing AGY shortcut).",
+                "完全退出软件后，双击快捷方式「{path}」启动即可生效。",
+                "Quit and launch via \"{path}\" to activate.",
                 { path: launcherCmdPath || quickCmd, port: cdpPort }
               );
         }
@@ -1095,53 +1095,53 @@ export function createThemeStudio({
       if (!hudEnabled) {
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descDefault",
-          "通过 Shadow DOM 原生挂载到输入框工具栏内，0 漂移、0 遮挡误判、0 UIA 内存；检测到官方更新覆盖或失效时自动补注。",
-          "Mounts via Shadow DOM directly inside the composer toolbar: 0 drift, 0 occlusion bugs, 0 UIA RAM; auto-reinjects after updates."
+          "紧贴输入框显示上下文进度与速率，更新后自动恢复。",
+          "Shows context progress and speed right in the composer."
         );
       } else if (hudMode === "uia") {
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descUia",
-          "当前使用旧版外部 Win32 + UIA 浮窗；如遇飘移或遮挡建议切回「持久化注入」。",
-          "Using legacy Win32 + UIA overlay; switch back to Persistent Inject to eliminate drift/occlusion."
+          "当前为旧版外部浮窗，建议切换为「原生持久」。",
+          "Legacy overlay mode; Persistent mode is recommended."
         );
       } else if (nativeAlive) {
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descNativeLive",
-          "持久化原生 DOM 状态栏已激活（v{ver} · 0 漂移 / 0 UIA 内存），原版备份已留存。",
-          "Persistent native Shadow DOM HUD is live (v{ver} · 0 drift / 0 UIA RAM), clean backup verified.",
+          "原生状态栏已生效，随时可一键还原。",
+          "Native HUD active; one-click restore available.",
           { ver }
         );
       } else if (cdpHudLive) {
         const persistHint =
           hudMode === "asar" && asarInstalled
-            ? "app.asar 已完成持久化，下次正常启动即免快捷方式生效。"
+            ? "重启后将自动原生加载。"
             : hudMode === "asar"
-              ? "检测到 app.asar 待写入，看门狗将自动补注持久化。"
-              : "纯 CDP 模式零修改安装文件。";
+              ? "将自动持久化保存。"
+              : "未改动安装文件。";
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descCdpLive",
-          "当前窗口已通过 CDP 热注入原生 Shadow DOM 状态栏（0 漂移、0 遮挡）；{persistHint}",
-          "Native Shadow DOM HUD is live via CDP hot-inject (0 drift, 0 occlusion); {persistHint}",
+          "状态栏已临时生效；{persistHint}",
+          "HUD is live; {persistHint}",
           { persistHint }
         );
       } else if (hudMode === "asar" && asarInstalled) {
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descPendingRestart",
-          "已将持久化钩子写入 app.asar（v{ver} · 备份已保存），重启 Antigravity 后即自动原生挂载并开放 CDP 通道。",
-          "Persistent hook written to app.asar (v{ver} · backup saved); restart Antigravity for automatic native mounting.",
+          "已写入配置并保留备份，重启软件后生效。",
+          "Saved with backup; restart to apply.",
           { ver }
         );
       } else if (hudMode === "asar") {
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descAsarWait",
-          "默认持久化注入已启用；检测到 app.asar 未注入或已更新，看门狗将自动补注（也可点右侧「立即注入 / 补注」）。",
-          "Persistent injection enabled; watchdog will auto-reinject when stock/updated app.asar is detected."
+          "待自动应用，也可点击右侧「立即应用」。",
+          "Pending auto-apply, or click Apply Now."
         );
       } else {
         nativeHudStatusHint.textContent = tr(
           "nativeHud.descCdpWait",
-          "纯 CDP 模式不修改 app.asar，启动带调试端口的 Antigravity 后自动挂载原生 DOM 状态栏。",
-          "Pure CDP mode keeps app.asar untouched and mounts Shadow DOM HUD once debugging port connects."
+          "使用带调试端口的方式启动软件后自动生效。",
+          "Auto-activates when launched with debug port."
         );
       }
     }

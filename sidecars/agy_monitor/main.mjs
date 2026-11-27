@@ -2652,6 +2652,18 @@ export function createMonitorHandlers({
     }
   });
 
+  register('POST', '/api/accounts/tier', async (data = {}) => {
+    try {
+      const result = await accounts.updateAccountTier(data.accountId, data.tier ?? '');
+      if (!result.ok) {
+        return errorResponse(ResponseCtor, result.status || 400, result.error || '修改账号层级失败');
+      }
+      return result;
+    } catch (err) {
+      return errorResponse(ResponseCtor, err?.status || 500, err);
+    }
+  });
+
   register('POST', '/api/accounts/groups', async (data = {}) => {
     try {
       const result = await accounts.manageAccountGroups({

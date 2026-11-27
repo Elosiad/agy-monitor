@@ -69,6 +69,109 @@ const BUILTIN_ACCOUNT_GROUP_BY_LOWER = new Map(
   BUILTIN_ACCOUNT_GROUPS.map((name) => [name.toLowerCase(), name]),
 );
 
+export const ACCOUNT_TIERS = Object.freeze([
+  'free',
+  'plus',
+  'free_pro',
+  'paid_pro',
+  'pro',
+  'ultra',
+  'ultra_5x',
+  'ultra_20x',
+]);
+const VALID_ACCOUNT_TIERS = new Set(ACCOUNT_TIERS);
+
+export const ACCOUNT_TIER_WEIGHTS = Object.freeze({
+  free: 1,
+  plus: 1,
+  free_pro: 1,
+  paid_pro: 1,
+  pro: 1,
+  ultra: 5,
+  ultra_5x: 5,
+  ultra_20x: 20,
+});
+
+export function normalizeAccountTier(raw) {
+  const clean = String(raw ?? '').trim().toLowerCase();
+  if (!clean) return '';
+  if (VALID_ACCOUNT_TIERS.has(clean)) return clean;
+  const compact = clean.replace(/[\s_-]+/g, ' ').trim();
+  if (
+    compact.includes('20x') ||
+    /ultra\s*20\b/.test(compact)
+  ) {
+    return 'ultra_20x';
+  }
+  if (
+    compact.includes('5x') ||
+    /ultra\s*5\b/.test(compact)
+  ) {
+    return 'ultra_5x';
+  }
+  if (compact.includes('ultra')) return 'ultra';
+  if (
+    (compact.includes('free') || compact.includes('student') || compact.includes('trial')) &&
+    compact.includes('pro')
+  ) {
+    return 'free_pro';
+  }
+  if (compact.includes('paid') && compact.includes('pro')) return 'paid_pro';
+  if (compact.includes('plus')) return 'plus';
+  if (/\bpro\b/.test(compact) || compact.includes('g1 pro') || compact.includes('teams tier pro')) {
+    return 'pro';
+  }
+  if (compact.includes('free') || compact.includes('standard') || compact.includes('individual')) {
+    return 'free';
+  }
+  return '';
+}
+
+export function resolveAccountQuotaWeight(account) {
+  const tier = normalizeAccountTier(account?.tier);
+  const groupLower = String(account?.group || '').trim().toLowerCase().replace(/[\s_-]+/g, ' ');
+  if (tier === 'ultra_20x') return 20;
+  if (tier === 'ultra_5x') return 5;
+  if (tier === 'ultra') {
+    return groupLower === 'ultra 20x' ? 20 : 5;
+  }
+  if (!tier) {
+    if (groupLower === 'ultra 20x') return 20;
+    if (groupLower === 'ultra 5x') return 5;
+    return 1;
+  }
+  return ACCOUNT_TIER_WEIGHTS[tier] || 1;
+}
+
+function applyDetectedTierToAccount(acc, rawTier, rawTierLabel = '') {
+  if (!acc || typeof acc !== 'object') return false;
+  const rawDisplay = String(rawTierLabel || rawTier || '').trim().slice(0, 64);
+  let changed = false;
+  if (rawDisplay && acc.tierRaw !== rawDisplay) {
+    acc.tierRaw = rawDisplay;
+    changed = true;
+  }
+  const detected = normalizeAccountTier(rawTier) || normalizeAccountTier(rawTierLabel);
+  if (!detected) return changed;
+
+  const existingTier = normalizeAccountTier(acc.tier);
+  if (acc.tierSource === 'manual' && existingTier) {
+    return changed;
+  }
+  if ((existingTier === 'ultra_20x' || existingTier === 'ultra_5x') && detected === 'ultra') {
+    return changed;
+  }
+  if ((existingTier === 'free_pro' || existingTier === 'paid_pro') && detected === 'pro') {
+    return changed;
+  }
+  if (acc.tier !== detected || acc.tierSource !== 'auto') {
+    acc.tier = detected;
+    acc.tierSource = 'auto';
+    changed = true;
+  }
+  return changed;
+}
+
 const VALID_AUTO_SWITCH_TARGETS = new Set(['gemini', 'gpt_claude']);
 const VALID_SORT_BY = new Set(['email', 'gemini', 'gpt_claude', 'lastUsed']);
 const VALID_SORT_ORDER = new Set(['asc', 'desc']);
@@ -3419,11 +3522,20 @@ export function parseImportPayload(rawInput, { fallbackEmail = '', fallbackRemar
     const hasExplicitGroup = Boolean(rawItemGroup || cleanFallbackGroup);
     const resolvedGroup = rawItemGroup || cleanFallbackGroup || DEFAULT_ACCOUNT_GROUP;
 
+    const rawItemTier = normalizeAccountTier(item.tier || item.planTier || item.subscriptionTier || '');
+    const itemTierSource = rawItemTier
+      ? item.tierSource === 'manual'
+        ? 'manual'
+        : 'auto'
+      : '';
+
     parsedEntries.push({
       email: finalEmail,
       remark: sanitizeRemark(item.remark ?? item.note ?? (idx === 0 ? cleanFallbackRemark : '')),
       group: resolvedGroup,
       hasExplicitGroup,
+      tier: rawItemTier,
+      tierSource: itemTierSource,
       enabled: item.enabled !== false,
       credTarget: typeof item.credTarget === 'string' && item.credTarget.trim()
         ? item.credTarget.trim()
@@ -3578,9 +3690,22 @@ export function normalizeStoredQuota(rawQuota, nowMs = Date.now()) {
     };
   });
 
+  const planTier =
+    typeof rawQuota.planTier === 'string' && rawQuota.planTier.trim()
+      ? rawQuota.planTier.trim().slice(0, 64)
+      : typeof rawQuota.plan_tier === 'string' && rawQuota.plan_tier.trim()
+        ? rawQuota.plan_tier.trim().slice(0, 64)
+        : '';
+  const rawTierName =
+    typeof rawQuota.rawTierName === 'string' && rawQuota.rawTierName.trim()
+      ? rawQuota.rawTierName.trim().slice(0, 64)
+      : '';
+
   return {
     fetchedAtMs: Number(rawQuota.fetchedAtMs) > 0 ? Number(rawQuota.fetchedAtMs) : nowMs,
     source: rawQuota.source === 'estimated' ? 'estimated' : 'live',
+    ...(planTier ? { planTier } : {}),
+    ...(rawTierName ? { rawTierName } : {}),
     groups,
   };
 }
@@ -4371,6 +4496,11 @@ export function createAccountManager({
       );
       if (!target) return false;
       target.quota = normalized;
+      applyDetectedTierToAccount(
+        target,
+        rawQuotaSummary?.planTier || rawQuotaSummary?.plan_tier || normalized?.planTier || '',
+        rawQuotaSummary?.rawTierName || normalized?.rawTierName || '',
+      );
       target.updatedAtMs = nowMs;
       clearAccountErrorFields(target);
       index.activeAccountId = target.id;
@@ -4407,11 +4537,17 @@ export function createAccountManager({
   function formatPublicAccount(acc, liveEmail, nowMs) {
     const isCurrent = Boolean(liveEmail && sanitizeEmail(acc.email) === liveEmail);
     const accountStatus = buildAccountStatus(acc, nowMs, isCurrent);
+    const tier = normalizeAccountTier(acc.tier);
+    const tierSource = tier ? (acc.tierSource === 'manual' ? 'manual' : 'auto') : '';
     return {
       id: acc.id,
       email: acc.email,
       remark: acc.remark || '',
       group: sanitizeAccountGroup(acc.group, DEFAULT_ACCOUNT_GROUP),
+      tier,
+      tierSource,
+      ...(typeof acc.tierRaw === 'string' && acc.tierRaw.trim() ? { tierRaw: acc.tierRaw.trim() } : {}),
+      quotaWeight: resolveAccountQuotaWeight({ tier, group: acc.group }),
       enabled: acc.enabled !== false,
       authMethod: acc.authMethod || 'oauth',
       source: acc.source || 'capture',
@@ -4567,6 +4703,7 @@ export function createAccountManager({
           ...(credClientId ? { oauthClientId: credClientId } : {}),
           quota: liveQuota,
         };
+        applyDetectedTierToAccount(existing, liveQuota?.planTier || '', liveQuota?.rawTierName || '');
         index.accounts.unshift(existing);
       } else {
         existing.updatedAtMs = ts;
@@ -4577,6 +4714,7 @@ export function createAccountManager({
         if (credClientId) existing.oauthClientId = credClientId;
         existing.hasRefreshToken = Boolean(extractRefreshToken(norm.credObj));
         clearAccountErrorFields(existing);
+        applyDetectedTierToAccount(existing, liveQuota?.planTier || '', liveQuota?.rawTierName || '');
         if (remark && sanitizeRemark(remark)) {
           existing.remark = sanitizeRemark(remark);
         }
@@ -4654,6 +4792,7 @@ export function createAccountManager({
             email: item.email,
             remark: item.remark || '',
             group: sanitizeAccountGroup(item.group, DEFAULT_ACCOUNT_GROUP),
+            ...(item.tier ? { tier: item.tier, tierSource: item.tierSource || 'auto' } : {}),
             enabled: item.enabled !== false,
             authMethod: item.authMethod || 'consumer',
             source: 'import',
@@ -4680,6 +4819,10 @@ export function createAccountManager({
             existing.group = sanitizeAccountGroup(item.group, DEFAULT_ACCOUNT_GROUP);
           } else {
             existing.group = sanitizeAccountGroup(existing.group, DEFAULT_ACCOUNT_GROUP);
+          }
+          if (item.tier && (item.tierSource === 'manual' || !existing.tier)) {
+            existing.tier = item.tier;
+            existing.tierSource = item.tierSource || 'auto';
           }
           if (item.quota && !existing.quota) existing.quota = item.quota;
           updatedCount += 1;
@@ -4772,6 +4915,42 @@ export function createAccountManager({
         account: formatPublicAccount(acc, liveInfo.email, ts),
         groups: index.groups,
         builtinGroups: [...BUILTIN_ACCOUNT_GROUPS],
+      };
+    });
+  }
+
+  async function updateAccountTier(accountId, tier) {
+    const id = String(accountId || '').trim();
+    if (!id) return { ok: false, status: 400, error: 'accountId 不能为空' };
+
+    const rawTier = String(tier ?? '').trim();
+    const nextTier = rawTier ? normalizeAccountTier(rawTier) : '';
+    if (rawTier && !nextTier) {
+      return { ok: false, status: 400, error: `不支持的账号层级：${rawTier}` };
+    }
+
+    const liveInfo = await readLiveEmailSafe();
+    const ts = now();
+
+    return withStoreLock(async () => {
+      const index = await readIndex();
+      const acc = index.accounts.find((a) => a.id === id);
+      if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
+      if (!nextTier) {
+        acc.tier = '';
+        acc.tierSource = '';
+        if (acc.tierRaw) {
+          applyDetectedTierToAccount(acc, acc.tierRaw, acc.tierRaw);
+        }
+      } else {
+        acc.tier = nextTier;
+        acc.tierSource = 'manual';
+      }
+      acc.updatedAtMs = ts;
+      await writeIndex(index);
+      return {
+        ok: true,
+        account: formatPublicAccount(acc, liveInfo.email, ts),
       };
     });
   }
@@ -4887,6 +5066,12 @@ export function createAccountManager({
       email: acc.email,
       remark: acc.remark || '',
       group: sanitizeAccountGroup(acc.group, DEFAULT_ACCOUNT_GROUP),
+      ...(normalizeAccountTier(acc.tier)
+        ? {
+            tier: normalizeAccountTier(acc.tier),
+            tierSource: acc.tierSource === 'manual' ? 'manual' : 'auto',
+          }
+        : {}),
       enabled: acc.enabled !== false,
       credTarget: secret.credTarget || 'gemini:antigravity',
       credUserName: secret.credUserName || 'antigravity',
@@ -4950,6 +5135,7 @@ export function createAccountManager({
           const acc = index.accounts.find((a) => a.id === id);
           if (!acc) return { ok: false, status: 404, error: '目标账号不存在' };
           acc.quota = freshQuota;
+          applyDetectedTierToAccount(acc, freshQuota?.planTier || '', freshQuota?.rawTierName || '');
           acc.updatedAtMs = nowMs;
           clearAccountErrorFields(acc);
           index.activeAccountId = acc.id;
@@ -6402,6 +6588,7 @@ export function createAccountManager({
     toggleAccountEnabled,
     updateAccountRemark,
     updateAccountGroup,
+    updateAccountTier,
     manageAccountGroups,
     deleteAccount,
     exportAccountJson,

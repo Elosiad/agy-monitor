@@ -10,6 +10,7 @@ import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import {
   callRetrieveUserQuotaSummary,
   createQuotaClient,
+  extractTierFromUserStatus,
   inspectOfficialStatusLine,
   installOfficialStatusLineHook,
   normalizeQuotaSummary,
@@ -163,6 +164,7 @@ test('callRetrieveUserQuotaSummary and createQuotaClient handle live HTTP, cachi
     ttlMs: 30_000,
     minForceIntervalMs: 2_500,
     fetcher: callRetrieveUserQuotaSummary,
+    userStatusFetcher: null,
     now: () => fakeNow,
   });
 
@@ -311,4 +313,46 @@ test('official CLI statusLine bridge, priority over local LS RPC, and hard-stop 
   assert.equal(removed.statusLine.configured, false);
   const afterSettings = JSON.parse(fs.readFileSync(paths.antigravityCliSettingsFile, 'utf8'));
   assert.equal(afterSettings.statusLine, undefined);
+});
+
+test('extractTierFromUserStatus prefers userTier over generic planInfo.planName and createQuotaClient attaches tier safely', async () => {
+  const tier = extractTierFromUserStatus({
+    userStatus: {
+      planStatus: { planInfo: { teamsTier: 'TEAMS_TIER_PRO', planName: 'Pro' } },
+      userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra', description: 'Google AI Ultra' },
+    },
+  });
+  assert.equal(tier?.planTier, 'Google AI Ultra');
+  assert.equal(tier?.rawTierId, 'g1-ultra-tier');
+
+  const client = createQuotaClient({
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:19999',
+      ANTIGRAVITY_CSRF_TOKEN: 'csrf-tier',
+    },
+    fetcher: async () => OFFICIAL_SAMPLE_PAYLOAD,
+    userStatusFetcher: async () => ({
+      userStatus: {
+        userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra 20x' },
+      },
+    }),
+  });
+  const res = await client.getQuotaSummary({ force: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.planTier, 'Google AI Ultra 20x');
+
+  // Optional userStatusFetcher errors must never break quota retrieval
+  const resilientClient = createQuotaClient({
+    env: {
+      ANTIGRAVITY_LS_ADDRESS: '127.0.0.1:19999',
+      ANTIGRAVITY_CSRF_TOKEN: 'csrf-tier',
+    },
+    fetcher: async () => OFFICIAL_SAMPLE_PAYLOAD,
+    userStatusFetcher: async () => {
+      throw new Error('GetUserStatus unavailable');
+    },
+  });
+  const okRes = await resilientClient.getQuotaSummary({ force: true });
+  assert.equal(okRes.ok, true);
+  assert.equal(okRes.groups.length, 2);
 });

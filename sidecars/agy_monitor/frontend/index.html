@@ -606,7 +606,7 @@
             <div class="theme-section-header">
               <div class="theme-section-title-group">
                 <span class="theme-section-title" data-i18n="theme.colorTitle">色调</span>
-                <span class="theme-section-sub" data-i18n="theme.colorSub">本面板配色定制与明暗反色适配</span>
+                <span class="theme-section-sub" data-i18n="theme.colorSub">自定义面板配色</span>
               </div>
               <div class="theme-section-actions">
                 <button
@@ -614,7 +614,7 @@
                   id="themeSyncGlobalBtn"
                   type="button"
                   aria-pressed="true"
-                  title="开启后仅监听宿主明暗主题事件（不读写 config.json）"
+                  title="自动跟随窗口深浅主题"
                   data-i18n-title="theme.syncTitle"
                 >
                   <span class="theme-toggle-dot" aria-hidden="true"></span>
@@ -780,17 +780,17 @@
               </div>
 
               <div class="wallpaper-options-row">
-                <span class="theme-sub-label" data-i18n="backdrop.modeLabel">渲染方案</span>
+                <span class="theme-sub-label" data-i18n="backdrop.modeLabel">方案</span>
                 <div class="filter-tab-group" id="hostThemeModeGroup" role="tablist" aria-label="整机美化渲染方案">
-                  <button class="filter-tab" type="button" data-host-mode="backdrop" aria-selected="false" data-i18n="backdrop.modeBackdrop">方案一 · 贴背微透</button>
-                  <button class="filter-tab" type="button" data-host-mode="cdp" aria-selected="false" data-i18n="backdrop.modeCdp">方案二 · CDP 纯CSS</button>
-                  <button class="filter-tab is-active" type="button" data-host-mode="inject" aria-selected="true" data-i18n="backdrop.modeInject">方案三 · 持久注入 (默认)</button>
+                  <button class="filter-tab" type="button" data-host-mode="backdrop" aria-selected="false" data-i18n="backdrop.modeBackdrop">贴背透明</button>
+                  <button class="filter-tab" type="button" data-host-mode="cdp" aria-selected="false" data-i18n="backdrop.modeCdp">调试注入</button>
+                  <button class="filter-tab is-active" type="button" data-host-mode="inject" aria-selected="true" data-i18n="backdrop.modeInject">原生注入 (推荐)</button>
                 </div>
               </div>
 
               <label class="theme-slider-item">
                 <span class="theme-slider-head">
-                  <span id="backdropBlendLabel" data-i18n="backdrop.blendLabelCdp">底层壁纸透出强度（文字 100% 锐利）</span>
+                  <span id="backdropBlendLabel" data-i18n="backdrop.blendLabelCdp">壁纸透出强度</span>
                   <span class="theme-slider-val" id="backdropBlendVal">25%</span>
                 </span>
                 <input class="theme-range" id="backdropBlendInput" type="range" min="5" max="42" value="25" />
@@ -798,7 +798,7 @@
 
               <div class="backdrop-helper-row" id="backdropHelperRow">
                 <span class="backdrop-helper-desc" id="backdropStatusHint" data-i18n="backdrop.descInjectNeed">
-                  方案三默认持久注入已启用，检测到 app.asar 待补注时将自动写入并保留原版备份（也可在下方点「立即注入 / 补注」或「还原原版」）。
+                  已启用原生壁纸，调节上方参数实时生效，随时可一键还原。
                 </span>
                 <button
                   class="theme-pill-btn"
@@ -820,10 +820,10 @@
               />
             </div>
 
-            <div class="backdrop-companion-card" id="nativeHudCard" style="margin-top: 10px;">
+            <div class="backdrop-companion-card" id="nativeHudCard" style="margin-top: 8px;">
               <div class="backdrop-companion-head">
                 <div class="backdrop-title-wrap">
-                  <span class="backdrop-companion-title" data-i18n="nativeHud.title">输入框上下文状态栏</span>
+                  <span class="backdrop-companion-title" data-i18n="nativeHud.title">输入框状态栏</span>
                   <span class="boundary-badge is-scoped" id="nativeHudStatusBadge" data-i18n="nativeHud.statusChecking">检测中</span>
                 </div>
                 <button
@@ -838,17 +838,17 @@
               </div>
 
               <div class="wallpaper-options-row">
-                <span class="theme-sub-label" data-i18n="nativeHud.modeLabel">挂载方式</span>
+                <span class="theme-sub-label" data-i18n="nativeHud.modeLabel">方式</span>
                 <div class="filter-tab-group" id="nativeHudModeGroup" role="tablist" aria-label="状态栏挂载方式">
-                  <button class="filter-tab is-active" type="button" data-hud-mode="asar" aria-selected="true" data-i18n="nativeHud.modeAsar">持久化注入 (默认)</button>
-                  <button class="filter-tab" type="button" data-hud-mode="cdp" aria-selected="false" data-i18n="nativeHud.modeCdp">纯 CDP 热注入</button>
-                  <button class="filter-tab" type="button" data-hud-mode="uia" aria-selected="false" data-i18n="nativeHud.modeUia">旧版 UIA 浮窗</button>
+                  <button class="filter-tab is-active" type="button" data-hud-mode="asar" aria-selected="true" data-i18n="nativeHud.modeAsar">原生持久 (推荐)</button>
+                  <button class="filter-tab" type="button" data-hud-mode="cdp" aria-selected="false" data-i18n="nativeHud.modeCdp">临时热加载</button>
+                  <button class="filter-tab" type="button" data-hud-mode="uia" aria-selected="false" data-i18n="nativeHud.modeUia">旧版浮窗</button>
                 </div>
               </div>
 
               <div class="backdrop-helper-row">
                 <span class="backdrop-helper-desc" id="nativeHudStatusHint" data-i18n="nativeHud.descDefault">
-                  通过 Shadow DOM 原生挂载到输入框工具栏内，0 漂移、0 遮挡误判、0 UIA 内存；检测到官方更新覆盖或失效时自动补注。
+                  紧贴输入框显示上下文进度与速率，更新后自动恢复。
                 </span>
               </div>
 
@@ -860,59 +860,26 @@
                   aria-pressed="true"
                 >
                   <span class="theme-toggle-dot" aria-hidden="true"></span>
-                  <span data-i18n="nativeHud.autoReinjectBtn">失效自动补注</span>
+                  <span data-i18n="nativeHud.autoReinjectBtn">失效自动恢复</span>
                 </button>
                 <div style="display: inline-flex; gap: 6px; flex-wrap: wrap;">
-                  <button class="theme-pill-btn" id="nativeHudInstallBtn" type="button" data-i18n="nativeHud.installBtn">立即注入 / 补注</button>
-                  <button class="theme-pill-btn" id="nativeHudRestoreBtn" type="button" data-i18n="nativeHud.restoreBtn">还原原版</button>
+                  <button class="theme-pill-btn" id="nativeHudInstallBtn" type="button" data-i18n="nativeHud.installBtn">立即应用</button>
+                  <button class="theme-pill-btn" id="nativeHudRestoreBtn" type="button" data-i18n="nativeHud.restoreBtn">还原默认</button>
                 </div>
               </div>
             </div>
           </section>
 
-          <!-- 模块三：语言设置与官方沙箱能力边界说明 -->
-          <section class="theme-section theme-language-section" aria-label="语言设置与能力边界说明">
+          <!-- 模块三：语言设置 -->
+          <section class="theme-section theme-language-section" aria-label="语言设置">
             <div class="theme-section-header">
               <div class="theme-section-title-group">
-                <span class="theme-section-title" data-i18n="theme.languageTitle">宿主界面语言</span>
-                <span class="theme-section-sub" data-i18n="theme.languageSub">仅切换 Antigravity 宿主界面（需 CDP 连通），本控制台固定中文</span>
+                <span class="theme-section-title" data-i18n="theme.languageTitle">主窗口语言</span>
+                <span class="theme-section-sub" data-i18n="theme.languageSub">切换 Antigravity 界面语言</span>
               </div>
               <div class="filter-tab-group" id="languageSelector" role="tablist" aria-label="Antigravity 宿主界面语言">
                 <button class="filter-tab is-active" type="button" role="tab" data-lang="zh-CN" aria-selected="true">简体中文</button>
                 <button class="filter-tab" type="button" role="tab" data-lang="en" aria-selected="false">English</button>
-              </div>
-            </div>
-
-            <div class="host-boundary-card" id="hostBoundaryCard">
-              <div class="boundary-card-title" data-i18n="theme.boundaryTitle">能力范围与官方沙箱边界说明</div>
-              <div class="boundary-list">
-                <div class="boundary-item">
-                  <div class="boundary-item-head">
-                    <span class="boundary-item-name" data-i18n="theme.boundaryThemeLabel">主题配色与明暗跟随</span>
-                    <span class="boundary-badge is-synced" id="hostThemeSyncBadge" data-i18n="theme.boundarySynced">仅监听宿主明暗</span>
-                  </div>
-                  <div class="boundary-item-desc" data-i18n="theme.boundaryThemeDesc">
-                    所有颜色方案与浅色画布高对比反色均在插件面板内生效；开启「跟随宿主明暗」后仅只读响应宿主 theme-change 事件，不直接写 ~/.gemini/config/config.json。
-                  </div>
-                </div>
-                <div class="boundary-item">
-                  <div class="boundary-item-head">
-                    <span class="boundary-item-name" data-i18n="theme.boundaryWallpaperLabel">整机壁纸方案</span>
-                    <span class="boundary-badge is-synced" data-i18n="theme.boundaryBackdropBadge">三方案可选</span>
-                  </div>
-                  <div class="boundary-item-desc" data-i18n="theme.boundaryWallpaperDesc">
-                    默认方案三复用 app.asar 持久化钩子注入全窗纯 CSS 壁纸（免快捷方式、文字 100% 锐利、留存原版备份且支持一键还原）；如需零改包也可随时切至方案一（外置贴背微透窗）或方案二（纯 CDP 注入）。
-                  </div>
-                </div>
-                <div class="boundary-item">
-                  <div class="boundary-item-head">
-                    <span class="boundary-item-name" data-i18n="theme.boundaryLangLabel">双语切换与宿主菜单</span>
-                    <span class="boundary-badge is-scoped" data-i18n="theme.boundaryPanelOnly">仅作用于本面板</span>
-                  </div>
-                  <div class="boundary-item-desc" data-i18n="theme.boundaryLangDesc">
-                    双语切换完整覆盖本监控插件全部界面；桌面主窗口菜单、原生设置与左侧新建模型选择器保持 Antigravity 官方原生行为与语言。
-                  </div>
-                </div>
               </div>
             </div>
           </section>
@@ -985,9 +952,9 @@
             </div>
 
             <div class="acc-toolbar-meta">
-              <span class="acc-vault-pill" id="accVaultBadge" title="所有 OAuth 凭证均经 Windows DPAPI 本机当前用户加密保存，磁盘零明文">
+              <span class="acc-vault-pill" id="accVaultBadge" title="账号凭据已在本机加密保存">
                 <span class="acc-vault-dot" aria-hidden="true"></span>
-                <span id="accVaultText">DPAPI 加密保护</span>
+                <span id="accVaultText">本地加密</span>
               </span>
               <span class="acc-count-pill" id="accCountBadge">0 个账号</span>
               <button class="acc-rollback-btn" id="accRollbackBtn" type="button" title="一键还原至最近一次切号前的加密备份快照" hidden>
@@ -1079,17 +1046,17 @@
           <div class="acc-list" id="accList" role="list" aria-label="已保存账号列表"></div>
         </div>
 
-        <!-- 其他面板：官方额度查看总开关、CLI statusLine 合规通道与关闭后布局说明 -->
+        <!-- 其他面板：紧凑设置项 -->
         <div class="monitor-tab-panel monitor-other-panel" id="panelOther" data-subnav-panel="other" aria-label="其他设置" data-i18n-aria="other.ariaLabel" hidden>
-          <!-- 模块一：额度查看与查询总开关 -->
+          <!-- 选项一：额度显示 -->
           <section class="other-card" id="otherQuotaMasterCard" aria-label="额度查看与查询开关">
             <div class="other-card-head">
               <div class="other-card-title-group">
-                <span class="other-card-title" data-i18n="other.quotaTitle">额度查看与查询</span>
-                <span class="other-card-sub" data-i18n="other.quotaSub">默认开启 · 仅走官方合规通道，关闭后立即停查并自动填满空位</span>
+                <span class="other-card-title" data-i18n="other.quotaTitle">额度显示</span>
+                <span class="other-card-sub" data-i18n="other.quotaSub">关闭后停止额度查询并隐藏额度栏</span>
               </div>
               <div class="other-card-controls">
-                <span class="other-status-pill is-on" id="otherQuotaStatusBadge" data-i18n="other.quotaBadgeOn">已开启 · 官方通道</span>
+                <span class="other-status-pill is-on" id="otherQuotaStatusBadge" data-i18n="other.quotaBadgeOn">已开启</span>
                 <label class="other-switch">
                   <input
                     type="checkbox"
@@ -1104,35 +1071,27 @@
               </div>
             </div>
 
-            <p class="other-card-desc" data-i18n="other.quotaDesc">
-              开启时优先被动读取官方 Antigravity CLI statusLine 回调数据，桌面端通过官方本机回环语言服务同步当前登录账号，彻底禁绝直接请求 Google cloudcode-pa.googleapis.com 内部接口。关闭后将立即停止一切前后台额度查询，并自动重排界面填满原配额区域。
-            </p>
-
             <div class="other-meta-grid">
               <div class="other-meta-item">
-                <span class="other-meta-label" data-i18n="other.channelLabel">当前数据通道</span>
-                <span class="other-meta-value" id="otherQuotaChannelVal" data-i18n="other.channelLocalLs">官方宿主本机回环服务</span>
+                <span class="other-meta-label" data-i18n="other.channelLabel">来源</span>
+                <span class="other-meta-value" id="otherQuotaChannelVal" data-i18n="other.channelLocalLs">本机官方</span>
               </div>
               <div class="other-meta-item">
-                <span class="other-meta-label" data-i18n="other.guardLabel">风控合规防护</span>
-                <span class="other-meta-value is-safe" id="otherQuotaGuardVal" data-i18n="other.guardBlocked">已禁绝 cloudcode-pa 直连</span>
-              </div>
-              <div class="other-meta-item">
-                <span class="other-meta-label" data-i18n="other.scopeLabel">影响范围</span>
-                <span class="other-meta-value" id="otherQuotaScopeVal" data-i18n="other.scopeOn">通用页 · 输入框 HUD · 账号页 · 桌宠</span>
+                <span class="other-meta-label" data-i18n="other.guardLabel">通道</span>
+                <span class="other-meta-value is-safe" id="otherQuotaGuardVal" data-i18n="other.guardBlocked">仅官方安全通道</span>
               </div>
             </div>
           </section>
 
-          <!-- 模块二：轻量省显存模式（可选开关，默认关闭） -->
+          <!-- 选项二：轻量模式（默认关闭） -->
           <section class="other-card" id="otherLiteModeCard" aria-label="轻量省显存模式" data-i18n-aria="other.liteAriaLabel">
             <div class="other-card-head">
               <div class="other-card-title-group">
-                <span class="other-card-title" data-i18n="other.liteTitle">轻量省显存模式</span>
-                <span class="other-card-sub" data-i18n="other.liteSub">默认关闭 · 禁用毛玻璃模糊、壁纸遮罩与装饰动效，降低显存与内存占用</span>
+                <span class="other-card-title" data-i18n="other.liteTitle">轻量模式</span>
+                <span class="other-card-sub" data-i18n="other.liteSub">关闭模糊与动效，更省内存和显存</span>
               </div>
               <div class="other-card-controls">
-                <span class="other-status-pill is-muted" id="otherLiteModeBadge" data-i18n="other.liteBadgeOff">已关闭 · 标准视觉</span>
+                <span class="other-status-pill is-muted" id="otherLiteModeBadge" data-i18n="other.liteBadgeOff">标准</span>
                 <label class="other-switch">
                   <input
                     type="checkbox"
@@ -1145,44 +1104,21 @@
                 </label>
               </div>
             </div>
-
-            <p class="other-card-desc" data-i18n="other.liteDesc">
-              开启后将同步关闭侧边栏与 Antigravity 宿主窗口中的 backdrop-filter 毛玻璃模糊、粘贴壁纸遮罩以及非必要装饰动效，替换为清爽高不透明实色表面，显著降低 GPU 显存与 RAM 占用；关闭后即刻恢复完整视觉质感。
-            </p>
-
-            <div class="other-meta-grid">
-              <div class="other-meta-item">
-                <span class="other-meta-label" data-i18n="other.liteEffectLabel">视觉策略</span>
-                <span class="other-meta-value" id="otherLiteEffectVal" data-i18n="other.liteEffectOff">完整毛玻璃与动效</span>
-              </div>
-              <div class="other-meta-item">
-                <span class="other-meta-label" data-i18n="other.liteScopeLabel">生效范围</span>
-                <span class="other-meta-value" id="otherLiteScopeVal" data-i18n="other.liteScopeVal">侧边栏面板 · Antigravity 宿主</span>
-              </div>
-              <div class="other-meta-item">
-                <span class="other-meta-label" data-i18n="other.liteCostLabel">显存优化</span>
-                <span class="other-meta-value" id="otherLiteCostVal" data-i18n="other.liteCostOff">未启用（默认画质）</span>
-              </div>
-            </div>
           </section>
 
-          <!-- 模块二：官方 Antigravity CLI statusLine 零请求桥接 -->
-          <section class="other-card" aria-label="官方 CLI statusLine 回调配置">
+          <!-- 选项三：CLI 额度同步 -->
+          <section class="other-card" aria-label="CLI 额度同步配置">
             <div class="other-card-head">
               <div class="other-card-title-group">
-                <span class="other-card-title" data-i18n="other.slTitle">官方 CLI statusLine 回调</span>
-                <span class="other-card-sub" data-i18n="other.slSub">被动接收 Antigravity CLI 推送的官方额度 JSON · 零额外查询请求</span>
+                <span class="other-card-title" data-i18n="other.slTitle">CLI 额度同步</span>
+                <span class="other-card-sub" data-i18n="other.slSub">使用 agy 命令行时自动同步额度</span>
               </div>
               <span class="other-status-pill is-muted" id="otherStatusLineBadge" data-i18n="other.slBadgeIdle">未接入</span>
             </div>
 
-            <p class="other-card-desc" data-i18n="other.slDesc">
-              若您日常同时使用 Antigravity CLI (agy)，可一键写入官方 ~/.gemini/antigravity-cli/settings.json 的 statusLine.command 桥接脚本；当 CLI 刷新底部状态栏时，官方配额快照会自动同步到本面板，全程无需额外 RPC 请求。
-            </p>
-
             <div class="other-sl-actions">
-              <button class="theme-pill-btn is-primary" id="otherStatusLineInstallBtn" type="button" data-i18n="other.slInstallBtn">一键配置 CLI statusLine</button>
-              <button class="theme-pill-btn" id="otherStatusLineCopyBtn" type="button" data-i18n="other.slCopyBtn">复制 /statusline 命令</button>
+              <button class="theme-pill-btn is-primary" id="otherStatusLineInstallBtn" type="button" data-i18n="other.slInstallBtn">一键配置</button>
+              <button class="theme-pill-btn" id="otherStatusLineCopyBtn" type="button" data-i18n="other.slCopyBtn">复制命令</button>
             </div>
             <input
               class="other-cmd-input"
@@ -1193,34 +1129,6 @@
               aria-label="Antigravity CLI statusLine 配置命令"
               data-i18n-aria="other.slCmdAria"
             />
-          </section>
-
-          <!-- 模块三：关闭额度后的界面自适应补位说明 -->
-          <section class="other-card" aria-label="关闭后界面自适应说明">
-            <div class="other-card-head">
-              <div class="other-card-title-group">
-                <span class="other-card-title" data-i18n="other.adaptTitle">关闭后的全界面自动填充</span>
-                <span class="other-card-sub" data-i18n="other.adaptSub">关闭开关后无空白留白、零冗余按钮、零后台轮询</span>
-              </div>
-            </div>
-            <div class="other-adapt-grid">
-              <div class="other-adapt-item">
-                <div class="other-adapt-title" data-i18n="other.adaptGeneralTitle">通用页 · Token 列表延展</div>
-                <div class="other-adapt-desc" data-i18n="other.adaptGeneralDesc">自动隐藏底部双配额卡片，模型 Token 用量列表无缝向下拉满，与左侧上下文饼图齐平。</div>
-              </div>
-              <div class="other-adapt-item">
-                <div class="other-adapt-title" data-i18n="other.adaptHudTitle">输入框 HUD · 指标加宽</div>
-                <div class="other-adapt-desc" data-i18n="other.adaptHudDesc">自动收起原生输入栏配额胶囊与设置项，多余宽度全量让给生成速率、缓存命中与模型名。</div>
-              </div>
-              <div class="other-adapt-item">
-                <div class="other-adapt-title" data-i18n="other.adaptAccountsTitle">账号页 · 精简紧凑卡片</div>
-                <div class="other-adapt-desc" data-i18n="other.adaptAccountsDesc">隐藏汇总栏、单卡配额条、刷新额度按钮与按额度排序项，剩余操作按钮等宽铺满整行。</div>
-              </div>
-              <div class="other-adapt-item">
-                <div class="other-adapt-title" data-i18n="other.adaptPetTitle">桌宠与后台 · 彻底静默</div>
-                <div class="other-adapt-desc" data-i18n="other.adaptPetDesc">全面停用所有定时器、焦点刷新与桌宠配额同步，保留纯本地 Token 与会话监控。</div>
-              </div>
-            </div>
           </section>
         </div>
       </main>
@@ -1240,21 +1148,21 @@
         </div>
         <div class="modal-body" id="promptHelpBody">
           <div class="modal-section">
-            <div class="modal-section-title" data-i18n="promptModal.formatTitle">基础格式要求</div>
+            <div class="modal-section-title" data-i18n="promptModal.formatTitle">格式要求</div>
             <p class="modal-text" data-i18n="promptModal.formatDesc">
-              支持 UTF-8 编码的 .md / .markdown 纯文本文件（严格不超过 24,000 字节）。首行可使用「# 方案名称」作为预设显示名，未填写时自动取文件名。
+              支持 .md 文件（不超过 24 KB），首行「# 名称」将自动作为预设名。
             </p>
           </div>
           <div class="modal-section">
-            <div class="modal-section-title" data-i18n="promptModal.scopeTitle">生效范围说明</div>
+            <div class="modal-section-title" data-i18n="promptModal.scopeTitle">生效方式</div>
             <p class="modal-text" data-i18n="promptModal.scopeDesc">
-              在 Antigravity 原生插件机制下，所选预设会作为附加行为规则写入受控 rules/AGENTS.md，无法删改或替换官方内置系统底座，因此饼图会诚实拆分为「官方底座」与「规则增量」。
+              切换后作为附加规则在下一轮对话生效，不会改动官方默认设置。
             </p>
           </div>
           <div class="modal-alert-box">
-            <strong class="modal-alert-title" data-i18n="promptModal.securityTitle">重要防风控安全提醒</strong>
+            <strong class="modal-alert-title" data-i18n="promptModal.securityTitle">安全提醒</strong>
             <p class="modal-alert-text" data-i18n="promptModal.securityDesc">
-              官方正持续通过提示词与工具调用特征匹配打击未授权反代接口及 dsh、PI（pi-coding-agent）等第三方 Harness 外壳。日常请优先选用「官方原版」或近官方行为规范预设，切勿导入包含 &lt;system&gt; 伪造标签、第三方客户端工具协议或反代/Harness 特征头的内容（后端将自动拦截高危特征）。
+              请勿导入含伪造系统标签或第三方代理特征的文件，高危内容会被自动拦截。
             </p>
           </div>
         </div>
@@ -1339,7 +1247,7 @@
         </div>
 
         <div class="modal-footer req-modal-footer">
-          <span class="req-modal-note" id="reqModalNote" data-i18n="usage.reqNote">注：首字 (TTFT) 与耗时优先取自宿主本地会话库精确时间戳（含末轮纯文本回复），费用为公开 API 估算参考。</span>
+          <span class="req-modal-note" id="reqModalNote" data-i18n="usage.reqNote">费用按公开单价估算，仅供参考。</span>
           <div class="req-pagination">
             <button class="req-page-btn" id="reqPrevPageBtn" type="button" disabled data-i18n="usage.reqPrevPage">上一页</button>
             <span class="req-page-info" id="reqPageInfo">0 / 0</span>
@@ -1473,26 +1381,26 @@
         <div class="modal-body acc-modal-body">
           <div class="acc-oauth-option">
             <div class="acc-oauth-option-head">
-              <span class="acc-oauth-option-title">方式一：一键捕获当前已登录账号</span>
-              <span class="acc-oauth-tag is-fast">零重启 · 推荐</span>
+              <span class="acc-oauth-option-title">保存当前登录账号</span>
+              <span class="acc-oauth-tag is-fast">推荐</span>
             </div>
             <p class="acc-oauth-option-desc" id="accOauthCurrentHint">
-              自动读取当前 Antigravity 登录凭证与官方实时额度，使用本机 DPAPI 加密入库。
+              直接收录当前正在使用的账号。
             </p>
             <div class="acc-field-inline">
               <select class="acc-group-modal-select" id="accCaptureGroupSelect" aria-label="目标分组" title="选择账号分组（默认 default）"></select>
-              <input class="acc-input" id="accCaptureRemarkInput" type="text" maxlength="120" placeholder="可选：给该账号写个备注（如 主力 Pro）…" />
-              <button class="acc-primary-btn" id="accCaptureCurrentBtn" type="button">立即捕获当前号</button>
+              <input class="acc-input" id="accCaptureRemarkInput" type="text" maxlength="120" placeholder="备注（选填，如 主力号）…" />
+              <button class="acc-primary-btn" id="accCaptureCurrentBtn" type="button">保存当前号</button>
             </div>
           </div>
 
           <div class="acc-oauth-option">
             <div class="acc-oauth-option-head">
-              <span class="acc-oauth-option-title">方式二：打开浏览器直接登录新号</span>
-              <span class="acc-oauth-tag is-fast">官方一键直连 · 不影响当前 AGY</span>
+              <span class="acc-oauth-option-title">浏览器登录新账号</span>
+              <span class="acc-oauth-tag is-fast">不影响当前会话</span>
             </div>
             <p class="acc-oauth-option-desc">
-              点击直接唤起系统默认浏览器打开 Google 官方登录授权页，完成后本地安全端点自动捕获 Refresh Token 凭据并经 DPAPI 硬件级加密收录，全程无需注销当前 Antigravity 会话！
+              打开浏览器登录 Google 账号，完成后自动保存。
             </p>
             <div class="acc-oauth-action-row" id="accDirectOauthInitialRow">
               <button class="acc-primary-btn" id="accStartDirectOauthBtn" type="button">
@@ -1582,11 +1490,11 @@
         </div>
         <div class="modal-body acc-modal-body">
           <div class="acc-quota-paused-note" id="accSettingsQuotaPausedNote" hidden>
-            当前已在「其他」分页关闭额度查看与查询，配额自动刷新及按额度自动切号均已彻底暂停；如需恢复请前往「其他」分页重新开启。
+            已在「其他」页关闭额度显示，定时刷新与自动切号已暂停。
           </div>
           <div class="acc-setting-card">
             <div class="acc-setting-row">
-              <label class="acc-setting-label" for="accSettingRefreshMinInput">配额自动刷新时间间隔：</label>
+              <label class="acc-setting-label" for="accSettingRefreshMinInput">额度刷新间隔：</label>
               <div class="acc-setting-num-wrap">
                 <input
                   class="acc-input acc-setting-num-input"
@@ -1600,9 +1508,9 @@
                 <span class="acc-setting-unit">min</span>
               </div>
             </div>
-            <p class="acc-setting-hint">仅按此间隔通过官方通道（CLI statusLine 或本机 language_server）同步当前登录账号额度，已永久禁绝直接请求 cloudcode-pa 探测未激活账号；填 0 关闭定时刷新。</p>
+            <p class="acc-setting-hint">定时同步当前账号额度，填 0 关闭。</p>
             <div class="acc-setting-sentence" style="margin-top: 8px;" hidden>
-              <span>后台探测未激活账号（已按官方合规策略永久停用）</span>
+              <span>后台探测未激活账号（已停用）</span>
               <button
                 class="acc-setting-toggle-btn is-off"
                 id="accSettingBgInactiveToggleBtn"
@@ -1623,7 +1531,7 @@
                 <option value="gemini" selected>Gemini</option>
                 <option value="gpt_claude">Claude</option>
               </select>
-              <span>的 5h/周额度耗尽或出现额度为空报错时，自动切号</span>
+              <span>额度耗尽时自动切号</span>
               <button
                 class="acc-setting-toggle-btn is-off"
                 id="accSettingAutoToggleBtn"
@@ -1635,7 +1543,7 @@
               </button>
             </div>
             <p class="acc-setting-hint">
-              自动优先切往该分类剩余额度最高的已启用账号，周额度为 0 或 5h 额度为 0 的账号均跳过；切号后自动续跑正在运行或因额度报错中断的会话。
+              优先切到余量最高的可用账号，并继续未完成的对话。
             </p>
           </div>
         </div>
@@ -1810,30 +1718,30 @@
           </details>
 
           <section class="mem-section-card mem-settings-card" aria-label="内存优化策略">
-            <div class="mem-section-title" data-i18n="memory.settingsTitle">自动防膨胀与根因防护</div>
+            <div class="mem-section-title" data-i18n="memory.settingsTitle">自动优化</div>
             <label class="mem-toggle-row">
               <span class="mem-toggle-copy">
-                <span class="mem-toggle-name" data-i18n="memory.zeroUiaLabel">极致零 UIA 省内存模式</span>
-                <span class="mem-toggle-desc" data-i18n="memory.zeroUiaDesc">彻底停用壁纸伴侣 UIA（会暂停方案一桌面悬浮圆环；搭配方案二 CDP 可兼得零 UIA 与像素级原生圆环）</span>
+                <span class="mem-toggle-name" data-i18n="memory.zeroUiaLabel">禁用无障碍监听</span>
+                <span class="mem-toggle-desc" data-i18n="memory.zeroUiaDesc">减少主程序内存增长（仅停用旧版悬浮圆环）</span>
               </span>
               <input class="mem-toggle-input" id="memZeroUiaToggle" type="checkbox" />
             </label>
             <div class="mem-toggle-divider"></div>
             <label class="mem-toggle-row">
               <span class="mem-toggle-copy">
-                <span class="mem-toggle-name" data-i18n="memory.autoTrimLabel">超阈值自动安全瘦身</span>
-                <span class="mem-toggle-desc" data-i18n="memory.autoTrimDesc">当 AGY 物理内存超过阈值时后台静默压缩空闲工作集与 SQLite 缓存（冷却 10 分钟）</span>
+                <span class="mem-toggle-name" data-i18n="memory.autoTrimLabel">超限时自动释放</span>
+                <span class="mem-toggle-desc" data-i18n="memory.autoTrimDesc">内存超标时自动静默清理缓存</span>
               </span>
               <input class="mem-toggle-input" id="memAutoTrimToggle" type="checkbox" checked />
             </label>
             <div class="mem-threshold-bar">
-              <span class="mem-threshold-label" data-i18n="memory.thresholdLabel">自动瘦身触发阈值</span>
+              <span class="mem-threshold-label" data-i18n="memory.thresholdLabel">触发阈值</span>
               <div class="mem-threshold-chips" id="memThresholdRow"></div>
             </div>
           </section>
         </div>
         <div class="modal-footer memory-modal-footer">
-          <span class="memory-footer-meta" id="memoryFooterMeta" data-i18n="memory.footerSafeNote">仅安全压缩空闲工作集与缓存，不关闭窗口、不中断运行中会话。</span>
+          <span class="memory-footer-meta" id="memoryFooterMeta" data-i18n="memory.footerSafeNote">仅释放空闲缓存，不影响当前对话。</span>
           <button class="modal-confirm-btn" type="button" data-memory-close data-i18n="common.close">关闭</button>
         </div>
       </div>

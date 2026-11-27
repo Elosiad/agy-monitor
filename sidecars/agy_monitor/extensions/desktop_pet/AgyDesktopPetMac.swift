@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import QuartzCore
@@ -640,19 +641,28 @@ final class PetHostController: NSObject {
     private var sparkleRemaining: Double = 0.0
     private var sparkleTicks: Int = 0
 
-    // Custom image / frames cache
+    // Custom image / frames cache (bounded decode & lazy LRU tracks)
+    private static let maxGifFrames = 90
+    private static let maxCachedCustomTracks = 2
+    private static let fallbackVisibleFrame = NSRect(x: 0, y: 0, width: 1440, height: 900)
+
     private var loadedImagePath: String = ""
     private var loadedImageMtime: Date = .distantPast
+    private var loadedImageMaxPx: Int = 0
     private var gifFrames: [NSImage] = []
     private var gifDelaysSec: [Double] = []
     private var gifIndex: Int = 0
     private var gifAccumSec: Double = 0
 
     private var loadedFramesSig: String = ""
+    private var customTrackPaths: [String: [String]] = [:]
     private var customTrackImages: [String: [NSImage]] = [:]
+    private var customTrackLru: [String] = []
     private var activeCustomTrack: String = "idle"
     private var customFrameIndex: Int = 0
     private var customFrameAccumSec: Double = 0
+
+    private var currentAnimIntervalSec: TimeInterval = 0
 
     // Dynamic layout tracking
     private var stageSide: CGFloat = 112.0
@@ -697,17 +707,56 @@ final class PetHostController: NSObject {
         petPanel.orderFrontRegardless()
         writeStatusFile(running: true)
 
-        lastTickTime = ProcessInfo.processInfo.systemUptime
-        animTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            let dt = min(0.05, max(0.001, now - self.lastTickTime))
-            self.lastTickTime = now
-            self.onAnimTick(dt: dt)
-        }
+        let initialInterval = computeDesiredAnimIntervalSec(agentState: lastAgentState, sleepy: false)
+        setAnimTimerInterval(initialInterval)
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             self?.onPollTick()
         }
+        pollTimer?.tolerance = 0.08
+    }
+
+    private func computeDesiredAnimIntervalSec(agentState: String, sleepy: Bool) -> TimeInterval {
+        let activeMotion = isDragging || wanderMoving || hopRemaining > 0 || landBounceRemaining > 0
+            || interactRemaining > 0 || sparkleRemaining > 0 || abs(dragTiltAngle) > 0.25
+        if activeMotion {
+            return 1.0 / 60.0
+        }
+        var target: TimeInterval
+        if !customTrackPaths.isEmpty {
+            let fps = Double(clampInt(config.activeCustomPet?.fps ?? 8, 1, 30))
+            target = sleepy ? (1.0 / max(6.0, min(fps, 10.0))) : (1.0 / max(15.0, min(fps, 30.0)))
+        } else if gifFrames.count > 1 {
+            target = sleepy ? (1.0 / 10.0) : (1.0 / 24.0)
+        } else if gifFrames.count == 1 {
+            target = sleepy ? (1.0 / 6.0) : (1.0 / 15.0)
+        } else {
+            if agentState == "running" || agentState == "unread" {
+                target = 1.0 / 30.0
+            } else {
+                target = sleepy ? (1.0 / 8.0) : (1.0 / 20.0)
+            }
+        }
+        if !config.selectable {
+            target = min(target, 0.1)
+        }
+        return target
+    }
+
+    private func setAnimTimerInterval(_ interval: TimeInterval) {
+        if disposed { return }
+        if animTimer != nil && abs(currentAnimIntervalSec - interval) < 0.002 { return }
+        animTimer?.invalidate()
+        currentAnimIntervalSec = interval
+        lastTickTime = ProcessInfo.processInfo.systemUptime
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let dt = min(0.25, max(0.001, now - self.lastTickTime))
+            self.lastTickTime = now
+            self.onAnimTick(dt: dt)
+        }
+        timer.tolerance = interval * 0.2
+        animTimer = timer
     }
 
     private func writePidFile() {
@@ -805,30 +854,32 @@ final class PetHostController: NSObject {
         return NSScreen.screens.first?.frame.maxY ?? NSScreen.main?.frame.maxY ?? 1080.0
     }
 
-    private func screenForStageTopLeft(_ pt: NSPoint) -> NSScreen {
+    private func visibleFrameForStageTopLeft(_ pt: NSPoint) -> NSRect {
         let appKitY = primaryMaxY - pt.y - stageSide / 2.0
         let testPt = NSPoint(x: pt.x + stageSide / 2.0, y: appKitY)
         for s in NSScreen.screens {
-            if s.frame.contains(testPt) { return s }
+            if s.frame.contains(testPt) { return s.visibleFrame }
         }
-        return NSScreen.main ?? NSScreen.screens.first!
+        return (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? Self.fallbackVisibleFrame
+    }
+
+    private func primaryVisibleFrame() -> NSRect {
+        return (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? Self.fallbackVisibleFrame
     }
 
     private func clampStageTopLeft(_ pt: NSPoint) -> NSPoint {
-        let screen = screenForStageTopLeft(pt)
-        let vf = screen.visibleFrame
+        let vf = visibleFrameForStageTopLeft(pt)
         let minTopY = primaryMaxY - vf.maxY
-        let maxTopY = primaryMaxY - vf.minY - stageSide
+        let maxTopY = max(minTopY, primaryMaxY - vf.minY - stageSide)
         let minX = vf.minX
-        let maxX = vf.maxX - stageSide
+        let maxX = max(minX, vf.maxX - stageSide)
         let cx = max(minX, min(maxX, pt.x))
         let cy = max(minTopY, min(maxTopY, pt.y))
         return NSPoint(x: cx, y: cy)
     }
 
     private func defaultStageTopLeft() -> NSPoint {
-        let screen = NSScreen.main ?? NSScreen.screens.first!
-        let vf = screen.visibleFrame
+        let vf = primaryVisibleFrame()
         let margin: CGFloat = 28.0
         let x = vf.maxX - stageSide - margin
         let bottomAppKitY = vf.minY + margin
@@ -1097,11 +1148,81 @@ final class PetHostController: NSObject {
         lockBadgeView.needsDisplay = true
     }
 
+    private func computeDecodeMaxPixelSize() -> Int {
+        // Two coarse buckets prevent reload thrashing while dragging size slider,
+        // and decodeCompactImage never upscales sprites smaller than the bucket.
+        return stageSide <= 140.0 ? 256 : 512
+    }
+
+    private func decodeCompactImage(from src: CGImageSource, index: Int, maxPixelSize: Int) -> NSImage? {
+        var srcW = 0
+        var srcH = 0
+        if let props = CGImageSourceCopyPropertiesAtIndex(src, index, nil) as? [String: Any] {
+            if let w = props[kCGImagePropertyPixelWidth as String] as? NSNumber { srcW = w.intValue }
+            if let h = props[kCGImagePropertyPixelHeight as String] as? NSNumber { srcH = h.intValue }
+        }
+        let cgImg: CGImage?
+        if max(srcW, srcH) > maxPixelSize {
+            let opts: [String: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways as String: true,
+                kCGImageSourceCreateThumbnailWithTransform as String: true,
+                kCGImageSourceShouldCacheImmediately as String: true,
+                kCGImageSourceThumbnailMaxPixelSize as String: maxPixelSize,
+            ]
+            cgImg = CGImageSourceCreateThumbnailAtIndex(src, index, opts as CFDictionary)
+                ?? CGImageSourceCreateImageAtIndex(src, index, nil)
+        } else {
+            cgImg = CGImageSourceCreateImageAtIndex(src, index, nil)
+        }
+        guard let cg = cgImg else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    private func loadCompactImageFile(at path: String, maxPixelSize: Int) -> NSImage? {
+        let url = URL(fileURLWithPath: path) as CFURL
+        if let src = CGImageSourceCreateWithURL(url, nil), CGImageSourceGetCount(src) > 0 {
+            return decodeCompactImage(from: src, index: 0, maxPixelSize: maxPixelSize)
+        }
+        return NSImage(contentsOfFile: path)
+    }
+
+    private func touchTrackLru(_ track: String) {
+        customTrackLru.removeAll { $0 == track }
+        customTrackLru.append(track)
+    }
+
+    private func ensureCustomTrackLoaded(_ track: String) -> [NSImage]? {
+        if let cached = customTrackImages[track], !cached.isEmpty {
+            touchTrackLru(track)
+            return cached
+        }
+        guard let paths = customTrackPaths[track], !paths.isEmpty else { return nil }
+        let maxPx = computeDecodeMaxPixelSize()
+        var imgs: [NSImage] = []
+        imgs.reserveCapacity(paths.count)
+        for p in paths {
+            if let img = loadCompactImageFile(at: p, maxPixelSize: maxPx) {
+                imgs.append(img)
+            }
+        }
+        guard !imgs.isEmpty else { return nil }
+        customTrackImages[track] = imgs
+        touchTrackLru(track)
+
+        while customTrackImages.count > Self.maxCachedCustomTracks {
+            guard let victim = customTrackLru.first(where: { $0 != "idle" && $0 != track }) else { break }
+            customTrackImages.removeValue(forKey: victim)
+            customTrackLru.removeAll { $0 == victim }
+        }
+        return imgs
+    }
+
     private func loadMediaAssetsIfNeeded() {
+        let maxPx = computeDecodeMaxPixelSize()
         let active = config.activeCustomPet
         if let entry = active, entry.kind == "frames", !entry.frames.isEmpty {
-            // Multi-track frames
-            var sigParts = [entry.id, "\(entry.fps)"]
+            // Multi-track frames (lazy per-track decode + bounded LRU cache)
+            var sigParts = [entry.id, "\(entry.fps)", "px:\(maxPx)"]
             for f in entry.frames { sigParts.append("idle:\(f.filename)") }
             for k in entry.stateFrames.keys.sorted() {
                 for f in entry.stateFrames[k] ?? [] {
@@ -1111,41 +1232,49 @@ final class PetHostController: NSObject {
             let sig = sigParts.joined(separator: "|")
             if sig != loadedFramesSig {
                 loadedFramesSig = sig
+                customTrackPaths.removeAll()
                 customTrackImages.removeAll()
-                let loadTrack = { [weak self] (refs: [CustomPetFrameRef]) -> [NSImage] in
+                customTrackLru.removeAll()
+                let mapPaths = { [weak self] (refs: [CustomPetFrameRef]) -> [String] in
                     guard let self = self else { return [] }
-                    var imgs: [NSImage] = []
+                    var out: [String] = []
                     for r in refs {
                         let p = (self.config.petsDir as NSString).appendingPathComponent(r.filename)
-                        if let img = NSImage(contentsOfFile: p) {
-                            imgs.append(img)
+                        if FileManager.default.fileExists(atPath: p) {
+                            out.append(p)
                         }
                     }
-                    return imgs
+                    return out
                 }
-                customTrackImages["idle"] = loadTrack(entry.frames)
+                let idlePaths = mapPaths(entry.frames)
+                if !idlePaths.isEmpty { customTrackPaths["idle"] = idlePaths }
                 for (k, refs) in entry.stateFrames {
-                    let imgs = loadTrack(refs)
-                    if !imgs.isEmpty { customTrackImages[k] = imgs }
+                    let paths = mapPaths(refs)
+                    if !paths.isEmpty { customTrackPaths[k] = paths }
                 }
+                _ = ensureCustomTrackLoaded("idle")
                 customFrameIndex = 0
                 customFrameAccumSec = 0
             }
             loadedImagePath = ""
+            loadedImageMaxPx = 0
             gifFrames.removeAll()
             gifDelaysSec.removeAll()
             return
         }
 
         loadedFramesSig = ""
+        customTrackPaths.removeAll()
         customTrackImages.removeAll()
+        customTrackLru.removeAll()
 
         let imgPath = config.customImagePath
         if !imgPath.isEmpty && FileManager.default.fileExists(atPath: imgPath) {
             let mtime = fileMeta(imgPath)?.0 ?? .distantPast
-            if imgPath != loadedImagePath || mtime != loadedImageMtime {
+            if imgPath != loadedImagePath || mtime != loadedImageMtime || maxPx != loadedImageMaxPx {
                 loadedImagePath = imgPath
                 loadedImageMtime = mtime
+                loadedImageMaxPx = maxPx
                 gifFrames.removeAll()
                 gifDelaysSec.removeAll()
                 gifIndex = 0
@@ -1154,30 +1283,35 @@ final class PetHostController: NSObject {
                 let url = URL(fileURLWithPath: imgPath) as CFURL
                 if let src = CGImageSourceCreateWithURL(url, nil) {
                     let count = CGImageSourceGetCount(src)
-                    for i in 0..<count {
-                        if let cg = CGImageSourceCreateImageAtIndex(src, i, nil) {
-                            let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                            gifFrames.append(img)
-                            var delay = 0.1
-                            if let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [String: Any],
-                               let gifDict = props[kCGImagePropertyGIFDictionary as String] as? [String: Any] {
-                                if let u = gifDict[kCGImagePropertyGIFUnclampedDelayTime as String] as? Double, u > 0.01 {
-                                    delay = u
-                                } else if let d = gifDict[kCGImagePropertyGIFDelayTime as String] as? Double, d > 0.01 {
-                                    delay = d
+                    if count > 0 {
+                        let cappedCount = min(count, Self.maxGifFrames)
+                        let strideStep = count > Self.maxGifFrames ? (Double(count) / Double(Self.maxGifFrames)) : 1.0
+                        for slot in 0..<cappedCount {
+                            let i = min(count - 1, Int(Double(slot) * strideStep))
+                            if let img = decodeCompactImage(from: src, index: i, maxPixelSize: maxPx) {
+                                gifFrames.append(img)
+                                var delay = 0.1
+                                if let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [String: Any],
+                                   let gifDict = props[kCGImagePropertyGIFDictionary as String] as? [String: Any] {
+                                    if let u = gifDict[kCGImagePropertyGIFUnclampedDelayTime as String] as? Double, u > 0.01 {
+                                        delay = u
+                                    } else if let d = gifDict[kCGImagePropertyGIFDelayTime as String] as? Double, d > 0.01 {
+                                        delay = d
+                                    }
                                 }
+                                gifDelaysSec.append(max(0.02, delay * strideStep))
                             }
-                            gifDelaysSec.append(max(0.02, delay))
                         }
                     }
                 }
-                if gifFrames.isEmpty, let single = NSImage(contentsOfFile: imgPath) {
+                if gifFrames.isEmpty, let single = loadCompactImageFile(at: imgPath, maxPixelSize: maxPx) {
                     gifFrames.append(single)
                     gifDelaysSec.append(0.1)
                 }
             }
         } else {
             loadedImagePath = ""
+            loadedImageMaxPx = 0
             gifFrames.removeAll()
             gifDelaysSec.removeAll()
         }
@@ -1525,8 +1659,7 @@ final class PetHostController: NSObject {
             wanderCooldownSec -= dt
             if wanderCooldownSec > 0 { return }
 
-            let screen = screenForStageTopLeft(cur)
-            let vf = screen.visibleFrame
+            let vf = visibleFrameForStageTopLeft(cur)
             let minX = vf.minX + 8.0
             let maxX = max(minX + 40.0, vf.maxX - stageSide - 8.0)
             let dist = CGFloat(Double.random(in: 110.0...340.0))
@@ -1608,18 +1741,18 @@ final class PetHostController: NSObject {
             }
         }
 
-        // Determine active track & advance media frames
+        // Determine active track & advance media frames (lazy per-track LRU)
         // Priority matches AgyDesktopPet.cs: drag > interact > walk > running > unread > idle
         let desiredTrack: String
-        if isDragging && customTrackImages["drag"]?.isEmpty == false { desiredTrack = "drag" }
-        else if interactRemaining > 0 && customTrackImages["interact"]?.isEmpty == false { desiredTrack = "interact" }
-        else if wanderMoving && customTrackImages["walk"]?.isEmpty == false { desiredTrack = "walk" }
-        else if agentState == "running" && customTrackImages["running"]?.isEmpty == false { desiredTrack = "running" }
-        else if agentState == "unread" && customTrackImages["unread"]?.isEmpty == false { desiredTrack = "unread" }
+        if isDragging && customTrackPaths["drag"]?.isEmpty == false { desiredTrack = "drag" }
+        else if interactRemaining > 0 && customTrackPaths["interact"]?.isEmpty == false { desiredTrack = "interact" }
+        else if wanderMoving && customTrackPaths["walk"]?.isEmpty == false { desiredTrack = "walk" }
+        else if agentState == "running" && customTrackPaths["running"]?.isEmpty == false { desiredTrack = "running" }
+        else if agentState == "unread" && customTrackPaths["unread"]?.isEmpty == false { desiredTrack = "unread" }
         else { desiredTrack = "idle" }
 
-        if !customTrackImages.isEmpty {
-            let trackImgs = (customTrackImages[desiredTrack]?.isEmpty == false ? customTrackImages[desiredTrack] : customTrackImages["idle"]) ?? []
+        if !customTrackPaths.isEmpty {
+            let trackImgs = ensureCustomTrackLoaded(desiredTrack) ?? ensureCustomTrackLoaded("idle") ?? []
             if desiredTrack != activeCustomTrack {
                 activeCustomTrack = desiredTrack
                 customFrameIndex = 0
@@ -1629,10 +1762,13 @@ final class PetHostController: NSObject {
                 let fps = Double(clampInt(config.activeCustomPet?.fps ?? 8, 1, 30))
                 let frameDur = 1.0 / fps
                 customFrameAccumSec += dt
-                while customFrameAccumSec >= frameDur {
+                var steps = 0
+                while customFrameAccumSec >= frameDur && steps < 4 {
                     customFrameAccumSec -= frameDur
                     customFrameIndex = (customFrameIndex + 1) % trackImgs.count
+                    steps += 1
                 }
+                if customFrameAccumSec >= frameDur { customFrameAccumSec = 0 }
                 stageView.customImage = trackImgs[customFrameIndex % trackImgs.count]
             } else {
                 stageView.customImage = nil
@@ -1642,7 +1778,7 @@ final class PetHostController: NSObject {
                 gifAccumSec += dt
                 let delay = gifDelaysSec[gifIndex % gifDelaysSec.count]
                 if gifAccumSec >= delay {
-                    gifAccumSec -= delay
+                    gifAccumSec = min(gifAccumSec - delay, delay)
                     gifIndex = (gifIndex + 1) % gifFrames.count
                 }
             }
@@ -1709,10 +1845,15 @@ final class PetHostController: NSObject {
         if !config.selectable {
             lockBadgeCheckAccum += dt
             if lockBadgeCheckAccum >= 0.1 {
+                let elapsed = min(0.25, lockBadgeCheckAccum)
                 lockBadgeCheckAccum = 0
-                updateLockBadgeVisibility(dt: 0.1)
+                updateLockBadgeVisibility(dt: elapsed)
             }
         }
+
+        // Adapt timer cadence to motion & sleep state to save macOS battery
+        let desiredInterval = computeDesiredAnimIntervalSec(agentState: agentState, sleepy: sleepy)
+        setAnimTimerInterval(desiredInterval)
     }
 
     private func updateLockBadgeVisibility(dt: Double) {
@@ -1800,6 +1941,7 @@ final class PetHostController: NSObject {
         dragStartOrigin = currentStageTopLeft()
         lastDragMouseX = mouse.x
         dragVelocityX = 0
+        setAnimTimerInterval(1.0 / 60.0)
     }
 
     private func handleDragMove(_ mouse: NSPoint) {
@@ -1832,6 +1974,7 @@ final class PetHostController: NSObject {
         wanderCooldownSec = Double.random(in: 9.0...17.0)
         interactRemaining = 1.15
         hopRemaining = 0.58
+        setAnimTimerInterval(1.0 / 60.0)
         let sparkles = ["✨", "♥", "★"]
         sparkleTicks += 1
         sparkleLabel.stringValue = sparkles[sparkleTicks % sparkles.count]
@@ -1845,6 +1988,7 @@ final class PetHostController: NSObject {
         wanderCooldownSec = Double.random(in: 9.0...17.0)
         interactRemaining = 1.15
         hopRemaining = 0.58
+        setAnimTimerInterval(1.0 / 60.0)
         let inTok = formatTokenCount(telemetry.latestInputTokens)
         let outTok = formatTokenCount(telemetry.latestOutputTokens)
         let model = telemetry.upstreamModelId.isEmpty ? "待机" : telemetry.upstreamModelId
@@ -2001,6 +2145,12 @@ final class PetHostController: NSObject {
 
         lockPanel?.orderOut(nil)
         petPanel?.orderOut(nil)
+        stageView?.customImage = nil
+        customTrackImages.removeAll()
+        customTrackPaths.removeAll()
+        customTrackLru.removeAll()
+        gifFrames.removeAll()
+        gifDelaysSec.removeAll()
         writeStatusFile(running: false)
         try? FileManager.default.removeItem(atPath: pidFilePath)
         NSApplication.shared.terminate(nil)
@@ -2012,6 +2162,17 @@ final class PetHostController: NSObject {
 func defaultDataDir() -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return (((home as NSString).appendingPathComponent(".gemini") as NSString).appendingPathComponent("antigravity") as NSString).appendingPathComponent("plugin_data/agy-monitor")
+}
+
+func isMatchingPetCompanionProcess(pid: pid_t) -> Bool {
+    if pid <= 0 || pid == getpid() { return false }
+    let bufSize = 4096
+    var pathBuf = [CChar](repeating: 0, count: bufSize)
+    let ret = proc_pidpath(pid, &pathBuf, UInt32(bufSize))
+    if ret <= 0 { return false }
+    let procPath = String(cString: pathBuf)
+    let baseName = (procPath as NSString).lastPathComponent
+    return baseName == "agy_desktop_pet_mac" || baseName.hasPrefix("agy_desktop_pet_mac.")
 }
 
 func readExistingPid(dataDir: String) -> pid_t? {
@@ -2031,12 +2192,32 @@ func readExistingPid(dataDir: String) -> pid_t? {
 }
 
 func stopCompanion(dataDir: String) {
+    let binDir = (dataDir as NSString).appendingPathComponent("bin")
+    let lockPath = (binDir as NSString).appendingPathComponent("agy_desktop_pet_mac.lock")
+    let pidFile = (binDir as NSString).appendingPathComponent("agy_desktop_pet_mac.pid")
+
+    // Fast path: if nobody holds the single-instance lock, clean up any stale PID file and do NOT signal anything.
+    let probeFd = open(lockPath, O_RDWR)
+    if probeFd >= 0 {
+        let gotLock = flock(probeFd, LOCK_EX | LOCK_NB) == 0
+        if gotLock {
+            _ = flock(probeFd, LOCK_UN)
+            close(probeFd)
+            try? FileManager.default.removeItem(atPath: pidFile)
+            return
+        }
+        close(probeFd)
+    }
+
     guard let pid = readExistingPid(dataDir: dataDir), pid > 0 else { return }
     if kill(pid, 0) != 0 && errno == ESRCH { return }
+    // Guard against PID reuse: only terminate if the executable is actually agy_desktop_pet_mac.
+    guard isMatchingPetCompanionProcess(pid: pid) else { return }
     _ = kill(pid, SIGTERM)
     let deadline = Date().addingTimeInterval(1.5)
     while Date() < deadline {
         if kill(pid, 0) != 0 && errno == ESRCH { break }
+        if !isMatchingPetCompanionProcess(pid: pid) { break }
         Thread.sleep(forTimeInterval: 0.05)
     }
 }

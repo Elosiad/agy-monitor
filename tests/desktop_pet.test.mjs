@@ -19,6 +19,7 @@ import {
   listCatalogWithStatus,
 } from '../sidecars/agy_monitor/extensions/desktop_pet/pet_catalog.mjs';
 import {
+  detectMacHostEnv,
   ensurePetCompanionAssets,
   getPetCompanionStatus,
 } from '../sidecars/agy_monitor/extensions/desktop_pet/pet_companion.mjs';
@@ -802,6 +803,43 @@ test('desktop_pet macOS native Swift companion integrity, compilation, and statu
   assert.match(swiftSrc, /pet_status\.json/);
   assert.match(swiftSrc, /\{quota5h\}/);
   assert.match(swiftSrc, /sessionProgress/);
+
+  // Hardening assertions: PID reuse guard, safe NSScreen handling, bounded decode/LRU, adaptive FPS
+  assert.doesNotMatch(swiftSrc, /NSScreen\.screens\.first!/, 'AgyDesktopPetMac.swift must not force-unwrap NSScreen.screens.first');
+  assert.match(swiftSrc, /proc_pidpath\s*\(/, 'stopCompanion must verify process identity via proc_pidpath before SIGTERM');
+  assert.match(swiftSrc, /isMatchingPetCompanionProcess\s*\(/, 'stopCompanion must guard against recycled PIDs');
+  assert.match(swiftSrc, /flock\s*\(\s*probeFd,\s*LOCK_EX\s*\|\s*LOCK_NB\s*\)/, 'stopCompanion must probe single-instance lock before signaling');
+  assert.match(swiftSrc, /maxGifFrames\s*=\s*90/, 'GIF decoder must cap frames to 90 matching Windows companion');
+  assert.match(swiftSrc, /CGImageSourceCreateThumbnailAtIndex/, 'Media loader must downsample oversized images via ImageIO thumbnail API');
+  assert.match(swiftSrc, /ensureCustomTrackLoaded\s*\(/, 'Multi-track frames must load lazily on demand with LRU eviction');
+  assert.match(swiftSrc, /computeDesiredAnimIntervalSec\s*\(/, 'Animation timer must adapt cadence for idle/sleepy battery savings');
+  assert.match(swiftSrc, /timer\.tolerance\s*=/, 'AppKit timers should set tolerance for macOS timer coalescing');
+
+  // macOS CLT detection: must NOT treat /usr/bin/swiftc stub as usable when xcode-select -p fails
+  const stubMac = detectMacHostEnv({
+    platform: 'darwin',
+    existsSync: (p) => p === '/usr/bin/swiftc',
+    execFileSync: () => {
+      throw new Error('xcode-select: error: unable to get active developer directory');
+    },
+    pathEnv: '/usr/bin:/bin',
+  });
+  assert.equal(stubMac.isMacOS, true);
+  assert.equal(stubMac.cltInstalled, false);
+  assert.equal(stubMac.swiftcPath, '');
+
+  // When xcode-select -p succeeds and points to CLT dir, resolve real swiftc inside it
+  const cltDir = '/Library/Developer/CommandLineTools';
+  const cltSwiftc = path.posix.join(cltDir, 'usr', 'bin', 'swiftc');
+  const validMac = detectMacHostEnv({
+    platform: 'darwin',
+    existsSync: (p) => p === cltDir || p === cltSwiftc || p === '/usr/bin/swiftc',
+    execFileSync: () => `${cltDir}\n`,
+    pathEnv: '/usr/bin:/bin',
+  });
+  assert.equal(validMac.isMacOS, true);
+  assert.equal(validMac.cltInstalled, true);
+  assert.equal(validMac.swiftcPath, cltSwiftc);
 
   if (process.platform === 'darwin') {
     const prevSkip = process.env.AGY_MONITOR_SKIP_DESKTOP_PROBE;

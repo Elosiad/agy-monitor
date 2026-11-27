@@ -1694,3 +1694,151 @@ test('Mastery hub optimizations: unchanged polls skip DOM rebuild, image cache e
   const thumbImg = attachStrip.querySelector('img');
   assert.equal(thumbImg?.getAttribute?.('src') || thumbImg?.src, 'data:image/png;base64,QUJDRA==');
 });
+
+test('Accounts Hub weighted quota summary (Ultra 20x=2000%, Ultra 5x=500%, Plus=100%) and inline tier selector', async (t) => {
+  const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+  const { document } = createMiniDom(html);
+  const prevGlobals = {
+    document: globalThis.document,
+    window: globalThis.window,
+  };
+
+  const nowMs = Date.now();
+  const makeQuota = (g5, gw, c5, cw) => ({
+    fetchedAtMs: nowMs,
+    groups: [
+      {
+        key: 'gemini',
+        label: 'Gemini',
+        fiveHour: { remainingPct: g5, resetTimeMs: nowMs + 3600_000, disabled: false, isFull: g5 === 100 },
+        weekly: { remainingPct: gw, resetTimeMs: nowMs + 86400_000, disabled: false, isFull: gw === 100 },
+      },
+      {
+        key: 'gpt_claude',
+        label: 'GPT&Claude',
+        fiveHour: { remainingPct: c5, resetTimeMs: nowMs + 3600_000, disabled: false, isFull: c5 === 100 },
+        weekly: { remainingPct: cw, resetTimeMs: nowMs + 86400_000, disabled: false, isFull: cw === 100 },
+      },
+    ],
+  });
+
+  const accounts = [
+    {
+      id: 'acc-u20',
+      email: 'u20@gmail.com',
+      group: 'default',
+      tier: 'ultra_20x',
+      tierSource: 'manual',
+      quotaWeight: 20,
+      enabled: true,
+      isCurrent: true,
+      accountStatus: { state: 'healthy', code: 'OK', blocking: false },
+      quota: makeQuota(50, 100, 50, 100),
+    },
+    {
+      id: 'acc-u5',
+      email: 'u5@gmail.com',
+      group: 'default',
+      tier: 'ultra_5x',
+      tierSource: 'manual',
+      quotaWeight: 5,
+      enabled: true,
+      isCurrent: false,
+      accountStatus: { state: 'healthy', code: 'OK', blocking: false },
+      quota: makeQuota(80, 60, 80, 60),
+    },
+    {
+      id: 'acc-plus',
+      email: 'plus@gmail.com',
+      group: 'default',
+      tier: 'plus',
+      tierSource: 'auto',
+      quotaWeight: 1,
+      enabled: true,
+      isCurrent: false,
+      accountStatus: { state: 'healthy', code: 'OK', blocking: false },
+      quota: makeQuota(100, 100, 100, 100),
+    },
+  ];
+
+  const tierPosts = [];
+  const apiFetch = async (url, options = {}) => {
+    if (url === '/api/accounts') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            ok: true,
+            supported: true,
+            quotaQueryEnabled: true,
+            officialActiveOnly: true,
+            currentEmail: 'u20@gmail.com',
+            accounts,
+            groups: ['default', 'pro', 'ultra 5x', 'ultra 20x'],
+            settings: { sortBy: 'lastUsed', sortOrder: 'desc' },
+          };
+        },
+      };
+    }
+    if (url === '/api/accounts/tier' && options.method === 'POST') {
+      const body = JSON.parse(String(options.body || '{}'));
+      tierPosts.push(body);
+      const target = accounts.find((a) => a.id === body.accountId);
+      if (target) {
+        target.tier = body.tier;
+        target.tierSource = body.tier ? 'manual' : '';
+        target.quotaWeight = body.tier === 'ultra_20x' ? 20 : body.tier === 'ultra_5x' ? 5 : 1;
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, account: target };
+        },
+      };
+    }
+    return { ok: true, status: 200, async json() { return { ok: true }; } };
+  };
+
+  globalThis.document = document;
+  globalThis.window = {
+    location: { search: '' },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  const { createAccountsHub } = await import(
+    `${pathToFileURL(path.join(FRONTEND_DIR, 'components', 'accounts_hub.js')).href}?tier=${Date.now()}`
+  );
+  const hub = createAccountsHub({ apiFetch, onToast() {} });
+  t.after(() => {
+    hub?.destroy?.();
+    globalThis.document = prevGlobals.document;
+    globalThis.window = prevGlobals.window;
+  });
+
+  await hub.refresh({ silent: true });
+
+  // Total pool capacity = 2000% + 500% + 100% = 2600%
+  assert.equal(document.getElementById('accSummaryHint').textContent, '可用总容量 2600%');
+  // Gemini 5h = 50*20 + 80*5 + 100*1 = 1000 + 400 + 100 = 1500/2600%
+  // Gemini weekly = 100*20 + 60*5 + 100*1 = 2000 + 300 + 100 = 2400/2600%
+  const summaryText = document.getElementById('accSummaryGrid').textContent;
+  assert.ok(summaryText.includes('1500/2600%'), `Expected weighted 5h 1500/2600%, got: ${summaryText}`);
+  assert.ok(summaryText.includes('2400/2600%'), `Expected weighted weekly 2400/2600%, got: ${summaryText}`);
+
+  // Changing Plus card's inline tier select to Ultra 5x updates total capacity to 3000%
+  const tierSelects = document.getElementById('accList').querySelectorAll('.acc-tier-select');
+  assert.equal(tierSelects.length, 3);
+  const plusSelect = tierSelects.find((sel) => sel.value === 'plus');
+  assert.ok(plusSelect, 'Expected inline tier selector with value="plus"');
+  plusSelect.value = 'ultra_5x';
+  plusSelect.dispatchEvent({ type: 'change', target: plusSelect });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.equal(tierPosts.length, 1);
+  assert.deepEqual(tierPosts[0], { accountId: 'acc-plus', tier: 'ultra_5x' });
+  assert.equal(document.getElementById('accSummaryHint').textContent, '可用总容量 3000%');
+  assert.ok(document.getElementById('accSummaryGrid').textContent.includes('1900/3000%'));
+});

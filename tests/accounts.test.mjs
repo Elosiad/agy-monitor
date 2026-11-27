@@ -36,12 +36,14 @@ import {
   mapModelToQuotaGroup,
   normalizeAccountGroups,
   normalizeAccountSettings,
+  normalizeAccountTier,
   parseGoogleCloudCodeError,
   parseImportPayload,
   parseQuotaExhaustedStepError,
   parseWindowsProxyServer,
   refreshAccessTokenForCredential,
   requestOverProxy,
+  resolveAccountQuotaWeight,
   resolveSystemProxyUrl,
   sanitizeAccountGroup,
   sanitizeValidationUrl,
@@ -2617,4 +2619,94 @@ test('detectRecentQuotaExhaustedError prunes removed/expired entries and enforce
     maxStampCacheEntries: 3,
   });
   assert.equal(stampCache.size, 0, 'Expired entries must be pruned when no recent files remain');
+});
+
+test('account tier auto-detection, manual refinement protection, quota weights (20x/5x/1x), and export/import roundtrip', async (t) => {
+  // 1. Canonical tier normalization & quota weights
+  assert.equal(normalizeAccountTier('g1-pro-tier'), 'pro');
+  assert.equal(normalizeAccountTier('Google AI Ultra'), 'ultra');
+  assert.equal(normalizeAccountTier('Google AI Ultra 5x'), 'ultra_5x');
+  assert.equal(normalizeAccountTier('Ultra20x'), 'ultra_20x');
+  assert.equal(normalizeAccountTier('Free Pro'), 'free_pro');
+  assert.equal(normalizeAccountTier('Paid Pro'), 'paid_pro');
+  assert.equal(normalizeAccountTier('Google AI Plus'), 'plus');
+  assert.equal(normalizeAccountTier('free-tier'), 'free');
+
+  assert.equal(resolveAccountQuotaWeight({ tier: 'ultra_20x', group: 'default' }), 20);
+  assert.equal(resolveAccountQuotaWeight({ tier: 'ultra_5x', group: 'default' }), 5);
+  assert.equal(resolveAccountQuotaWeight({ tier: 'ultra', group: 'default' }), 5);
+  assert.equal(resolveAccountQuotaWeight({ tier: 'ultra', group: 'ultra 20x' }), 20);
+  assert.equal(resolveAccountQuotaWeight({ tier: 'plus', group: 'default' }), 1);
+  assert.equal(resolveAccountQuotaWeight({ tier: 'free_pro', group: 'default' }), 1);
+  assert.equal(resolveAccountQuotaWeight({ tier: 'paid_pro', group: 'default' }), 1);
+  assert.equal(resolveAccountQuotaWeight({ tier: '', group: 'ultra 20x' }), 20);
+  assert.equal(resolveAccountQuotaWeight({ tier: '', group: 'ultra 5x' }), 5);
+  assert.equal(resolveAccountQuotaWeight({ tier: '', group: 'default' }), 1);
+
+  // 2. Live capture auto-detects tier, manual override persists across auto-syncs & export/import
+  const nowMs = Date.parse('2026-11-27T04:00:00Z');
+  const fx = createFixture(t, {
+    liveCred: {
+      credObj: {
+        token: {
+          access_token: 'ya29.tier_acc',
+          refresh_token: '1//0eTIER_RT',
+          expiry: new Date(nowMs + 3600_000).toISOString(),
+        },
+        auth_method: 'consumer',
+        id_token_email: 'ultra@gmail.com',
+      },
+    },
+    quotaPayload: {
+      ...makeSampleQuota(80, 90, 100, nowMs + 3600_000),
+      planTier: 'Google AI Ultra',
+      rawTierName: 'Google AI Ultra',
+    },
+  });
+
+  const mgr = createAccountManager({
+    paths: fx.paths,
+    storage: fx.storage,
+    quotaClient: fx.quotaClient,
+    sidecarBridge: fx.sidecarBridge,
+    driver: fx.driver,
+    now: () => nowMs,
+  });
+
+  const cap = await mgr.captureCurrentAccount();
+  assert.equal(cap.ok, true);
+  assert.equal(cap.account.tier, 'ultra');
+  assert.equal(cap.account.tierSource, 'auto');
+  assert.equal(cap.account.quotaWeight, 5);
+
+  // Manually refine Ultra -> Ultra 20x
+  const refined = await mgr.updateAccountTier(cap.account.id, 'ultra_20x');
+  assert.equal(refined.ok, true);
+  assert.equal(refined.account.tier, 'ultra_20x');
+  assert.equal(refined.account.tierSource, 'manual');
+  assert.equal(refined.account.quotaWeight, 20);
+
+  // Subsequent generic auto-sync must NEVER clobber manual refinement
+  await mgr.syncActiveAccountQuotaFromLive(
+    {
+      ...makeSampleQuota(60, 75, 100, nowMs + 3600_000),
+      planTier: 'g1-ultra-tier',
+      rawTierName: 'Google AI Ultra',
+    },
+    { skipAutoSwitch: true },
+  );
+  const listed = await mgr.listAccounts();
+  assert.equal(listed.accounts[0].tier, 'ultra_20x');
+  assert.equal(listed.accounts[0].tierSource, 'manual');
+  assert.equal(listed.accounts[0].quotaWeight, 20);
+
+  // Export -> Import preserves tier & tierSource
+  const exp = await mgr.exportAccountJson(cap.account.id);
+  assert.equal(exp.ok, true);
+  assert.equal(exp.data.tier, 'ultra_20x');
+  assert.equal(exp.data.tierSource, 'manual');
+  const parsedImp = parseImportPayload(exp.jsonText);
+  assert.equal(parsedImp.ok, true);
+  assert.equal(parsedImp.items[0].tier, 'ultra_20x');
+  assert.equal(parsedImp.items[0].tierSource, 'manual');
 });

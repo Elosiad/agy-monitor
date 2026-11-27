@@ -119,42 +119,42 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
     if (statusBadgeEl) {
       statusBadgeEl.className = `other-status-pill ${enabled ? "is-on" : "is-off"}`;
       statusBadgeEl.textContent = enabled
-        ? tr("other.quotaBadgeOn", "已开启 · 官方通道")
-        : tr("other.quotaBadgeOff", "已关闭 · 零查询");
+        ? tr("other.quotaBadgeOn", "已开启")
+        : tr("other.quotaBadgeOff", "已关闭");
     }
 
     if (channelValEl) {
       if (!enabled) {
-        channelValEl.textContent = tr("other.channelDisabled", "已全面停用");
+        channelValEl.textContent = tr("other.channelDisabled", "已停用");
       } else if (comp.activeSource === "official_statusline" || sl.fresh) {
-        channelValEl.textContent = tr("other.channelStatusLine", "官方 CLI statusLine 回调");
+        channelValEl.textContent = tr("other.channelStatusLine", "CLI 回调");
       } else if (comp.hasLocalLs || comp.activeSource === "official_local_ls") {
-        channelValEl.textContent = tr("other.channelLocalLs", "官方宿主本机回环服务");
+        channelValEl.textContent = tr("other.channelLocalLs", "本机官方");
       } else {
-        channelValEl.textContent = tr("other.channelWaiting", "待宿主/CLI 通道就绪");
+        channelValEl.textContent = tr("other.channelWaiting", "等待就绪");
       }
     }
 
     if (guardValEl) {
-      guardValEl.textContent = tr("other.guardBlocked", "已禁绝 cloudcode-pa 直连");
+      guardValEl.textContent = tr("other.guardBlocked", "仅官方安全通道");
     }
 
     if (scopeValEl) {
       scopeValEl.textContent = enabled
-        ? tr("other.scopeOn", "通用页 · 输入框 HUD · 账号页 · 桌宠")
-        : tr("other.scopeOff", "已停查并自动填满所有空位");
+        ? tr("other.scopeOn", "全局生效")
+        : tr("other.scopeOff", "已隐藏额度栏");
     }
 
     if (slBadgeEl) {
       if (sl.fresh) {
         slBadgeEl.className = "other-status-pill is-on";
-        slBadgeEl.textContent = tr("other.slBadgeFresh", "实时同步中");
+        slBadgeEl.textContent = tr("other.slBadgeFresh", "同步中");
       } else if (sl.configured) {
         slBadgeEl.className = "other-status-pill is-info";
-        slBadgeEl.textContent = tr("other.slBadgeConfigured", "已接入 · 待 CLI 触发");
+        slBadgeEl.textContent = tr("other.slBadgeConfigured", "已配置");
       } else if (sl.configuredByOther) {
         slBadgeEl.className = "other-status-pill is-warn";
-        slBadgeEl.textContent = tr("other.slBadgeCustom", "已存在自定义配置");
+        slBadgeEl.textContent = tr("other.slBadgeCustom", "已有自定义");
       } else {
         slBadgeEl.className = "other-status-pill is-muted";
         slBadgeEl.textContent = tr("other.slBadgeIdle", "未接入");
@@ -167,8 +167,8 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
       slInstallBtn.textContent = busySl
         ? tr("other.slWorking", "处理中…")
         : sl.configured
-          ? tr("other.slUninstallBtn", "移除 CLI 接入")
-          : tr("other.slInstallBtn", "一键配置 CLI statusLine");
+          ? tr("other.slUninstallBtn", "移除配置")
+          : tr("other.slInstallBtn", "一键配置");
     }
 
     const slashCmd = sl.slashCommand || "";
@@ -192,8 +192,8 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeCh
     if (liteBadgeEl) {
       liteBadgeEl.className = `other-status-pill ${liteEnabled ? "is-on" : "is-muted"}`;
       liteBadgeEl.textContent = liteEnabled
-        ? tr("other.liteBadgeOn", "已开启 · 省显存")
-        : tr("other.liteBadgeOff", "已关闭 · 标准视觉");
+        ? tr("other.liteBadgeOn", "省显存")
+        : tr("other.liteBadgeOff", "标准");
     }
     if (liteEffectValEl) {
       liteEffectValEl.textContent = liteEnabled

@@ -149,26 +149,26 @@ export function createMemoryModal({ apiFetch, t, onToast } = {}) {
 
       const data = d.data || {};
       if (d.code === "uia_active_restart_hint") {
-        titleEl.textContent = tr("memory.diagUiaTitle", "主进程已加载 UIA 无障碍树");
+        titleEl.textContent = tr("memory.diagUiaTitle", "主程序内存偏高（无障碍监听已开启）");
         detailEl.textContent = tr(
           "memory.diagUiaRestartDetail",
-          "主进程当前占 {mainMb}（提交 {commitMb}）。已开启零 UIA 省内存模式，重启一次 Antigravity 即可彻底释放历史 AXTree 占用。",
+          "主程序当前占 {mainMb}。已开启省内存开关，重启一次软件即可释放。",
           { mainMb: formatMemDetail(data.mainMb), commitMb: formatMemDetail(data.mainCommitMb) }
         );
       } else if (d.code === "uia_active_enable_zero_uia") {
-        titleEl.textContent = tr("memory.diagUiaTitle", "主进程已加载 UIA 无障碍树");
+        titleEl.textContent = tr("memory.diagUiaTitle", "主程序内存偏高（无障碍监听已开启）");
         detailEl.textContent = tr(
           "memory.diagUiaEnableDetail",
-          "检测到主进程加载了 uiautomationcore.dll（当前 {mainMb}），建议开启下方「零 UIA 省内存模式」避免 Chromium 持续膨胀。",
+          "主程序当前占 {mainMb}，建议开启下方「禁用无障碍监听」防止内存持续上涨。",
           { mainMb: formatMemDetail(data.mainMb) }
         );
       } else if (d.code === "companion_bloat") {
-        titleEl.textContent = tr("memory.diagCompanionTitle", "伴侣进程内存偏高：{name}", {
+        titleEl.textContent = tr("memory.diagCompanionTitle", "伴侣进程占用偏高：{name}", {
           name: data.name || "agy_backdrop",
         });
         detailEl.textContent = tr(
           "memory.diagCompanionDetail",
-          "当前占 {wsMb}（提交 {commitMb}，已运行 {hours}h），可一键重启伴侣立即回落至约 30-50 MB。",
+          "当前占 {wsMb}（已运行 {hours}h），点重启可立即回落。",
           {
             wsMb: formatMemDetail(data.privateWsMb),
             commitMb: formatMemDetail(data.privateCommitMb),
@@ -176,20 +176,20 @@ export function createMemoryModal({ apiFetch, t, onToast } = {}) {
           }
         );
       } else if (d.code === "large_conv_db") {
-        titleEl.textContent = tr("memory.diagLargeDbTitle", "单个超长会话数据库较大（{size}）", {
+        titleEl.textContent = tr("memory.diagLargeDbTitle", "单个会话记录较大（{size}）", {
           size: formatMemDetail(data.sizeMb),
         });
         detailEl.textContent = tr(
           "memory.diagLargeDbDetail",
-          "超长对话历史会推高主进程与渲染进程常驻内存，建议阶段性执行 /compact 或开启新对话。"
+          "超长对话会增加内存占用，建议执行 /compact 或开新对话。"
         );
       } else if (d.code === "many_renderers") {
-        titleEl.textContent = tr("memory.diagRenderersTitle", "渲染与子视图进程较多（{count} 个）", {
+        titleEl.textContent = tr("memory.diagRenderersTitle", "后台视图进程较多（{count} 个）", {
           count: data.count || 0,
         });
         detailEl.textContent = tr(
           "memory.diagRenderersDetail",
-          "共占用 {wsMb}，关闭闲置标签页或点击上方「一键释放全量内存」可压缩非活跃工作集。",
+          "共占 {wsMb}，关闭闲置标签或点上方「一键释放」即可。",
           { wsMb: formatMemDetail(data.privateWsMb) }
         );
       } else if (d.code === "high_system_pressure") {

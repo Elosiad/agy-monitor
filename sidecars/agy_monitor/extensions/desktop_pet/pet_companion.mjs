@@ -4,7 +4,7 @@
  * and manages its lifecycle completely independently of AgyBackdrop.
  */
 
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -23,18 +23,49 @@ let cachedDesktopInfo = null;
 const compilePromises = new Map();
 const syncQueues = new Map();
 
-function detectMacHostEnv() {
-  if (process.platform !== 'darwin') {
-    return { isMacOS: false, swiftcPath: '' };
+export function detectMacHostEnv(opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== 'darwin') {
+    return { isMacOS: false, swiftcPath: '', cltInstalled: false };
   }
-  const candidates = ['/usr/bin/swiftc'];
-  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, 'swiftc'));
+  const existsSync = opts.existsSync ?? fs.existsSync;
+  const runSync = opts.execFileSync ?? execFileSync;
+
+  // On clean macOS without Xcode CLT, /usr/bin/swiftc still exists as an xcrun stub
+  // that pops up a GUI install prompt when invoked. Verify via xcode-select -p first.
+  let devDir = '';
+  try {
+    devDir = String(
+      runSync('/usr/bin/xcode-select', ['-p'], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }) || '',
+    ).trim();
+  } catch {
+    devDir = '';
   }
+
+  const cltInstalled = Boolean(devDir && existsSync(devDir));
+  const candidates = [];
+  if (cltInstalled) {
+    candidates.push(
+      path.posix.join(devDir, 'usr', 'bin', 'swiftc'),
+      path.posix.join(devDir, 'Toolchains', 'XcodeDefault.xctoolchain', 'usr', 'bin', 'swiftc'),
+      '/usr/bin/swiftc',
+    );
+  }
+  for (const dir of String(opts.pathEnv ?? process.env.PATH ?? '').split(':')) {
+    if (!dir) continue;
+    const cand = path.posix.join(dir, 'swiftc');
+    if (!cltInstalled && path.posix.resolve(cand) === '/usr/bin/swiftc') continue;
+    candidates.push(cand);
+  }
+
   let swiftcPath = '';
   for (const c of candidates) {
     try {
-      if (fs.existsSync(c)) {
+      if (existsSync(c)) {
         swiftcPath = c;
         break;
       }
@@ -42,7 +73,7 @@ function detectMacHostEnv() {
       // Ignore permission errors
     }
   }
-  return { isMacOS: true, swiftcPath };
+  return { isMacOS: true, swiftcPath, cltInstalled };
 }
 
 function writeUtf16LeBom(filePath, content) {
