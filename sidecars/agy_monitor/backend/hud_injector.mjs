@@ -48,12 +48,54 @@ const WP_EXT_TO_MIME = new Map([
   ['.gif', 'image/gif'],
 ]);
 
+const ASAR_INSPECT_CACHE_MAX = 16;
+const STAGED_SIGNATURE_CACHE_MAX = 64;
+const EMPTY_CONTENT_SIG = crypto.createHash('sha256').update('', 'utf8').digest('hex');
+
+let cachedGuidePath = '';
+let cachedGuideMtime = -1;
+let cachedGuideSize = -1;
 let cachedGuideDataUri = null;
 let cachedResolvedAsarPosix = '';
 let cachedResolvedDevToolsPosix = '';
 let cachedStagedWpPath = '';
 let cachedStagedWpMtime = -1;
+let cachedStagedWpSize = -1;
 let cachedStagedWpUri = '';
+const asarInspectCache = new Map();
+const stagedFileSignatures = new Map();
+
+function setBoundedMap(map, key, value, maxSize) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > maxSize) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+
+function sha256Text(text) {
+  return crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
+
+function clearWallpaperBase64Cache() {
+  cachedStagedWpPath = '';
+  cachedStagedWpMtime = -1;
+  cachedStagedWpSize = -1;
+  cachedStagedWpUri = '';
+}
+
+export function clearHudInjectorCaches() {
+  clearWallpaperBase64Cache();
+  cachedGuidePath = '';
+  cachedGuideMtime = -1;
+  cachedGuideSize = -1;
+  cachedGuideDataUri = null;
+  cachedResolvedAsarPosix = '';
+  cachedResolvedDevToolsPosix = '';
+  asarInspectCache.clear();
+  stagedFileSignatures.clear();
+}
 
 // ============================================================================
 // Pure Node.js Surgical In-Memory ASAR Parser & Repacker
@@ -141,6 +183,119 @@ export function extractAsarFile(parsed, relPath) {
     throw new Error(`文件 ${relPath} 载荷越界`);
   }
   return Buffer.from(parsed.payload.subarray(offset, offset + size));
+}
+
+async function readExactAt(fh, position, length) {
+  if (length === 0) return Buffer.alloc(0);
+  const buf = Buffer.allocUnsafe(length);
+  let totalRead = 0;
+  while (totalRead < length) {
+    const { bytesRead } = await fh.read(buf, totalRead, length - totalRead, position + totalRead);
+    if (!bytesRead || bytesRead <= 0) {
+      throw new Error('ASAR 文件读取提前结束');
+    }
+    totalRead += bytesRead;
+  }
+  return buf;
+}
+
+async function readAsarHeaderFromHandle(fh, fileSize) {
+  if (!Number.isFinite(fileSize) || fileSize < 16) {
+    throw new Error('ASAR 文件过小或已损坏');
+  }
+  const preamble = await readExactAt(fh, 0, 16);
+  const pickleSize = preamble.readUInt32LE(0);
+  const headerSize = preamble.readUInt32LE(4);
+  const headerBodySize = preamble.readUInt32LE(8);
+  const jsonLen = preamble.readUInt32LE(12);
+  if (pickleSize !== 4 || headerSize < 8 || headerBodySize < 4) {
+    throw new Error('ASAR 头部结构非法');
+  }
+  const baseOffset = 8 + headerSize;
+  if (16 + jsonLen > fileSize || baseOffset > fileSize) {
+    throw new Error('ASAR 头部长度越界');
+  }
+  const jsonBuf = await readExactAt(fh, 16, jsonLen);
+  let root;
+  try {
+    root = JSON.parse(jsonBuf.toString('utf8'));
+  } catch (err) {
+    throw new Error(`解析 ASAR JSON 目录树失败: ${err?.message || err}`);
+  }
+  return { root, baseOffset };
+}
+
+async function extractAsarFileFromHandle(fh, root, baseOffset, fileSize, relPath) {
+  const node = lookupAsarNode(root, relPath);
+  if (!node) {
+    throw new Error(`ASAR 内未找到文件: ${relPath}`);
+  }
+  if (node.unpacked === true) {
+    throw new Error(`文件 ${relPath} 标记为 unpacked，不在 ASAR 载荷中`);
+  }
+  const offset = Number(node.offset);
+  const size = Number(node.size);
+  if (!Number.isFinite(offset) || !Number.isFinite(size) || offset < 0 || size < 0) {
+    throw new Error(`文件 ${relPath} offset/size 非法`);
+  }
+  const absStart = baseOffset + offset;
+  if (absStart + size > fileSize) {
+    throw new Error(`文件 ${relPath} 载荷越界`);
+  }
+  return await readExactAt(fh, absStart, size);
+}
+
+async function resolveEntryRelPathFromHandle(fh, root, baseOffset, fileSize) {
+  try {
+    const pkgBuf = await extractAsarFileFromHandle(fh, root, baseOffset, fileSize, 'package.json');
+    const pkg = JSON.parse(pkgBuf.toString('utf8'));
+    const mainField = String(pkg?.main || 'dist/main.js').replace(/\\/g, '/').replace(/^\.\//, '');
+    if (lookupAsarNode(root, mainField)) {
+      return { entryRel: mainField, appVersion: String(pkg?.version || 'unknown') };
+    }
+    return { entryRel: 'dist/main.js', appVersion: String(pkg?.version || 'unknown') };
+  } catch {
+    return { entryRel: 'dist/main.js', appVersion: 'unknown' };
+  }
+}
+
+async function inspectAsarMetadataBySlices(asarPath, fileSize) {
+  let fh = null;
+  try {
+    fh = await fsp.open(asarPath, 'r');
+    const { root, baseOffset } = await readAsarHeaderFromHandle(fh, fileSize);
+    const { entryRel, appVersion } = await resolveEntryRelPathFromHandle(fh, root, baseOffset, fileSize);
+    const hasMain = Boolean(lookupAsarNode(root, ASAR_MAIN_REL));
+    const hasRenderer = Boolean(lookupAsarNode(root, ASAR_RENDERER_REL));
+    const hasWallpaper = Boolean(lookupAsarNode(root, ASAR_WALLPAPER_REL));
+    let hasEntryHook = false;
+    if (lookupAsarNode(root, entryRel)) {
+      const entryText = (await extractAsarFileFromHandle(fh, root, baseOffset, fileSize, entryRel)).toString('utf8');
+      hasEntryHook = entryText.includes(MAIN_HOOK_MARKER);
+    }
+    let installedVersion = '';
+    if (lookupAsarNode(root, ASAR_META_REL)) {
+      try {
+        const metaText = (await extractAsarFileFromHandle(fh, root, baseOffset, fileSize, ASAR_META_REL)).toString('utf8');
+        const meta = JSON.parse(metaText);
+        installedVersion = String(meta?.version || '');
+      } catch {
+        installedVersion = '';
+      }
+    }
+
+    let state = 'stock';
+    if (hasMain && hasRenderer && hasWallpaper && hasEntryHook) {
+      state = installedVersion === NATIVE_HUD_VERSION ? 'installed' : 'outdated';
+    } else if (hasMain || hasRenderer || hasWallpaper || hasEntryHook) {
+      state = 'outdated';
+    }
+    return { appVersion, state, installedVersion };
+  } finally {
+    if (fh) {
+      await fh.close().catch(() => {});
+    }
+  }
 }
 
 function removeAsarNode(root, relPath) {
@@ -447,7 +602,8 @@ function parseWpHexRgb(hex, fallback = [7, 7, 9]) {
  * Shared pure-CSS wallpaper & palette styling for Antigravity's Electron shell
  * (used by both Scheme 2 CDP and Scheme 3 app.asar Persistent Injection).
  */
-export function buildHostWallpaperCss(themes = {}, wallpaperDataUri = '') {
+export function buildHostWallpaperCss(themes = {}, wallpaperDataUri = '', options = {}) {
+  const liteMode = Boolean(options?.liteMode ?? themes?.liteMode);
   const opacity = clampWpInt(themes.opacity, 0, 100, 32);
   const blur = clampWpInt(themes.blur, 0, 24, 4);
   const dim = clampWpInt(themes.dim, 0, 85, 52);
@@ -474,8 +630,280 @@ export function buildHostWallpaperCss(themes = {}, wallpaperDataUri = '') {
   const popupGlassAlpha = Math.max(0.64, Math.min(0.84, 1 - blendFrac * 0.92)).toFixed(3);
   const safeUrl = wallpaperDataUri ? `url("${wallpaperDataUri}")` : 'none';
 
+  const canvasLum = (0.299 * cr + 0.587 * cg + 0.114 * cb) / 255;
+  const isLightPalette = canvasLum > 0.55;
+  const liteCardAlpha = Math.max(0.84, Math.min(0.94, 0.90 - blendFrac * 0.14)).toFixed(3);
+  const liteBubbleAlpha = Math.max(0.86, Math.min(0.95, 0.92 - blendFrac * 0.12)).toFixed(3);
+  const litePopupAlpha = Math.max(0.91, Math.min(0.95, 0.95 - blendFrac * 0.06)).toFixed(3);
+  const liteStickyAlpha = Math.max(0.88, Math.min(0.95, 0.93 - blendFrac * 0.08)).toFixed(3);
+
+  const liteVarsBlock = liteMode
+    ? `
+:root {
+  --agy-wp-url: ${safeUrl};
+  --agy-lite-card-bg: rgba(${br}, ${bg}, ${bb}, ${liteCardAlpha});
+  --agy-lite-bubble-bg: rgba(${br}, ${bg}, ${bb}, ${liteBubbleAlpha});
+  --agy-lite-popup-bg: rgba(${chr}, ${chg}, ${chb}, ${litePopupAlpha});
+  --agy-lite-sticky-bg: rgba(${cr}, ${cg}, ${cb}, ${liteStickyAlpha});
+  --agy-lite-sticky-sidebar-bg: rgba(${chr}, ${chg}, ${chb}, ${liteStickyAlpha});
+  --agy-lite-border: ${isLightPalette ? 'rgba(15, 23, 42, 0.14)' : 'rgba(255, 255, 255, 0.12)'};
+  --agy-lite-highlight: ${isLightPalette ? 'rgba(255, 255, 255, 0.65)' : 'rgba(255, 255, 255, 0.10)'};
+}
+
+${
+  isLightPalette
+    ? `html.dark,
+html[data-theme="dark"],
+body.dark,
+body[data-theme="dark"],
+body[data-agy-theme].dark {
+  --agy-lite-card-bg: rgba(24, 26, 34, 0.90);
+  --agy-lite-bubble-bg: rgba(30, 33, 44, 0.92);
+  --agy-lite-popup-bg: rgba(20, 22, 29, 0.95);
+  --agy-lite-sticky-bg: rgba(16, 18, 24, 0.93);
+  --agy-lite-sticky-sidebar-bg: rgba(20, 22, 29, 0.93);
+  --agy-lite-border: rgba(255, 255, 255, 0.12);
+  --agy-lite-highlight: rgba(255, 255, 255, 0.10);
+}`
+    : `html.light,
+html[data-theme="light"],
+body.light,
+body[data-theme="light"],
+body[data-agy-theme="light"] {
+  --agy-lite-card-bg: rgba(248, 250, 252, 0.92);
+  --agy-lite-bubble-bg: rgba(241, 245, 249, 0.94);
+  --agy-lite-popup-bg: rgba(255, 255, 255, 0.95);
+  --agy-lite-sticky-bg: rgba(248, 250, 252, 0.94);
+  --agy-lite-sticky-sidebar-bg: rgba(241, 245, 249, 0.94);
+  --agy-lite-border: rgba(15, 23, 42, 0.14);
+  --agy-lite-highlight: rgba(255, 255, 255, 0.72);
+}`
+}
+`
+    : `
+:root {
+  --agy-wp-url: ${safeUrl};
+}
+`;
+
+  const cardSurfaceBg = liteMode ? 'var(--agy-lite-card-bg)' : `rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha})`;
+  const bubbleSurfaceBg = liteMode ? 'var(--agy-lite-bubble-bg)' : `rgba(${br}, ${bg}, ${bb}, ${bubbleGlassAlpha})`;
+  const popupSurfaceBg = liteMode ? 'var(--agy-lite-popup-bg)' : `rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha})`;
+
+  const composerSurfaceBlock = liteMode
+    ? `.surface-composer-card,
+[data-agy-mon-layer="composer"] {
+  background-color: ${cardSurfaceBg} !important;
+  background-image: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: inset 0 1px 0 var(--agy-lite-highlight), 0 0 0 1px var(--agy-lite-border) !important;
+}
+
+.agy-user-bubble {
+  background-color: ${bubbleSurfaceBg} !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: inset 0 1px 0 var(--agy-lite-highlight), 0 0 0 1px var(--agy-lite-border) !important;
+}
+
+/* Crisp High-Contrast Cards (Lite Mode — zero backdrop-filter blur) */
+.bg-card,
+.surface-opaque,
+.surface-glass,
+[role="region"][aria-label="Queued messages"] {
+  background-color: ${cardSurfaceBg} !important;
+  background-image: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: inset 0 1px 0 var(--agy-lite-highlight), 0 0 0 1px var(--agy-lite-border) !important;
+}`
+    : `.surface-composer-card,
+[data-agy-mon-layer="composer"] {
+  background-color: ${cardSurfaceBg} !important;
+  background-image: none !important;
+  backdrop-filter: blur(20px) saturate(145%) !important;
+  -webkit-backdrop-filter: blur(20px) saturate(145%) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
+}
+
+.agy-user-bubble {
+  background-color: ${bubbleSurfaceBg} !important;
+  backdrop-filter: blur(12px) saturate(125%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(125%) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
+}
+
+/* Frosted-Glass Cards: Queued Messages, Approval/Permission Cards, Settings Cards & Inline Panels */
+.bg-card,
+.surface-opaque,
+.surface-glass,
+[role="region"][aria-label="Queued messages"] {
+  background-color: ${cardSurfaceBg} !important;
+  background-image: none !important;
+  backdrop-filter: blur(18px) saturate(140%) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(140%) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
+}`;
+
+  const stickyHeadersBlock = liteMode
+    ? `/* Clean solid/semi-transparent sticky header occlusion (Lite Mode — zero fixed-attachment wallpaper blur) */
+.sticky.bg-background:not(.pointer-events-none),
+.sticky.bg-shell:not(.pointer-events-none),
+div.sticky.bg-secondary:not(.pointer-events-none),
+.bg-background[style*="sticky"]:not(.pointer-events-none),
+[data-agy-mon-layer="sticky-main"] {
+  background-color: var(--agy-lite-sticky-bg) !important;
+  background-image: none !important;
+  filter: none !important;
+  isolation: isolate !important;
+}
+
+[role="navigation"] .bg-sidebar[style*="sticky"],
+[role="navigation"] .sticky.bg-sidebar,
+[role="navigation"] .sticky.bg-background,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"] {
+  background-color: var(--agy-lite-sticky-sidebar-bg) !important;
+  background-image: none !important;
+  filter: none !important;
+  isolation: isolate !important;
+}
+
+.sticky.bg-background:not(.pointer-events-none)::before,
+.sticky.bg-shell:not(.pointer-events-none)::before,
+div.sticky.bg-secondary:not(.pointer-events-none)::before,
+.bg-background[style*="sticky"]:not(.pointer-events-none)::before,
+[data-agy-mon-layer="sticky-main"]::before,
+[role="navigation"] .bg-sidebar[style*="sticky"]::before,
+[role="navigation"] .sticky.bg-sidebar::before,
+[role="navigation"] .sticky.bg-background::before,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::before {
+  content: none !important;
+  background-image: none !important;
+  filter: none !important;
+}
+
+.sticky.bg-background:not(.pointer-events-none)::after,
+.sticky.bg-shell:not(.pointer-events-none)::after,
+div.sticky.bg-secondary:not(.pointer-events-none)::after,
+.bg-background[style*="sticky"]:not(.pointer-events-none)::after,
+[data-agy-mon-layer="sticky-main"]::after,
+[role="navigation"] .bg-sidebar[style*="sticky"]::after,
+[role="navigation"] .sticky.bg-sidebar::after,
+[role="navigation"] .sticky.bg-background::after,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::after {
+  content: none !important;
+  background-image: none !important;
+  filter: none !important;
+}`
+    : `/* Seamless viewport-aligned wallpaper occlusion for ALL sticky headers (Projects sidebar, Customizations, Automations, Settings, Diff):
+   completely blocks scrolled items underneath while aligning 1:1 pixel-for-pixel with the continuous full-window wallpaper! */
+.sticky.bg-background:not(.pointer-events-none),
+.sticky.bg-shell:not(.pointer-events-none),
+div.sticky.bg-secondary:not(.pointer-events-none),
+.bg-background[style*="sticky"]:not(.pointer-events-none),
+[data-agy-mon-layer="sticky-main"],
+[role="navigation"] .bg-sidebar[style*="sticky"],
+[role="navigation"] .sticky.bg-sidebar,
+[role="navigation"] .sticky.bg-background,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"] {
+  background-color: rgb(${cr}, ${cg}, ${cb}) !important;
+  ${blur > 0 ? 'overflow: clip !important;' : ''}
+  isolation: isolate !important;
+}
+
+.sticky.bg-background:not(.pointer-events-none)::before,
+.sticky.bg-shell:not(.pointer-events-none)::before,
+div.sticky.bg-secondary:not(.pointer-events-none)::before,
+.bg-background[style*="sticky"]:not(.pointer-events-none)::before,
+[data-agy-mon-layer="sticky-main"]::before,
+[role="navigation"] .bg-sidebar[style*="sticky"]::before,
+[role="navigation"] .sticky.bg-sidebar::before,
+[role="navigation"] .sticky.bg-background::before,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::before {
+  content: "" !important;
+  position: absolute !important;
+  inset: ${blur > 0 ? '-16px' : '0'} !important;
+  z-index: -2 !important;
+  pointer-events: none !important;
+  background-image: var(--agy-wp-url) !important;
+  background-position: center center !important;
+  background-repeat: no-repeat !important;
+  background-size: ${fit} !important;
+  background-attachment: fixed !important;
+  opacity: ${wpOpacity} !important;
+  filter: ${blur > 0 ? `blur(${blur}px)` : 'none'} !important;
+}
+
+.sticky.bg-background:not(.pointer-events-none)::after,
+.sticky.bg-shell:not(.pointer-events-none)::after,
+div.sticky.bg-secondary:not(.pointer-events-none)::after,
+.bg-background[style*="sticky"]:not(.pointer-events-none)::after,
+[data-agy-mon-layer="sticky-main"]::after {
+  content: "" !important;
+  position: absolute !important;
+  inset: 0 !important;
+  z-index: -1 !important;
+  pointer-events: none !important;
+  background: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+}
+
+[role="navigation"] .bg-sidebar[style*="sticky"]::after,
+[role="navigation"] .sticky.bg-sidebar::after,
+[role="navigation"] .sticky.bg-background::after,
+[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::after {
+  content: "" !important;
+  position: absolute !important;
+  inset: 0 !important;
+  z-index: -1 !important;
+  pointer-events: none !important;
+  background:
+    linear-gradient(rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}), rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha})),
+    rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
+}`;
+
+  const popupSurfaceBlock = liteMode
+    ? `/* Crisp high-contrast popups, dropdowns, dialogs, menus, hover widgets, and tooltips (Lite Mode — zero backdrop-filter blur) */
+[role="dialog"],
+[role="alertdialog"],
+[role="menu"],
+[role="listbox"],
+[role="tooltip"],
+[data-radix-popper-content-wrapper] > *,
+[data-sonner-toast],
+.monaco-hover,
+.suggest-widget,
+.quick-input-widget,
+.agy-fastpick,
+.context-view .monaco-menu {
+  background-color: ${popupSurfaceBg} !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: inset 0 1px 0 var(--agy-lite-highlight), 0 0 0 1px var(--agy-lite-border), 0 10px 28px rgba(0, 0, 0, 0.30) !important;
+}`
+    : `/* Translucent frosted-glass popups, dropdowns, dialogs, menus, hover widgets, and tooltips (matches Scheme 1 depth with 100% crisp text) */
+[role="dialog"],
+[role="alertdialog"],
+[role="menu"],
+[role="listbox"],
+[role="tooltip"],
+[data-radix-popper-content-wrapper] > *,
+[data-sonner-toast],
+.monaco-hover,
+.suggest-widget,
+.quick-input-widget,
+.agy-fastpick,
+.context-view .monaco-menu {
+  background-color: ${popupSurfaceBg} !important;
+  backdrop-filter: blur(18px) saturate(140%) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(140%) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 12px 32px rgba(0, 0, 0, 0.38) !important;
+}`;
+
   return `
-/* Antigravity Monitor · Crisp Pure-CSS Wallpaper (Scheme 2 CDP / Scheme 3 Persistent Inject) */
+/* Antigravity Monitor · Crisp Pure-CSS Wallpaper (Scheme 2 CDP / Scheme 3 Persistent Inject${liteMode ? ' · Lite Mode' : ''}) */
+${liteVarsBlock.trim()}
+
 :root,
 body,
 body[data-agy-theme],
@@ -490,13 +918,13 @@ body[data-agy-theme] .agy-inset-shell {
   --sidebar: transparent !important;
   --color-sidebar: transparent !important;
   --onyx-frame: transparent !important;
-  --card: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha}) !important;
-  --color-card: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha}) !important;
-  --glass: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha}) !important;
-  --onyx-raised: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha}) !important;
+  --card: ${cardSurfaceBg} !important;
+  --color-card: ${cardSurfaceBg} !important;
+  --glass: ${cardSurfaceBg} !important;
+  --onyx-raised: ${cardSurfaceBg} !important;
   --onyx-selected: rgba(${br}, ${bg}, ${bb}, ${softSurfaceAlpha}) !important;
-  --popover: rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha}) !important;
-  --color-popover: rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha}) !important;
+  --popover: ${popupSurfaceBg} !important;
+  --color-popover: ${popupSurfaceBg} !important;
 }
 
 html {
@@ -510,14 +938,14 @@ html::before {
   inset: 0 !important;
   z-index: 0 !important;
   pointer-events: none !important;
-  background-image: ${safeUrl} !important;
+  background-image: var(--agy-wp-url) !important;
   background-position: center center !important;
   background-repeat: no-repeat !important;
   background-size: ${fit} !important;
   opacity: ${wpOpacity} !important;
   filter: ${blur > 0 ? `blur(${blur}px)` : 'none'} !important;
   transform: ${blur > 0 ? 'scale(1.04)' : 'none'} !important;
-  will-change: opacity, filter !important;
+  ${liteMode ? '' : 'will-change: opacity, filter !important;'}
 }
 
 html::after {
@@ -608,33 +1036,7 @@ body > div:first-of-type {
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12), 0 10px 30px rgba(0, 0, 0, 0.28) !important;
 }
 
-.surface-composer-card,
-[data-agy-mon-layer="composer"] {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha}) !important;
-  background-image: none !important;
-  backdrop-filter: blur(20px) saturate(145%) !important;
-  -webkit-backdrop-filter: blur(20px) saturate(145%) !important;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
-}
-
-.agy-user-bubble {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${bubbleGlassAlpha}) !important;
-  backdrop-filter: blur(12px) saturate(125%) !important;
-  -webkit-backdrop-filter: blur(12px) saturate(125%) !important;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
-}
-
-/* Frosted-Glass Cards: Queued Messages, Approval/Permission Cards, Settings Cards & Inline Panels */
-.bg-card,
-.surface-opaque,
-.surface-glass,
-[role="region"][aria-label="Queued messages"] {
-  background-color: rgba(${br}, ${bg}, ${bb}, ${composerGlassAlpha}) !important;
-  background-image: none !important;
-  backdrop-filter: blur(18px) saturate(140%) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(140%) !important;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
-}
+${composerSurfaceBlock}
 
 /* Clear bottom/top scroll fade gradient scrims above composer & lists */
 .pointer-events-none[style*="linear-gradient"],
@@ -668,98 +1070,19 @@ div:has(> div > div > iframe[src*="agy-monitor"]) {
   background-image: none !important;
 }
 
-/* Seamless viewport-aligned wallpaper occlusion for ALL sticky headers (Projects sidebar, Customizations, Automations, Settings, Diff):
-   completely blocks scrolled items underneath while aligning 1:1 pixel-for-pixel with the continuous full-window wallpaper! */
-.sticky.bg-background:not(.pointer-events-none),
-.sticky.bg-shell:not(.pointer-events-none),
-div.sticky.bg-secondary:not(.pointer-events-none),
-.bg-background[style*="sticky"]:not(.pointer-events-none),
-[data-agy-mon-layer="sticky-main"],
-[role="navigation"] .bg-sidebar[style*="sticky"],
-[role="navigation"] .sticky.bg-sidebar,
-[role="navigation"] .sticky.bg-background,
-[role="navigation"] [data-agy-mon-layer="sticky-sidebar"] {
-  background-color: rgb(${cr}, ${cg}, ${cb}) !important;
-  ${blur > 0 ? 'overflow: clip !important;' : ''}
-  isolation: isolate !important;
-}
-
-.sticky.bg-background:not(.pointer-events-none)::before,
-.sticky.bg-shell:not(.pointer-events-none)::before,
-div.sticky.bg-secondary:not(.pointer-events-none)::before,
-.bg-background[style*="sticky"]:not(.pointer-events-none)::before,
-[data-agy-mon-layer="sticky-main"]::before,
-[role="navigation"] .bg-sidebar[style*="sticky"]::before,
-[role="navigation"] .sticky.bg-sidebar::before,
-[role="navigation"] .sticky.bg-background::before,
-[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::before {
-  content: "" !important;
-  position: absolute !important;
-  inset: ${blur > 0 ? '-16px' : '0'} !important;
-  z-index: -2 !important;
-  pointer-events: none !important;
-  background-image: ${safeUrl} !important;
-  background-position: center center !important;
-  background-repeat: no-repeat !important;
-  background-size: ${fit} !important;
-  background-attachment: fixed !important;
-  opacity: ${wpOpacity} !important;
-  filter: ${blur > 0 ? `blur(${blur}px)` : 'none'} !important;
-}
-
-.sticky.bg-background:not(.pointer-events-none)::after,
-.sticky.bg-shell:not(.pointer-events-none)::after,
-div.sticky.bg-secondary:not(.pointer-events-none)::after,
-.bg-background[style*="sticky"]:not(.pointer-events-none)::after,
-[data-agy-mon-layer="sticky-main"]::after {
-  content: "" !important;
-  position: absolute !important;
-  inset: 0 !important;
-  z-index: -1 !important;
-  pointer-events: none !important;
-  background: rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
-}
-
-[role="navigation"] .bg-sidebar[style*="sticky"]::after,
-[role="navigation"] .sticky.bg-sidebar::after,
-[role="navigation"] .sticky.bg-background::after,
-[role="navigation"] [data-agy-mon-layer="sticky-sidebar"]::after {
-  content: "" !important;
-  position: absolute !important;
-  inset: 0 !important;
-  z-index: -1 !important;
-  pointer-events: none !important;
-  background:
-    linear-gradient(rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha}), rgba(${chr}, ${chg}, ${chb}, ${sidebarTintAlpha})),
-    rgba(${cr}, ${cg}, ${cb}, ${totalVeilAlpha}) !important;
-}
+${stickyHeadersBlock}
 
 thead.sticky,
 thead.sticky th,
 th.sticky {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha}) !important;
+  background-color: ${popupSurfaceBg} !important;
 }
 
-/* Translucent frosted-glass popups, dropdowns, dialogs, menus, hover widgets, and tooltips (matches Scheme 1 depth with 100% crisp text) */
-[role="dialog"],
-[role="alertdialog"],
-[role="menu"],
-[role="listbox"],
-[role="tooltip"],
-[data-radix-popper-content-wrapper] > *,
-[data-sonner-toast],
-.monaco-hover,
-.suggest-widget,
-.quick-input-widget,
-.agy-fastpick,
-.context-view .monaco-menu {
-  background-color: rgba(${chr}, ${chg}, ${chb}, ${popupGlassAlpha}) !important;
-  backdrop-filter: blur(18px) saturate(140%) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(140%) !important;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 12px 32px rgba(0, 0, 0, 0.38) !important;
-}
+${popupSurfaceBlock}
 `.trim();
 }
+
+export { buildHostWallpaperCss as buildWallpaperCss };
 
 export function buildNativeWallpaperEngineScript() {
   return `(function () {
@@ -772,7 +1095,7 @@ export function buildNativeWallpaperEngineScript() {
   }
 
   function ensureLayerEngine() {
-    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 5) {
+    if (window.__agyMonLayerEngine && window.__agyMonLayerEngine.version !== 6) {
       try { window.__agyMonLayerEngine.stop(); } catch (e) {}
     }
     if (!window.__agyMonLayerEngine) {
@@ -907,6 +1230,7 @@ export function buildNativeWallpaperEngineScript() {
       }
 
       function scanLayers() {
+        if (document.hidden) return 0;
         var vw = window.innerWidth || 0;
         var vh = window.innerHeight || 0;
         if (vw < 300 || vh < 200) return 0;
@@ -957,30 +1281,86 @@ export function buildNativeWallpaperEngineScript() {
         return tagged;
       }
 
+      var MUT_THROTTLE_MS = 350;
       var timer = setInterval(scanLayers, 1100);
-      var onResize = function () { setTimeout(scanLayers, 40); };
+      var resizeTimer = null;
+      var onResize = function () {
+        if (document.hidden) return;
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(function () {
+          resizeTimer = null;
+          scanLayers();
+        }, 120);
+      };
       window.addEventListener('resize', onResize, { passive: true });
+
       var mutTimer = null;
+      var mutPending = false;
+      var lastMutScanAt = 0;
+      function flushMutScan() {
+        mutTimer = null;
+        if (document.hidden) {
+          mutPending = true;
+          return;
+        }
+        mutPending = false;
+        lastMutScanAt = Date.now();
+        scanLayers();
+        if (mutPending && !mutTimer) {
+          mutTimer = setTimeout(flushMutScan, MUT_THROTTLE_MS);
+        }
+      }
+      function scheduleMutScan() {
+        if (document.hidden) {
+          mutPending = true;
+          return;
+        }
+        mutPending = true;
+        if (mutTimer) return;
+        var elapsed = Date.now() - lastMutScanAt;
+        var wait = elapsed >= MUT_THROTTLE_MS ? MUT_THROTTLE_MS : Math.max(50, MUT_THROTTLE_MS - elapsed);
+        mutTimer = setTimeout(flushMutScan, wait);
+      }
+
+      var onVisibilityChange = function () {
+        if (document.hidden) {
+          if (mutTimer) {
+            clearTimeout(mutTimer);
+            mutTimer = null;
+            mutPending = true;
+          }
+          if (resizeTimer) {
+            clearTimeout(resizeTimer);
+            resizeTimer = null;
+          }
+          return;
+        }
+        mutPending = false;
+        lastMutScanAt = Date.now();
+        scanLayers();
+      };
+      document.addEventListener('visibilitychange', onVisibilityChange);
+
       var layerObserver = null;
       if (typeof MutationObserver === 'function' && document.body) {
         layerObserver = new MutationObserver(function () {
-          if (mutTimer) return;
-          mutTimer = setTimeout(function () {
-            mutTimer = null;
-            scanLayers();
-          }, 32);
+          scheduleMutScan();
         });
         layerObserver.observe(document.body, { childList: true, subtree: true });
       }
 
       window.__agyMonLayerEngine = {
-        version: 5,
+        version: 6,
+        throttleMs: MUT_THROTTLE_MS,
         scan: scanLayers,
         stop: function () {
           clearInterval(timer);
           if (mutTimer) { clearTimeout(mutTimer); mutTimer = null; }
+          if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null; }
+          mutPending = false;
           if (layerObserver) { layerObserver.disconnect(); layerObserver = null; }
           window.removeEventListener('resize', onResize);
+          document.removeEventListener('visibilitychange', onVisibilityChange);
           var nodes = document.querySelectorAll('[data-agy-mon-layer]');
           for (var i = 0; i < nodes.length; i++) {
             nodes[i].removeAttribute('data-agy-mon-layer');
@@ -1024,24 +1404,83 @@ export function buildNativeWallpaperEngineScript() {
 })();`;
 }
 
-export async function resolveWallpaperDataUriForThemes(paths = {}, themes = {}) {
+function resolveWallpaperFilePathForThemes(paths = {}, themes = {}) {
   const wpId = typeof themes?.activeWallpaperId === 'string' ? themes.activeWallpaperId.trim() : '';
   if (!wpId) return '';
-
-  let filePath = '';
   if (/^wp-\d+$/i.test(wpId) && paths?.wallpapersDir) {
-    filePath = path.join(paths.wallpapersDir, `${path.basename(wpId)}.webp`);
-  } else if (Array.isArray(themes?.customWallpapers) && paths?.customWallpapersDir) {
+    return path.join(paths.wallpapersDir, `${path.basename(wpId)}.webp`);
+  }
+  if (Array.isArray(themes?.customWallpapers) && paths?.customWallpapersDir) {
     const match = themes.customWallpapers.find((w) => w && w.id === wpId && w.filename);
     if (match) {
-      filePath = path.join(paths.customWallpapersDir, path.basename(match.filename));
+      return path.join(paths.customWallpapersDir, path.basename(match.filename));
     }
   }
-  if (!filePath) return '';
+  return '';
+}
+
+async function writeTextIfChanged(filePath, content, { sig = '', inputSig = '' } = {}) {
+  const text = String(content ?? '');
+  const expectedBytes = Buffer.byteLength(text, 'utf8');
+  const effectiveSig = sig || sha256Text(text);
+  const prev = stagedFileSignatures.get(filePath);
+  if (prev && prev.sig === effectiveSig && prev.size === expectedBytes) {
+    const st = await fsp.stat(filePath).catch(() => null);
+    if (st && st.isFile() && st.size === expectedBytes) {
+      if (inputSig && prev.inputSig !== inputSig) {
+        setBoundedMap(stagedFileSignatures, filePath, { ...prev, inputSig }, STAGED_SIGNATURE_CACHE_MAX);
+      }
+      return { written: false, bytes: expectedBytes };
+    }
+  }
+  await fsp.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {});
+  await atomicWriteText(filePath, text);
+  setBoundedMap(
+    stagedFileSignatures,
+    filePath,
+    { sig: effectiveSig, size: expectedBytes, inputSig: inputSig || '' },
+    STAGED_SIGNATURE_CACHE_MAX,
+  );
+  return { written: true, bytes: expectedBytes };
+}
+
+function buildWallpaperCssInputSignature(themes = {}, filePath = '', st = null, liteMode = false) {
+  const colors = themes?.colors && typeof themes.colors === 'object' ? themes.colors : {};
+  return sha256Text(
+    JSON.stringify({
+      v: NATIVE_HUD_VERSION,
+      liteMode: Boolean(liteMode),
+      filePath,
+      mtimeMs: st ? st.mtimeMs : 0,
+      size: st ? st.size : 0,
+      opacity: clampWpInt(themes?.opacity, 0, 100, 32),
+      blur: clampWpInt(themes?.blur, 0, 24, 4),
+      dim: clampWpInt(themes?.dim, 0, 85, 52),
+      hostBlendPct: clampWpInt(themes?.hostBlendPct, 5, 42, 18),
+      fit: themes?.fit === 'contain' ? 'contain' : 'cover',
+      canvas: typeof colors.canvas === 'string' ? colors.canvas : '',
+      chrome: typeof colors.chrome === 'string' ? colors.chrome : '',
+      bubble: typeof colors.bubble === 'string' ? colors.bubble : '',
+      accent: typeof colors.accent === 'string' ? colors.accent : '',
+    }),
+  );
+}
+
+export async function resolveWallpaperDataUriForThemes(paths = {}, themes = {}) {
+  const filePath = resolveWallpaperFilePathForThemes(paths, themes);
+  if (!filePath) {
+    clearWallpaperBase64Cache();
+    return '';
+  }
 
   try {
     const st = await fsp.stat(filePath);
-    if (filePath === cachedStagedWpPath && st.mtimeMs === cachedStagedWpMtime && cachedStagedWpUri) {
+    if (
+      filePath === cachedStagedWpPath &&
+      st.mtimeMs === cachedStagedWpMtime &&
+      st.size === cachedStagedWpSize &&
+      cachedStagedWpUri
+    ) {
       return cachedStagedWpUri;
     }
     const ext = path.extname(filePath).toLowerCase();
@@ -1049,49 +1488,110 @@ export async function resolveWallpaperDataUriForThemes(paths = {}, themes = {}) 
     const buf = await fsp.readFile(filePath);
     cachedStagedWpPath = filePath;
     cachedStagedWpMtime = st.mtimeMs;
+    cachedStagedWpSize = st.size;
     cachedStagedWpUri = `data:${mime};base64,${buf.toString('base64')}`;
     return cachedStagedWpUri;
   } catch {
+    clearWallpaperBase64Cache();
     return '';
   }
 }
 
-export async function stageLiveWallpaperCss(paths = {}, themes = {}) {
-  if (!paths?.pluginDataDir) return { staged: false, hasCss: false };
-  await fsp.mkdir(paths.pluginDataDir, { recursive: true }).catch(() => {});
+export async function stageLiveWallpaperCss(paths = {}, themes = {}, options = {}) {
+  if (!paths?.pluginDataDir) return { staged: false, hasCss: false, skipped: false };
+  const liteMode = Boolean(options?.liteMode ?? themes?.liteMode);
   const cssFile = paths.nativeWallpaperCssFile || path.join(paths.pluginDataDir, 'native_wallpaper.css');
   const engineFile = paths.nativeWallpaperEngineFile || path.join(paths.pluginDataDir, 'native_wallpaper_engine.js');
-  await atomicWriteText(engineFile, buildNativeWallpaperEngineScript()).catch(() => {});
+  const engineSrc = buildNativeWallpaperEngineScript();
+  await writeTextIfChanged(engineFile, engineSrc, { sig: sha256Text(engineSrc) }).catch(() => {});
 
   const mode = themes?.hostThemeMode === 'cdp' || themes?.hostThemeMode === 'backdrop' ? themes.hostThemeMode : 'inject';
   const wantInjectCss = mode === 'inject' && themes?.backdropEnabled !== false && Boolean(themes?.activeWallpaperId);
   if (!wantInjectCss) {
-    await atomicWriteText(cssFile, '').catch(() => {});
-    return { staged: true, hasCss: false };
+    clearWallpaperBase64Cache();
+    const res = await writeTextIfChanged(cssFile, '', { sig: EMPTY_CONTENT_SIG, inputSig: 'empty' }).catch(() => ({
+      written: false,
+      bytes: 0,
+    }));
+    return { staged: true, hasCss: false, skipped: !res.written };
+  }
+
+  const wpFilePath = resolveWallpaperFilePathForThemes(paths, themes);
+  if (!wpFilePath) {
+    clearWallpaperBase64Cache();
+    const res = await writeTextIfChanged(cssFile, '', { sig: EMPTY_CONTENT_SIG, inputSig: 'empty' }).catch(() => ({
+      written: false,
+      bytes: 0,
+    }));
+    return { staged: true, hasCss: false, skipped: !res.written };
+  }
+
+  const wpStat = await fsp.stat(wpFilePath).catch(() => null);
+  if (!wpStat || !wpStat.isFile()) {
+    clearWallpaperBase64Cache();
+    const res = await writeTextIfChanged(cssFile, '', { sig: EMPTY_CONTENT_SIG, inputSig: 'empty' }).catch(() => ({
+      written: false,
+      bytes: 0,
+    }));
+    return { staged: true, hasCss: false, skipped: !res.written };
+  }
+
+  const wpInputSig = buildWallpaperCssInputSignature(themes, wpFilePath, wpStat, liteMode);
+  const prevCss = stagedFileSignatures.get(cssFile);
+  if (prevCss && prevCss.inputSig === wpInputSig) {
+    const cssStat = await fsp.stat(cssFile).catch(() => null);
+    if (cssStat && cssStat.isFile() && cssStat.size === prevCss.size) {
+      return { staged: true, hasCss: true, bytes: prevCss.size, skipped: true };
+    }
   }
 
   const dataUri = await resolveWallpaperDataUriForThemes(paths, themes);
   if (!dataUri) {
-    await atomicWriteText(cssFile, '').catch(() => {});
-    return { staged: true, hasCss: false };
+    clearWallpaperBase64Cache();
+    const res = await writeTextIfChanged(cssFile, '', { sig: EMPTY_CONTENT_SIG, inputSig: 'empty' }).catch(() => ({
+      written: false,
+      bytes: 0,
+    }));
+    return { staged: true, hasCss: false, skipped: !res.written };
   }
-  const css = buildHostWallpaperCss(themes, dataUri);
-  await atomicWriteText(cssFile, css).catch(() => {});
-  return { staged: true, hasCss: true, bytes: Buffer.byteLength(css, 'utf8') };
+  const css = buildHostWallpaperCss(themes, dataUri, { liteMode });
+  const res = await writeTextIfChanged(cssFile, css, {
+    sig: sha256Text(css),
+    inputSig: wpInputSig,
+  }).catch(() => ({ written: false, bytes: Buffer.byteLength(css, 'utf8') }));
+  return { staged: true, hasCss: true, bytes: res.bytes, skipped: !res.written };
 }
 
 async function resolveGuideImageDataUri(paths) {
-  if (cachedGuideDataUri !== null) return cachedGuideDataUri;
+  const p = paths?.assetsDir ? path.join(paths.assetsDir, 'open_console_guide.jpg') : '';
+  if (!p) {
+    cachedGuidePath = '';
+    cachedGuideMtime = -1;
+    cachedGuideSize = -1;
+    cachedGuideDataUri = '';
+    return '';
+  }
   try {
-    const p = paths?.assetsDir ? path.join(paths.assetsDir, 'open_console_guide.jpg') : '';
-    if (!p || !fs.existsSync(p)) {
-      cachedGuideDataUri = '';
-      return '';
+    const st = await fsp.stat(p);
+    if (
+      cachedGuideDataUri !== null &&
+      p === cachedGuidePath &&
+      st.mtimeMs === cachedGuideMtime &&
+      st.size === cachedGuideSize
+    ) {
+      return cachedGuideDataUri;
     }
     const buf = await fsp.readFile(p);
+    cachedGuidePath = p;
+    cachedGuideMtime = st.mtimeMs;
+    cachedGuideSize = st.size;
     cachedGuideDataUri = `data:image/jpeg;base64,${buf.toString('base64')}`;
     return cachedGuideDataUri;
   } catch {
+    cachedGuidePath = '';
+    cachedGuideMtime = -1;
+    cachedGuideSize = -1;
+    cachedGuideDataUri = null;
     return '';
   }
 }
@@ -1387,6 +1887,9 @@ export function buildNativeHudRendererScript() {
     ':host { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 auto; min-width: 0; max-width: 580px; margin-right: 4px; position: relative; height: 24px; user-select: none; -webkit-app-region: no-drag; font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; color: #e4e4ec; --hud-dur: 0.44s; --hud-ease: cubic-bezier(0.32, 0.04, 0.20, 1); --hud-fade: 0.28s; --hud-accent: #5b8cff; --hud-bg: rgba(33, 37, 51, 0.30); --hud-bg-hover: rgba(33, 37, 51, 0.44); --hud-border: rgba(255, 255, 255, 0.13); --hud-border-hover: rgba(255, 255, 255, 0.24); --hud-track: rgba(255, 255, 255, 0.22); --hud-text: #e8e7ef; --hud-muted: #b8b8c4; --hud-cache: #b8dfcf; --hud-dot: rgba(255, 255, 255, 0.40); }',
     ':host([data-qhover="1"]) { --hud-dur: 0.48s; --hud-ease: cubic-bezier(0.32, 0.04, 0.20, 1); --hud-fade: 0.34s; }',
     ':host([data-theme="light"]) { color: #1d1c22; --hud-bg: rgba(255, 255, 255, 0.46); --hud-bg-hover: rgba(255, 255, 255, 0.70); --hud-border: rgba(15, 23, 42, 0.14); --hud-border-hover: rgba(15, 23, 42, 0.26); --hud-track: rgba(15, 23, 42, 0.18); --hud-text: #1e293b; --hud-muted: #475569; --hud-cache: #0f766e; --hud-dot: rgba(15, 23, 42, 0.32); }',
+    ':host([data-lite="1"]) { --hud-bg: rgba(24, 27, 38, 0.90); --hud-bg-hover: rgba(32, 36, 50, 0.95); }',
+    ':host([data-lite="1"][data-theme="light"]) { --hud-bg: rgba(248, 250, 252, 0.94); --hud-bg-hover: rgba(255, 255, 255, 0.98); }',
+    ':host([data-lite="1"]) .ring-pill:hover, :host([data-lite="1"]) .meta-pill, :host([data-lite="1"]) .quota-pill, :host([data-lite="1"]) .empty-pill { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }',
     '* { box-sizing: border-box; }',
     '.ring-pill { display: inline-flex; align-items: center; height: 22px; padding: 0 3px; border-radius: 999px; border: 1px solid transparent; background: transparent; cursor: pointer; flex-shrink: 0; color: inherit; transition: background 0.24s ease, border-color 0.24s ease, padding 0.30s cubic-bezier(0.22, 1, 0.36, 1); }',
     '.ring-pill:hover { background: var(--hud-bg-hover); border-color: var(--hud-border-hover); padding: 0 7px 0 5px; backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%); }',
@@ -1453,6 +1956,9 @@ export function buildNativeHudRendererScript() {
     '<style>',
     ':host { font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif; color: #e4e4ec; --hud-accent: #5b8cff; --hud-border-hover: rgba(255, 255, 255, 0.26); --hud-text: #e8e7ef; --hud-muted: #b6b5c0; --pop-bg: rgba(22, 24, 33, 0.78); --pop-border: rgba(255, 255, 255, 0.14); --pop-row-hover: rgba(255, 255, 255, 0.08); --pop-shadow: 0 12px 32px rgba(0, 0, 0, 0.42); }',
     ':host([data-theme="light"]) { color: #1d1c22; --hud-border-hover: rgba(15, 23, 42, 0.24); --hud-text: #1e293b; --hud-muted: #475569; --pop-bg: rgba(250, 251, 254, 0.86); --pop-border: rgba(15, 23, 42, 0.12); --pop-row-hover: rgba(15, 23, 42, 0.06); --pop-shadow: 0 10px 28px rgba(15, 23, 42, 0.14); }',
+    ':host([data-lite="1"]) { --pop-bg: rgba(22, 24, 33, 0.95); }',
+    ':host([data-lite="1"][data-theme="light"]) { --pop-bg: rgba(252, 253, 255, 0.96); }',
+    ':host([data-lite="1"]) .ring-tip, :host([data-lite="1"]) .pop, :host([data-lite="1"]) .guide-card { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }',
     '* { box-sizing: border-box; }',
     '.ring-tip { position: fixed; z-index: 2147483635; pointer-events: none; padding: 3px 8px; border-radius: 7px; border: 1px solid var(--pop-border); background: var(--pop-bg); backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%); color: var(--hud-text); font-size: 10.5px; font-variant-numeric: tabular-nums; white-space: nowrap; box-shadow: var(--pop-shadow); opacity: 0; transform: translateY(5px); transition: opacity 0.36s cubic-bezier(0.37, 0.04, 0.22, 1), transform 0.36s cubic-bezier(0.37, 0.04, 0.22, 1); }',
     '.ring-tip[data-open="1"] { opacity: 1; transform: translateY(0); }',
@@ -1596,6 +2102,7 @@ export function buildNativeHudRendererScript() {
             accent: d.accent || '#5b8cff',
             bubbleColor: d.bubbleColor || '#212533',
             hostBlendPct: Number(d.hostBlendPct) || 25,
+            liteMode: Boolean(d.liteMode),
             guideImageDataUri: d.guideImageDataUri || ''
           };
         }
@@ -1613,6 +2120,7 @@ export function buildNativeHudRendererScript() {
       accent: d.accent || '#5b8cff',
       bubbleColor: d.bubbleColor || '#212533',
       hostBlendPct: Number(d.hostBlendPct) || 25,
+      liteMode: Boolean(d.liteMode),
       guideImageDataUri: d.guideImageDataUri || ''
     };
   }
@@ -1872,12 +2380,15 @@ export function buildNativeHudRendererScript() {
 
     // Sync translucent pill & popover colors dynamically with composer bubble & blend settings
     var isLight = host.getAttribute('data-theme') === 'light';
+    var isLite = Boolean(m.liteMode);
+    host.setAttribute('data-lite', isLite ? '1' : '0');
+    portalHost.setAttribute('data-lite', isLite ? '1' : '0');
     if (!isLight) {
       var rgb = parseHexColorRgb(m.bubbleColor, [33, 37, 51]);
       var blendFrac = Math.max(5, Math.min(42, Number(m.hostBlendPct) || 25)) / 100;
-      var pillAlpha = Math.max(0.24, Math.min(0.42, 0.38 - blendFrac * 0.32));
-      var hoverAlpha = Math.max(0.36, Math.min(0.56, pillAlpha + 0.12));
-      var popAlpha = Math.max(0.68, Math.min(0.84, 0.86 - blendFrac * 0.42));
+      var pillAlpha = isLite ? 0.90 : Math.max(0.24, Math.min(0.42, 0.38 - blendFrac * 0.32));
+      var hoverAlpha = isLite ? 0.95 : Math.max(0.36, Math.min(0.56, pillAlpha + 0.12));
+      var popAlpha = isLite ? 0.95 : Math.max(0.68, Math.min(0.84, 0.86 - blendFrac * 0.42));
       host.style.setProperty('--hud-bg', 'rgba(' + rgb[0] + ', ' + rgb[1] + ', ' + rgb[2] + ', ' + pillAlpha.toFixed(3) + ')');
       host.style.setProperty('--hud-bg-hover', 'rgba(' + rgb[0] + ', ' + rgb[1] + ', ' + rgb[2] + ', ' + hoverAlpha.toFixed(3) + ')');
       portalHost.style.setProperty('--pop-bg', 'rgba(' + rgb[0] + ', ' + rgb[1] + ', ' + rgb[2] + ', ' + popAlpha.toFixed(3) + ')');
@@ -2216,38 +2727,47 @@ export function buildNativeHudRendererScript() {
   ensureDocked();
   render();
 
-  window.__agyMonitorNativeHud = {
-    version: VERSION,
-    sync: function (payload) {
-      if (isStaleInstance()) return { hudInjected: false };
-      if (payload && typeof payload === 'object') {
-        state.data = payload;
-        var inc = payload.display;
-        if (inc && typeof inc === 'object' && !state.dirtyDisplayPatch) {
-          if ((Number(inc.updatedAtMs) || 0) >= (Number(state.display.updatedAtMs) || 0)) {
-            state.display = {
-              showSpeed: inc.showSpeed !== false,
-              showCacheHit: inc.showCacheHit !== false,
-              showModel: inc.showModel !== false,
-              showContext: inc.showContext !== false,
-              showQuota: inc.showQuota !== false,
-              updatedAtMs: Number(inc.updatedAtMs) || 0
-            };
-          }
+  function syncHudPayload(payload) {
+    if (isStaleInstance()) return { hudInjected: false };
+    if (payload && typeof payload === 'object') {
+      var prevGuideUri = (state.data && state.data.guideImageDataUri) || '';
+      var nextData = payload;
+      if (nextData.guideImageDataUri === undefined && prevGuideUri) {
+        nextData = Object.assign({}, nextData, { guideImageDataUri: prevGuideUri });
+      }
+      state.data = nextData;
+      var inc = nextData.display;
+      if (inc && typeof inc === 'object' && !state.dirtyDisplayPatch) {
+        if ((Number(inc.updatedAtMs) || 0) >= (Number(state.display.updatedAtMs) || 0)) {
+          state.display = {
+            showSpeed: inc.showSpeed !== false,
+            showCacheHit: inc.showCacheHit !== false,
+            showModel: inc.showModel !== false,
+            showContext: inc.showContext !== false,
+            showQuota: inc.showQuota !== false,
+            updatedAtMs: Number(inc.updatedAtMs) || 0
+          };
         }
       }
-      syncTheme();
-      var docked = ensureDocked();
-      if (docked) render();
-      var patch = state.dirtyDisplayPatch;
-      if (patch) state.dirtyDisplayPatch = null;
-      return {
-        hudInjected: Boolean(docked && host.isConnected),
-        activeView: readActiveView(),
-        focused: typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true,
-        displayPatch: patch
-      };
-    },
+    }
+    syncTheme();
+    var docked = ensureDocked();
+    if (docked) render();
+    var patch = state.dirtyDisplayPatch;
+    if (patch) state.dirtyDisplayPatch = null;
+    return {
+      hudInjected: Boolean(docked && host.isConnected),
+      activeView: readActiveView(),
+      focused: typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true,
+      displayPatch: patch
+    };
+  }
+
+  window.__agyMonitorNativeHud = {
+    version: VERSION,
+    scriptSig: '',
+    sync: syncHudPayload,
+    update: syncHudPayload,
     getSnapshot: function () {
       return {
         version: VERSION,
@@ -2282,6 +2802,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
   const TELEMETRY_FILE = path.join(PLUGIN_DATA_DIR, 'hud_telemetry.json');
   const DISPLAY_FILE = path.join(PLUGIN_DATA_DIR, 'hud_display.json');
   const THEMES_FILE = path.join(PLUGIN_DATA_DIR, 'themes.json');
+  const USER_PREFS_FILE = path.join(PLUGIN_DATA_DIR, 'user_prefs.json');
   const ACTIVE_VIEW_FILE = path.join(PLUGIN_DATA_DIR, 'hud_active_view.json');
   const STATUS_FILE = path.join(PLUGIN_DATA_DIR, 'native_hud_status.json');
   const LIVE_RENDERER_FILE = path.join(PLUGIN_DATA_DIR, 'native_hud_renderer.js');
@@ -2440,6 +2961,8 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
 
     let payload = null;
     if (wantNative) {
+      const prefs = readJsonSafe(USER_PREFS_FILE, {}) || {};
+      const liteMode = Boolean(prefs.liteMode ?? themes.liteMode);
       const telemetry = readJsonSafe(TELEMETRY_FILE, {}) || {};
       const display = readJsonSafe(DISPLAY_FILE, {
         showSpeed: true,
@@ -2472,6 +2995,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
         accent,
         bubbleColor,
         hostBlendPct,
+        liteMode,
         display,
         guideImageDataUri: getGuideDataUri(),
       };
@@ -2674,6 +3198,7 @@ if (globalThis.__AGY_MONITOR_HUD_MAIN_INSTALLED__) {
               n === 'hud_telemetry.json' ||
               n === 'hud_display.json' ||
               n === 'themes.json' ||
+              n === 'user_prefs.json' ||
               n === 'native_hud_renderer.js' ||
               n === 'native_wallpaper.css' ||
               n === 'native_wallpaper_engine.js'
@@ -2826,21 +3351,60 @@ async function ensureCleanBackupForCurrentVersion(paths, curAsarBuf, appVersion)
   return { cleanStockBuf, bakPath };
 }
 
-export async function stageLiveHudAssets(paths, themes = null) {
-  if (!paths?.pluginDataDir) return;
-  await fsp.mkdir(paths.pluginDataDir, { recursive: true }).catch(() => {});
+export async function stageLiveHudAssets(paths, themes = null, options = {}) {
+  if (!paths?.pluginDataDir) return { staged: false, skipped: false, writtenFiles: 0 };
+  const liteMode = Boolean(options?.liteMode ?? themes?.liteMode);
   const rendererFile = paths.nativeHudRendererFile || path.join(paths.pluginDataDir, 'native_hud_renderer.js');
   const wpEngineFile = paths.nativeWallpaperEngineFile || path.join(paths.pluginDataDir, 'native_wallpaper_engine.js');
   const guideFile = paths.nativeHudGuideFile || path.join(paths.pluginDataDir, 'native_hud_guide.txt');
-  await atomicWriteText(rendererFile, buildNativeHudRendererScript()).catch(() => {});
-  await atomicWriteText(wpEngineFile, buildNativeWallpaperEngineScript()).catch(() => {});
-  const guideUri = await resolveGuideImageDataUri(paths);
-  if (guideUri) {
-    await atomicWriteText(guideFile, guideUri).catch(() => {});
+
+  let writtenFiles = 0;
+  const rendererSrc = buildNativeHudRendererScript();
+  const rRes = await writeTextIfChanged(rendererFile, rendererSrc, { sig: sha256Text(rendererSrc) }).catch(() => ({
+    written: false,
+  }));
+  if (rRes.written) writtenFiles += 1;
+
+  const wpEngineSrc = buildNativeWallpaperEngineScript();
+  const eRes = await writeTextIfChanged(wpEngineFile, wpEngineSrc, { sig: sha256Text(wpEngineSrc) }).catch(() => ({
+    written: false,
+  }));
+  if (eRes.written) writtenFiles += 1;
+
+  const guideSrcPath = paths?.assetsDir ? path.join(paths.assetsDir, 'open_console_guide.jpg') : '';
+  if (guideSrcPath) {
+    const gSrcStat = await fsp.stat(guideSrcPath).catch(() => null);
+    if (gSrcStat && gSrcStat.isFile()) {
+      const guideInputSig = sha256Text(`${guideSrcPath}|${gSrcStat.mtimeMs}|${gSrcStat.size}`);
+      const prevGuide = stagedFileSignatures.get(guideFile);
+      let guideAlreadyCurrent = false;
+      if (prevGuide && prevGuide.inputSig === guideInputSig) {
+        const gOutStat = await fsp.stat(guideFile).catch(() => null);
+        if (gOutStat && gOutStat.isFile() && gOutStat.size === prevGuide.size) {
+          guideAlreadyCurrent = true;
+        }
+      }
+      if (!guideAlreadyCurrent) {
+        const guideUri = await resolveGuideImageDataUri(paths);
+        if (guideUri) {
+          const gRes = await writeTextIfChanged(guideFile, guideUri, {
+            sig: sha256Text(guideUri),
+            inputSig: guideInputSig,
+          }).catch(() => ({ written: false }));
+          if (gRes.written) writtenFiles += 1;
+        }
+      }
+    }
   }
+
+  let wallpaper = null;
   if (themes && typeof themes === 'object') {
-    await stageLiveWallpaperCss(paths, themes).catch(() => {});
+    wallpaper = await stageLiveWallpaperCss(paths, themes, { liteMode }).catch(() => null);
+    if (wallpaper && wallpaper.staged && wallpaper.skipped === false) {
+      writtenFiles += 1;
+    }
   }
+  return { staged: true, skipped: writtenFiles === 0, writtenFiles, wallpaper };
 }
 
 export async function inspectNativeHudState(paths = {}) {
@@ -2868,7 +3432,7 @@ export async function inspectNativeHudState(paths = {}) {
     };
   }
 
-  if (!asarPath || !fs.existsSync(asarPath)) {
+  if (!asarPath) {
     return {
       supported: true,
       asarPath,
@@ -2885,34 +3449,63 @@ export async function inspectNativeHudState(paths = {}) {
     };
   }
 
-  try {
-    const raw = await fsp.readFile(asarPath);
-    const parsed = parseAsar(raw);
-    const { entryRel, appVersion } = resolveEntryRelPath(parsed);
-    const hasMain = Boolean(lookupAsarNode(parsed.root, ASAR_MAIN_REL));
-    const hasRenderer = Boolean(lookupAsarNode(parsed.root, ASAR_RENDERER_REL));
-    const hasWallpaper = Boolean(lookupAsarNode(parsed.root, ASAR_WALLPAPER_REL));
-    let hasEntryHook = false;
-    if (lookupAsarNode(parsed.root, entryRel)) {
-      const entryText = extractAsarFile(parsed, entryRel).toString('utf8');
-      hasEntryHook = entryText.includes(MAIN_HOOK_MARKER);
-    }
-    let installedVersion = '';
-    if (lookupAsarNode(parsed.root, ASAR_META_REL)) {
-      try {
-        const meta = JSON.parse(extractAsarFile(parsed, ASAR_META_REL).toString('utf8'));
-        installedVersion = String(meta?.version || '');
-      } catch {
-        installedVersion = '';
-      }
-    }
+  const stat = await fsp.stat(asarPath).catch(() => null);
+  if (!stat || !stat.isFile()) {
+    asarInspectCache.delete(asarPath);
+    return {
+      supported: true,
+      asarPath,
+      asarExists: false,
+      bakPath,
+      bakExists,
+      appVersion: '',
+      state: 'not_found',
+      installedVersion: '',
+      currentVersion: NATIVE_HUD_VERSION,
+      devToolsPort,
+      heartbeat,
+      error: '',
+    };
+  }
 
-    let state = 'stock';
-    if (hasMain && hasRenderer && hasWallpaper && hasEntryHook) {
-      state = installedVersion === NATIVE_HUD_VERSION ? 'installed' : 'outdated';
-    } else if (hasMain || hasRenderer || hasWallpaper || hasEntryHook) {
-      state = 'outdated';
-    }
+  const cached = asarInspectCache.get(asarPath);
+  if (
+    cached &&
+    cached.mtimeMs === stat.mtimeMs &&
+    cached.size === stat.size &&
+    cached.currentVersion === NATIVE_HUD_VERSION
+  ) {
+    return {
+      supported: true,
+      asarPath,
+      asarExists: true,
+      bakPath,
+      bakExists,
+      appVersion: cached.appVersion,
+      state: cached.state,
+      installedVersion: cached.installedVersion,
+      currentVersion: NATIVE_HUD_VERSION,
+      devToolsPort,
+      heartbeat,
+      error: '',
+    };
+  }
+
+  try {
+    const inspected = await inspectAsarMetadataBySlices(asarPath, stat.size);
+    setBoundedMap(
+      asarInspectCache,
+      asarPath,
+      {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        currentVersion: NATIVE_HUD_VERSION,
+        appVersion: inspected.appVersion,
+        state: inspected.state,
+        installedVersion: inspected.installedVersion,
+      },
+      ASAR_INSPECT_CACHE_MAX,
+    );
 
     return {
       supported: true,
@@ -2920,15 +3513,16 @@ export async function inspectNativeHudState(paths = {}) {
       asarExists: true,
       bakPath,
       bakExists,
-      appVersion,
-      state,
-      installedVersion,
+      appVersion: inspected.appVersion,
+      state: inspected.state,
+      installedVersion: inspected.installedVersion,
       currentVersion: NATIVE_HUD_VERSION,
       devToolsPort,
       heartbeat,
       error: '',
     };
   } catch (err) {
+    asarInspectCache.delete(asarPath);
     return {
       supported: true,
       asarPath,
@@ -2946,8 +3540,8 @@ export async function inspectNativeHudState(paths = {}) {
   }
 }
 
-export async function installNativeHud(paths = {}, { force = false } = {}) {
-  await stageLiveHudAssets(paths);
+export async function installNativeHud(paths = {}, { force = false, liteMode, themes = null } = {}) {
+  await stageLiveHudAssets(paths, themes, typeof liteMode === 'boolean' ? { liteMode } : {});
   const before = await inspectNativeHudState(paths);
   if (!before.supported) {
     return { ok: false, diskWritten: false, pendingRestart: false, error: before.error || '不支持当前系统', status: before };
@@ -2991,6 +3585,7 @@ export async function installNativeHud(paths = {}, { force = false } = {}) {
 
     const newAsarBuf = repackAsarInMemory(cleanStockBuf, overrides, new Set());
     const writeRes = await writeAsarWithRenameFallback(before.asarPath, newAsarBuf);
+    asarInspectCache.delete(before.asarPath);
     const after = await inspectNativeHudState(paths);
 
     if (!writeRes.ok) {
@@ -3015,6 +3610,7 @@ export async function installNativeHud(paths = {}, { force = false } = {}) {
       status: after,
     };
   } catch (err) {
+    asarInspectCache.delete(before.asarPath);
     const after = await inspectNativeHudState(paths).catch(() => before);
     return {
       ok: false,
@@ -3057,6 +3653,7 @@ export async function restoreStockAsar(paths = {}) {
     }
 
     const writeRes = await writeAsarWithRenameFallback(before.asarPath, cleanStockBuf);
+    asarInspectCache.delete(before.asarPath);
     const after = await inspectNativeHudState(paths);
     if (!writeRes.ok) {
       return {
@@ -3075,6 +3672,7 @@ export async function restoreStockAsar(paths = {}) {
       status: after,
     };
   } catch (err) {
+    asarInspectCache.delete(before.asarPath);
     const after = await inspectNativeHudState(paths).catch(() => before);
     return {
       ok: false,

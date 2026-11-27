@@ -51,6 +51,26 @@
 
 ## 版本更新日志（Changelog）
 
+### `v1.2.0`（2026-11-27）— 全链路 RAM / VRAM 深度性能优化（Issue #7）& 新增可选「轻量省显存模式」
+
+- **Node 后台常驻内存与峰值抖动根治**：
+  - 15 秒 Watchdog 对 `app.asar` 的检验改为 `(mtimeMs, size)` 缓存 + 文件句柄头部切片读取，彻底告别每 15 秒整包读取 80–160 MB；`stageLiveHudAssets` 增加内容指纹跳过无变化写盘。
+  - `discoverLocalOAuthClient()` 改为 4 MB 滑动窗口分块流式扫描，消除 300–520 MB 内存峰值；`resolveSessionProgress` 改为按单会话 `convId` 独立 LRU 缓存并优先只读 128 KB 尾部窗口。
+  - `scan_worker` 迁入 `worker_threads` 省下独立 Electron-as-Node 进程基线，SQLite `gen_metadata` 回退查询改 `.iterate()` 流式遍历；内存瘦身回调同步释放壁纸/引导图/错误缓存并清理 `sessions_meta` 过期键。
+- **HUD 注入与 CDP 通信降载**：
+  - CDP 900ms 轮询在页面已挂载 HUD 时仅发送轻量增量 JSON（`< 2 KB`），不再重复推送整段渲染脚本与引导图 base64。
+  - 注入图层引擎 `scanLayers()` 在 `document.hidden` 时暂停并放宽至 350ms 节流；吸顶壁纸 CSS 抽成 `:root` 的 `--agy-wp-url` 变量去重（默认观感零变化）。
+- **WPF 壁纸与桌宠伴侣显存/CPU 优化**：
+  - `AgyDesktopPet.cs` 与 `AgyBackdrop.cs` 解码前均先探测原图尺寸并禁止放大解码（256×256 序列帧与小壁纸不再被放大占 4 倍内存，GIF 同步封顶）。
+  - 桌宠改为多轨道按需懒加载（LRU 保留活跃轨 + `idle`）、空闲/全屏遮挡自动降频暂停、冻结画刷并降级 `BitmapCache`。
+  - 壁纸伴侣在隐藏/暂停/切换至 CSS 或 CDP 模式时释放位图与窗口、用离线三遍盒式预模糊替代实时全屏 `BlurEffect`，并补齐原生 Windows 下的 `--parent-pid` 孤儿自动退出守卫。
+- **侧栏前端优化 & 可选「轻量省显存模式」**：
+  - 共享宿主壁纸模式下将侧栏壁纸层设为 `display: none` 并清空 `backgroundImage`，彻底消除重复 GPU 纹理；自定义壁纸上传自动限长边 `2560px` 并转码 WebP（动图与异常自动兜底）。
+  - 静默 SVG 动画停跑、`mastery_hub.js` 增加轮询签名防重绘与图片/草稿缓存封顶去重。
+  - 在「其他」分页新增可选 **「轻量省显存模式」** 开关（默认关闭，保持原有默认视觉不变；开启后通过 `/api/preferences/lite-mode` 即时关闭侧栏与宿主端 `backdrop-filter` 毛玻璃、吸顶壁纸遮罩与非必要动画，深浅主题均已高对比适配）。
+
+---
+
 ### `v1.1.9`（2026-11-27）— 精选「Gemini 猫娘」按需下载桌宠（预览图占位 · 点击下载 6 轨 144 帧动画包）
 
 - **轻量预览图占位 + 点击按需下载架构**：

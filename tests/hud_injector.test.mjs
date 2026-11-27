@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,6 +11,7 @@ import {
   buildMainHookScript,
   buildNativeHudRendererScript,
   buildNativeWallpaperEngineScript,
+  clearHudInjectorCaches,
   computeAsarIntegrity,
   extractAsarFile,
   inspectNativeHudState,
@@ -19,10 +21,15 @@ import {
   readDevToolsActivePort,
   readNativeHudHeartbeat,
   repackAsarInMemory,
+  resolveWallpaperDataUriForThemes,
   restoreStockAsar,
+  stageLiveHudAssets,
   stageLiveWallpaperCss,
 } from '../sidecars/agy_monitor/backend/hud_injector.mjs';
-import { isAntigravityAppTarget } from '../sidecars/agy_monitor/backend/cdp_theme_bridge.mjs';
+import {
+  buildCdpThemeCss,
+  isAntigravityAppTarget,
+} from '../sidecars/agy_monitor/backend/cdp_theme_bridge.mjs';
 import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 import { createMonitorHandlers } from '../sidecars/agy_monitor/main.mjs';
@@ -347,4 +354,434 @@ test('hud_injector: main hook wallpaper cleanup does not leak global window.el',
 
   assert.equal(ctx.window.el, sentinelFn);
   assert.equal(ctx.el, sentinelFn);
+});
+
+test('hud_injector: inspectNativeHudState reads only ASAR header + target slices and caches by (path, mtimeMs, size)', async () => {
+  clearHudInjectorCaches();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-slice-'));
+  const origReadFile = fsp.readFile;
+  const origOpen = fsp.open;
+  try {
+    const asarPath = path.join(tmpDir, 'app.asar');
+    const bigBlob = Buffer.alloc(4 * 1024 * 1024, 0xab);
+    fs.writeFileSync(
+      asarPath,
+      buildSyntheticAsar({
+        'package.json': JSON.stringify({ name: 'antigravity', version: '2.37.0', main: 'dist/main.js' }),
+        'dist/main.js': '"use strict";\nconsole.log("slice test");\n',
+        'dist/huge_asset.bin': bigBlob,
+      }),
+    );
+
+    const paths = resolvePaths({
+      appDataDir: path.join(tmpDir, 'appdata'),
+      geminiConfigDir: path.join(tmpDir, 'config'),
+      hostAsarPath: asarPath,
+      devToolsActivePortFile: path.join(tmpDir, 'missing_dt'),
+    });
+
+    let fullReadFileCalls = 0;
+    let openCalls = 0;
+    let closeCalls = 0;
+    let totalBytesRead = 0;
+
+    fsp.readFile = async function patchedReadFile(target, ...rest) {
+      if (path.resolve(String(target)) === path.resolve(asarPath)) {
+        fullReadFileCalls += 1;
+      }
+      return origReadFile.call(this, target, ...rest);
+    };
+    fsp.open = async function patchedOpen(target, ...rest) {
+      const fh = await origOpen.call(this, target, ...rest);
+      if (path.resolve(String(target)) === path.resolve(asarPath)) {
+        openCalls += 1;
+        const origRead = fh.read.bind(fh);
+        const origClose = fh.close.bind(fh);
+        fh.read = async (...args) => {
+          const r = await origRead(...args);
+          totalBytesRead += Number(r?.bytesRead || 0);
+          return r;
+        };
+        fh.close = async (...args) => {
+          closeCalls += 1;
+          return origClose(...args);
+        };
+      }
+      return fh;
+    };
+
+    // 1. First inspect (cache miss): opens via fsp.open, reads ONLY header + package.json + dist/main.js (< 64 KB), NEVER calls readFile
+    const r1 = await inspectNativeHudState(paths);
+    assert.equal(r1.state, 'stock');
+    assert.equal(r1.appVersion, '2.37.0');
+    assert.equal(fullReadFileCalls, 0, 'inspectNativeHudState must never call full fsp.readFile on app.asar');
+    assert.equal(openCalls, 1);
+    assert.equal(closeCalls, 1);
+    assert.ok(totalBytesRead > 0 && totalBytesRead < 64 * 1024, `expected slice-only read < 64KB, got ${totalBytesRead}`);
+
+    // 2. Second inspect with unchanged metadata: cache hit -> ZERO opens, ZERO bytes read
+    const bytesBeforeHit = totalBytesRead;
+    const r2 = await inspectNativeHudState(paths);
+    assert.equal(r2.state, 'stock');
+    assert.equal(r2.appVersion, '2.37.0');
+    assert.equal(openCalls, 1, 'cached inspect should perform zero fsp.open calls');
+    assert.equal(totalBytesRead, bytesBeforeHit, 'cached inspect should read 0 bytes');
+
+    // 3. Clearing cache forces a fresh slice-only read on next inspect
+    clearHudInjectorCaches();
+    const r3 = await inspectNativeHudState(paths);
+    assert.equal(r3.state, 'stock');
+    assert.equal(openCalls, 2);
+    assert.equal(closeCalls, 2);
+    assert.equal(fullReadFileCalls, 0);
+
+    // 4. Modifying app.asar invalidates cache automatically by (mtimeMs, size)
+    fs.writeFileSync(
+      asarPath,
+      buildSyntheticAsar({
+        'package.json': JSON.stringify({ name: 'antigravity', version: '2.38.1', main: 'dist/main.js' }),
+        'dist/main.js': '"use strict";\ntry { require("./agy-monitor-hud-main"); } catch {}\nconsole.log("patched");\n',
+        'dist/agy-monitor-hud-main.js': '// main',
+        'dist/agy-monitor-hud.js': '// hud',
+        'dist/agy-monitor-wallpaper.js': '// wp',
+        'dist/agy-monitor-hud.meta.json': JSON.stringify({ version: NATIVE_HUD_VERSION }),
+        'dist/huge_asset.bin': bigBlob,
+      }),
+    );
+    const r4 = await inspectNativeHudState(paths);
+    assert.equal(r4.state, 'installed');
+    assert.equal(r4.appVersion, '2.38.1');
+    assert.equal(r4.installedVersion, NATIVE_HUD_VERSION);
+    assert.equal(openCalls, 3);
+    assert.equal(closeCalls, 3);
+    assert.equal(fullReadFileCalls, 0);
+  } finally {
+    fsp.readFile = origReadFile;
+    fsp.open = origOpen;
+    clearHudInjectorCaches();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('hud_injector: stageLiveHudAssets skips unchanged writes, reacts to liteMode toggle & file removal, and clears caches', async () => {
+  clearHudInjectorCaches();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-stage-'));
+  const origReadFile = fsp.readFile;
+  try {
+    const wpDir = path.join(tmpDir, 'wallpapers');
+    const assetsDir = path.join(tmpDir, 'assets');
+    fs.mkdirSync(wpDir, { recursive: true });
+    fs.mkdirSync(assetsDir, { recursive: true });
+    const wpFile = path.join(wpDir, 'wp-1.webp');
+    const guideFileSrc = path.join(assetsDir, 'open_console_guide.jpg');
+    fs.writeFileSync(wpFile, Buffer.from('FAKE_WEBP_DATA_123456'));
+    fs.writeFileSync(guideFileSrc, Buffer.from('FAKE_GUIDE_JPEG_7890'));
+
+    const paths = resolvePaths({
+      appDataDir: path.join(tmpDir, 'appdata'),
+      geminiConfigDir: path.join(tmpDir, 'config'),
+      wallpapersDir: wpDir,
+      assetsDir,
+    });
+    const themes = {
+      hostThemeMode: 'inject',
+      backdropEnabled: true,
+      activeWallpaperId: 'wp-1',
+      opacity: 60,
+      blur: 6,
+      dim: 30,
+      hostBlendPct: 22,
+      fit: 'cover',
+      colors: { canvas: '#111218', chrome: '#171922', bubble: '#1d202b', accent: '#5b8cff' },
+    };
+
+    let wpReadCount = 0;
+    fsp.readFile = async function spyReadFile(target, ...rest) {
+      if (path.resolve(String(target)) === path.resolve(wpFile)) {
+        wpReadCount += 1;
+      }
+      return origReadFile.call(this, target, ...rest);
+    };
+
+    // 1. Initial staging writes all live assets
+    const first = await stageLiveHudAssets(paths, themes, { liteMode: false });
+    assert.equal(first.staged, true);
+    assert.equal(first.skipped, false);
+    assert.ok(first.writtenFiles >= 4);
+    assert.equal(wpReadCount, 1);
+
+    const mtimesBefore = {
+      renderer: fs.statSync(paths.nativeHudRendererFile).mtimeMs,
+      engine: fs.statSync(paths.nativeWallpaperEngineFile).mtimeMs,
+      guide: fs.statSync(paths.nativeHudGuideFile).mtimeMs,
+      css: fs.statSync(paths.nativeWallpaperCssFile).mtimeMs,
+    };
+
+    // 2. Repeated staging with identical inputs skips ALL disk writes and wallpaper reads
+    await new Promise((r) => setTimeout(r, 25));
+    const second = await stageLiveHudAssets(paths, themes, { liteMode: false });
+    assert.equal(second.staged, true);
+    assert.equal(second.skipped, true);
+    assert.equal(second.writtenFiles, 0);
+    assert.equal(wpReadCount, 1);
+    assert.equal(fs.statSync(paths.nativeHudRendererFile).mtimeMs, mtimesBefore.renderer);
+    assert.equal(fs.statSync(paths.nativeWallpaperEngineFile).mtimeMs, mtimesBefore.engine);
+    assert.equal(fs.statSync(paths.nativeHudGuideFile).mtimeMs, mtimesBefore.guide);
+    assert.equal(fs.statSync(paths.nativeWallpaperCssFile).mtimeMs, mtimesBefore.css);
+
+    // 3. Toggling liteMode changes staged signature and immediately rewrites native_wallpaper.css
+    const liteOn = await stageLiveHudAssets(paths, themes, { liteMode: true });
+    assert.equal(liteOn.staged, true);
+    assert.equal(liteOn.skipped, false);
+    assert.equal(liteOn.writtenFiles, 1);
+    const liteCss = fs.readFileSync(paths.nativeWallpaperCssFile, 'utf8');
+    assert.doesNotMatch(liteCss, /backdrop-filter:\s*blur\(/);
+    assert.doesNotMatch(liteCss, /background-attachment:\s*fixed/);
+    assert.match(liteCss, /backdrop-filter:\s*none\s*!important/);
+
+    // 4. Subsequent tick with liteMode still true skips again
+    const liteRepeat = await stageLiveHudAssets(paths, themes, { liteMode: true });
+    assert.equal(liteRepeat.skipped, true);
+    assert.equal(liteRepeat.writtenFiles, 0);
+
+    // 5. Deleting a staged target file causes re-staging even with same signature
+    fs.unlinkSync(paths.nativeWallpaperCssFile);
+    const restoredFile = await stageLiveHudAssets(paths, themes, { liteMode: true });
+    assert.equal(restoredFile.skipped, false);
+    assert.equal(fs.existsSync(paths.nativeWallpaperCssFile), true);
+
+    // 6. Disabling wallpaper automatically releases cached wallpaper base64
+    await stageLiveWallpaperCss(paths, { ...themes, activeWallpaperId: '' });
+    assert.equal(fs.readFileSync(paths.nativeWallpaperCssFile, 'utf8'), '');
+    const uriAfterClear = await resolveWallpaperDataUriForThemes(paths, themes);
+    assert.match(uriAfterClear, /^data:image\/webp;base64,/);
+    assert.equal(wpReadCount, 2, 'wallpaper base64 cache must be released when wallpaper is disabled');
+
+    // 7. clearHudInjectorCaches releases wallpaper/guide/signature caches cleanly
+    clearHudInjectorCaches();
+    await resolveWallpaperDataUriForThemes(paths, themes);
+    assert.equal(wpReadCount, 3, 'clearHudInjectorCaches must clear cached wallpaper base64');
+
+    // 8. installNativeHud forwards themes + liteMode to stageLiveHudAssets so native_wallpaper.css stages cleanly
+    const asarPath = path.join(tmpDir, 'install_themes.asar');
+    fs.writeFileSync(
+      asarPath,
+      buildSyntheticAsar({
+        'package.json': JSON.stringify({ name: 'antigravity', version: '2.39.0', main: 'dist/main.js' }),
+        'dist/main.js': '"use strict";\nconsole.log("ok");\n',
+      }),
+    );
+    const installPaths = resolvePaths({
+      appDataDir: path.join(tmpDir, 'appdata_install'),
+      geminiConfigDir: path.join(tmpDir, 'config_install'),
+      wallpapersDir: wpDir,
+      assetsDir,
+      hostAsarPath: asarPath,
+      devToolsActivePortFile: path.join(tmpDir, 'missing_dt'),
+    });
+    const instWithThemes = await installNativeHud(installPaths, {
+      force: true,
+      liteMode: true,
+      themes: { ...themes, liteMode: true },
+    });
+    assert.equal(instWithThemes.ok, true);
+    assert.equal(fs.existsSync(installPaths.nativeWallpaperCssFile), true);
+    const stagedViaInstallCss = fs.readFileSync(installPaths.nativeWallpaperCssFile, 'utf8');
+    assert.match(stagedViaInstallCss, /--agy-wp-url:/);
+    assert.doesNotMatch(stagedViaInstallCss, /backdrop-filter:\s*blur\(/);
+    assert.match(stagedViaInstallCss, /backdrop-filter:\s*none\s*!important/);
+  } finally {
+    fsp.readFile = origReadFile;
+    clearHudInjectorCaches();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('hud_injector: CSS deduplicates wallpaper base64 via --agy-wp-url and supports opt-in liteMode for dark & light themes', () => {
+  const marker = 'data:image/webp;base64,UNIQUE_WP_DEDUP_TOKEN_999';
+  const darkThemes = {
+    opacity: 75,
+    blur: 8,
+    dim: 25,
+    hostBlendPct: 24,
+    fit: 'cover',
+    colors: { canvas: '#12131a', chrome: '#181a24', bubble: '#202330', accent: '#5b8cff' },
+  };
+  const lightThemes = {
+    ...darkThemes,
+    colors: { canvas: '#f4f6fb', chrome: '#ffffff', bubble: '#eaedf6', accent: '#3570e4' },
+  };
+
+  // Default (liteMode === false): zero visual regression + base64 appears ONCE in :root --agy-wp-url
+  const normalCss = buildHostWallpaperCss(darkThemes, marker);
+  assert.equal(normalCss.split(marker).length - 1, 1, 'base64 wallpaper data URI must appear only once in CSS');
+  assert.match(normalCss, /--agy-wp-url:\s*url\("data:image\/webp;base64,UNIQUE_WP_DEDUP_TOKEN_999"\);/);
+  assert.match(normalCss, /html::before[\s\S]*?background-image:\s*var\(--agy-wp-url\)\s*!important/);
+  assert.match(normalCss, /sticky-main"\]::before[\s\S]*?background-image:\s*var\(--agy-wp-url\)\s*!important/);
+  assert.match(normalCss, /backdrop-filter:\s*blur\(20px\)/);
+  assert.match(normalCss, /background-attachment:\s*fixed/);
+
+  // Opt-in liteMode === true via options AND via themes.liteMode / buildCdpThemeCss
+  const liteDarkCss = buildHostWallpaperCss(darkThemes, marker, { liteMode: true });
+  const liteViaThemeProp = buildCdpThemeCss({ ...darkThemes, liteMode: true }, marker);
+  assert.equal(liteDarkCss, liteViaThemeProp);
+  assert.equal(liteDarkCss.split(marker).length - 1, 1, 'liteMode CSS must also deduplicate wallpaper URL via --agy-wp-url');
+  assert.doesNotMatch(liteDarkCss, /backdrop-filter:\s*blur\(/, 'liteMode must eliminate all backdrop-filter blur rules');
+  assert.doesNotMatch(liteDarkCss, /background-attachment:\s*fixed/, 'liteMode must eliminate fixed-attachment sticky wallpaper masks');
+  assert.match(liteDarkCss, /\.agy-user-bubble[\s\S]*?backdrop-filter:\s*none\s*!important[\s\S]*?-webkit-backdrop-filter:\s*none\s*!important/);
+  assert.match(liteDarkCss, /\.bg-card[\s\S]*?backdrop-filter:\s*none\s*!important[\s\S]*?-webkit-backdrop-filter:\s*none\s*!important/);
+  assert.match(liteDarkCss, /\[role="dialog"\][\s\S]*?backdrop-filter:\s*none\s*!important[\s\S]*?-webkit-backdrop-filter:\s*none\s*!important/);
+  assert.match(liteDarkCss, /sticky-main"\]::before[\s\S]*?background-image:\s*none\s*!important[\s\S]*?filter:\s*none\s*!important/);
+  assert.match(liteDarkCss, /html\.light[\s\S]*?--agy-lite-card-bg:/, 'dark palette liteMode must still guard light host themes');
+
+  const liteLightCss = buildHostWallpaperCss(lightThemes, marker, { liteMode: true });
+  assert.doesNotMatch(liteLightCss, /backdrop-filter:\s*blur\(/);
+  assert.doesNotMatch(liteLightCss, /background-attachment:\s*fixed/);
+  assert.match(liteLightCss, /html\.dark[\s\S]*?--agy-lite-card-bg:/, 'light palette liteMode must still guard dark host themes');
+});
+
+test('hud_injector: scanLayers pauses when document.hidden, rescans on visibilitychange, and throttles mutations to 350ms with trailing settle', () => {
+  const scriptSrc = buildNativeWallpaperEngineScript();
+  assert.doesNotMatch(scriptSrc, /,\s*32\s*\)/, 'must not retain 32ms MutationObserver polling');
+  assert.match(scriptSrc, /document\.hidden/);
+  assert.match(scriptSrc, /visibilitychange/);
+  assert.match(scriptSrc, /350/);
+
+  let nowMs = 1000;
+  let nextTimerId = 1;
+  const timeouts = new Map();
+  const intervals = new Map();
+  const docListeners = new Map();
+  const winListeners = new Map();
+  let mutCallback = null;
+  let elementsFromPointCalls = 0;
+
+  const styleEl = { id: 'agy-monitor-cdp-theme', textContent: '', parentNode: null };
+  const headEl = { appendChild(el) { el.parentNode = headEl; } };
+  const bodyEl = { tagName: 'BODY' };
+
+  const fakeDoc = {
+    hidden: false,
+    head: headEl,
+    body: bodyEl,
+    documentElement: headEl,
+    getElementById: (id) => (id === styleEl.id && styleEl.parentNode ? styleEl : null),
+    createElement: () => styleEl,
+    elementsFromPoint: () => {
+      elementsFromPointCalls += 1;
+      return [];
+    },
+    querySelectorAll: () => [],
+    addEventListener: (evt, fn) => {
+      if (!docListeners.has(evt)) docListeners.set(evt, new Set());
+      docListeners.get(evt).add(fn);
+    },
+    removeEventListener: (evt, fn) => {
+      docListeners.get(evt)?.delete(fn);
+    },
+  };
+
+  class FakeMutationObserver {
+    constructor(cb) {
+      mutCallback = cb;
+      this.disconnected = false;
+    }
+    observe() {}
+    disconnect() {
+      this.disconnected = true;
+    }
+  }
+
+  const fakeWin = {
+    innerWidth: 1280,
+    innerHeight: 800,
+    document: fakeDoc,
+    MutationObserver: FakeMutationObserver,
+    Set,
+    Math,
+    Date: { now: () => nowMs },
+    setTimeout: (fn, delay) => {
+      const id = nextTimerId++;
+      timeouts.set(id, { fn, delay, at: nowMs + delay });
+      return id;
+    },
+    clearTimeout: (id) => {
+      timeouts.delete(id);
+    },
+    setInterval: (fn, delay) => {
+      const id = nextTimerId++;
+      intervals.set(id, { fn, delay });
+      return id;
+    },
+    clearInterval: (id) => {
+      intervals.delete(id);
+    },
+    addEventListener: (evt, fn) => {
+      if (!winListeners.has(evt)) winListeners.set(evt, new Set());
+      winListeners.get(evt).add(fn);
+    },
+    removeEventListener: (evt, fn) => {
+      winListeners.get(evt)?.delete(fn);
+    },
+  };
+  fakeWin.window = fakeWin;
+
+  vm.createContext(fakeWin);
+  vm.runInContext(scriptSrc, fakeWin);
+  fakeWin.__agyMonitorWallpaper.apply('html { color: #fff; }');
+
+  assert.equal(fakeWin.__agyMonLayerEngine.version, 6);
+  assert.equal(fakeWin.__agyMonLayerEngine.throttleMs, 350);
+  const initialCalls = elementsFromPointCalls;
+  assert.ok(initialCalls > 0, 'initial visible apply should scan once');
+
+  // 1. When document.hidden is true, direct scanLayers() and MutationObserver skip all work
+  fakeDoc.hidden = true;
+  elementsFromPointCalls = 0;
+  assert.equal(fakeWin.__agyMonLayerEngine.scan(), 0);
+  assert.equal(elementsFromPointCalls, 0);
+  mutCallback();
+  mutCallback();
+  assert.equal(timeouts.size, 0, 'must not schedule mutation timers while document.hidden is true');
+  assert.equal(elementsFromPointCalls, 0);
+
+  // 2. When visibilitychange fires with document.hidden = false, clean rescan executes immediately
+  fakeDoc.hidden = false;
+  nowMs += 500;
+  for (const fn of docListeners.get('visibilitychange') || []) fn();
+  assert.ok(elementsFromPointCalls > 0, 'visibilitychange back to visible must trigger a clean rescan');
+
+  // 3. Rapid MutationObserver bursts coalesce into a single >= 350ms timer (never 32ms) and settle cleanly
+  elementsFromPointCalls = 0;
+  nowMs += 400;
+  mutCallback();
+  mutCallback();
+  mutCallback();
+  assert.equal(timeouts.size, 1, 'rapid mutation burst must coalesce into one throttled timer');
+  const [firstId, firstEntry] = [...timeouts.entries()][0];
+  assert.ok(firstEntry.delay >= 350, `expected throttle delay >= 350ms, got ${firstEntry.delay}`);
+
+  // Fire timer -> runs scan once and settles
+  timeouts.delete(firstId);
+  nowMs += firstEntry.delay;
+  firstEntry.fn();
+  assert.ok(elementsFromPointCalls > 0, 'throttled timer must perform layer scan');
+
+  // Mutation immediately after scan schedules trailing settle timer honoring 350ms cadence
+  elementsFromPointCalls = 0;
+  nowMs += 40;
+  mutCallback();
+  assert.equal(timeouts.size, 1);
+  const [trailId, trailEntry] = [...timeouts.entries()][0];
+  assert.ok(trailEntry.delay >= 300, `expected trailing delay ~310ms, got ${trailEntry.delay}`);
+  timeouts.delete(trailId);
+  nowMs += trailEntry.delay;
+  trailEntry.fn();
+  assert.ok(elementsFromPointCalls > 0, 'trailing timer must settle final DOM state');
+
+  // 4. stop() cleans up listeners and timers
+  fakeWin.__agyMonLayerEngine.stop();
+  assert.equal((docListeners.get('visibilitychange') || new Set()).size, 0);
+  assert.equal(intervals.size, 0);
+  assert.equal(timeouts.size, 0);
 });

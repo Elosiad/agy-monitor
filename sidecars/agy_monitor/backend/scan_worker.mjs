@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 import { resolvePaths } from './paths.mjs';
 
@@ -473,7 +474,7 @@ export function readConvDbStepTelemetry(convDbPath, stepIndices) {
         .prepare(
           `SELECT idx, metadata FROM steps WHERE idx IN (${placeholders}) AND metadata IS NOT NULL`
         )
-        .all(...slice);
+        .iterate(...slice);
       for (const row of rows) {
         const idx = Number(row.idx);
         if (!Number.isInteger(idx)) continue;
@@ -505,7 +506,7 @@ export function readConvDbStepTelemetry(convDbPath, stepIndices) {
           .prepare(
             `SELECT idx, data FROM gen_metadata WHERE idx IN (${placeholders}) AND data IS NOT NULL`
           )
-          .all(...slice);
+          .iterate(...slice);
         for (const gr of genRows) {
           const gIdx = Number(gr.idx);
           const parsed = parseGenMetadataRecord(gr.data);
@@ -535,12 +536,13 @@ export function readConvDbStepTelemetry(convDbPath, stepIndices) {
       }
 
       // Fallback / SessionModels recovery pass only when a step lacked direct genIdx or omitted #19
+      // Stream rows via .iterate() so large gen_metadata BLOBs are never materialized in full.
       if (needsFullGenScan) {
         const allGenRows = convDb
           .prepare(
             `SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL AND length(data) < 262144 ORDER BY idx ASC`
           )
-          .all();
+          .iterate();
         const allParsed = [];
         const byStepIdx = new Map();
         const byResponseId = new Map();
@@ -1548,11 +1550,35 @@ export async function scanOnce(brainDirOrOpts, cacheDbPathArg, options = {}) {
 export { scanOnce as runIncrementalScanOnce };
 
 async function runWorkerMain() {
-  const brainDir = resolveDefaultBrainDir();
-  const conversationsDir = resolveDefaultConversationsDir(brainDir);
-  const cacheDbPath = resolveDefaultCacheDbPath();
-  const rawInterval = process.env.AGY_MONITOR_SCAN_INTERVAL_MS;
+  const useWorkerPort = !isMainThread && Boolean(parentPort);
+  const wData = useWorkerPort && workerData && typeof workerData === 'object' ? workerData : null;
+  const brainDir =
+    typeof wData?.brainDir === 'string' && wData.brainDir
+      ? path.resolve(wData.brainDir)
+      : resolveDefaultBrainDir();
+  const conversationsDir =
+    typeof wData?.conversationsDir === 'string' && wData.conversationsDir
+      ? path.resolve(wData.conversationsDir)
+      : resolveDefaultConversationsDir(brainDir);
+  const cacheDbPath =
+    typeof wData?.cacheDbPath === 'string' && wData.cacheDbPath
+      ? path.resolve(wData.cacheDbPath)
+      : resolveDefaultCacheDbPath();
+  const rawInterval =
+    wData?.scanIntervalMs !== undefined ? wData.scanIntervalMs : process.env.AGY_MONITOR_SCAN_INTERVAL_MS;
   const intervalMs = rawInterval === undefined ? 1500 : Number(rawInterval);
+
+  const sendToParent = (payload) => {
+    try {
+      if (useWorkerPort) {
+        parentPort.postMessage(payload);
+      } else if (process.connected && typeof process.send === 'function') {
+        process.send(payload);
+      }
+    } catch {
+      // Ignore IPC/port disconnect during shutdown
+    }
+  };
 
   const db = openCacheDb(cacheDbPath);
   const coldCache = new Map();
@@ -1580,27 +1606,17 @@ async function runWorkerMain() {
             // Non-fatal SQLite shrink error
           }
         }
-        if ((res.etagChanged || forceNotify) && process.connected && typeof process.send === 'function') {
-          try {
-            process.send({
-              type: 'updated',
-              etag: res.etag,
-              changedConvs: res.changedConvs,
-              newSteps: res.newSteps,
-            });
-          } catch {
-            // Ignore IPC disconnect during shutdown
-          }
+        if (res.etagChanged || forceNotify) {
+          sendToParent({
+            type: 'updated',
+            etag: res.etag,
+            changedConvs: res.changedConvs,
+            newSteps: res.newSteps,
+          });
         }
         return res;
       } catch (err) {
-        if (process.connected && typeof process.send === 'function') {
-          try {
-            process.send({ type: 'error', message: err?.message || 'scan_error' });
-          } catch {
-            // Ignore IPC disconnect during shutdown
-          }
-        }
+        sendToParent({ type: 'error', message: err?.message || 'scan_error' });
         return null;
       } finally {
         inFlight = null;
@@ -1609,25 +1625,7 @@ async function runWorkerMain() {
     return inFlight;
   };
 
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
-    }
-    if (inFlight) {
-      await inFlight.catch(() => {});
-    }
-    try {
-      db.close();
-    } catch {
-      // Ignore close error on shutdown
-    }
-    process.exit(0);
-  };
-
-  process.on('message', (msg) => {
+  const onParentMessage = (msg) => {
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'rescan') {
       void triggerScan(Boolean(msg.forceNotify));
@@ -1647,10 +1645,42 @@ async function runWorkerMain() {
     } else if (msg.type === 'shutdown') {
       void shutdown();
     }
-  });
+  };
 
-  process.on('SIGTERM', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+    if (inFlight) {
+      await inFlight.catch(() => {});
+    }
+    try {
+      db.close();
+    } catch {
+      // Ignore close error on shutdown
+    }
+    if (useWorkerPort) {
+      try {
+        parentPort.removeListener('message', onParentMessage);
+        parentPort.close();
+      } catch {
+        // Ignore port close error on shutdown
+      }
+    } else {
+      process.exit(0);
+    }
+  };
+
+  if (useWorkerPort) {
+    parentPort.on('message', onParentMessage);
+  } else {
+    process.on('message', onParentMessage);
+    process.on('SIGTERM', () => void shutdown());
+    process.on('SIGINT', () => void shutdown());
+  }
 
   await triggerScan(true);
 
@@ -1667,7 +1697,11 @@ async function runWorkerMain() {
 const isEntrypoint =
   typeof process.argv[1] === 'string' &&
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+const isWorkerThreadEntry =
+  !isMainThread &&
+  Boolean(parentPort) &&
+  (Boolean(workerData?.isScanWorker) || isEntrypoint);
 
-if (isEntrypoint) {
+if (isEntrypoint || isWorkerThreadEntry) {
   void runWorkerMain();
 }

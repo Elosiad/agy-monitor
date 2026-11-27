@@ -20,7 +20,9 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-const MAX_TRANSCRIPT_TAIL_BYTES = 1_500_000;
+export const MAX_TRANSCRIPT_TAIL_BYTES = 1_500_000;
+export const COMPACT_TRANSCRIPT_TAIL_BYTES = 128 * 1024;
+const DEFAULT_COMPACT_PROGRESS_CACHE_MAX = 64;
 const PROGRESS_TAG_RE = /[\[\【]\s*AGY_PROGRESS\s*[|｜]\s*(\d{1,3})\s*%?\s*[|｜]\s*([^\]\】\r\n]+?)\s*[\]\】]/i;
 const PROGRESS_TAG_GLOBAL_RE = /[\[\【]\s*AGY_PROGRESS\s*[|｜]\s*(\d{1,3})\s*%?\s*[|｜]\s*([^\]\】\r\n]+?)\s*[\]\】]/gi;
 
@@ -440,13 +442,13 @@ function deriveHeuristicProgress(turnPlannerSteps, hasEdit, hasCmdAfterEdit, isC
   return Math.min(55, 14 + turnPlannerSteps * 6);
 }
 
-async function readTailLines(filePath, maxBytes = MAX_TRANSCRIPT_TAIL_BYTES) {
+async function readTailLinesMeta(filePath, maxBytes = MAX_TRANSCRIPT_TAIL_BYTES) {
   let fh = null;
   try {
     fh = await fsp.open(filePath, 'r');
     const st = await fh.stat();
     const size = st.size;
-    if (size <= 0) return [];
+    if (size <= 0) return { lines: [], size: 0, truncatedByWindow: false, bytesRead: 0 };
     const start = Math.max(0, size - maxBytes);
     const len = size - start;
     const buf = Buffer.allocUnsafe(len);
@@ -454,11 +456,16 @@ async function readTailLines(filePath, maxBytes = MAX_TRANSCRIPT_TAIL_BYTES) {
     let text = buf.subarray(0, bytesRead).toString('utf8');
     if (start > 0) {
       const nl = text.indexOf('\n');
-      if (nl >= 0) text = text.slice(nl + 1);
+      text = nl >= 0 ? text.slice(nl + 1) : '';
     }
-    return text.split(/\r?\n/).filter(Boolean);
+    return {
+      lines: text ? text.split(/\r?\n/).filter(Boolean) : [],
+      size,
+      truncatedByWindow: start > 0,
+      bytesRead,
+    };
   } catch {
-    return [];
+    return { lines: [], size: 0, truncatedByWindow: false, bytesRead: 0 };
   } finally {
     if (fh) await fh.close().catch(() => {});
   }
@@ -486,19 +493,36 @@ export async function parseAgentJourney(
     fallbackBrief = '',
     nowMs = Date.now(),
     externalSummary = null,
+    maxTailBytes = MAX_TRANSCRIPT_TAIL_BYTES,
+    fallbackTailBytes = 0,
   } = {},
 ) {
   const transcriptPath = path.join(brainDir, convId, '.system_generated', 'logs', 'transcript.jsonl');
-  const lines = await readTailLines(transcriptPath);
-
-  const parsedEntries = [];
-  for (const line of lines) {
-    try {
-      const obj = JSON.parse(line);
-      if (obj && typeof obj === 'object') parsedEntries.push(obj);
-    } catch {
-      // skip incomplete trailing line
+  const parseLinesToEntries = (rawLines) => {
+    const out = [];
+    for (const line of rawLines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj === 'object') out.push(obj);
+      } catch {
+        // skip incomplete trailing line
+      }
     }
+    return out;
+  };
+
+  let tailMeta = await readTailLinesMeta(transcriptPath, maxTailBytes);
+  let parsedEntries = parseLinesToEntries(tailMeta.lines);
+
+  // For compact progress extraction (e.g. 128 KB window), fall back to the full tail window
+  // only when the file exceeded the compact window and no PLANNER_RESPONSE appeared in the slice.
+  if (
+    fallbackTailBytes > maxTailBytes &&
+    tailMeta.truncatedByWindow &&
+    !parsedEntries.some((e) => e.type === 'PLANNER_RESPONSE')
+  ) {
+    tailMeta = await readTailLinesMeta(transcriptPath, fallbackTailBytes);
+    parsedEntries = parseLinesToEntries(tailMeta.lines);
   }
 
   // Locate current task run boundary while keeping prior turns & mid-run supplements in the timeline.
@@ -1493,13 +1517,65 @@ export async function buildMasterySnapshot(
 }
 
 /**
+ * Prune stale or over-cap entries from a per-convId compact progress LRU cache.
+ */
+export function pruneCompactProgressCache(
+  cache,
+  {
+    keepIds = null,
+    maxEntries = DEFAULT_COMPACT_PROGRESS_CACHE_MAX,
+    maxAgeMs = 10 * 60_000,
+    nowMs = Date.now(),
+  } = {},
+) {
+  if (!(cache instanceof Map)) return 0;
+  let removed = 0;
+  const keepSet =
+    keepIds instanceof Set
+      ? keepIds
+      : Array.isArray(keepIds)
+        ? new Set(keepIds)
+        : null;
+  for (const [convId, entry] of cache.entries()) {
+    const tooOld =
+      maxAgeMs > 0 &&
+      Number.isFinite(entry?.lastAccessMs) &&
+      nowMs - entry.lastAccessMs > maxAgeMs;
+    const notKept = keepSet !== null && !keepSet.has(convId);
+    if (tooOld || notKept) {
+      cache.delete(convId);
+      removed += 1;
+    }
+  }
+  const cap = Math.max(1, Math.trunc(maxEntries));
+  if (cache.size > cap) {
+    for (const key of cache.keys()) {
+      if (cache.size <= cap) break;
+      cache.delete(key);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+/**
  * Lightweight session progress summary for HUD telemetry & Desktop Pet bubbles.
- * Hydrates active, unread, and any explicitly pinned conversation IDs.
+ * Hydrates active, unread, and any explicitly pinned conversation IDs using a compact
+ * 128 KB tail window first (falling back to 1.5 MB only if needed) and optional
+ * per-convId `{ mtimeMs, size, summary }` LRU caching so unchanged transcripts are skipped.
  */
 export async function queryCompactSessionProgress(
   paths,
   sessionsHub,
-  { extraIds = [], maxItems = 16, nowMs = Date.now() } = {},
+  {
+    extraIds = [],
+    maxItems = 16,
+    nowMs = Date.now(),
+    cache = null,
+    maxCacheEntries = DEFAULT_COMPACT_PROGRESS_CACHE_MAX,
+    compactTailBytes = COMPACT_TRANSCRIPT_TAIL_BYTES,
+    fallbackTailBytes = MAX_TRANSCRIPT_TAIL_BYTES,
+  } = {},
 ) {
   const brainDir = paths?.brainDir;
   if (!brainDir) return [];
@@ -1541,9 +1617,41 @@ export async function queryCompactSessionProgress(
 
   if (ordered.length === 0) return [];
 
+  const useCache = cache instanceof Map;
   const hydrated = await Promise.all(
     ordered.map(async (item) => {
       const isActive = item.status === 'active';
+      const cleanName = String(item.title || item.id.slice(0, 8)).slice(0, 48);
+      let mtimeMs = 0;
+      let size = 0;
+      if (useCache) {
+        const transcriptPath = path.join(brainDir, item.id, '.system_generated', 'logs', 'transcript.jsonl');
+        try {
+          const st = await fsp.stat(transcriptPath);
+          if (st.isFile()) {
+            mtimeMs = Math.trunc(st.mtimeMs);
+            size = st.size;
+          }
+        } catch {
+          // Missing transcript -> (0, 0)
+        }
+        const cached = cache.get(item.id);
+        if (
+          cached &&
+          cached.mtimeMs === mtimeMs &&
+          cached.size === size &&
+          cached.status === item.status &&
+          cached.name === cleanName &&
+          cached.summary
+        ) {
+          cache.delete(item.id);
+          cached.lastAccessMs = nowMs;
+          cache.set(item.id, cached);
+          return { ...cached.summary };
+        }
+      }
+
+      let summary;
       try {
         const j = await parseAgentJourney(brainDir, item.id, {
           isMaster: true,
@@ -1551,10 +1659,12 @@ export async function queryCompactSessionProgress(
           isSleep: false,
           fallbackBrief: item.title,
           nowMs,
+          maxTailBytes: compactTailBytes,
+          fallbackTailBytes,
         });
-        return {
+        summary = {
           id: item.id,
-          name: String(item.title || item.id.slice(0, 8)).slice(0, 48),
+          name: cleanName,
           status: item.status,
           progress: isActive ? Math.max(0, Math.min(100, Math.round(Number(j?.progress) || 0))) : 100,
           tag: isActive
@@ -1565,17 +1675,39 @@ export async function queryCompactSessionProgress(
           content: String(j?.taskLine || j?.shortStatus || item.title || '').slice(0, 80),
         };
       } catch {
-        return {
+        summary = {
           id: item.id,
-          name: String(item.title || item.id.slice(0, 8)).slice(0, 48),
+          name: cleanName,
           status: item.status,
           progress: isActive ? 15 : 100,
           tag: isActive ? '进行中' : item.status === 'unread' ? '结束未读' : '任务结束',
           content: String(item.title || '').slice(0, 80),
         };
       }
+
+      if (useCache) {
+        cache.delete(item.id);
+        cache.set(item.id, {
+          mtimeMs,
+          size,
+          status: item.status,
+          name: cleanName,
+          summary,
+          lastAccessMs: nowMs,
+        });
+      }
+      return { ...summary };
     }),
   );
+
+  if (useCache) {
+    const cap = Math.max(1, Math.trunc(maxCacheEntries));
+    while (cache.size > cap) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      cache.delete(oldestKey);
+    }
+  }
 
   return hydrated;
 }

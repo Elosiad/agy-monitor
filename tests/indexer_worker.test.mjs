@@ -4,12 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fork } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import {
   parseGenMetadataRecord,
   parseStepMetadataTiming,
+  readConvDbStepTelemetry,
   scanOnce,
 } from '../sidecars/agy_monitor/backend/scan_worker.mjs';
 import {
@@ -732,4 +734,117 @@ test('conversation rewind reusing earlier step_index immediately purges dead bra
   assert.equal(logsAfter.items[0].stepIndex, 2508);
   assert.equal(logsAfter.items[0].upstreamModel, 'gemini-4-hydrogen');
   assert.equal(logsAfter.items[0].durationMs, 25000);
+});
+
+test('scan_worker runs cleanly inside node:worker_threads with node:sqlite, handles shrink/rescan, and exits cleanly on shutdown', async (t) => {
+  const { root, brainDir, cacheDbPath } = createWorkerFixture(t);
+  const conversationsDir = path.join(root, 'conversations');
+  fs.mkdirSync(conversationsDir, { recursive: true });
+
+  const convPath = writeConvLines(
+    brainDir,
+    'conv-wt-1',
+    `${JSON.stringify({
+      step_index: 0,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-27T02:00:00Z',
+      model: 'gemini-4-argon',
+      input_tokens: 400,
+      cache_read_tokens: 600,
+      output_tokens: 40,
+    })}\n`,
+  );
+
+  const worker = new Worker(WORKER_SCRIPT, {
+    execArgv: [],
+    workerData: {
+      isScanWorker: true,
+      brainDir,
+      conversationsDir,
+      cacheDbPath,
+      scanIntervalMs: 0,
+    },
+  });
+
+  t.after(async () => {
+    await worker.terminate().catch(() => {});
+  });
+
+  const messages = [];
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('worker_threads scan_worker timeout')), 8000);
+    worker.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    worker.on('message', (msg) => {
+      messages.push(msg);
+      if (messages.length === 1 && msg?.type === 'updated') {
+        worker.postMessage({ type: 'shrink' });
+        fs.appendFileSync(
+          convPath,
+          `${JSON.stringify({
+            step_index: 1,
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            created_at: '2026-11-27T02:00:10Z',
+            model: 'gemini-4-argon',
+            input_tokens: 200,
+            cache_read_tokens: 900,
+            output_tokens: 55,
+          })}\n`,
+          'utf8',
+        );
+        worker.postMessage({ type: 'rescan', forceNotify: true });
+      } else if (messages.length >= 2 && msg?.type === 'updated') {
+        worker.postMessage({ type: 'shutdown' });
+      }
+    });
+    worker.on('exit', (code) => {
+      clearTimeout(timer);
+      assert.equal(code, 0, 'Worker thread must exit cleanly with code 0');
+      resolve();
+    });
+  });
+
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].type, 'updated');
+  assert.equal(messages[1].type, 'updated');
+  assert.equal(messages[1].newSteps, 1);
+  assert.notEqual(messages[0].etag, messages[1].etag);
+});
+
+test('readConvDbStepTelemetry streams gen_metadata via .iterate() on needsFullGenScan fallback', (t) => {
+  const { root } = createWorkerFixture(t);
+  const dbPath = path.join(root, 'conv-iter-fallback.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+  `);
+  // Step 7 has NO direct genIdx in metadata (forces needsFullGenScan -> .iterate() scan over gen_metadata)
+  const t0 = 1795550000;
+  db.prepare(`INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 15, 3, ?)`).run(
+    7,
+    encodeStepMetaWithGenLink(t0, null, 'resp-iter-7'),
+  );
+  for (let i = 0; i < 12; i += 1) {
+    db.prepare(`INSERT INTO gen_metadata (idx, data) VALUES (?, ?)`).run(
+      i,
+      encodeGenMetadataBlob({
+        stepIndices: [i === 9 ? 7 : 100 + i],
+        responseModel: i === 9 ? 'gemini-4-hydrogen-iter' : 'gemini-3.8-flash-n',
+        displayLabel: i === 9 ? 'Gemini 4 Hydrogen' : 'Gemini 3.8 Flash',
+        responseId: i === 9 ? 'resp-iter-7' : `resp-other-${i}`,
+      }),
+    );
+  }
+  db.close();
+
+  const res = readConvDbStepTelemetry(dbPath, [7]);
+  assert.equal(res.get(7)?.upstreamModel, 'gemini-4-hydrogen-iter');
+  assert.equal(res.get(7)?.requestedModelLabel, 'Gemini 4 Hydrogen');
 });

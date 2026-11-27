@@ -748,3 +748,40 @@ test('desktop_pet downloadable catalog: lightweight preview placeholder, SHA-256
   assert.equal(bundle.includes('api/ext/pet/catalog-preview'), true);
   assert.equal(bundle.includes('/api/pet/catalog/download'), true);
 });
+
+test('AgyDesktopPet.cs Issue #7 RAM, lazy track LRU, timer throttling & frozen brush optimizations', () => {
+  const src = fs.readFileSync(PET_CS, 'utf8');
+
+  // 1. Never upscale sprites (no hardcoded DecodePixelWidth = 512) & cap GIF frames cleanly
+  assert.doesNotMatch(src, /bmp\.DecodePixelWidth\s*=\s*512\s*;/, 'LoadSingleFrameBitmap must NOT hardcode DecodePixelWidth = 512 upscaling');
+  assert.match(src, /TryProbeImageDimensions\s*\(/, 'AgyDesktopPet.cs must probe original image dimensions before decoding');
+  assert.match(src, /BitmapCreateOptions\.DelayCreation[\s\S]{0,80}BitmapCacheOption\.None/, 'Sprite dimension probe must avoid full pixel decode');
+  assert.match(
+    src,
+    /Math\.Min\s*\(\s*srcWidth\s*,\s*Math\.Max\s*\(\s*128\s*,\s*Math\.Min\s*\(\s*512\s*,\s*desiredDisplayPx\s*\)\s*\)\s*\)/,
+    'Sprite decode width must clamp to [128, 512] without upscaling past srcWidth',
+  );
+  assert.match(src, /MaterializeCompactFrame\s*\(/, 'Animated GIF frames must be capped and detached from GifBitmapDecoder');
+
+  // 2. Lazy per-track frame loading with bounded LRU cache & hide cleanup
+  assert.match(src, /_customTrackPaths/, 'Custom frame tracks must store path metadata lazily');
+  assert.match(src, /Dictionary<string,\s*BitmapSource\[\]>\s+_customTrackBitmaps/, 'Loaded tracks must cache compact BitmapSource[] arrays');
+  assert.match(src, /EnsureCustomTrackLoaded\s*\(/, 'Tracks must decode lazily on demand when entered');
+  assert.match(src, /MaxCachedCustomTracks/, 'Custom track cache must enforce a bounded LRU limit');
+  assert.match(src, /ReleaseDecodedFrameMemoryOnHide\s*\(/, 'Hiding the pet window must release decoded track frames');
+  assert.match(src, /EvictNonIdleCustomTracks\s*\(/, 'Suspend/occlusion must evict non-idle tracks');
+
+  // 3. Throttle/pause 60 FPS _animTimer when hidden, occluded by fullscreen, or idle/static
+  assert.match(src, /IsWindowOccludedByFullscreen\s*\(/, 'PetNative must detect fullscreen window occlusion');
+  assert.match(src, /ComputeDesiredAnimIntervalMs\s*\(/, 'DesktopPetWindow must dynamically throttle _animTimer when idle/static');
+  assert.match(src, /SetAnimTimerIntervalMs\s*\(/, 'DesktopPetWindow must update _animTimer.Interval only when cadence changes');
+  assert.match(src, /if\s*\(\s*_currentAnimIntervalMs\s*>\s*33\s*\)\s*\{\s*_lastTickMs\s*=\s*0;\s*\}/s, 'EnsureActiveAnimationRate must reset _lastTickMs when waking from throttled mode so physics dt never spikes');
+  assert.match(src, /RefreshAnimationState\s*\(/, 'PetHostController poll must resume/pause animation on fullscreen occlusion transitions');
+
+  // 4. Freeze brushes & eliminate RenderAtScale = 2.0 GPU cache bloat
+  assert.match(src, /CreateFrozenBrush\s*\(/, 'DesktopPetWindow must freeze cached SolidColorBrush instances');
+  assert.match(src, /_cachedBubbleThemeKey/, 'Telemetry ticks must reuse cached frozen speech-bubble brushes');
+  assert.doesNotMatch(src, /RenderAtScale\s*=\s*2\.0/, 'Speech bubble BitmapCache must NOT waste 4x VRAM at RenderAtScale = 2.0');
+  assert.match(src, /RenderAtScale\s*=\s*1\.0/, 'Speech bubble BitmapCache must use RenderAtScale = 1.0');
+  assert.match(src, /_bubbleBorder\.CacheMode\s*=\s*null;/, 'Collapsed speech bubble must release BitmapCache offscreen surface');
+});

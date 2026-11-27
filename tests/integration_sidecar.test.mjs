@@ -346,6 +346,7 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
   assert.equal(prefsRes.language, 'zh-CN');
   assert.equal(prefsRes.windowCap, 512000);
   assert.equal(prefsRes.quotaQueryEnabled, true);
+  assert.equal(prefsRes.liteMode, false);
   assert.equal(prefsRes.quotaCompliance?.directCloudCodeBlocked, true);
   assert.equal(prefsRes.themeState.activeWallpaperId, 'wp-1');
   assert.equal(prefsRes.themeState.opacity, 100);
@@ -663,6 +664,22 @@ test('SidecarServer E2E: X-Sidecar-Token auth, Follow Latest anti-hijack, legacy
   const quotaBackOnRes = await (await jsonPost('/api/preferences/quota-query', { enabled: true })).json();
   assert.equal(quotaBackOnRes.ok, true);
   assert.equal(quotaBackOnRes.quotaQueryEnabled, true);
+
+  // 11. Opt-in Lightweight / Low-VRAM Mode (liteMode) preference roundtrip
+  const liteOnRes = await (await jsonPost('/api/preferences/lite-mode', { enabled: true })).json();
+  assert.equal(liteOnRes.ok, true);
+  assert.equal(liteOnRes.liteMode, true);
+  const prefsAfterLiteOn = await (await fetch(base + '/api/preferences')).json();
+  assert.equal(prefsAfterLiteOn.liteMode, true);
+  await new Promise((r) => setTimeout(r, 40));
+  const hudAfterLiteOn = JSON.parse(fs.readFileSync(handle.paths.hudTelemetryFile, 'utf8'));
+  assert.equal(hudAfterLiteOn.liteMode, true);
+
+  const liteOffRes = await (await jsonPost('/api/preferences/lite-mode', { enabled: false })).json();
+  assert.equal(liteOffRes.ok, true);
+  assert.equal(liteOffRes.liteMode, false);
+  const prefsAfterLiteOff = await (await fetch(base + '/api/preferences')).json();
+  assert.equal(prefsAfterLiteOff.liteMode, false);
 
   // Confirm ZERO host_injector.js, ZERO config.json modification, ZERO .pbtxt modification
   assert.equal(fs.existsSync(path.join(handle.paths.pluginDataDir, 'host_injector.js')), false);

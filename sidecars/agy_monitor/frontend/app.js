@@ -170,6 +170,7 @@ export function mountMonitorApp() {
     range: "today",
     etag: "",
     quotaQueryEnabled: true,
+    liteMode: false,
     preferences: null,
     snapshot: null,
     configuredRulesTokens: 0,
@@ -287,15 +288,30 @@ export function mountMonitorApp() {
     return quotaPromise;
   }
 
+  function applyLiteMode(nextEnabled) {
+    const enabled = Boolean(nextEnabled);
+    state.liteMode = enabled;
+    if (state.preferences && typeof state.preferences === "object") {
+      state.preferences.liteMode = enabled;
+    }
+    if (typeof document !== "undefined" && document.body) {
+      document.body.classList.toggle("lite-mode", enabled);
+    }
+    components.otherHub?.setLiteMode?.(enabled);
+  }
+
   async function refreshPreferences() {
     try {
       const prefs = await fetchJson("/api/preferences");
       if (destroyed) return null;
       state.preferences = prefs;
       const qEnabled = prefs.quotaQueryEnabled !== false;
+      const liteEnabled = Boolean(prefs.liteMode);
       state.quotaQueryEnabled = qEnabled;
+      state.liteMode = liteEnabled;
       if (typeof document !== "undefined" && document.body) {
         document.body.classList.toggle("is-quota-disabled", !qEnabled);
+        document.body.classList.toggle("lite-mode", liteEnabled);
       }
       state.configuredRulesTokens = resolveConfiguredRulesTokens(prefs);
       components.contextPie?.setConfiguredRulesTokens?.(state.configuredRulesTokens);
@@ -393,6 +409,9 @@ export function mountMonitorApp() {
           data.quotaQueryEnabled !== state.quotaQueryEnabled
         ) {
           void applyQuotaQueryEnabled(data.quotaQueryEnabled, null, { fetchIfEnabled: false });
+        }
+        if (typeof data.liteMode === "boolean" && data.liteMode !== state.liteMode) {
+          applyLiteMode(data.liteMode);
         }
 
         const effectiveCap =
@@ -551,6 +570,9 @@ export function mountMonitorApp() {
     t: translator,
     onQuotaEnabledChange: (nextEnabled, compliance) => {
       void applyQuotaQueryEnabled(nextEnabled, compliance, { fetchIfEnabled: true });
+    },
+    onLiteModeChange: (nextLiteMode) => {
+      applyLiteMode(nextLiteMode);
     },
     onToast: showToast,
   });

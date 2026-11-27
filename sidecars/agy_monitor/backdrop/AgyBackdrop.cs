@@ -764,6 +764,168 @@ namespace AgyBackdropCompanion
         }
     }
 
+    internal static class BitmapUtil
+    {
+        public static bool TryProbeImageDimensions(string filePath, out int srcWidth, out int srcHeight)
+        {
+            srcWidth = 0;
+            srcHeight = 0;
+            try
+            {
+                if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath)) return false;
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    BitmapDecoder decoder = BitmapDecoder.Create(
+                        fs,
+                        BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile,
+                        BitmapCacheOption.None);
+                    if (decoder != null && decoder.Frames != null && decoder.Frames.Count > 0)
+                    {
+                        BitmapFrame frame = decoder.Frames[0];
+                        srcWidth = frame.PixelWidth;
+                        srcHeight = frame.PixelHeight;
+                        return srcWidth > 0 && srcHeight > 0;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// Pre-renders a blurred wallpaper ONCE into a frozen WriteableBitmap via a fast 3-pass separable box blur
+        /// (approximating Gaussian blur in O(W*H) independent of radius) so BackdropSurfaceWindow needs no live BlurEffect.
+        /// </summary>
+        public static BitmapSource CreatePreBlurredBitmap(BitmapSource source, int blurLevel)
+        {
+            if (source == null) return null;
+            int blur = Math.Max(0, Math.Min(24, blurLevel));
+            if (blur <= 0) return source;
+
+            try
+            {
+                int srcW = source.PixelWidth;
+                int srcH = source.PixelHeight;
+                if (srcW <= 1 || srcH <= 1) return source;
+
+                int maxBlurWidth = blur <= 3 ? 1920 : (blur <= 10 ? 1280 : 960);
+                double scale = srcW > maxBlurWidth ? ((double)maxBlurWidth / srcW) : 1.0;
+
+                BitmapSource working = source;
+                if (working.Format != PixelFormats.Pbgra32)
+                {
+                    var converted = new FormatConvertedBitmap();
+                    converted.BeginInit();
+                    converted.Source = working;
+                    converted.DestinationFormat = PixelFormats.Pbgra32;
+                    converted.EndInit();
+                    working = converted;
+                }
+                if (scale < 0.999)
+                {
+                    var scaled = new TransformedBitmap();
+                    scaled.BeginInit();
+                    scaled.Source = working;
+                    scaled.Transform = new ScaleTransform(scale, scale);
+                    scaled.EndInit();
+                    working = scaled;
+                }
+
+                int w = Math.Max(1, working.PixelWidth);
+                int h = Math.Max(1, working.PixelHeight);
+                int stride = w * 4;
+                byte[] bufA = new byte[stride * h];
+                byte[] bufB = new byte[stride * h];
+                working.CopyPixels(bufA, stride, 0);
+
+                int radius = Math.Max(1, (int)Math.Round(blur * 0.65 * scale));
+                int div = radius * 2 + 1;
+
+                for (int pass = 0; pass < 3; pass++)
+                {
+                    // Horizontal sliding-window pass: bufA -> bufB
+                    for (int y = 0; y < h; y++)
+                    {
+                        int row = y * stride;
+                        int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                        for (int k = -radius; k <= radius; k++)
+                        {
+                            int sx = k < 0 ? 0 : (k >= w ? w - 1 : k);
+                            int off = row + sx * 4;
+                            sumB += bufA[off];
+                            sumG += bufA[off + 1];
+                            sumR += bufA[off + 2];
+                            sumA += bufA[off + 3];
+                        }
+                        for (int x = 0; x < w; x++)
+                        {
+                            int dstOff = row + x * 4;
+                            bufB[dstOff] = (byte)(sumB / div);
+                            bufB[dstOff + 1] = (byte)(sumG / div);
+                            bufB[dstOff + 2] = (byte)(sumR / div);
+                            bufB[dstOff + 3] = (byte)(sumA / div);
+
+                            int outX = x - radius;
+                            if (outX < 0) outX = 0;
+                            int inX = x + radius + 1;
+                            if (inX >= w) inX = w - 1;
+                            int outOff = row + outX * 4;
+                            int inOff = row + inX * 4;
+                            sumB += bufA[inOff] - bufA[outOff];
+                            sumG += bufA[inOff + 1] - bufA[outOff + 1];
+                            sumR += bufA[inOff + 2] - bufA[outOff + 2];
+                            sumA += bufA[inOff + 3] - bufA[outOff + 3];
+                        }
+                    }
+
+                    // Vertical sliding-window pass: bufB -> bufA
+                    for (int x = 0; x < w; x++)
+                    {
+                        int xOff = x * 4;
+                        int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                        for (int k = -radius; k <= radius; k++)
+                        {
+                            int sy = k < 0 ? 0 : (k >= h ? h - 1 : k);
+                            int off = sy * stride + xOff;
+                            sumB += bufB[off];
+                            sumG += bufB[off + 1];
+                            sumR += bufB[off + 2];
+                            sumA += bufB[off + 3];
+                        }
+                        for (int y = 0; y < h; y++)
+                        {
+                            int dstOff = y * stride + xOff;
+                            bufA[dstOff] = (byte)(sumB / div);
+                            bufA[dstOff + 1] = (byte)(sumG / div);
+                            bufA[dstOff + 2] = (byte)(sumR / div);
+                            bufA[dstOff + 3] = (byte)(sumA / div);
+
+                            int outY = y - radius;
+                            if (outY < 0) outY = 0;
+                            int inY = y + radius + 1;
+                            if (inY >= h) inY = h - 1;
+                            int outOff = outY * stride + xOff;
+                            int inOff = inY * stride + xOff;
+                            sumB += bufB[inOff] - bufB[outOff];
+                            sumG += bufB[inOff + 1] - bufB[outOff + 1];
+                            sumR += bufB[inOff + 2] - bufB[outOff + 2];
+                            sumA += bufB[inOff + 3] - bufB[outOff + 3];
+                        }
+                    }
+                }
+
+                var wb = new WriteableBitmap(w, h, 96.0, 96.0, PixelFormats.Pbgra32, null);
+                wb.WritePixels(new Int32Rect(0, 0, w, h), bufA, stride, 0);
+                wb.Freeze();
+                return wb;
+            }
+            catch
+            {
+                return source;
+            }
+        }
+    }
+
     internal sealed class BackdropSurfaceWindow : Window
     {
         private readonly Border _frameBorder;
@@ -772,7 +934,8 @@ namespace AgyBackdropCompanion
         private IntPtr _hwnd = IntPtr.Zero;
         private string _loadedPath = "";
         private bool _interactiveResizing = false;
-        private int _configuredBlur = 0;
+        private System.Windows.Media.Color _lastCanvasColor = System.Windows.Media.Color.FromRgb(7, 7, 9);
+        private SolidColorBrush _cachedCanvasBrush;
         private int _lastCornerW = -1;
         private int _lastCornerH = -1;
         private int _lastCornerRadius = -1;
@@ -781,12 +944,20 @@ namespace AgyBackdropCompanion
 
         public IntPtr Handle { get { return _hwnd; } }
 
+        private static SolidColorBrush CreateFrozenBrush(System.Windows.Media.Color col)
+        {
+            var b = new SolidColorBrush(col);
+            b.Freeze();
+            return b;
+        }
+
         public BackdropSurfaceWindow()
         {
             WindowStyle = WindowStyle.None;
             // Hardware-accelerated DirectX surface (opaque canvas + native DWM/region corners) eliminates software resize lag
             AllowsTransparency = false;
-            Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(7, 7, 9));
+            _cachedCanvasBrush = CreateFrozenBrush(_lastCanvasColor);
+            Background = _cachedCanvasBrush;
             ShowInTaskbar = false;
             ShowActivated = false;
             Focusable = false;
@@ -807,7 +978,7 @@ namespace AgyBackdropCompanion
 
             _dimRect = new System.Windows.Shapes.Rectangle
             {
-                Fill = new SolidColorBrush(System.Windows.Media.Color.FromRgb(7, 7, 9)),
+                Fill = _cachedCanvasBrush,
                 Opacity = 0.2
             };
 
@@ -819,7 +990,7 @@ namespace AgyBackdropCompanion
             {
                 CornerRadius = new CornerRadius(0),
                 ClipToBounds = true,
-                Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(7, 7, 9)),
+                Background = _cachedCanvasBrush,
                 Child = grid
             };
 
@@ -836,6 +1007,11 @@ namespace AgyBackdropCompanion
                 {
                     src.AddHook(BackdropWndProc);
                 }
+            };
+
+            Closed += delegate
+            {
+                ReleaseSurfaceResources();
             };
         }
 
@@ -854,36 +1030,30 @@ namespace AgyBackdropCompanion
             return IntPtr.Zero;
         }
 
+        public void ReleaseSurfaceResources()
+        {
+            _loadedPath = "";
+            if (_image != null)
+            {
+                if (_image.Effect != null) _image.Effect = null;
+                _image.Source = null;
+                _image.Margin = new Thickness(0);
+            }
+        }
+
         private void ApplyBlurAndScaling()
         {
-            if (_interactiveResizing)
-            {
-                RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.LowQuality);
-                if (_image.Effect != null)
-                {
-                    _image.Effect = null;
-                    _image.Margin = new Thickness(0);
-                }
-                return;
-            }
-
-            RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.HighQuality);
-            int blur = Math.Max(0, Math.Min(24, _configuredBlur));
-            if (blur > 0)
-            {
-                double effRadius = blur * 1.6;
-                _image.Effect = new BlurEffect
-                {
-                    Radius = effRadius,
-                    KernelType = KernelType.Gaussian,
-                    RenderingBias = RenderingBias.Performance
-                };
-                double bleed = -(effRadius + 6);
-                _image.Margin = new Thickness(bleed);
-            }
-            else
+            // Blurring is pre-rendered offline into a single frozen bitmap in CompanionController;
+            // keep Effect = null on the live full-screen Image so WPF never allocates D3D9 blur render targets.
+            RenderOptions.SetBitmapScalingMode(
+                _image,
+                _interactiveResizing ? BitmapScalingMode.LowQuality : BitmapScalingMode.HighQuality);
+            if (_image.Effect != null)
             {
                 _image.Effect = null;
+            }
+            if (_image.Margin.Left != 0 || _image.Margin.Top != 0 || _image.Margin.Right != 0 || _image.Margin.Bottom != 0)
+            {
                 _image.Margin = new Thickness(0);
             }
         }
@@ -961,10 +1131,14 @@ namespace AgyBackdropCompanion
         public void ApplyVisuals(ThemeConfig cfg, BitmapSource sharedImage, bool isMaximized)
         {
             System.Windows.Media.Color canvasCol = ColorUtil.ParseHex(cfg.canvasColor, System.Windows.Media.Color.FromRgb(7, 7, 9));
-            var canvasBrush = new SolidColorBrush(canvasCol);
-            Background = canvasBrush;
-            _frameBorder.Background = canvasBrush;
-            _dimRect.Fill = canvasBrush;
+            if (_cachedCanvasBrush == null || _lastCanvasColor != canvasCol)
+            {
+                _lastCanvasColor = canvasCol;
+                _cachedCanvasBrush = CreateFrozenBrush(canvasCol);
+            }
+            Background = _cachedCanvasBrush;
+            _frameBorder.Background = _cachedCanvasBrush;
+            _dimRect.Fill = _cachedCanvasBrush;
 
             double imgOpacity = Math.Max(0.0, Math.Min(1.0, cfg.opacity / 100.0));
             _image.Opacity = imgOpacity;
@@ -976,7 +1150,6 @@ namespace AgyBackdropCompanion
                 ? Stretch.Uniform
                 : Stretch.UniformToFill;
 
-            _configuredBlur = Math.Max(0, Math.Min(24, cfg.blur));
             ApplyBlurAndScaling();
 
             if (!string.Equals(_loadedPath, cfg.wallpaperPath ?? "", StringComparison.OrdinalIgnoreCase) || _image.Source != sharedImage)
@@ -1389,13 +1562,21 @@ namespace AgyBackdropCompanion
             {
                 var fi = new FileInfo(filePath);
                 if (fi.Length == 0 || fi.Length > 15 * 1024 * 1024) return false;
+                const int maxLightboxWidth = 3840;
+                int srcWidth;
+                int srcHeight;
+                bool probed = BitmapUtil.TryProbeImageDimensions(filePath, out srcWidth, out srcHeight);
+                int targetDecodeWidth = probed ? Math.Min(srcWidth, maxLightboxWidth) : maxLightboxWidth;
                 BitmapImage bmp = new BitmapImage();
                 using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
                     bmp.BeginInit();
                     bmp.CacheOption = BitmapCacheOption.OnLoad;
                     bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-                    bmp.DecodePixelWidth = 3840;
+                    if (!probed || srcWidth > maxLightboxWidth)
+                    {
+                        bmp.DecodePixelWidth = targetDecodeWidth;
+                    }
                     bmp.StreamSource = fs;
                     bmp.EndInit();
                 }
@@ -4596,6 +4777,8 @@ namespace AgyBackdropCompanion
         private ContextMenuStrip _trayMenu;
         private IntPtr _trayIconHandle = IntPtr.Zero;
         private readonly int _selfPid;
+        private readonly int _parentPid;
+        private DateTime _orphanSinceUtc = DateTime.MinValue;
         private ToolStripMenuItem _statusMenuItem;
         private ToolStripMenuItem _pauseMenuItem;
         private ToolStripMenuItem _hudMenuItem;
@@ -4606,6 +4789,10 @@ namespace AgyBackdropCompanion
         private string _cachedWpPath = "";
         private DateTime _cachedWpMtimeUtc = DateTime.MinValue;
         private BitmapSource _cachedBitmap = null;
+        private BitmapSource _cachedBlurredBitmap = null;
+        private int _cachedBlurredRadius = 0;
+        private string _cachedBlurredWpPath = "";
+        private DateTime _cachedBlurredWpMtimeUtc = DateTime.MinValue;
         private DateTime _lastThemesWriteUtc = DateTime.MinValue;
         private long _lastThemesLength = -1;
         private DateTime _lastHudWriteUtc = DateTime.MinValue;
@@ -4659,7 +4846,7 @@ namespace AgyBackdropCompanion
         private DateTime _renderFollowLastChangeUtc = DateTime.MinValue;
         private Native.RECT _renderFollowLastRect;
 
-        public CompanionController(string dataDir, string assetsDir, Dispatcher dispatcher)
+        public CompanionController(string dataDir, string assetsDir, Dispatcher dispatcher, int parentPid = 0)
         {
             _dataDir = dataDir;
             _assetsDir = assetsDir;
@@ -4671,10 +4858,80 @@ namespace AgyBackdropCompanion
             _statusPath = System.IO.Path.Combine(_dataDir, "backdrop_status.json");
             _lightboxCmdPath = System.IO.Path.Combine(_dataDir, "lightbox_cmd.json");
             _dispatcher = dispatcher;
+            _parentPid = parentPid > 0 ? parentPid : 0;
             using (Process cur = Process.GetCurrentProcess())
             {
                 _selfPid = cur.Id;
             }
+        }
+
+        private static bool IsPidAlive(int pid)
+        {
+            if (pid <= 0) return false;
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                {
+                    return !p.HasExited;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool HasAnyAntigravityHostProcess()
+        {
+            Process[] procs = null;
+            try
+            {
+                procs = Process.GetProcesses();
+                for (int i = 0; i < procs.Length; i++)
+                {
+                    Process p = procs[i];
+                    if (p == null) continue;
+                    try
+                    {
+                        if (IsAntigravityHostProcessName(p.ProcessName)) return true;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            finally
+            {
+                if (procs != null)
+                {
+                    for (int i = 0; i < procs.Length; i++)
+                    {
+                        try { if (procs[i] != null) procs[i].Dispose(); } catch { }
+                    }
+                }
+            }
+            return false;
+        }
+
+        private bool CheckHostLiveness()
+        {
+            if (_parentPid <= 0) return true;
+            if (IsPidAlive(_parentPid) || HasAnyAntigravityHostProcess())
+            {
+                _orphanSinceUtc = DateTime.MinValue;
+                return true;
+            }
+            DateTime now = DateTime.UtcNow;
+            if (_orphanSinceUtc == DateTime.MinValue)
+            {
+                _orphanSinceUtc = now;
+                return true;
+            }
+            if ((now - _orphanSinceUtc).TotalSeconds >= 20.0)
+            {
+                ShutdownGracefully();
+                return false;
+            }
+            return true;
         }
 
         public void Start()
@@ -4715,7 +4972,9 @@ namespace AgyBackdropCompanion
             _reconcileTimer.Interval = TimeSpan.FromMilliseconds(1000);
             _reconcileTimer.Tick += delegate
             {
+                if (_disposed) return;
                 reconcileTick++;
+                if (!CheckHostLiveness()) return;
                 CheckDataFilesTimestamp();
                 SyncAllWindows((reconcileTick % 2) == 0);
                 if (!startupTrimmed && reconcileTick >= 4)
@@ -5510,6 +5769,7 @@ namespace AgyBackdropCompanion
                             RestoreBackdropOnly(item, false);
                             HideHudIfVisible(item);
                         }
+                        ReleaseSharedWallpaperBitmaps();
                     }));
                 }
                 catch { RestoreAllHostOpacityEmergency(); }
@@ -5536,6 +5796,7 @@ namespace AgyBackdropCompanion
                             RestoreBackdropOnly(item, false);
                             HideHudIfVisible(item);
                         }
+                        ReleaseSharedWallpaperBitmaps();
                     }));
                 }
                 catch { RestoreAllHostOpacityEmergency(); }
@@ -6656,7 +6917,11 @@ namespace AgyBackdropCompanion
                     tItem.BackdropBlockReason = "";
                 }
 
-                if (forceImageReload || !string.Equals(_cachedWpPath, _config.wallpaperPath ?? "", StringComparison.OrdinalIgnoreCase))
+                if (!IsBackdropEffectWanted())
+                {
+                    ReleaseSharedWallpaperBitmaps();
+                }
+                else if (forceImageReload || _cachedBitmap == null || !string.Equals(_cachedWpPath, _config.wallpaperPath ?? "", StringComparison.OrdinalIgnoreCase))
                 {
                     LoadSharedWallpaperBitmap(_config.wallpaperPath);
                 }
@@ -6669,12 +6934,20 @@ namespace AgyBackdropCompanion
                     }
                 }
 
+                BitmapSource effectiveWallpaper = IsBackdropEffectWanted() ? GetEffectiveWallpaperBitmap() : null;
                 foreach (TrackedHostWindow item in _tracked.Values)
                 {
                     if (item.Backdrop != null)
                     {
-                        item.AppliedConfigVersion = _configVersion;
-                        item.Backdrop.ApplyVisuals(_config, _cachedBitmap, item.LastMaximized);
+                        if (effectiveWallpaper == null)
+                        {
+                            RestoreBackdropOnly(item, false);
+                        }
+                        else
+                        {
+                            item.AppliedConfigVersion = _configVersion;
+                            item.Backdrop.ApplyVisuals(_config, effectiveWallpaper, item.LastMaximized);
+                        }
                     }
                     if (item.Hud != null)
                     {
@@ -6716,10 +6989,63 @@ namespace AgyBackdropCompanion
             return "";
         }
 
+        private bool IsBackdropEffectWanted()
+        {
+            bool isCssMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(_config.hostThemeMode, "inject", StringComparison.OrdinalIgnoreCase);
+            return _config.backdropEnabled && !_pausedByTray && !isCssMode && !string.IsNullOrEmpty(_config.wallpaperPath);
+        }
+
+        private void ReleaseSharedWallpaperBitmaps()
+        {
+            bool hadAny = _cachedBitmap != null || _cachedBlurredBitmap != null;
+            _cachedBitmap = null;
+            _cachedBlurredBitmap = null;
+            _cachedBlurredRadius = 0;
+            _cachedBlurredWpPath = "";
+            _cachedBlurredWpMtimeUtc = DateTime.MinValue;
+            _cachedWpPath = "";
+            _cachedWpMtimeUtc = DateTime.MinValue;
+            if (hadAny)
+            {
+                Native.TrimWorkingSet();
+            }
+        }
+
+        private BitmapSource GetEffectiveWallpaperBitmap()
+        {
+            if (_cachedBitmap == null) return null;
+            int blur = Math.Max(0, Math.Min(24, _config.blur));
+            if (blur <= 0)
+            {
+                _cachedBlurredBitmap = null;
+                _cachedBlurredRadius = 0;
+                _cachedBlurredWpPath = "";
+                _cachedBlurredWpMtimeUtc = DateTime.MinValue;
+                return _cachedBitmap;
+            }
+            if (_cachedBlurredBitmap != null &&
+                _cachedBlurredRadius == blur &&
+                string.Equals(_cachedBlurredWpPath, _cachedWpPath, StringComparison.OrdinalIgnoreCase) &&
+                _cachedBlurredWpMtimeUtc == _cachedWpMtimeUtc)
+            {
+                return _cachedBlurredBitmap;
+            }
+            _cachedBlurredBitmap = BitmapUtil.CreatePreBlurredBitmap(_cachedBitmap, blur);
+            _cachedBlurredRadius = blur;
+            _cachedBlurredWpPath = _cachedWpPath;
+            _cachedBlurredWpMtimeUtc = _cachedWpMtimeUtc;
+            return _cachedBlurredBitmap ?? _cachedBitmap;
+        }
+
         private void LoadSharedWallpaperBitmap(string filePath)
         {
             _cachedWpPath = filePath ?? "";
             _cachedBitmap = null;
+            _cachedBlurredBitmap = null;
+            _cachedBlurredRadius = 0;
+            _cachedBlurredWpPath = "";
+            _cachedBlurredWpMtimeUtc = DateTime.MinValue;
             _cachedWpMtimeUtc = DateTime.MinValue;
             if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
             {
@@ -6730,14 +7056,21 @@ namespace AgyBackdropCompanion
             try
             {
                 _cachedWpMtimeUtc = File.GetLastWriteTimeUtc(filePath);
-                int decodeW = Native.GetMaxMonitorPhysicalWidth();
+                int maxMonitorWidth = Native.GetMaxMonitorPhysicalWidth();
+                int srcWidth;
+                int srcHeight;
+                bool probed = BitmapUtil.TryProbeImageDimensions(filePath, out srcWidth, out srcHeight);
+                int targetDecodeWidth = probed ? Math.Min(srcWidth, maxMonitorWidth) : maxMonitorWidth;
                 using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
                     var bmp = new BitmapImage();
                     bmp.BeginInit();
                     bmp.CacheOption = BitmapCacheOption.OnLoad;
                     bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
-                    bmp.DecodePixelWidth = decodeW;
+                    if (!probed || srcWidth > maxMonitorWidth)
+                    {
+                        bmp.DecodePixelWidth = targetDecodeWidth;
+                    }
                     bmp.StreamSource = fs;
                     bmp.EndInit();
                     bmp.Freeze();
@@ -6748,6 +7081,7 @@ namespace AgyBackdropCompanion
             catch
             {
                 _cachedBitmap = null;
+                _cachedBlurredBitmap = null;
             }
         }
 
@@ -7038,9 +7372,13 @@ namespace AgyBackdropCompanion
                     SweepOrphanedWindows();
                 }
 
-                bool isCssMode = string.Equals(_config.hostThemeMode, "cdp", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(_config.hostThemeMode, "inject", StringComparison.OrdinalIgnoreCase);
-                bool activeEffect = _config.backdropEnabled && !_pausedByTray && _cachedBitmap != null && !isCssMode;
+                bool wantBackdrop = IsBackdropEffectWanted();
+                if (wantBackdrop && _cachedBitmap == null)
+                {
+                    LoadSharedWallpaperBitmap(_config.wallpaperPath);
+                }
+                BitmapSource effectiveWallpaper = wantBackdrop ? GetEffectiveWallpaperBitmap() : null;
+                bool activeEffect = wantBackdrop && effectiveWallpaper != null;
                 byte targetAlpha = activeEffect
                     ? (byte)Math.Max(148, Math.Min(254, Math.Round(255.0 * (100 - _config.hostBlendPct) / 100.0)))
                     : (byte)255;
@@ -7109,13 +7447,13 @@ namespace AgyBackdropCompanion
                         item.BackdropVisible = false;
                         item.LastMaximized = isMaximized;
                         item.AppliedConfigVersion = _configVersion;
-                        backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
+                        backdrop.ApplyVisuals(_config, effectiveWallpaper, isMaximized);
                     }
                     else if (item.LastMaximized != isMaximized || item.AppliedConfigVersion != _configVersion)
                     {
                         item.LastMaximized = isMaximized;
                         item.AppliedConfigVersion = _configVersion;
-                        item.Backdrop.ApplyVisuals(_config, _cachedBitmap, isMaximized);
+                        item.Backdrop.ApplyVisuals(_config, effectiveWallpaper, isMaximized);
                     }
 
                     IntPtr wpHwnd = item.Backdrop.Handle;
@@ -7189,6 +7527,11 @@ namespace AgyBackdropCompanion
                     {
                         alphaTargets.Add(item);
                     }
+                }
+
+                if (!wantBackdrop && (_cachedBitmap != null || _cachedBlurredBitmap != null))
+                {
+                    ReleaseSharedWallpaperBitmaps();
                 }
 
                 // Phase 1: Place backdrops behind their hosts BEFORE revealing or applying host translucency
@@ -7426,6 +7769,15 @@ namespace AgyBackdropCompanion
             item.LastAlpha = 255;
         }
 
+        private bool HasAnyActiveBackdropSurface()
+        {
+            foreach (TrackedHostWindow other in _tracked.Values)
+            {
+                if (other != null && other.Backdrop != null) return true;
+            }
+            return false;
+        }
+
         private void RestoreBackdropOnly(TrackedHostWindow item, bool closing)
         {
             if (item == null) return;
@@ -7433,18 +7785,19 @@ namespace AgyBackdropCompanion
 
             if (item.Backdrop != null)
             {
-                if (closing)
-                {
-                    BackdropSurfaceWindow closingBackdrop = item.Backdrop;
-                    item.Backdrop = null;
-                    item.BackdropVisible = false;
-                    ForceCloseOwnedWindow(closingBackdrop);
-                }
-                else if (item.BackdropVisible && item.Backdrop.Handle != IntPtr.Zero)
-                {
-                    Native.ShowWindow(item.Backdrop.Handle, Native.SW_HIDE);
-                    item.BackdropVisible = false;
-                }
+                BackdropSurfaceWindow closingBackdrop = item.Backdrop;
+                item.Backdrop = null;
+                item.BackdropVisible = false;
+                item.LastWidth = 0;
+                item.LastHeight = 0;
+                item.AppliedConfigVersion = 0;
+                try { closingBackdrop.ReleaseSurfaceResources(); } catch { }
+                ForceCloseOwnedWindow(closingBackdrop);
+            }
+
+            if (!IsBackdropEffectWanted() || (closing && !HasAnyActiveBackdropSurface()))
+            {
+                ReleaseSharedWallpaperBitmaps();
             }
         }
 
@@ -7620,6 +7973,7 @@ namespace AgyBackdropCompanion
                 RestoreHostWindow(item, true);
             }
             _tracked.Clear();
+            ReleaseSharedWallpaperBitmaps();
             if (_lightbox != null)
             {
                 ImageLightboxWindow closingLightbox = _lightbox;
@@ -8368,6 +8722,7 @@ namespace AgyBackdropCompanion
             bool restoreOpacityMode = false;
             bool memorySnapshotMode = false;
             bool trimMemoryMode = false;
+            int parentPid = 0;
             var extraPids = new HashSet<int>();
 
             for (int i = 0; i < args.Length; i++)
@@ -8377,6 +8732,14 @@ namespace AgyBackdropCompanion
                 else if (args[i] == "--restore-opacity") restoreOpacityMode = true;
                 else if (args[i] == "--memory-snapshot") memorySnapshotMode = true;
                 else if (args[i] == "--trim-memory") trimMemoryMode = true;
+                else if (string.Equals(args[i], "--parent-pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    int parsedParentPid;
+                    if (int.TryParse(args[++i], NumberStyles.Integer, CultureInfo.InvariantCulture, out parsedParentPid) && parsedParentPid > 0)
+                    {
+                        parentPid = parsedParentPid;
+                    }
+                }
                 else if (args[i] == "--extra-pids" && i + 1 < args.Length)
                 {
                     string rawPids = args[++i] ?? "";
@@ -8439,7 +8802,7 @@ namespace AgyBackdropCompanion
                     ShutdownMode = ShutdownMode.OnExplicitShutdown
                 };
 
-                var controller = new CompanionController(dataDir, assetsDir, app.Dispatcher);
+                var controller = new CompanionController(dataDir, assetsDir, app.Dispatcher, parentPid);
                 int recentUiExceptions = 0;
                 DateTime uiExceptionWindowStart = DateTime.UtcNow;
                 app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)

@@ -33,7 +33,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { atomicWriteBuffer, atomicWriteJson, atomicWriteText } from './paths.mjs';
 import { findAntigravityExePath } from './cdp_theme_bridge.mjs';
 import { restoreHostOpacityFallback } from './backdrop_manager.mjs';
-import { extractAsarFile, parseAsar } from './hud_injector.mjs';
+import { lookupAsarNode } from './hud_injector.mjs';
 import { normalizeQuotaSummary } from './quota.mjs';
 import { detectWindowsHostEnv } from './wsl_bridge.mjs';
 
@@ -48,6 +48,9 @@ export const QUOTA_ERROR_FRESHNESS_MS = 90 * 1000;
 export const WINDOWS_CRED_MAX_BLOB_BYTES = 5 * 512; // 2560 bytes (Windows CredWriteW limit)
 export const NATIVE_OAUTH_USER_AGENT = 'vscode/1.X.X (Antigravity/4.3.0)';
 const MAX_HANDLED_QUOTA_ERRORS = 40;
+export const MAX_QUOTA_ERROR_STAMP_CACHE = 64;
+const OAUTH_SCAN_CHUNK_BYTES = 4 * 1024 * 1024;
+const OAUTH_SCAN_OVERLAP_BYTES = 512;
 const MAX_BACKUPS_RETAINED = 10;
 const MAX_IMPORT_CHARS = 1024 * 1024;
 const MAX_IMPORT_BATCH = 50;
@@ -104,20 +107,160 @@ function uniqueStrings(arr) {
 }
 
 /**
- * Safely read a raw file on disk even inside Electron (where `fs` treats `.asar`
- * archives as virtual directories unless `process.noAsar = true`).
+ * Stream-scan a potentially huge local file (e.g. 160 MB app.asar or 260 MB language_server*.exe)
+ * using a fixed sliding-window buffer (`chunkSize` + `overlapBytes`) over a raw file descriptor,
+ * bypassing Electron's virtual ASAR fs patching and avoiding 300-520 MB full-file RAM spikes.
  */
-function readRawFileBypassingAsar(filePath, maxBytes) {
+export function scanFileInChunksBypassingAsar(
+  filePath,
+  onChunk,
+  {
+    maxBytes = 260 * 1024 * 1024,
+    chunkSize = OAUTH_SCAN_CHUNK_BYTES,
+    overlapBytes = OAUTH_SCAN_OVERLAP_BYTES,
+  } = {},
+) {
   const isElectron = Boolean(process.versions && process.versions.electron);
   const prevNoAsar = process.noAsar;
+  let fd = null;
   try {
     if (isElectron) process.noAsar = true;
-    const st = fs.statSync(filePath);
-    if (!st.isFile() || st.size > maxBytes) return null;
-    return fs.readFileSync(filePath);
+    fd = fs.openSync(filePath, 'r');
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > maxBytes) return false;
+
+    const effChunk = Math.max(1024, Math.trunc(chunkSize));
+    const effOverlap = Math.max(0, Math.min(effChunk - 1, Math.trunc(overlapBytes)));
+    const readBuf = Buffer.allocUnsafe(effChunk + effOverlap);
+    let carryLen = 0;
+    let position = 0;
+
+    while (position < st.size) {
+      const toRead = Math.min(effChunk, st.size - position);
+      const bytesRead = fs.readSync(fd, readBuf, carryLen, toRead, position);
+      if (bytesRead <= 0) break;
+      position += bytesRead;
+
+      const windowLen = carryLen + bytesRead;
+      const text = readBuf.toString('latin1', 0, windowLen);
+      const stop = onChunk(text, {
+        carryLen,
+        windowLen,
+        position,
+        totalSize: st.size,
+      });
+      if (stop === true) break;
+
+      if (position < st.size && effOverlap > 0) {
+        const nextCarry = Math.min(effOverlap, windowLen);
+        readBuf.copy(readBuf, 0, windowLen - nextCarry, windowLen);
+        carryLen = nextCarry;
+      } else {
+        carryLen = 0;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
+    if (isElectron) process.noAsar = prevNoAsar;
+  }
+}
+
+/**
+ * Read a single small file slice (e.g. `package.json`) directly from an `.asar` archive
+ * via Chromium Pickle header offsets without loading the entire 160 MB archive into RAM.
+ */
+function readAsarSingleFileBypassingAsar(
+  asarPath,
+  relPath,
+  {
+    maxAsarBytes = 160 * 1024 * 1024,
+    maxHeaderBytes = 16 * 1024 * 1024,
+    maxEntryBytes = 4 * 1024 * 1024,
+  } = {},
+) {
+  const isElectron = Boolean(process.versions && process.versions.electron);
+  const prevNoAsar = process.noAsar;
+  let fd = null;
+  try {
+    if (isElectron) process.noAsar = true;
+    fd = fs.openSync(asarPath, 'r');
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size < 16 || st.size > maxAsarBytes) return null;
+
+    const preamble = Buffer.allocUnsafe(16);
+    if (fs.readSync(fd, preamble, 0, 16, 0) < 16) return null;
+    const pickleSize = preamble.readUInt32LE(0);
+    const headerSize = preamble.readUInt32LE(4);
+    const headerBodySize = preamble.readUInt32LE(8);
+    const jsonLen = preamble.readUInt32LE(12);
+    if (
+      pickleSize !== 4 ||
+      headerSize < 8 ||
+      headerBodySize < 4 ||
+      jsonLen <= 0 ||
+      jsonLen > maxHeaderBytes
+    ) {
+      return null;
+    }
+    const baseOffset = 8 + headerSize;
+    if (16 + jsonLen > st.size || baseOffset > st.size) return null;
+
+    const headerBuf = Buffer.allocUnsafe(jsonLen);
+    let headerRead = 0;
+    while (headerRead < jsonLen) {
+      const n = fs.readSync(fd, headerBuf, headerRead, jsonLen - headerRead, 16 + headerRead);
+      if (n <= 0) return null;
+      headerRead += n;
+    }
+    const root = JSON.parse(headerBuf.toString('utf8'));
+    const node = lookupAsarNode(root, relPath);
+    if (!node || node.unpacked === true) return null;
+    const entryOffset = Number(node.offset);
+    const entrySize = Number(node.size);
+    if (
+      !Number.isFinite(entryOffset) ||
+      !Number.isFinite(entrySize) ||
+      entryOffset < 0 ||
+      entrySize < 0 ||
+      entrySize > maxEntryBytes ||
+      baseOffset + entryOffset + entrySize > st.size
+    ) {
+      return null;
+    }
+    if (entrySize === 0) return Buffer.alloc(0);
+    const entryBuf = Buffer.allocUnsafe(entrySize);
+    let entryRead = 0;
+    while (entryRead < entrySize) {
+      const n = fs.readSync(
+        fd,
+        entryBuf,
+        entryRead,
+        entrySize - entryRead,
+        baseOffset + entryOffset + entryRead,
+      );
+      if (n <= 0) return null;
+      entryRead += n;
+    }
+    return entryBuf;
   } catch {
     return null;
   } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
     if (isElectron) process.noAsar = prevNoAsar;
   }
 }
@@ -178,6 +321,7 @@ export async function discoverLocalOAuthClient({
   env = process.env,
   exePath = '',
   forceRefresh = false,
+  chunkSize = OAUTH_SCAN_CHUNK_BYTES,
 } = {}) {
   const envId = typeof env?.ANTIGRAVITY_OAUTH_CLIENT_ID === 'string' ? env.ANTIGRAVITY_OAUTH_CLIENT_ID.trim() : '';
   const envSecret =
@@ -235,14 +379,23 @@ export async function discoverLocalOAuthClient({
   for (const root of uniqueRoots) {
     for (const rel of ['app.asar', path.join('app', 'out', 'main.js')]) {
       const p = path.join(root, rel);
-      const rawBuf = readRawFileBypassingAsar(p, 160 * 1024 * 1024);
-      if (rawBuf) {
-        const hit = extractPersonalClientIdFromText(rawBuf.toString('latin1'));
-        if (hit) {
-          personalId = hit;
-          break;
-        }
-      }
+      scanFileInChunksBypassingAsar(
+        p,
+        (text) => {
+          const hit = extractPersonalClientIdFromText(text);
+          if (hit) {
+            personalId = hit;
+            return true;
+          }
+          return false;
+        },
+        {
+          maxBytes: 160 * 1024 * 1024,
+          chunkSize,
+          overlapBytes: OAUTH_SCAN_OVERLAP_BYTES,
+        },
+      );
+      if (personalId) break;
     }
     if (!personalId) {
       // Secondary fallback inside Electron virtual ASAR filesystem
@@ -277,11 +430,33 @@ export async function discoverLocalOAuthClient({
   for (const root of uniqueRoots) {
     for (const rel of lsCandidates) {
       const p = path.join(root, rel);
-      const rawBuf = readRawFileBypassingAsar(p, 260 * 1024 * 1024);
-      if (!rawBuf) continue;
-      const txt = rawBuf.toString('latin1');
-      const ids = uniqueStrings(txt.match(idRe) || []);
-      const secrets = uniqueStrings(txt.match(secRe) || []);
+      const idSet = new Set();
+      const secretSet = new Set();
+      const scanned = scanFileInChunksBypassingAsar(
+        p,
+        (text, { carryLen }) => {
+          idRe.lastIndex = 0;
+          let m;
+          while ((m = idRe.exec(text)) !== null) {
+            if (carryLen > 0 && m.index + m[0].length <= carryLen) continue;
+            idSet.add(m[0]);
+          }
+          secRe.lastIndex = 0;
+          while ((m = secRe.exec(text)) !== null) {
+            if (carryLen > 0 && m.index + m[0].length <= carryLen) continue;
+            secretSet.add(m[0]);
+          }
+          return false;
+        },
+        {
+          maxBytes: 260 * 1024 * 1024,
+          chunkSize,
+          overlapBytes: OAUTH_SCAN_OVERLAP_BYTES,
+        },
+      );
+      if (!scanned) continue;
+      const ids = [...idSet];
+      const secrets = [...secretSet];
       if (ids.length === 0 || secrets.length === 0) continue;
 
       const orderedIds = uniqueStrings([
@@ -1020,18 +1195,16 @@ export function detectLocalAntigravityVersion({ exePath = '', forceRefresh = fal
       detected = directPkg;
       break;
     }
-    const asarBuf = readRawFileBypassingAsar(path.join(root, 'app.asar'), 160 * 1024 * 1024);
-    if (asarBuf) {
+    const pkgBuf = readAsarSingleFileBypassingAsar(path.join(root, 'app.asar'), 'package.json');
+    if (pkgBuf) {
       try {
-        const parsedAsar = parseAsar(asarBuf);
-        const pkgBuf = extractAsarFile(parsedAsar, 'package.json');
         const pkg = JSON.parse(pkgBuf.toString('utf8'));
         if (typeof pkg?.version === 'string' && pkg.version.trim()) {
           detected = pkg.version.trim();
           break;
         }
       } catch {
-        // ignore malformed asar
+        // ignore malformed package.json
       }
     }
   }
@@ -2733,6 +2906,18 @@ export function parseQuotaExhaustedStepError(metadataBuf, payloadBuf, { convId =
  * to detect a fresh halted `step_type = 17` quota-exhausted error.
  * Uses an optional file-stamp cache (`mtime:size` across `.db` + `.db-wal`) so idle ticks do zero SQLite opens.
  */
+function setBoundedStampCache(cache, convId, stamp, maxEntries = MAX_QUOTA_ERROR_STAMP_CACHE) {
+  if (!(cache instanceof Map)) return;
+  cache.delete(convId);
+  cache.set(convId, stamp);
+  const cap = Math.max(1, Math.trunc(maxEntries));
+  while (cache.size > cap) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
+
 export async function detectRecentQuotaExhaustedError(
   conversationsDir,
   {
@@ -2741,10 +2926,14 @@ export async function detectRecentQuotaExhaustedError(
     minCreatedAtMs = 0,
     handledErrorKeys = null,
     fileStampCache = null,
+    maxStampCacheEntries = MAX_QUOTA_ERROR_STAMP_CACHE,
     summariesDbPath = '',
   } = {},
 ) {
-  if (!conversationsDir || !fs.existsSync(conversationsDir)) return null;
+  if (!conversationsDir || !fs.existsSync(conversationsDir)) {
+    if (fileStampCache instanceof Map) fileStampCache.clear();
+    return null;
+  }
   let entries;
   try {
     entries = await fsp.readdir(conversationsDir, { withFileTypes: true });
@@ -2780,6 +2969,22 @@ export async function detectRecentQuotaExhaustedError(
     recentFiles.push({ convId, dbPath, effectiveMtime, stamp });
   }
 
+  // Prune removed or expired entries from fileStampCache and enforce max size cap
+  if (fileStampCache instanceof Map && fileStampCache.size > 0) {
+    const activeConvIds = new Set(recentFiles.map((f) => f.convId));
+    for (const key of fileStampCache.keys()) {
+      if (!activeConvIds.has(key)) {
+        fileStampCache.delete(key);
+      }
+    }
+    const cap = Math.max(1, Math.trunc(maxStampCacheEntries));
+    while (fileStampCache.size > cap) {
+      const oldest = fileStampCache.keys().next().value;
+      if (oldest === undefined) break;
+      fileStampCache.delete(oldest);
+    }
+  }
+
   if (recentFiles.length === 0) return null;
   recentFiles.sort((a, b) => b.effectiveMtime - a.effectiveMtime);
   const topCandidates = recentFiles.slice(0, 10);
@@ -2796,7 +3001,7 @@ export async function detectRecentQuotaExhaustedError(
         .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'`)
         .get();
       if (!hasSteps) {
-        fileStampCache?.set(item.convId, item.stamp);
+        setBoundedStampCache(fileStampCache, item.convId, item.stamp, maxStampCacheEntries);
         continue;
       }
       // Latest major step (14=USER_INPUT, 15=PLANNER_RESPONSE, 17=ERROR_MESSAGE):
@@ -2810,7 +3015,7 @@ export async function detectRecentQuotaExhaustedError(
            LIMIT 1`,
         )
         .get();
-      fileStampCache?.set(item.convId, item.stamp);
+      setBoundedStampCache(fileStampCache, item.convId, item.stamp, maxStampCacheEntries);
       if (!row || Number(row.step_type) !== 17) continue;
 
       const parsed = parseQuotaExhaustedStepError(row.metadata, row.step_payload, {
@@ -6179,6 +6384,16 @@ export function createAccountManager({
     });
   }
 
+  function pruneTransientCaches() {
+    quotaErrorFileStampCache.clear();
+    const cutoff = now() - Math.max(OAUTH_BACKGROUND_RETRY_COOLDOWN_MS, 30 * 60_000);
+    for (const [accId, ts] of autoTokenAttemptAtMs.entries()) {
+      if (!Number.isFinite(ts) || ts < cutoff) {
+        autoTokenAttemptAtMs.delete(accId);
+      }
+    }
+  }
+
   return {
     listAccounts,
     updateAccountSettings,
@@ -6208,5 +6423,6 @@ export function createAccountManager({
     runLifecycleTick,
     startLifecycleWatcher,
     stopLifecycleWatcher,
+    pruneTransientCaches,
   };
 }

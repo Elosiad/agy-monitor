@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
@@ -52,6 +53,24 @@ const EXT_TO_MIME = new Map([
 ]);
 
 const launcherSignatureCache = new Map();
+const activeBridgeCacheClearers = new Set();
+let cachedRendererBundle = null;
+
+function getNativeHudScriptBundle() {
+  if (!cachedRendererBundle) {
+    const src = buildNativeHudRendererScript();
+    const hash = crypto.createHash('sha256').update(src, 'utf8').digest('hex').slice(0, 16);
+    cachedRendererBundle = {
+      src,
+      scriptSig: `${NATIVE_HUD_VERSION}:${hash}`,
+    };
+  }
+  return cachedRendererBundle;
+}
+
+export function getNativeHudScriptSignature() {
+  return getNativeHudScriptBundle().scriptSig;
+}
 
 function clampInt(val, min, max, fallback) {
   const n = Number(val);
@@ -76,6 +95,20 @@ function escapeVbsString(str) {
 
 let cachedResolvedExeWin = '';
 let cachedLauncherSnapshot = null;
+
+export function clearCdpBridgeCaches() {
+  launcherSignatureCache.clear();
+  cachedResolvedExeWin = '';
+  cachedLauncherSnapshot = null;
+  cachedRendererBundle = null;
+  for (const clearFn of activeBridgeCacheClearers) {
+    try {
+      clearFn();
+    } catch {
+      // ignore per-instance cache clear error
+    }
+  }
+}
 
 /**
  * Locate Antigravity's desktop executable on Windows (or via WSL2 mount).
@@ -306,8 +339,8 @@ export async function ensureCdpLauncher(paths, cdpPort = DEFAULT_CDP_PORT) {
  * Uses the exact same optical veil formula as Scheme 1 + AGY Console so wallpaper brightness
  * matches 1:1 while keeping all text, code, icons, and popovers 100% solid & crisp.
  */
-export function buildCdpThemeCss(themes = {}, wallpaperDataUri = '') {
-  return buildHostWallpaperCss(themes, wallpaperDataUri);
+export function buildCdpThemeCss(themes = {}, wallpaperDataUri = '', options = {}) {
+  return buildHostWallpaperCss(themes, wallpaperDataUri, options);
 }
 
 export function isAntigravityAppTarget(target) {
@@ -415,12 +448,12 @@ function buildRemoveThemeExpr() {
   })()`;
 }
 
-function buildHudSyncExpr(
+function buildNormalizedHudPayload(
   hudPayload,
   accentColor,
   displayConfig = null,
-  guideImageDataUri = '',
   themeVisual = null,
+  { guideImageDataUri = '', includeGuide = true } = {},
 ) {
   const disp = normalizeHudDisplayConfig(displayConfig);
   const bubbleColor =
@@ -428,7 +461,7 @@ function buildHudSyncExpr(
       ? themeVisual.bubbleColor
       : '#212533';
   const hostBlendPct = clampInt(themeVisual?.hostBlendPct, 5, 42, 25);
-  const safePayload = JSON.stringify({
+  const payload = {
     activeConvId: typeof hudPayload?.activeConvId === 'string' ? hudPayload.activeConvId : '',
     percent: clampInt(hudPayload?.percent, 0, 999, 0),
     totalUsed: Math.max(0, Math.round(Number(hudPayload?.totalUsed) || 0)),
@@ -453,15 +486,41 @@ function buildHudSyncExpr(
         : '#5b8cff',
     bubbleColor,
     hostBlendPct,
+    liteMode: Boolean(themeVisual?.liteMode),
     display: disp,
-    guideImageDataUri: typeof guideImageDataUri === 'string' ? guideImageDataUri : '',
-  });
-  const rendererSrc = buildNativeHudRendererScript();
+  };
+  if (includeGuide) {
+    payload.guideImageDataUri = typeof guideImageDataUri === 'string' ? guideImageDataUri : '';
+  }
+  return payload;
+}
+
+export function buildHudMountExpr(
+  hudPayload,
+  accentColor,
+  displayConfig = null,
+  guideImageDataUri = '',
+  themeVisual = null,
+) {
+  const safePayload = JSON.stringify(
+    buildNormalizedHudPayload(hudPayload, accentColor, displayConfig, themeVisual, {
+      guideImageDataUri,
+      includeGuide: true,
+    }),
+  );
+  const { src: rendererSrc, scriptSig } = getNativeHudScriptBundle();
 
   return `(function(data){
-    if (!window.__agyMonitorNativeHud || window.__agyMonitorNativeHud.version !== ${JSON.stringify(NATIVE_HUD_VERSION)}) {
+    var sig = ${JSON.stringify(scriptSig)};
+    if (!window.__agyMonitorNativeHud || window.__agyMonitorNativeHud.version !== ${JSON.stringify(NATIVE_HUD_VERSION)} || window.__agyMonitorNativeHud.scriptSig !== sig) {
       try {
+        if (window.__agyMonitorNativeHud && typeof window.__agyMonitorNativeHud.dispose === 'function') {
+          window.__agyMonitorNativeHud.dispose();
+        }
         (0, eval)(${JSON.stringify(rendererSrc)});
+        if (window.__agyMonitorNativeHud) {
+          window.__agyMonitorNativeHud.scriptSig = sig;
+        }
       } catch (e) {
         return { hudInjected: false };
       }
@@ -469,8 +528,45 @@ function buildHudSyncExpr(
     if (!window.__agyMonitorNativeHud || typeof window.__agyMonitorNativeHud.sync !== 'function') {
       return { hudInjected: false };
     }
-    return window.__agyMonitorNativeHud.sync(data);
+    var res = window.__agyMonitorNativeHud.sync(data);
+    if (res && typeof res === 'object') {
+      res.mountedSig = window.__agyMonitorNativeHud.scriptSig || sig;
+    }
+    return res;
   })(${safePayload})`;
+}
+
+export function buildHudDeltaExpr(
+  hudPayload,
+  accentColor,
+  displayConfig = null,
+  themeVisual = null,
+  { guideImageDataUri = '', includeGuide = false, scriptSig = '' } = {},
+) {
+  const sig = scriptSig || getNativeHudScriptBundle().scriptSig;
+  const safePayload = JSON.stringify(
+    buildNormalizedHudPayload(hudPayload, accentColor, displayConfig, themeVisual, {
+      guideImageDataUri,
+      includeGuide,
+    }),
+  );
+  return `(function(data){
+    var hud = window.__agyMonitorNativeHud;
+    if (!hud || hud.version !== ${JSON.stringify(NATIVE_HUD_VERSION)} || hud.scriptSig !== ${JSON.stringify(sig)} || typeof hud.update !== 'function') {
+      return { needsMount: true, hudInjected: false };
+    }
+    return hud.update(data);
+  })(${safePayload})`;
+}
+
+function buildHudSyncExpr(
+  hudPayload,
+  accentColor,
+  displayConfig = null,
+  guideImageDataUri = '',
+  themeVisual = null,
+) {
+  return buildHudMountExpr(hudPayload, accentColor, displayConfig, guideImageDataUri, themeVisual);
 }
 
 function buildRemoveHudExpr() {
@@ -848,7 +944,7 @@ function buildHostI18nRestoreExpr() {
  * 3) Provides reversible in-memory Chinese UI localization for Antigravity host without editing app.asar.
  */
 export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
-  /** @type {Map<string, { ws: WebSocket, wsUrl: string, title: string, url: string, type: string, cssApplied: boolean, hudInjected: boolean, hostLocalized: boolean }>} */
+  /** @type {Map<string, { ws: WebSocket, wsUrl: string, title: string, url: string, type: string, cssApplied: boolean, hudInjected: boolean, hudMountedSig: string, hudGuideSig: string, hostLocalized: boolean }>} */
   const sessions = new Map();
   const connectingUrls = new Set();
   let lastError = '';
@@ -861,6 +957,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   let hudTickTimer = null;
   let latestThemes = null;
   let latestHostLanguage = 'zh-CN';
+  let latestLiteMode = false;
   let latestHudData = null;
   let lastActiveViewKey = '';
   let lastNotifiedHudInjected = false;
@@ -880,7 +977,35 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
 
   let cachedWpId = '';
   let cachedWpMtime = 0;
+  let cachedWpSize = 0;
   let cachedWpDataUri = '';
+
+  let cachedGuideMtime = -1;
+  let cachedGuideSize = -1;
+  let cachedGuideDataUri = '';
+
+  let cachedDisplayMtime = -1;
+  let cachedDisplaySize = -1;
+  let cachedDisplayConfig = null;
+
+  const clearWallpaperCache = () => {
+    cachedWpId = '';
+    cachedWpMtime = 0;
+    cachedWpSize = 0;
+    cachedWpDataUri = '';
+  };
+
+  const clearCaches = () => {
+    clearWallpaperCache();
+    cachedGuideMtime = -1;
+    cachedGuideSize = -1;
+    cachedGuideDataUri = '';
+    cachedDisplayMtime = -1;
+    cachedDisplaySize = -1;
+    cachedDisplayConfig = null;
+    lastActiveViewKey = '';
+  };
+  activeBridgeCacheClearers.add(clearCaches);
 
   const closeAllSessions = () => {
     for (const entry of sessions.values()) {
@@ -923,7 +1048,10 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
 
   const resolveWallpaperDataUri = async (themes) => {
     const wpId = typeof themes?.activeWallpaperId === 'string' ? themes.activeWallpaperId.trim() : '';
-    if (!wpId) return '';
+    if (!wpId) {
+      clearWallpaperCache();
+      return '';
+    }
 
     let filePath = '';
     if (/^wp-\d+$/i.test(wpId) && paths?.wallpapersDir) {
@@ -934,11 +1062,14 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         filePath = path.join(paths.customWallpapersDir, path.basename(match.filename));
       }
     }
-    if (!filePath) return '';
+    if (!filePath) {
+      clearWallpaperCache();
+      return '';
+    }
 
     try {
       const st = await fsp.stat(filePath);
-      if (wpId === cachedWpId && st.mtimeMs === cachedWpMtime && cachedWpDataUri) {
+      if (wpId === cachedWpId && st.mtimeMs === cachedWpMtime && st.size === cachedWpSize && cachedWpDataUri) {
         return cachedWpDataUri;
       }
       const ext = path.extname(filePath).toLowerCase();
@@ -946,28 +1077,52 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       const buf = await fsp.readFile(filePath);
       cachedWpId = wpId;
       cachedWpMtime = st.mtimeMs;
+      cachedWpSize = st.size;
       cachedWpDataUri = `data:${mime};base64,${buf.toString('base64')}`;
       return cachedWpDataUri;
     } catch {
+      clearWallpaperCache();
       return '';
     }
   };
 
-  let cachedGuideMtime = -1;
-  let cachedGuideDataUri = '';
-  const resolveGuideImageDataUri = async () => {
+  const resolveGuideImageMeta = async () => {
     const filePath = paths?.assetsDir ? path.join(paths.assetsDir, 'open_console_guide.jpg') : '';
-    if (!filePath) return '';
+    if (!filePath) return { filePath: '', guideSig: 'none', mtimeMs: -1, size: -1 };
     try {
       const st = await fsp.stat(filePath);
-      if (st.mtimeMs === cachedGuideMtime && cachedGuideDataUri) {
+      return {
+        filePath,
+        guideSig: `${filePath}|${st.mtimeMs}|${st.size}`,
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+      };
+    } catch {
+      return { filePath: '', guideSig: 'none', mtimeMs: -1, size: -1 };
+    }
+  };
+
+  const resolveGuideImageDataUri = async (meta = null) => {
+    const info = meta || (await resolveGuideImageMeta());
+    if (!info.filePath) {
+      cachedGuideMtime = -1;
+      cachedGuideSize = -1;
+      cachedGuideDataUri = '';
+      return '';
+    }
+    try {
+      if (info.mtimeMs === cachedGuideMtime && info.size === cachedGuideSize && cachedGuideDataUri) {
         return cachedGuideDataUri;
       }
-      const buf = await fsp.readFile(filePath);
-      cachedGuideMtime = st.mtimeMs;
+      const buf = await fsp.readFile(info.filePath);
+      cachedGuideMtime = info.mtimeMs;
+      cachedGuideSize = info.size;
       cachedGuideDataUri = `data:image/jpeg;base64,${buf.toString('base64')}`;
       return cachedGuideDataUri;
     } catch {
+      cachedGuideMtime = -1;
+      cachedGuideSize = -1;
+      cachedGuideDataUri = '';
       return '';
     }
   };
@@ -1112,6 +1267,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
             type: String(target.type || 'page'),
             cssApplied: false,
             hudInjected: false,
+            hudMountedSig: '',
+            hudGuideSig: '',
             hostLocalized: false,
           };
           sessions.set(url, entry);
@@ -1373,9 +1530,19 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
   const readHudDisplayConfig = async () => {
     if (!paths?.hudDisplayFile) return normalizeHudDisplayConfig(null);
     try {
+      const st = await fsp.stat(paths.hudDisplayFile);
+      if (cachedDisplayConfig && st.mtimeMs === cachedDisplayMtime && st.size === cachedDisplaySize) {
+        return cachedDisplayConfig;
+      }
       const raw = await fsp.readFile(paths.hudDisplayFile, 'utf8');
-      return normalizeHudDisplayConfig(JSON.parse(raw));
+      cachedDisplayConfig = normalizeHudDisplayConfig(JSON.parse(raw));
+      cachedDisplayMtime = st.mtimeMs;
+      cachedDisplaySize = st.size;
+      return cachedDisplayConfig;
     } catch {
+      cachedDisplayMtime = -1;
+      cachedDisplaySize = -1;
+      cachedDisplayConfig = null;
       return normalizeHudDisplayConfig(null);
     }
   };
@@ -1394,6 +1561,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
             await sendEvaluateOn(entry, rem).catch(() => {});
           }
           entry.hudInjected = false;
+          entry.hudMountedSig = '';
+          entry.hudGuideSig = '';
         }),
       );
       notifyHudStateIfChanged();
@@ -1404,18 +1573,90 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     const bubbleColor = latestThemes?.colors?.bubble || '#212533';
     const hostBlendPct = clampInt(latestThemes?.hostBlendPct, 5, 42, 25);
     const displayCfg = await readHudDisplayConfig();
-    const guideDataUri = await resolveGuideImageDataUri();
-    const expr = buildHudSyncExpr(latestHudData || {}, accent, displayCfg, guideDataUri, {
+    const { scriptSig } = getNativeHudScriptBundle();
+    const guideMeta = await resolveGuideImageMeta();
+    const themeVisual = {
       bubbleColor,
       hostBlendPct,
-    });
+      liteMode: latestLiteMode,
+    };
+
+    let guideUriPromise = null;
+    const ensureGuideDataUri = () => {
+      if (!guideUriPromise) {
+        guideUriPromise = resolveGuideImageDataUri(guideMeta);
+      }
+      return guideUriPromise;
+    };
+
+    let mountExprPromise = null;
+    const ensureMountExpr = () => {
+      if (!mountExprPromise) {
+        mountExprPromise = ensureGuideDataUri().then((guideDataUri) =>
+          buildHudMountExpr(latestHudData || {}, accent, displayCfg, guideDataUri, themeVisual),
+        );
+      }
+      return mountExprPromise;
+    };
+
+    let deltaExprNoGuide = '';
+    const getDeltaExprNoGuide = () => {
+      if (!deltaExprNoGuide) {
+        deltaExprNoGuide = buildHudDeltaExpr(latestHudData || {}, accent, displayCfg, themeVisual, {
+          includeGuide: false,
+          scriptSig,
+        });
+      }
+      return deltaExprNoGuide;
+    };
+
+    let deltaExprWithGuidePromise = null;
+    const ensureDeltaExprWithGuide = () => {
+      if (!deltaExprWithGuidePromise) {
+        deltaExprWithGuidePromise = ensureGuideDataUri().then((guideDataUri) =>
+          buildHudDeltaExpr(latestHudData || {}, accent, displayCfg, themeVisual, {
+            guideImageDataUri: guideDataUri,
+            includeGuide: true,
+            scriptSig,
+          }),
+        );
+      }
+      return deltaExprWithGuidePromise;
+    };
+
     let anyInjected = false;
     let latestPatch = null;
     await Promise.allSettled(
       [...sessions.values()].map(async (entry) => {
         if (entry.ws.readyState !== 1) return;
-        const res = await sendEvaluateOn(entry, expr).catch(() => null);
-        const val = res?.result?.value;
+        let val = null;
+        if (entry.hudMountedSig === scriptSig) {
+          const needGuide = entry.hudGuideSig !== guideMeta.guideSig;
+          const deltaExpr = needGuide ? await ensureDeltaExprWithGuide() : getDeltaExprNoGuide();
+          const res = await sendEvaluateOn(entry, deltaExpr).catch(() => null);
+          val = res?.result?.value || null;
+          if (!val || val.needsMount === true) {
+            // Page reloaded, window.__agyMonitorNativeHud missing, or script signature changed: fall back cleanly to full mount
+            entry.hudMountedSig = '';
+            entry.hudGuideSig = '';
+            const mountRes = await sendEvaluateOn(entry, await ensureMountExpr()).catch(() => null);
+            val = mountRes?.result?.value || null;
+            if (val?.mountedSig === scriptSig) {
+              entry.hudMountedSig = scriptSig;
+              entry.hudGuideSig = guideMeta.guideSig;
+            }
+          } else if (needGuide) {
+            entry.hudGuideSig = guideMeta.guideSig;
+          }
+        } else {
+          const mountRes = await sendEvaluateOn(entry, await ensureMountExpr()).catch(() => null);
+          val = mountRes?.result?.value || null;
+          if (val?.mountedSig === scriptSig) {
+            entry.hudMountedSig = scriptSig;
+            entry.hudGuideSig = guideMeta.guideSig;
+          }
+        }
+
         entry.hudInjected = Boolean(val?.hudInjected);
         if (entry.hudInjected) anyInjected = true;
         if (val?.activeView) {
@@ -1430,6 +1671,9 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       }),
     );
     if (latestPatch && paths?.hudDisplayFile) {
+      cachedDisplayConfig = latestPatch;
+      cachedDisplayMtime = -1;
+      cachedDisplaySize = -1;
       await atomicWriteJson(paths.hudDisplayFile, latestPatch).catch(() => {});
     }
     notifyHudStateIfChanged();
@@ -1444,6 +1688,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
           await sendEvaluateOn(entry, rem).catch(() => {});
         }
         entry.hudInjected = false;
+        entry.hudMountedSig = '';
+        entry.hudGuideSig = '';
       }),
     );
     notifyHudStateIfChanged();
@@ -1530,6 +1776,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         }
         if (needHud && !val.hasHud) {
           entry.hudInjected = false;
+          entry.hudMountedSig = '';
+          entry.hudGuideSig = '';
           needsResync = true;
         }
       }),
@@ -1560,12 +1808,12 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
         if (!hasOpenSessions()) {
           // Avoid noisy reconnect loops every 2s when native main-process already handles HUD & wallpaper
           if (isCdpMode || needCss || needCdpHud || retryTickCount % 6 === 0) {
-            void sync(latestThemes, { hostLanguage: latestHostLanguage });
+            void sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
           }
           return;
         }
         if ((needCss && !isAnyStyleApplied()) || (needI18n && !isAnyHostLocalized()) || (needCdpHud && !isHudInjected())) {
-          void sync(latestThemes, { hostLanguage: latestHostLanguage });
+          void sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
           return;
         }
         // Periodically detect newly opened windows & Ctrl+R page reloads whose DOM lost injected nodes
@@ -1574,13 +1822,13 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
             const lostMarkers = await probeSessionMarkers(needCss, needI18n, needCdpHud);
             if (disposed || !latestThemes) return;
             if (lostMarkers) {
-              await sync(latestThemes, { hostLanguage: latestHostLanguage });
+              await sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
               return;
             }
             const prevCount = sessions.size;
             const ok = await ensureConnected(activePort);
             if (!disposed && ok && sessions.size > prevCount) {
-              await sync(latestThemes, { hostLanguage: latestHostLanguage });
+              await sync(latestThemes, { hostLanguage: latestHostLanguage, liteMode: latestLiteMode });
             }
           })();
         }
@@ -1622,6 +1870,11 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     if (options.hostLanguage === 'zh-CN' || options.hostLanguage === 'en') {
       latestHostLanguage = options.hostLanguage;
     }
+    if (typeof options.liteMode === 'boolean') {
+      latestLiteMode = options.liteMode;
+    } else if (typeof themes?.liteMode === 'boolean') {
+      latestLiteMode = themes.liteMode;
+    }
     const port = clampInt(themes.cdpPort, 1024, 65535, DEFAULT_CDP_PORT);
     if (port !== activePort && sessions.size > 0 && !options.keepConnectedPort) {
       const devToolsPort = await readDevToolsActivePort(paths).catch(() => 0);
@@ -1641,6 +1894,9 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     const nativeWpAlive = isNativeWallpaperAlive();
     const wantDomHud = wantDomHudFor(themes);
     const wantCdpCss = wantCdpCssFor(themes);
+    if (!wantCdpCss) {
+      clearWallpaperCache();
+    }
     const shouldConnect = isCdpMode || wantCdpCss || wantDomHud || Boolean(options.probeForLang) || hasOpenSessions();
 
     if (!shouldConnect) {
@@ -1662,7 +1918,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
             await removeCssAll();
           }
         } else {
-          const css = buildCdpThemeCss(themes, dataUri);
+          const css = buildCdpThemeCss(themes, dataUri, { liteMode: latestLiteMode });
           await applyCssAll(css);
         }
       } else if (!(isInjectMode && nativeWpAlive && Boolean(themes.backdropEnabled) && Boolean(themes.activeWallpaperId))) {
@@ -1682,9 +1938,20 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     return getStatus(themes);
   };
 
-  const syncHostLanguage = async (language, themes = latestThemes || {}) => {
+  const syncHostLanguage = async (language, themes = latestThemes || {}, options = {}) => {
     latestHostLanguage = language === 'en' ? 'en' : 'zh-CN';
-    return await sync(themes, { hostLanguage: latestHostLanguage, probeForLang: true });
+    const nextLiteMode =
+      typeof options?.liteMode === 'boolean'
+        ? options.liteMode
+        : typeof themes?.liteMode === 'boolean'
+          ? themes.liteMode
+          : latestLiteMode;
+    return await sync(themes, {
+      ...options,
+      hostLanguage: latestHostLanguage,
+      liteMode: nextLiteMode,
+      probeForLang: true,
+    });
   };
 
   const getStatus = (themes = latestThemes || {}) => {
@@ -1712,6 +1979,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
       styleApplied: Boolean(connected && isAnyStyleApplied()),
       hudInjected: Boolean(connected && isHudInjected()),
       hostLanguage: latestHostLanguage,
+      liteMode: latestLiteMode,
       hostLocalized: Boolean(connected && isAnyHostLocalized()),
       targetTitle: connected ? title : '',
       shortcutLnkPath: lnkPath,
@@ -1740,6 +2008,8 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     }
     closeAllSessions();
     closeWslProxy();
+    clearCaches();
+    activeBridgeCacheClearers.delete(clearCaches);
   };
 
   return {
@@ -1748,6 +2018,7 @@ export function createCdpThemeBridge(paths, { onHudStateChange = null } = {}) {
     updateHudData,
     isHudInjected,
     getStatus,
+    clearCaches,
     dispose,
   };
 }

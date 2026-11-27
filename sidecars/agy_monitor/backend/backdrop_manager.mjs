@@ -447,6 +447,15 @@ export async function getBackdropStatus(paths, themes = {}) {
   };
 }
 
+export function buildBackdropSpawnArgs(rt, { isWsl = false, parentPid = process.pid } = {}) {
+  const args = ['--data-dir', rt.dataDirWin, '--assets-dir', rt.assetsDirWin];
+  // Only pass --parent-pid on native Windows; under WSL2 interop process.pid is a Linux PID.
+  if (!isWsl && Number.isInteger(parentPid) && parentPid > 0) {
+    args.push('--parent-pid', String(parentPid));
+  }
+  return args;
+}
+
 /**
  * Prepare binaries/launchers and start or stop the backdrop companion when running on interactive desktop.
  */
@@ -492,6 +501,7 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
 
   if (desk.canAutoLaunch) {
     if (wantRunning && !current.running) {
+      const spawnArgs = buildBackdropSpawnArgs(rt, { isWsl: hostInfo.isWsl, parentPid: process.pid });
       const child = hostInfo.isWsl && hostInfo.wscriptPath
         ? spawn(hostInfo.wscriptPath, ['//Nologo', rt.launcherVbsWin], {
             detached: true,
@@ -499,7 +509,7 @@ export async function controlBackdropCompanion(paths, themes = {}, action = 'syn
           })
         : spawn(
             rt.exePosix,
-            ['--data-dir', rt.dataDirWin, '--assets-dir', rt.assetsDirWin],
+            spawnArgs,
             { detached: true, stdio: 'ignore', windowsHide: true },
           );
       child.on('error', () => {});

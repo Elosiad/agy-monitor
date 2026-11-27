@@ -175,6 +175,7 @@ body.has-wallpaper .right-pane-canvas {
 /* When Scheme 1 desktop backdrop is active on the host window, suppress duplicate panel wallpaper
    so AGY Console shares the single continuous host wallpaper seamlessly at identical brightness */
 body.host-backdrop-shared .workspace-wallpaper-layer {
+  display: none !important;
   opacity: 0 !important;
 }
 
@@ -208,6 +209,7 @@ body.host-css-shared .host-boundary-card {
 }
 
 body.host-css-shared .workspace-wallpaper-layer {
+  display: none !important;
   opacity: 0 !important;
 }
 
@@ -4763,7 +4765,6 @@ html[lang="en"] .prompt-selector-row {
   stroke-width: 2.1;
   stroke-dasharray: 5 15;
   stroke-linecap: round;
-  animation: mgDashFlow 1.05s linear infinite;
   opacity: 0;
   transition: opacity 0.16s ease;
 }
@@ -4775,6 +4776,7 @@ html[lang="en"] .prompt-selector-row {
 .mg-edge-group.is-live .mg-edge-flow,
 .mg-edge-group.is-highlighted .mg-edge-flow {
   opacity: 0.94;
+  animation: mgDashFlow 1.05s linear infinite;
 }
 
 .mg-port-dot { fill: var(--mastery-running); }
@@ -10059,6 +10061,10 @@ body.host-backdrop-shared .mad-lightbox-img {
   border-color: color-mix(in srgb, var(--accent-amber) 34%, var(--border-hairline));
 }
 
+.other-card.is-lite-active {
+  border-color: color-mix(in srgb, var(--accent-teal) 40%, var(--border-hairline));
+}
+
 body.host-css-shared .other-card {
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
@@ -10304,4 +10310,133 @@ body.host-css-shared .other-card {
   .other-adapt-grid {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* ========== 轻量省显存模式 (Opt-in Lite / Low-VRAM Mode) ========== */
+body.lite-mode,
+body.lite-mode.host-css-shared {
+  --bg-surface: color-mix(in srgb, var(--bg-bubble) 86%, var(--bg-chrome));
+  --bg-elevated: color-mix(in srgb, var(--bg-chrome) 92%, var(--text-primary) 8%);
+  --bg-active-row: color-mix(in srgb, var(--bg-bubble) 88%, var(--text-primary) 12%);
+  --bg-control: color-mix(in srgb, var(--bg-bubble) 90%, var(--bg-chrome));
+  --bg-control-hover: color-mix(in srgb, var(--bg-bubble) 84%, var(--text-primary) 12%);
+  --bg-tooltip: var(--bg-elevated);
+  --bg-backdrop: color-mix(in srgb, var(--bg-canvas) 88%, transparent);
+}
+
+html.is-light-canvas body.lite-mode,
+html.is-light-canvas body.lite-mode.host-css-shared {
+  --bg-surface: color-mix(in srgb, var(--bg-bubble) 94%, var(--bg-chrome));
+  --bg-elevated: var(--bg-bubble);
+  --bg-active-row: color-mix(in srgb, var(--bg-bubble) 88%, var(--bg-chrome));
+  --bg-control: color-mix(in srgb, var(--bg-bubble) 92%, var(--bg-chrome));
+  --bg-control-hover: color-mix(in srgb, var(--bg-chrome) 86%, var(--text-primary) 6%);
+  --bg-backdrop: color-mix(in srgb, var(--text-strong) 42%, transparent);
+}
+
+body.lite-mode .acc-item-card,
+body.lite-mode .acc-toolbar-card,
+body.lite-mode .acc-summary-card,
+body.lite-mode .acc-empty-card,
+body.lite-mode .acc-group-bar,
+body.lite-mode .acc-sort-menu,
+body.lite-mode .bg-card,
+body.lite-mode .other-card,
+body.lite-mode .backdrop-companion-card,
+body.lite-mode .host-boundary-card,
+body.lite-mode .metric-card,
+body.lite-mode .session-group,
+body.lite-mode .theme-section,
+body.lite-mode .mad-composer-glass,
+body.lite-mode .mad-slash-menu,
+body.lite-mode .modal-backdrop,
+body.lite-mode .modal-dialog,
+body.lite-mode .req-modal-dialog,
+body.lite-mode .changelog-modal-dialog,
+body.lite-mode .memory-modal-dialog,
+body.lite-mode .tp-modal-backdrop,
+body.lite-mode .tp-modal,
+body.lite-mode .mad-lightbox-backdrop,
+body.lite-mode .preview-mini-sidebar,
+body.lite-mode .preview-mini-bubble,
+body.lite-mode .preview-mini-metrics,
+body.lite-mode .window-dropdown,
+body.lite-mode .prompt-dropdown,
+body.lite-mode .favorite-add-dropdown,
+body.lite-mode .pie-tooltip,
+body.lite-mode .toast-banner {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+body.lite-mode .acc-item-card,
+body.lite-mode .acc-toolbar-card,
+body.lite-mode .acc-summary-card,
+body.lite-mode .acc-empty-card,
+body.lite-mode .acc-group-bar,
+body.lite-mode .bg-card,
+body.lite-mode .other-card,
+body.lite-mode .backdrop-companion-card,
+body.lite-mode .host-boundary-card,
+body.lite-mode .metric-card,
+body.lite-mode .session-group,
+body.lite-mode .theme-section,
+body.lite-mode .mad-composer-glass,
+body.lite-mode .mad-composer-glass:focus-within {
+  background: color-mix(in srgb, var(--bg-surface) 96%, var(--bg-canvas));
+  border-color: var(--border-subtle);
+}
+
+body.lite-mode .acc-sort-menu,
+body.lite-mode .mad-slash-menu,
+body.lite-mode .modal-dialog,
+body.lite-mode .req-modal-dialog,
+body.lite-mode .changelog-modal-dialog,
+body.lite-mode .memory-modal-dialog,
+body.lite-mode .tp-modal,
+body.lite-mode .window-dropdown,
+body.lite-mode .prompt-dropdown,
+body.lite-mode .favorite-add-dropdown,
+body.lite-mode .pie-tooltip,
+body.lite-mode .toast-banner {
+  background: var(--bg-elevated);
+  border-color: var(--border-subtle);
+}
+
+body.lite-mode .preview-mini-sidebar,
+body.lite-mode .preview-mini-metrics {
+  background: var(--preview-chrome, var(--bg-chrome));
+}
+
+body.lite-mode .preview-mini-bubble {
+  background: var(--preview-bubble, var(--bg-bubble));
+}
+
+body.lite-mode .modal-backdrop,
+body.lite-mode .tp-modal-backdrop,
+body.lite-mode .mad-lightbox-backdrop {
+  background: var(--bg-backdrop);
+}
+
+body.lite-mode .workspace-wallpaper-layer {
+  filter: none !important;
+}
+
+body.lite-mode .subnav-update-btn.is-available .subnav-update-dot,
+body.lite-mode .subnav-update-btn.is-updating .subnav-update-dot,
+body.lite-mode .mv-f-lamp.is-active,
+body.lite-mode .mg-status-key.is-running .mg-key-dot,
+body.lite-mode .mg-edge-group.is-live .mg-edge-flow,
+body.lite-mode .mg-edge-group.is-highlighted .mg-edge-flow,
+body.lite-mode .mg-state-pill.is-running .mg-pill-dot,
+body.lite-mode .mad-live-foot.is-running .mad-live-dot,
+body.lite-mode .acc-status-dot,
+body.lite-mode .acc-item-card.is-trigger-pulse,
+body.lite-mode .acc-item-alert-btn.is-launching,
+body.lite-mode .acc-item-alert-btn.is-done,
+body.lite-mode .msm-extra-row,
+body.lite-mode .mastery-detail-view,
+body.lite-mode .mad-lightbox-backdrop,
+body.lite-mode .tp-modal-backdrop {
+  animation: none !important;
 }

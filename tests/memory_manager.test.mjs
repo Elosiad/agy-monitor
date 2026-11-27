@@ -278,3 +278,178 @@ test('memory HTTP routes persist zeroUiaMode/memoryGuard settings, trim memory, 
     await env.cleanup();
   }
 });
+
+test('expanded onShrinkInternal invokes optional HUD/CDP cache clearers, prunes sessions_meta, and liteMode preference plumbing propagates to HUD/CDP', async () => {
+  const env = await makeTempEnv();
+  try {
+    // Seed brainDir with one existing session
+    await fs.mkdir(path.join(env.paths.brainDir, 'conv-alive'), { recursive: true });
+
+    const nowMs = Date.now();
+    const veryOldMs = nowMs - 120 * 24 * 3600 * 1000;
+    const orphanOldMs = nowMs - 3 * 3600 * 1000;
+    const staleLastSeen = {
+      'conv-alive': nowMs - 1000,
+      'conv-fav': veryOldMs,
+      'conv-expired': veryOldMs,
+      'conv-orphan': orphanOldMs,
+    };
+    const staleAgents = {
+      'conv-alive': nowMs - 1000,
+      'agent-expired': veryOldMs,
+      'agent-orphan': orphanOldMs,
+    };
+    await env.storage.updateSessionsMeta({
+      favoriteIds: ['conv-fav'],
+      favoriteTitles: {
+        'conv-fav': 'Kept Favorite',
+        'conv-unfavorited-orphan': 'Should Be Pruned',
+      },
+      lastSeenModifiedMs: staleLastSeen,
+      lastSeenByConv: staleLastSeen,
+      lastSeenByAgent: staleAgents,
+    });
+
+    const calls = {
+      hudClear: 0,
+      cdpClearMod: 0,
+      cdpClearInst: 0,
+      progressPrune: 0,
+      workerShrink: 0,
+      stagedArgs: [],
+      cdpSyncArgs: [],
+    };
+
+    const mockHudInjectorMod = {
+      clearHudInjectorCaches() {
+        calls.hudClear += 1;
+      },
+      async stageLiveHudAssets(_paths, themes, opts) {
+        calls.stagedArgs.push({ themeLite: themes?.liteMode, optLite: opts?.liteMode });
+      },
+    };
+    const mockCdpBridgeMod = {
+      clearCdpBridgeCaches() {
+        calls.cdpClearMod += 1;
+      },
+    };
+    const mockCdpBridge = {
+      clearCaches() {
+        calls.cdpClearInst += 1;
+      },
+      async sync(themes, opts) {
+        calls.cdpSyncArgs.push({ themeLite: themes?.liteMode, optLite: opts?.liteMode, lang: opts?.hostLanguage });
+        return { connected: false, styleApplied: false };
+      },
+      async syncHostLanguage() {
+        return { connected: false };
+      },
+      getStatus() {
+        return { connected: false };
+      },
+      isHudInjected() {
+        return false;
+      },
+    };
+    const mockHudPublisher = {
+      pruneProgressCache() {
+        calls.progressPrune += 1;
+      },
+      refreshFromDb() {
+        return Promise.resolve();
+      },
+      writePayload() {
+        return Promise.resolve();
+      },
+    };
+    const mockMemDriver = {
+      async captureSnapshot() {
+        return {
+          ok: true,
+          ts: Date.now(),
+          supportedScope: 'full-windows',
+          system: { totalMb: 16384, availableMb: 8192, loadPct: 50 },
+          processes: [],
+        };
+      },
+      async trimMemory() {
+        return {
+          ok: true,
+          trimmedCount: 1,
+          failedCount: 0,
+          beforeTotalPrivateWsMb: 300,
+          afterTotalPrivateWsMb: 200,
+          freedMb: 100,
+          snapshot: await mockMemDriver.captureSnapshot(),
+        };
+      },
+    };
+
+    const routes = createMonitorHandlers({
+      paths: env.paths,
+      storage: env.storage,
+      hudPublisher: mockHudPublisher,
+      cdpBridge: mockCdpBridge,
+      memoryDriver: mockMemDriver,
+      shrinkWorkerMemory: () => {
+        calls.workerShrink += 1;
+      },
+      hudInjectorModule: mockHudInjectorMod,
+      cdpBridgeModule: mockCdpBridgeMod,
+    });
+
+    // 1. Trigger POST /api/memory/optimize -> invokes all shrink hooks + prunes sessions_meta.json
+    const optRes = await routes.get('POST /api/memory/optimize')({});
+    assert.equal(optRes.ok, true);
+    assert.equal(calls.hudClear, 1);
+    assert.equal(calls.cdpClearMod, 1);
+    assert.equal(calls.cdpClearInst, 1);
+    assert.equal(calls.progressPrune, 1);
+    assert.equal(calls.workerShrink, 1);
+
+    const metaAfter = await env.storage.getSessionsMeta();
+    assert.equal(metaAfter.favoriteTitles['conv-fav'], 'Kept Favorite');
+    assert.equal('conv-unfavorited-orphan' in metaAfter.favoriteTitles, false);
+    assert.equal('conv-alive' in metaAfter.lastSeenByConv, true);
+    assert.equal('conv-fav' in metaAfter.lastSeenByConv, true, 'Favorited conv must be preserved');
+    assert.equal('conv-expired' in metaAfter.lastSeenByConv, false);
+    assert.equal('conv-orphan' in metaAfter.lastSeenByConv, false);
+    assert.equal('agent-expired' in metaAfter.lastSeenByAgent, false);
+    assert.equal('agent-orphan' in metaAfter.lastSeenByAgent, false);
+
+    // 2. Verify pruneSessionsMeta enforces maxSeenConvs cap while keeping newest + favorites
+    const bulkSeen = { 'conv-fav': 10 };
+    for (let i = 1; i <= 25; i += 1) {
+      bulkSeen[`conv-bulk-${i}`] = nowMs - (30 - i) * 1000;
+    }
+    await env.storage.updateSessionsMeta({ lastSeenModifiedMs: bulkSeen, lastSeenByConv: bulkSeen });
+    const pruneRes = await env.storage.pruneSessionsMeta({ maxSeenConvs: 8, nowMs });
+    assert.equal(pruneRes.pruned, true);
+    const cappedMeta = await env.storage.getSessionsMeta();
+    assert.equal(Object.keys(cappedMeta.lastSeenByConv).length, 8);
+    assert.equal('conv-fav' in cappedMeta.lastSeenByConv, true);
+    assert.equal('conv-bulk-25' in cappedMeta.lastSeenByConv, true);
+    assert.equal('conv-bulk-1' in cappedMeta.lastSeenByConv, false);
+
+    // 3. Opt-in liteMode preference plumbing: default false -> POST /api/preferences/lite-mode -> HUD & CDP refresh
+    const prefsDefault = await routes.get('GET /api/preferences')({});
+    assert.equal(prefsDefault.liteMode, false);
+
+    const enableRes = await routes.get('POST /api/preferences/lite-mode')({ enabled: true });
+    assert.equal(enableRes.ok, true);
+    assert.equal(enableRes.liteMode, true);
+    assert.equal((await env.storage.getPrefs()).liteMode, true);
+    assert.equal((await routes.get('GET /api/preferences')({})).liteMode, true);
+    assert.deepEqual(calls.stagedArgs[0], { themeLite: true, optLite: true });
+    assert.equal(calls.cdpSyncArgs[0].themeLite, true);
+    assert.equal(calls.cdpSyncArgs[0].optLite, true);
+
+    const disableRes = await routes.get('POST /api/preferences/lite-mode')({ enabled: false });
+    assert.equal(disableRes.ok, true);
+    assert.equal(disableRes.liteMode, false);
+    assert.equal((await env.storage.getPrefs()).liteMode, false);
+    assert.deepEqual(calls.stagedArgs[1], { themeLite: false, optLite: false });
+  } finally {
+    await env.cleanup();
+  }
+});

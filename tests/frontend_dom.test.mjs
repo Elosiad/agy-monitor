@@ -1147,3 +1147,550 @@ test('Other tab & quota master toggle: default ON, turning OFF stops all /api/qu
     'Turning quota switch back ON must resume /api/quota fetch',
   );
 });
+
+test('Issue #7 CSS & shared-wallpaper GPU texture elimination: display:none, backgroundImage=none, .mg-edge-flow active-only animation, and body.lite-mode rules', async (t) => {
+  const css = fs.readFileSync(STYLES_CSS_PATH, 'utf8');
+  const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+
+  // 1. CSS static assertions for shared wallpaper display:none
+  const backdropSharedBlock = /body\.host-backdrop-shared\s+\.workspace-wallpaper-layer\s*\{([^}]*)\}/.exec(css);
+  assert.ok(backdropSharedBlock, 'Missing body.host-backdrop-shared .workspace-wallpaper-layer block');
+  assert.match(backdropSharedBlock[1], /display:\s*none\s*!important/);
+  assert.match(backdropSharedBlock[1], /opacity:\s*0\s*!important/);
+
+  const cssSharedBlock = /body\.host-css-shared\s+\.workspace-wallpaper-layer\s*\{([^}]*)\}/.exec(css);
+  assert.ok(cssSharedBlock, 'Missing body.host-css-shared .workspace-wallpaper-layer block');
+  assert.match(cssSharedBlock[1], /display:\s*none\s*!important/);
+  assert.match(cssSharedBlock[1], /opacity:\s*0\s*!important/);
+
+  // 2. CSS static assertions for .mg-edge-flow active-only animation
+  const edgeFlowBase = /\.mg-edge-flow\s*\{([^}]*)\}/.exec(css);
+  assert.ok(edgeFlowBase, 'Missing .mg-edge-flow base rule');
+  assert.equal(/\banimation\s*:/.test(edgeFlowBase[1]), false, '.mg-edge-flow must not animate while idle/invisible');
+  const edgeFlowActive = /\.mg-edge-group\.is-live\s+\.mg-edge-flow,\s*\.mg-edge-group\.is-highlighted\s+\.mg-edge-flow\s*\{([^}]*)\}/.exec(css);
+  assert.ok(edgeFlowActive, 'Missing active .mg-edge-flow rule');
+  assert.match(edgeFlowActive[1], /animation:\s*mgDashFlow/);
+
+  // 3. CSS static assertions for body.lite-mode
+  assert.match(css, /body\.lite-mode\s+\.acc-item-card[\s\S]*?backdrop-filter:\s*none\s*!important/);
+  assert.match(css, /body\.lite-mode\s+\.bg-card[\s\S]*?backdrop-filter:\s*none\s*!important/);
+  assert.match(css, /body\.lite-mode\s+\.modal-dialog[\s\S]*?-webkit-backdrop-filter:\s*none\s*!important/);
+  assert.match(css, /html\.is-light-canvas\s+body\.lite-mode/);
+
+  // 4. Runtime theme_studio shared-mode texture drop + clean restore
+  const { document } = createMiniDom(html);
+  const prevGlobals = { document: globalThis.document, window: globalThis.window };
+  globalThis.document = document;
+  globalThis.window = { location: { pathname: '/' }, addEventListener() {}, removeEventListener() {} };
+
+  const { createThemeStudio } = await import(
+    `${pathToFileURL(path.join(FRONTEND_DIR, 'components', 'theme_studio.js')).href}?shared=${Date.now()}`
+  );
+  const studio = createThemeStudio({
+    apiFetch: async () => ({ ok: true, status: 200, async json() { return { ok: true }; } }),
+  });
+  t.after(() => {
+    studio.destroy();
+    globalThis.document = prevGlobals.document;
+    globalThis.window = prevGlobals.window;
+  });
+
+  const wpLayer = document.getElementById('workspaceWallpaperLayer');
+  assert.ok(wpLayer);
+
+  // Standalone (not shared): wallpaper backgroundImage is set
+  studio.update({
+    themeState: { activeWallpaperId: 'wp-2', backdropEnabled: false, hostThemeMode: 'inject' },
+    backdropStatus: { running: false, cdp: { styleApplied: false, connected: false }, nativeHud: { heartbeat: { wallpaperAlive: false } } },
+  });
+  assert.equal(document.body.classList.contains('has-wallpaper'), true);
+  assert.equal(document.body.classList.contains('host-css-shared'), false);
+  assert.equal(document.body.classList.contains('host-backdrop-shared'), false);
+  assert.match(wpLayer.style.backgroundImage, /kind=builtin_wp&id=wp-2/);
+
+  // Shared via host CSS inject: backgroundImage dropped to 'none'
+  studio.update({
+    themeState: { activeWallpaperId: 'wp-2', backdropEnabled: true, hostThemeMode: 'inject' },
+    backdropStatus: { running: false, cdp: { styleApplied: true, connected: true }, nativeHud: { heartbeat: { wallpaperAlive: true } } },
+  });
+  assert.equal(document.body.classList.contains('host-css-shared'), true);
+  assert.equal(document.body.classList.contains('has-wallpaper'), false);
+  assert.equal(wpLayer.style.backgroundImage, 'none');
+
+  // Shared via host backdrop companion: backgroundImage also dropped to 'none'
+  studio.update({
+    themeState: { activeWallpaperId: 'wp-2', backdropEnabled: true, hostThemeMode: 'backdrop' },
+    backdropStatus: { running: true, paused: false, cdp: { styleApplied: false, connected: false } },
+  });
+  assert.equal(document.body.classList.contains('host-backdrop-shared'), true);
+  assert.equal(document.body.classList.contains('host-css-shared'), false);
+  assert.equal(wpLayer.style.backgroundImage, 'none');
+
+  // Exit shared mode (paused companion): backgroundImage cleanly restored
+  studio.update({
+    themeState: { activeWallpaperId: 'wp-2', backdropEnabled: true, hostThemeMode: 'backdrop' },
+    backdropStatus: { running: true, paused: true, cdp: { styleApplied: false, connected: false } },
+  });
+  assert.equal(document.body.classList.contains('host-backdrop-shared'), false);
+  assert.equal(document.body.classList.contains('has-wallpaper'), true);
+  assert.match(wpLayer.style.backgroundImage, /kind=builtin_wp&id=wp-2/);
+});
+
+test('Custom wallpaper upload helper: caps longest edge at 2560px, transcodes to WebP, and preserves safe fallbacks', async () => {
+  const {
+    computeCappedDimensions,
+    isAnimatedGifBytes,
+    isAnimatedWebpBytes,
+    optimizeWallpaperUpload,
+  } = await import(
+    `${pathToFileURL(path.join(FRONTEND_DIR, 'components', 'theme_studio.js')).href}?wp=${Date.now()}`
+  );
+
+  // Dimension capping without upscaling
+  assert.deepEqual(computeCappedDimensions(3840, 2160, 2560), { width: 2560, height: 1440, resized: true });
+  assert.deepEqual(computeCappedDimensions(2000, 4000, 2560), { width: 1280, height: 2560, resized: true });
+  assert.deepEqual(computeCappedDimensions(1920, 1080, 2560), { width: 1920, height: 1080, resized: false });
+
+  // 1. Oversized 4K PNG -> resized to 2560x1440 WebP @ 0.86 quality
+  let drawnArgs = null;
+  let encodedArgs = null;
+  let finalCanvasSize = null;
+  const origLargeBase64 = 'A'.repeat(400);
+  const mockSmallWebpBase64 = 'UklGRsmallwebp';
+  const resLarge = await optimizeWallpaperUpload({
+    dataUrl: `data:image/png;base64,${origLargeBase64}`,
+    base64: origLargeBase64,
+    mime: 'image/png',
+    loadImage: async () => ({ naturalWidth: 3840, naturalHeight: 2160 }),
+    createCanvas: () => {
+      const c = {
+        width: 0,
+        height: 0,
+        getContext: () => ({
+          drawImage(_img, x, y, w, h) {
+            drawnArgs = { x, y, w, h };
+          },
+        }),
+        toDataURL(mime, quality) {
+          encodedArgs = { mime, quality, w: c.width, h: c.height };
+          return `data:image/webp;base64,${mockSmallWebpBase64}`;
+        },
+      };
+      finalCanvasSize = c;
+      return c;
+    },
+  });
+  assert.equal(resLarge.transcoded, true);
+  assert.equal(resLarge.resized, true);
+  assert.equal(resLarge.mime, 'image/webp');
+  assert.equal(resLarge.base64, mockSmallWebpBase64);
+  assert.deepEqual(drawnArgs, { x: 0, y: 0, w: 2560, h: 1440 });
+  assert.equal(encodedArgs.mime, 'image/webp');
+  assert.equal(encodedArgs.quality, 0.86);
+  assert.equal(finalCanvasSize.width, 0);
+  assert.equal(finalCanvasSize.height, 0);
+
+  // 2. Fallback when WebP output is larger than original
+  const resLarger = await optimizeWallpaperUpload({
+    dataUrl: 'data:image/jpeg;base64,SHORT',
+    base64: 'SHORT',
+    mime: 'image/jpeg',
+    loadImage: async () => ({ naturalWidth: 1280, naturalHeight: 720 }),
+    createCanvas: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({ drawImage() {} }),
+      toDataURL: () => `data:image/webp;base64,${'W'.repeat(120)}`,
+    }),
+  });
+  assert.equal(resLarger.transcoded, false);
+  assert.equal(resLarger.reason, 'larger_than_original');
+  assert.equal(resLarger.mime, 'image/jpeg');
+  assert.equal(resLarger.base64, 'SHORT');
+
+  // 3. Fallback when WebP encoding fails / unsupported (browser falls back to PNG data URL)
+  const resUnsupported = await optimizeWallpaperUpload({
+    dataUrl: `data:image/jpeg;base64,${origLargeBase64}`,
+    base64: origLargeBase64,
+    mime: 'image/jpeg',
+    loadImage: async () => ({ naturalWidth: 3000, naturalHeight: 2000 }),
+    createCanvas: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({ drawImage() {} }),
+      toDataURL: () => 'data:image/png;base64,NOTWEBP',
+    }),
+  });
+  assert.equal(resUnsupported.transcoded, false);
+  assert.equal(resUnsupported.reason, 'webp_unsupported');
+  assert.equal(resUnsupported.mime, 'image/jpeg');
+
+  // 4. Animated GIF detection & safe passthrough
+  const animGifBytes = new Uint8Array([
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // LSD (no GCT)
+    0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, // Frame 1
+    0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, // Frame 2
+    0x3b,
+  ]);
+  assert.equal(isAnimatedGifBytes(animGifBytes), true);
+  const gifB64 = Buffer.from(animGifBytes).toString('base64');
+  let gifLoadCalled = false;
+  const resAnimGif = await optimizeWallpaperUpload({
+    dataUrl: `data:image/gif;base64,${gifB64}`,
+    base64: gifB64,
+    mime: 'image/gif',
+    loadImage: async () => {
+      gifLoadCalled = true;
+      return { naturalWidth: 4000, naturalHeight: 4000 };
+    },
+  });
+  assert.equal(gifLoadCalled, false);
+  assert.equal(resAnimGif.transcoded, false);
+  assert.equal(resAnimGif.reason, 'animated_gif');
+  assert.equal(resAnimGif.mime, 'image/gif');
+
+  // 5. Animated WebP detection (VP8X animation flag 0x02) & safe passthrough
+  const animWebpBytes = new Uint8Array([
+    0x52, 0x49, 0x46, 0x46, 0x16, 0x00, 0x00, 0x00, // RIFF
+    0x57, 0x45, 0x42, 0x50, // WEBP
+    0x56, 0x50, 0x38, 0x58, 0x0a, 0x00, 0x00, 0x00, // VP8X chunk (size 10)
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Animation bit set
+  ]);
+  assert.equal(isAnimatedWebpBytes(animWebpBytes), true);
+  const webpB64 = Buffer.from(animWebpBytes).toString('base64');
+  const resAnimWebp = await optimizeWallpaperUpload({
+    dataUrl: `data:image/webp;base64,${webpB64}`,
+    base64: webpB64,
+    mime: 'image/webp',
+  });
+  assert.equal(resAnimWebp.transcoded, false);
+  assert.equal(resAnimWebp.reason, 'animated_webp');
+});
+
+test('Other tab Lite Mode toggle: default OFF, toggles body.lite-mode via /api/preferences/lite-mode, and rolls back on failure', async (t) => {
+  const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+  const { document } = createMiniDom(html);
+  const prevGlobals = { document: globalThis.document, window: globalThis.window };
+
+  let persistedLiteMode = false;
+  let failNextLitePost = false;
+  const requests = [];
+
+  const mockWindow = {
+    location: { search: '?token=tok-lite' },
+    sidecar: {
+      conversationId: 'conv-lite',
+      async fetch(url, options = {}) {
+        const u = String(url);
+        requests.push({ url: u, method: options.method || 'GET', body: options.body || null });
+        if (u === '/api/preferences/lite-mode' && options.method === 'POST') {
+          if (failNextLitePost) {
+            failNextLitePost = false;
+            return {
+              ok: false,
+              status: 500,
+              async json() { return { ok: false, error: 'Simulated save failure' }; },
+            };
+          }
+          const body = JSON.parse(String(options.body || '{}'));
+          persistedLiteMode = Boolean(body.enabled);
+          return {
+            ok: true,
+            status: 200,
+            async json() { return { ok: true, liteMode: persistedLiteMode }; },
+          };
+        }
+        if (u.startsWith('/api/preferences')) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                language: 'zh-CN',
+                windowCap: 512000,
+                quotaQueryEnabled: true,
+                liteMode: persistedLiteMode,
+                prompts: [],
+                themeState: {},
+                availableModels: [],
+              };
+            },
+          };
+        }
+        if (u.startsWith('/api/quota')) {
+          return { ok: true, status: 200, async json() { return { ok: true, available: false, groups: [] }; } };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              unchanged: false,
+              etag: 'e-lite',
+              activeConvId: 'conv-lite',
+              contextPie: { windowCap: 512000, totalUsed: 0, percent: 0, segments: {} },
+              tokenUsage: { scope: 'current', range: 'today', totalTokens: 0, models: [] },
+              sessionsHub: { active: [], unread: [], recent: [], favorites: [], allSelectable: [] },
+              runtimeTelemetry: { latestTokPerSec: null, upstreamModelId: '', upstreamModelStatus: 'no_baseline' },
+              availableModels: [],
+            };
+          },
+        };
+      },
+      onWorkspaceChange() { return () => {}; },
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  globalThis.document = document;
+  globalThis.window = mockWindow;
+
+  const { mountMonitorApp } = await import(`${pathToFileURL(path.join(FRONTEND_DIR, 'app.js')).href}?lite=${Date.now()}`);
+  const controller = mountMonitorApp();
+  t.after(() => {
+    controller?.destroy?.();
+    globalThis.document = prevGlobals.document;
+    globalThis.window = prevGlobals.window;
+  });
+
+  await controller.readyPromise;
+
+  const liteToggle = document.getElementById('otherLiteModeToggle');
+  const liteBadge = document.getElementById('otherLiteModeBadge');
+  const liteCard = document.getElementById('otherLiteModeCard');
+  assert.ok(liteToggle && liteBadge && liteCard);
+
+  // Default OFF
+  assert.equal(liteToggle.checked, false);
+  assert.equal(document.body.classList.contains('lite-mode'), false);
+  assert.equal(controller.state.liteMode, false);
+  assert.equal(liteBadge.classList.contains('is-muted'), true);
+
+  // Turn ON
+  liteToggle.checked = true;
+  liteToggle.dispatchEvent({ type: 'change', target: liteToggle });
+  await new Promise((r) => setTimeout(r, 25));
+
+  const postOn = requests.find((r) => r.url === '/api/preferences/lite-mode' && r.method === 'POST');
+  assert.ok(postOn);
+  assert.equal(JSON.parse(String(postOn.body)).enabled, true);
+  assert.equal(document.body.classList.contains('lite-mode'), true);
+  assert.equal(controller.state.liteMode, true);
+  assert.equal(liteToggle.checked, true);
+  assert.equal(liteBadge.classList.contains('is-on'), true);
+
+  // Failure rollback when attempting to turn OFF
+  failNextLitePost = true;
+  liteToggle.checked = false;
+  liteToggle.dispatchEvent({ type: 'change', target: liteToggle });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(liteToggle.checked, true, 'Toggle should roll back to persisted ON state on error');
+  assert.equal(document.body.classList.contains('lite-mode'), true);
+  assert.equal(document.getElementById('toastBanner').classList.contains('is-error'), true);
+
+  // Cleanly turn OFF
+  liteToggle.checked = false;
+  liteToggle.dispatchEvent({ type: 'change', target: liteToggle });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(document.body.classList.contains('lite-mode'), false);
+  assert.equal(controller.state.liteMode, false);
+  assert.equal(liteToggle.checked, false);
+  assert.equal(liteBadge.classList.contains('is-muted'), true);
+});
+
+test('Mastery hub optimizations: unchanged polls skip DOM rebuild, image cache enforces 16-entry LRU, composer drafts store canonical base64 with LRU cap', async (t) => {
+  const html = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+  const { document } = createMiniDom(html);
+  const prevGlobals = {
+    document: globalThis.document,
+    window: globalThis.window,
+    FileReader: globalThis.FileReader,
+    requestAnimationFrame: globalThis.requestAnimationFrame,
+  };
+
+  let snapProgress = 42;
+  const makeMasteryPayload = (sessionId = 'sess-1') => ({
+    selectedSessionId: sessionId,
+    activeCount: 1,
+    unreadCount: 0,
+    favoriteIds: [],
+    sessions: [
+      {
+        id: sessionId,
+        project: 'demo',
+        name: `Session ${sessionId}`,
+        status: 'active',
+        isRead: false,
+        isFavorite: false,
+        subAgentCount: 1,
+        tag: '运行中',
+        progress: snapProgress,
+      },
+    ],
+    detailSession: {
+      id: sessionId,
+      project: 'demo',
+      name: `Session ${sessionId}`,
+      status: 'active',
+      isRead: false,
+      progress: snapProgress,
+      summaryText: 'Running',
+      goal: 'Optimize VRAM',
+      master: {
+        id: 'coord',
+        name: 'Coordinator',
+        stateKind: 'running',
+        stateLabel: '运行中',
+        progress: snapProgress,
+        task: 'Coordinating',
+        journey: {
+          brief: 'Test brief',
+          duration: '1m',
+          foot: 'Working',
+          steps: [{ type: 'msg', id: 's1', text: `Progress ${snapProgress}%` }],
+        },
+      },
+      subs: [
+        {
+          id: 'sub-1',
+          name: 'worker-1',
+          stateKind: 'running',
+          stateLabel: '运行中',
+          progress: snapProgress,
+          task: 'Working',
+          journey: { steps: [{ type: 'msg', id: 'w1', text: 'Sub step' }] },
+        },
+      ],
+      edges: [{ type: 'bus', from: 'coord', to: 'sub-1', dir: 'to-sub', live: true }],
+    },
+  });
+
+  let currentSessionId = 'sess-1';
+  const apiFetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith('/api/mastery/local-image')) {
+      const p = new URL(`http://local${u}`).searchParams.get('path') || '';
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        async json() { return { dataUrl: `data:image/png;base64,IMG_${p}` }; },
+      };
+    }
+    if (u.startsWith('/api/mastery/composer/commands')) {
+      return { ok: true, status: 200, async json() { return { commands: [] }; } };
+    }
+    if (u.startsWith('/api/mastery')) {
+      return { ok: true, status: 200, async json() { return makeMasteryPayload(currentSessionId); } };
+    }
+    return { ok: true, status: 200, async json() { return { ok: true }; } };
+  };
+
+  globalThis.document = document;
+  globalThis.window = { addEventListener() {}, removeEventListener() {} };
+  globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
+  globalThis.FileReader = class MockFileReader {
+    readAsDataURL(file) {
+      this.result = `data:${file.type};base64,${file._b64}`;
+      this.onload?.();
+    }
+  };
+
+  const { createMasteryHub } = await import(
+    `${pathToFileURL(path.join(FRONTEND_DIR, 'components', 'mastery_hub.js')).href}?mh=${Date.now()}`
+  );
+  const hub = createMasteryHub({ apiFetch });
+  t.after(() => {
+    hub.destroy();
+    globalThis.document = prevGlobals.document;
+    globalThis.window = prevGlobals.window;
+    globalThis.FileReader = prevGlobals.FileReader;
+    globalThis.requestAnimationFrame = prevGlobals.requestAnimationFrame;
+  });
+
+  // 1. Poll signature skips redundant DOM rebuilds when payload is unchanged
+  hub.setTabActive(true);
+  await new Promise((r) => setTimeout(r, 20));
+  const listEl = document.getElementById('masteryCliList');
+  const colMaster = document.getElementById('masteryColMaster');
+  const firstRowNode = listEl.children[0];
+  const firstMasterNode = colMaster.children[0];
+  assert.ok(firstRowNode && firstMasterNode);
+
+  await hub.refresh();
+  assert.equal(listEl.children[0], firstRowNode, 'Unchanged poll must reuse existing CLI list row DOM node');
+  assert.equal(colMaster.children[0], firstMasterNode, 'Unchanged poll must reuse existing master graph card DOM node');
+
+  // When payload changes, DOM updates cleanly
+  snapProgress = 75;
+  await hub.refresh();
+  assert.notEqual(listEl.children[0], firstRowNode, 'Changed poll must rebuild updated CLI list row');
+  assert.notEqual(colMaster.children[0], firstMasterNode, 'Changed poll must rebuild updated master graph card');
+
+  // Also verify unchanged poll in View 2 (detail timeline) skips rebuilding #madTimeline DOM
+  document.getElementById('masteryColMaster').children[0].click();
+  const timelineEl = document.getElementById('madTimeline');
+  const firstTimelineChild = timelineEl.children[0];
+  assert.ok(firstTimelineChild);
+  await hub.refresh();
+  assert.equal(timelineEl.children[0], firstTimelineChild, 'Unchanged poll in detail view must reuse existing timeline DOM');
+  document.getElementById('madBackBtn').click();
+  await new Promise((r) => setTimeout(r, 5));
+
+  // 2. localImageUrlCache enforces 16-entry LRU cap + clean clearing
+  for (let i = 1; i <= 16; i += 1) {
+    await hub.loadLocalImage(`C:/imgs/pic-${i}.png`);
+  }
+  // Touch pic-1 so pic-2 becomes the LRU victim
+  await hub.loadLocalImage('C:/imgs/pic-1.png');
+  for (let i = 17; i <= 18; i += 1) {
+    await hub.loadLocalImage(`C:/imgs/pic-${i}.png`);
+  }
+  const imgStats = hub.getCacheStats();
+  assert.equal(imgStats.imageCacheMax, 16);
+  assert.equal(imgStats.imageCacheSize, 16);
+  assert.ok(imgStats.imageCacheKeys.includes('C:/imgs/pic-1.png'), 'Recently accessed entry must stay in LRU cache');
+  assert.equal(imgStats.imageCacheKeys.includes('C:/imgs/pic-2.png'), false, 'Oldest untouched entry must be evicted');
+
+  hub.clearImageCache();
+  assert.equal(hub.getCacheStats().imageCacheSize, 0);
+
+  // 3. Composer drafts store canonical base64 only (no duplicate dataUrl) & cap sessions at 12 LRU
+  const composerInput = document.getElementById('madComposerInput');
+  const fileInput = document.getElementById('madComposerFileInput');
+  const attachStrip = document.getElementById('madAttachStrip');
+
+  // Open master detail view for 14 different sessions, attaching an image on session 14
+  for (let i = 1; i <= 14; i += 1) {
+    currentSessionId = `sess-${i}`;
+    await hub.refresh({ force: true });
+    const masterBtn = document.getElementById('masteryColMaster').children[0];
+    masterBtn.click();
+    composerInput.value = `draft-${i}`;
+    composerInput.dispatchEvent({ type: 'input', target: composerInput });
+    if (i === 14) {
+      fileInput.files = [{ name: 'shot.png', type: 'image/png', size: 128, _b64: 'QUJDRA==' }];
+      fileInput.dispatchEvent({ type: 'change', target: fileInput });
+    }
+    document.getElementById('madBackBtn').click();
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
+  const draftStats = hub.getCacheStats();
+  assert.equal(draftStats.composerDraftMax, 12);
+  assert.equal(draftStats.composerDraftCount, 12, 'Composer drafts must be capped at 12 LRU sessions');
+  assert.equal(draftStats.composerDraftKeys.includes('sess-1'), false);
+  assert.equal(draftStats.composerDraftKeys.includes('sess-2'), false);
+  assert.equal(draftStats.composerDraftKeys.includes('sess-14'), true);
+
+  const draft14 = draftStats.composerDrafts.find((d) => d.id === 'sess-14');
+  assert.ok(draft14 && draft14.attachments.length === 1);
+  assert.equal(draft14.attachments[0].base64, 'QUJDRA==');
+  assert.equal('dataUrl' in draft14.attachments[0], false, 'Attachment must not duplicate dataUrl alongside base64');
+  // Re-open sess-14 and verify preview <img src> lazily derives dataUrl
+  document.getElementById('masteryColMaster').children[0].click();
+  const thumbImg = attachStrip.querySelector('img');
+  assert.equal(thumbImg?.getAttribute?.('src') || thumbImg?.src, 'data:image/png;base64,QUJDRA==');
+});

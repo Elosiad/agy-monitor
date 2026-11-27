@@ -129,6 +129,276 @@ function resolveUploadImageMime(file) {
 }
 
 const MAX_WALLPAPER_BYTES = 8 * 1024 * 1024;
+const WALLPAPER_MAX_EDGE_PX = 2560;
+const WALLPAPER_WEBP_QUALITY = 0.86;
+
+function decodeBase64ToBytes(base64) {
+  if (typeof base64 !== "string" || !base64) return null;
+  try {
+    if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") {
+      return new Uint8Array(Buffer.from(base64, "base64"));
+    }
+    if (typeof atob === "function") {
+      const bin = atob(base64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) {
+        out[i] = bin.charCodeAt(i);
+      }
+      return out;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** Returns true if a GIF byte stream contains >= 2 image frames (animated GIF). */
+export function isAnimatedGifBytes(bytes) {
+  if (!bytes || bytes.length < 14) return false;
+  // Header: "GIF87a" or "GIF89a"
+  if (bytes[0] !== 0x47 || bytes[1] !== 0x49 || bytes[2] !== 0x46 || bytes[3] !== 0x38) {
+    return false;
+  }
+  if ((bytes[4] !== 0x37 && bytes[4] !== 0x39) || bytes[5] !== 0x61) {
+    return false;
+  }
+  const packed = bytes[10];
+  let pos = 13;
+  if (packed & 0x80) {
+    pos += 3 * (1 << ((packed & 0x07) + 1));
+  }
+  let frameCount = 0;
+  const skipSubBlocks = () => {
+    while (pos < bytes.length) {
+      const subLen = bytes[pos];
+      pos += 1;
+      if (subLen === 0) break;
+      pos += subLen;
+    }
+  };
+  while (pos < bytes.length) {
+    const marker = bytes[pos];
+    if (marker === 0x3b) break; // Trailer
+    if (marker === 0x2c) {
+      // Image Descriptor
+      frameCount += 1;
+      if (frameCount >= 2) return true;
+      if (pos + 10 >= bytes.length) break;
+      const imgPacked = bytes[pos + 9];
+      pos += 10;
+      if (imgPacked & 0x80) {
+        pos += 3 * (1 << ((imgPacked & 0x07) + 1));
+      }
+      pos += 1; // LZW minimum code size
+      skipSubBlocks();
+    } else if (marker === 0x21) {
+      // Extension block
+      pos += 2;
+      skipSubBlocks();
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
+/** Returns true if a WebP byte stream sets the VP8X animation flag or contains ANIM/ANMF chunks. */
+export function isAnimatedWebpBytes(bytes) {
+  if (!bytes || bytes.length < 16) return false;
+  // "RIFF" .... "WEBP"
+  if (
+    bytes[0] !== 0x52 ||
+    bytes[1] !== 0x49 ||
+    bytes[2] !== 0x46 ||
+    bytes[3] !== 0x46 ||
+    bytes[8] !== 0x57 ||
+    bytes[9] !== 0x45 ||
+    bytes[10] !== 0x42 ||
+    bytes[11] !== 0x50
+  ) {
+    return false;
+  }
+  let pos = 12;
+  while (pos + 8 <= bytes.length) {
+    const f0 = bytes[pos];
+    const f1 = bytes[pos + 1];
+    const f2 = bytes[pos + 2];
+    const f3 = bytes[pos + 3];
+    const chunkSize =
+      (bytes[pos + 4] |
+        (bytes[pos + 5] << 8) |
+        (bytes[pos + 6] << 16) |
+        (bytes[pos + 7] << 24)) >>>
+      0;
+    const payloadStart = pos + 8;
+    // "VP8X": feature flags byte bit 1 (0x02) indicates animation
+    if (f0 === 0x56 && f1 === 0x50 && f2 === 0x38 && f3 === 0x58) {
+      if (payloadStart < bytes.length && (bytes[payloadStart] & 0x02) !== 0) {
+        return true;
+      }
+    }
+    // "ANIM" or "ANMF" chunk
+    if (
+      f0 === 0x41 &&
+      f1 === 0x4e &&
+      ((f2 === 0x49 && f3 === 0x4d) || (f2 === 0x4d && f3 === 0x46))
+    ) {
+      return true;
+    }
+    const paddedSize = chunkSize + (chunkSize & 1);
+    const nextPos = payloadStart + paddedSize;
+    if (nextPos <= pos) break;
+    pos = nextPos;
+  }
+  return false;
+}
+
+/** Caps the longest edge to maxEdge without upscaling, preserving aspect ratio. */
+export function computeCappedDimensions(width, height, maxEdge = WALLPAPER_MAX_EDGE_PX) {
+  const w = Number(width) || 0;
+  const h = Number(height) || 0;
+  const cap = Math.max(1, Number(maxEdge) || WALLPAPER_MAX_EDGE_PX);
+  if (w <= 0 || h <= 0) {
+    return { width: 0, height: 0, resized: false };
+  }
+  const longest = Math.max(w, h);
+  if (longest <= cap) {
+    return { width: Math.round(w), height: Math.round(h), resized: false };
+  }
+  const scale = cap / longest;
+  return {
+    width: Math.max(1, Math.round(w * scale)),
+    height: Math.max(1, Math.round(h * scale)),
+    resized: true,
+  };
+}
+
+function defaultLoadImage(srcUrl) {
+  return new Promise((resolve) => {
+    if (typeof Image === "undefined") {
+      resolve(null);
+      return;
+    }
+    try {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => resolve(null);
+      img.src = srcUrl;
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Downscales large wallpaper uploads to <= 2560px longest edge and transcodes to WebP.
+ * Safely falls back to the original image on animated GIF/WebP, decode/encode errors,
+ * or when WebP output is larger than the original payload.
+ */
+export async function optimizeWallpaperUpload({
+  dataUrl = "",
+  base64 = "",
+  mime = "",
+  bytes = null,
+  maxEdge = WALLPAPER_MAX_EDGE_PX,
+  quality = WALLPAPER_WEBP_QUALITY,
+  loadImage = null,
+  createCanvas = null,
+} = {}) {
+  const fallback = (reason) => ({
+    base64,
+    mime,
+    dataUrl,
+    transcoded: false,
+    resized: false,
+    reason,
+  });
+
+  if (!base64 || !dataUrl) {
+    return fallback("empty");
+  }
+
+  const normalizedMime = String(mime || "").trim().toLowerCase();
+  if (normalizedMime === "image/gif" || normalizedMime === "image/webp") {
+    const rawBytes = bytes instanceof Uint8Array ? bytes : decodeBase64ToBytes(base64);
+    if (normalizedMime === "image/gif" && isAnimatedGifBytes(rawBytes)) {
+      return fallback("animated_gif");
+    }
+    if (normalizedMime === "image/webp" && isAnimatedWebpBytes(rawBytes)) {
+      return fallback("animated_webp");
+    }
+  }
+
+  let canvas = null;
+  try {
+    const imgLoader = typeof loadImage === "function" ? loadImage : defaultLoadImage;
+    const img = await imgLoader(dataUrl);
+    const naturalWidth = Number(img?.naturalWidth || img?.width || 0);
+    const naturalHeight = Number(img?.naturalHeight || img?.height || 0);
+    if (!img || naturalWidth <= 0 || naturalHeight <= 0) {
+      return fallback("decode_failed");
+    }
+
+    const { width, height, resized } = computeCappedDimensions(naturalWidth, naturalHeight, maxEdge);
+    if (width <= 0 || height <= 0) {
+      return fallback("invalid_dimensions");
+    }
+
+    canvas =
+      typeof createCanvas === "function"
+        ? createCanvas()
+        : typeof document !== "undefined" && typeof document.createElement === "function"
+          ? document.createElement("canvas")
+          : null;
+    if (!canvas || typeof canvas.getContext !== "function" || typeof canvas.toDataURL !== "function") {
+      return fallback("canvas_unavailable");
+    }
+
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx || typeof ctx.drawImage !== "function") {
+      return fallback("context_unavailable");
+    }
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const outDataUrl = canvas.toDataURL("image/webp", quality);
+    if (typeof outDataUrl !== "string" || !outDataUrl.startsWith("data:image/webp")) {
+      return fallback("webp_unsupported");
+    }
+    const commaIdx = outDataUrl.indexOf(",");
+    const outBase64 = commaIdx >= 0 ? outDataUrl.slice(commaIdx + 1) : "";
+    if (!outBase64) {
+      return fallback("encode_empty");
+    }
+    if (outBase64.length > base64.length || (!resized && outBase64.length >= base64.length)) {
+      return fallback("larger_than_original");
+    }
+
+    return {
+      base64: outBase64,
+      mime: "image/webp",
+      dataUrl: outDataUrl,
+      width,
+      height,
+      transcoded: true,
+      resized,
+      reason: "ok",
+    };
+  } catch {
+    return fallback("encode_error");
+  } finally {
+    if (canvas) {
+      try {
+        canvas.width = 0;
+        canvas.height = 0;
+      } catch {}
+    }
+  }
+}
 
 function translate(tFn, key, zhFallback, enFallback, vars) {
   let raw = typeof tFn === "function" ? tFn(key, vars) : "";
@@ -303,6 +573,8 @@ function generateThumbnail(dataUrl, width = 240, height = 148) {
             out = canvas.toDataURL(mime, 0.82);
           }
           const idx = out.indexOf(",");
+          canvas.width = 0;
+          canvas.height = 0;
           resolve(idx >= 0 ? { base64: out.slice(idx + 1), mime } : null);
         } catch {
           resolve(null);
@@ -976,19 +1248,21 @@ export function createThemeStudio({
           ((hostMode === "inject" && (Boolean(nh.heartbeat?.wallpaperAlive) || Boolean(cdp.styleApplied))) ||
             (hostMode === "cdp" && (Boolean(cdp.styleApplied) || Boolean(cdp.connected))))
       );
+      const isSharedWithHost = sharedWithHostBackdrop || sharedWithHostCss;
       const dimFrac = state.dim / 100;
       const blendFrac = state.hostBlendPct / 100;
       const panelVeilPct =
-        wpUrl && state.backdropEnabled && !sharedWithHostBackdrop && !sharedWithHostCss
+        wpUrl && state.backdropEnabled && !isSharedWithHost
           ? Math.round(Math.max(28, Math.min(96, (1 - (1 - dimFrac) * blendFrac) * 100)))
           : 0;
       const hostSurfaceAlphaPct = Math.round(Math.max(58, Math.min(92, 100 - state.hostBlendPct)));
       rootStyle.setProperty("--panel-surface-veil-pct", `${panelVeilPct}%`);
       rootStyle.setProperty("--host-surface-alpha-pct", `${hostSurfaceAlphaPct}%`);
-      workspaceWallpaperLayer.style.backgroundImage = wpCssUrl;
+      // Drop decoded sidebar wallpaper texture while host wallpaper is shared; restore on exit
+      workspaceWallpaperLayer.style.backgroundImage = isSharedWithHost ? "none" : wpCssUrl;
       workspaceWallpaperLayer.style.backgroundSize = state.fit;
       document.documentElement.classList.toggle("host-css-shared", sharedWithHostCss);
-      document.body.classList.toggle("has-wallpaper", Boolean(wpUrl) && !sharedWithHostBackdrop && !sharedWithHostCss);
+      document.body.classList.toggle("has-wallpaper", Boolean(wpUrl) && !isSharedWithHost);
       document.body.classList.toggle("host-backdrop-shared", sharedWithHostBackdrop);
       document.body.classList.toggle("host-css-shared", sharedWithHostCss);
     }
@@ -1702,12 +1976,18 @@ export function createThemeStudio({
         const cleanName = file.name.replace(/\.[^.]+$/, "") || "Wallpaper";
         mutationSeq += 1;
         try {
-          const thumb = await generateThumbnail(dataUrl);
+          const optimized = await optimizeWallpaperUpload({
+            dataUrl,
+            base64,
+            mime: resolvedMime,
+          });
+          if (destroyed) return;
+          const thumb = await generateThumbnail(optimized.dataUrl || dataUrl);
           if (destroyed) return;
           const uploadPayload = {
             name: cleanName,
-            mime: resolvedMime,
-            base64,
+            mime: optimized.mime,
+            base64: optimized.base64,
           };
           if (thumb) {
             uploadPayload.thumbBase64 = thumb.base64;
@@ -1814,11 +2094,11 @@ export function createThemeStudio({
       const res = await fetchViaSidecar(apiFetch, "/api/theme/backdrop/status");
       if (destroyed) return;
       if (res?.status) {
-        const prevBd = state.backdropStatus || {};
-        const prevKey = `${Boolean(prevBd.running && !prevBd.paused)}|${Boolean(prevBd.cdp?.styleApplied || prevBd.cdp?.connected)}|${Boolean(prevBd.nativeHud?.heartbeat?.wallpaperAlive)}`;
+        const sharedKeyOf = (bdObj) =>
+          `${Boolean(bdObj?.running && !bdObj?.paused)}|${Boolean(bdObj?.cdp?.styleApplied)}|${Boolean(bdObj?.cdp?.connected)}|${Boolean(bdObj?.nativeHud?.heartbeat?.wallpaperAlive)}`;
+        const prevKey = sharedKeyOf(state.backdropStatus);
         state.backdropStatus = res.status;
-        const nextBd = state.backdropStatus || {};
-        const nextKey = `${Boolean(nextBd.running && !nextBd.paused)}|${Boolean(nextBd.cdp?.styleApplied || nextBd.cdp?.connected)}|${Boolean(nextBd.nativeHud?.heartbeat?.wallpaperAlive)}`;
+        const nextKey = sharedKeyOf(state.backdropStatus);
         renderBackdropCompanion();
         if (prevKey !== nextKey) {
           applyTheme();

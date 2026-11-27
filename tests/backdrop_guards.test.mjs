@@ -3,9 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { buildBackdropSpawnArgs } from '../sidecars/agy_monitor/backend/backdrop_manager.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKDROP_CS = path.resolve(__dirname, '..', 'sidecars', 'agy_monitor', 'backdrop', 'AgyBackdrop.cs');
+const BACKDROP_MGR = path.resolve(__dirname, '..', 'sidecars', 'agy_monitor', 'backend', 'backdrop_manager.mjs');
 
 test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   const src = fs.readFileSync(BACKDROP_CS, 'utf8');
@@ -161,4 +163,62 @@ test('AgyBackdrop.cs prevents re-entrant orphaned HUD/Backdrop windows', () => {
   assert.match(src, /anchor-covered-console/, 'IsHudOccluded must distinguish maximized AGY Console Document from stale background conversation Document');
   assert.match(src, /int\s+bandTop\s*=\s*winRect\.Bottom\s*-\s*\(int\)Math\.Round\(108\s*\*\s*dpiScale\)/, 'ProbeComposerAnchor must keep tight 108 DIP bottom band to avoid latching onto chat/sidecar buttons');
   assert.match(src, /ComputePureWin32ComposerAnchor\s*\(/, 'Strict Zero-UIA mode must cleanly disable guessed Mode-1 HUD coordinates');
+});
+
+test('AgyBackdrop.cs & backdrop_manager.mjs Issue #7 RAM/VRAM optimizations and --parent-pid orphan guard', () => {
+  const src = fs.readFileSync(BACKDROP_CS, 'utf8');
+  const mgrSrc = fs.readFileSync(BACKDROP_MGR, 'utf8');
+
+  // 1. Never upscale wallpaper or lightbox images: probe dimensions first and only cap when srcWidth > targetMaxWidth
+  assert.match(src, /BitmapUtil\.TryProbeImageDimensions\s*\(/, 'AgyBackdrop.cs must probe image dimensions before decoding');
+  assert.match(src, /BitmapCreateOptions\.DelayCreation[\s\S]{0,80}BitmapCacheOption\.None/, 'Dimension probe must use DelayCreation + CacheOption.None');
+  assert.doesNotMatch(src, /bmp\.DecodePixelWidth\s*=\s*3840\s*;/, 'ImageLightboxWindow must NOT unconditionally upscale small images to 3840px');
+  const loadWpStart = src.indexOf('private void LoadSharedWallpaperBitmap(');
+  assert.ok(loadWpStart > 0, 'LoadSharedWallpaperBitmap missing');
+  const loadWpBlock = src.slice(loadWpStart, loadWpStart + 2000);
+  assert.match(loadWpBlock, /Math\.Min\s*\(\s*srcWidth\s*,\s*maxMonitorWidth\s*\)/, 'Wallpaper decode must cap without upscaling');
+  assert.match(loadWpBlock, /if\s*\(\s*!probed\s*\|\|\s*srcWidth\s*>\s*maxMonitorWidth\s*\)/, 'Wallpaper DecodePixelWidth must only be set when exceeding monitor width');
+
+  const lbLoadStart = src.indexOf('public bool LoadImage(');
+  assert.ok(lbLoadStart > 0, 'ImageLightboxWindow.LoadImage missing');
+  const lbLoadBlock = src.slice(lbLoadStart, lbLoadStart + 1800);
+  assert.match(lbLoadBlock, /Math\.Min\s*\(\s*srcWidth\s*,\s*maxLightboxWidth\s*\)/, 'Lightbox decode must cap at 3840 without upscaling');
+  assert.match(lbLoadBlock, /if\s*\(\s*!probed\s*\|\|\s*srcWidth\s*>\s*maxLightboxWidth\s*\)/, 'Lightbox DecodePixelWidth must only be set when exceeding 3840px');
+
+  // 2. Offline pre-blurred frozen bitmap cache instead of live full-screen BlurEffect
+  const bdStart = src.indexOf('internal sealed class BackdropSurfaceWindow');
+  const lbClassStart = src.indexOf('internal sealed class ImageLightboxWindow');
+  const bdSrc = src.slice(bdStart, lbClassStart);
+  assert.doesNotMatch(bdSrc, /new\s+BlurEffect/, 'BackdropSurfaceWindow must NOT attach live BlurEffect render targets');
+  assert.match(src, /CreatePreBlurredBitmap\s*\(/, 'BitmapUtil must pre-render blurred wallpapers offline');
+  assert.match(src, /new\s+WriteableBitmap\s*\(/, 'Pre-blurred wallpaper must be materialized into a WriteableBitmap');
+  assert.match(src, /_cachedBlurredBitmap/, 'CompanionController must cache pre-blurred bitmap across frames/windows');
+  assert.match(src, /GetEffectiveWallpaperBitmap\s*\(/, 'CompanionController must select unblurred or cached pre-blurred bitmap');
+
+  // 3. Release VRAM & close hidden surfaces in RestoreBackdropOnly
+  const restoreStart = src.indexOf('private void RestoreBackdropOnly(');
+  assert.ok(restoreStart > 0, 'RestoreBackdropOnly missing');
+  const restoreBlock = src.slice(restoreStart, restoreStart + 900);
+  assert.match(restoreBlock, /ReleaseSurfaceResources\s*\(\)/, 'RestoreBackdropOnly must clear _image.Source before closing surface');
+  assert.match(restoreBlock, /ForceCloseOwnedWindow\s*\(\s*closingBackdrop\s*\)/, 'RestoreBackdropOnly must close hidden BackdropSurfaceWindow to release D3D VRAM');
+  assert.match(restoreBlock, /!IsBackdropEffectWanted\(\)\s*\|\|\s*\(\s*closing\s*&&\s*!HasAnyActiveBackdropSurface\(\)\s*\)/, 'RestoreBackdropOnly must keep shared bitmaps alive while other host windows still use backdrops');
+  assert.match(restoreBlock, /ReleaseSharedWallpaperBitmaps\s*\(\)/, 'RestoreBackdropOnly must release cached wallpaper bitmaps when backdrop is inactive');
+  assert.match(bdSrc, /_image\.Source\s*=\s*null;/, 'BackdropSurfaceWindow.ReleaseSurfaceResources must clear _image.Source');
+
+  // 4. Orphan --parent-pid guard in AgyBackdrop.cs and native-Windows-only passing in backdrop_manager.mjs
+  assert.match(src, /"--parent-pid"/, 'AgyBackdrop.cs must parse --parent-pid CLI argument');
+  assert.match(src, /private\s+bool\s+CheckHostLiveness\s*\(\s*\)/, 'CompanionController must monitor parent PID liveness');
+  assert.match(src, /if\s*\(!CheckHostLiveness\(\)\)\s*return;/, 'Reconcile timer must enforce parent-PID orphan check');
+  assert.match(mgrSrc, /buildBackdropSpawnArgs\s*\(/, 'backdrop_manager.mjs must build spawn args via buildBackdropSpawnArgs');
+
+  const rtSample = { dataDirWin: 'C:\\data', assetsDirWin: 'C:\\assets' };
+  const nativeArgs = buildBackdropSpawnArgs(rtSample, { isWsl: false, parentPid: 4242 });
+  assert.deepEqual(nativeArgs, ['--data-dir', 'C:\\data', '--assets-dir', 'C:\\assets', '--parent-pid', '4242']);
+
+  const wslArgs = buildBackdropSpawnArgs(rtSample, { isWsl: true, parentPid: 4242 });
+  assert.deepEqual(wslArgs, ['--data-dir', 'C:\\data', '--assets-dir', 'C:\\assets']);
+  assert.equal(wslArgs.includes('--parent-pid'), false, 'WSL2 interop must NEVER pass Linux PID via --parent-pid');
+
+  const invalidPidArgs = buildBackdropSpawnArgs(rtSample, { isWsl: false, parentPid: 0 });
+  assert.equal(invalidPidArgs.includes('--parent-pid'), false);
 });

@@ -108,6 +108,8 @@ namespace AgyDesktopPetExtension
         public const int WS_EX_TRANSPARENT = 0x00000020;
         public const int WS_EX_TOOLWINDOW = 0x00000080;
         public const int WS_EX_NOACTIVATE = 0x08000000;
+        public const uint GW_HWNDPREV = 3;
+        public const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT
@@ -116,8 +118,53 @@ namespace AgyDesktopPetExtension
             public int Y;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MONITORINFO
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+        }
+
         [DllImport("user32.dll")]
         public static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForSystem();
 
         [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
         private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
@@ -210,7 +257,85 @@ namespace AgyDesktopPetExtension
                 }
             }
             catch { }
+            return GetPrimaryDpiScale();
+        }
+
+        public static double GetPrimaryDpiScale()
+        {
+            try
+            {
+                uint dpi = GetDpiForSystem();
+                if (dpi >= 72 && dpi <= 480) return dpi / 96.0;
+            }
+            catch { }
             return 1.0;
+        }
+
+        private static string GetWindowClassName(IntPtr hWnd)
+        {
+            try
+            {
+                var sb = new StringBuilder(128);
+                int len = GetClassName(hWnd, sb, sb.Capacity);
+                if (len > 0) return sb.ToString(0, Math.Min(len, sb.Length));
+            }
+            catch { }
+            return "";
+        }
+
+        public static bool IsWindowOccludedByFullscreen(IntPtr selfHwnd, IntPtr ignoreHwnd1, IntPtr ignoreHwnd2)
+        {
+            if (selfHwnd == IntPtr.Zero) return false;
+            try
+            {
+                IntPtr fg = GetForegroundWindow();
+                if (fg == IntPtr.Zero || fg == selfHwnd || fg == ignoreHwnd1 || fg == ignoreHwnd2) return false;
+                if (!IsWindowVisible(fg) || IsIconic(fg)) return false;
+
+                string cls = GetWindowClassName(fg);
+                if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                RECT fgRect;
+                RECT selfRect;
+                if (!GetWindowRect(fg, out fgRect) || !GetWindowRect(selfHwnd, out selfRect)) return false;
+                if ((fgRect.Right - fgRect.Left) < 320 || (fgRect.Bottom - fgRect.Top) < 240) return false;
+
+                IntPtr hMon = MonitorFromWindow(selfHwnd, MONITOR_DEFAULTTONEAREST);
+                if (hMon == IntPtr.Zero) return false;
+                var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (!GetMonitorInfo(hMon, ref mi)) return false;
+
+                bool fgCoversMonitor =
+                    fgRect.Left <= mi.rcMonitor.Left + 2 &&
+                    fgRect.Top <= mi.rcMonitor.Top + 2 &&
+                    fgRect.Right >= mi.rcMonitor.Right - 2 &&
+                    fgRect.Bottom >= mi.rcMonitor.Bottom - 2;
+                if (!fgCoversMonitor) return false;
+
+                bool fgCoversPet =
+                    fgRect.Left <= selfRect.Left + 2 &&
+                    fgRect.Top <= selfRect.Top + 2 &&
+                    fgRect.Right >= selfRect.Right - 2 &&
+                    fgRect.Bottom >= selfRect.Bottom - 2;
+                if (!fgCoversPet) return false;
+
+                IntPtr cur = GetWindow(selfHwnd, GW_HWNDPREV);
+                int steps = 0;
+                while (cur != IntPtr.Zero && steps < 96)
+                {
+                    if (cur == fg) return true;
+                    cur = GetWindow(cur, GW_HWNDPREV);
+                    steps++;
+                }
+            }
+            catch { }
+            return false;
         }
 
         public static string GetDesktopName()
@@ -235,11 +360,25 @@ namespace AgyDesktopPetExtension
         private const double BubbleHeightReserve = 44.0;
         private const double BaseWinWidth = 264.0;
         private const double BaseWinHeight = 162.0;
+        private const int MaxCachedCustomTracks = 2;
+
+        private static readonly SolidColorBrush FrozenLightTextBrush = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(24, 28, 38));
+        private static readonly SolidColorBrush FrozenDarkTextBrush = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(242, 244, 250));
+        private static readonly SolidColorBrush FrozenSparkleBrush = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(255, 214, 102));
+        private static readonly SolidColorBrush FrozenHitTestBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(1, 0, 0, 0));
+
+        private static SolidColorBrush CreateFrozenBrush(System.Windows.Media.Color color)
+        {
+            var brush = new SolidColorBrush(color);
+            brush.Freeze();
+            return brush;
+        }
 
         private readonly Grid _rootGrid;
         private double _bubbleExtraHeight = 0.0;
         private readonly Border _bubbleBorder;
         private readonly TextBlock _bubbleText;
+        private readonly BitmapCache _bubbleCacheMode;
         private readonly ScaleTransform _bubbleScale;
         private readonly TranslateTransform _bubbleTranslate;
         private readonly TextBlock _sparkleText;
@@ -259,6 +398,15 @@ namespace AgyDesktopPetExtension
         private long _lastTickMs = 0;
         private int _bubbleAnimGen = 0;
         private string _lastAppliedBubbleTemplate = "";
+        private string _cachedBubbleThemeKey = "";
+        private SolidColorBrush _cachedBubbleBgBrush = null;
+        private SolidColorBrush _cachedBubbleBorderBrush = null;
+        private SolidColorBrush _cachedBubbleFgBrush = null;
+
+        private bool _isSuspended = false;
+        private bool _isOccluded = false;
+        private DateTime _lastOcclusionCheckUtc = DateTime.MinValue;
+        private int _currentAnimIntervalMs = 16;
 
         private IntPtr _hwnd = IntPtr.Zero;
         private PetConfig _petConfig = new PetConfig();
@@ -272,6 +420,7 @@ namespace AgyDesktopPetExtension
         private double _lockBadgePollAccum = 0.0;
         private string _loadedImagePath = "";
         private DateTime _loadedImageMtimeUtc = DateTime.MinValue;
+        private int _loadedImageDesiredPx = 0;
         private readonly List<BitmapSource> _gifFrames = new List<BitmapSource>();
         private readonly List<int> _gifDelaysMs = new List<int>();
         private int _gifFrameIndex = 0;
@@ -279,8 +428,11 @@ namespace AgyDesktopPetExtension
 
         private bool _usingCustomFrames = false;
         private string _loadedFramesSig = "";
+        private int _loadedFrameDesiredPx = 256;
         private int _customFramesFps = 8;
-        private readonly Dictionary<string, List<BitmapSource>> _customTrackBitmaps = new Dictionary<string, List<BitmapSource>>();
+        private readonly Dictionary<string, List<string>> _customTrackPaths = new Dictionary<string, List<string>>();
+        private readonly Dictionary<string, BitmapSource[]> _customTrackBitmaps = new Dictionary<string, BitmapSource[]>();
+        private readonly LinkedList<string> _customTrackLru = new LinkedList<string>();
         private string _activeCustomTrack = "idle";
         private int _customFrameIndex = 0;
         private double _customFrameAccumMs = 0;
@@ -393,7 +545,7 @@ namespace AgyDesktopPetExtension
             _bubbleText = new TextBlock
             {
                 Text = "",
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(242, 244, 250)),
+                Foreground = FrozenDarkTextBrush,
                 FontSize = 11.2,
                 FontWeight = FontWeights.Medium,
                 TextWrapping = TextWrapping.Wrap,
@@ -403,11 +555,30 @@ namespace AgyDesktopPetExtension
                 TextAlignment = TextAlignment.Center
             };
 
+            _bubbleCacheMode = new BitmapCache
+            {
+                RenderAtScale = 1.0,
+                SnapsToDevicePixels = true
+            };
+            var bubbleShadow = new DropShadowEffect
+            {
+                Color = Colors.Black,
+                BlurRadius = 8,
+                ShadowDepth = 2,
+                Opacity = 0.38,
+                RenderingBias = RenderingBias.Performance
+            };
+            bubbleShadow.Freeze();
+
+            _cachedBubbleBgBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(228, 22, 25, 36));
+            _cachedBubbleBorderBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(140, 91, 140, 255));
+            _cachedBubbleFgBrush = FrozenDarkTextBrush;
+
             _bubbleBorder = new Border
             {
                 Child = _bubbleText,
-                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(228, 22, 25, 36)),
-                BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(140, 91, 140, 255)),
+                Background = _cachedBubbleBgBrush,
+                BorderBrush = _cachedBubbleBorderBrush,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(11),
                 Padding = new Thickness(10, 4.5, 10, 4.5),
@@ -418,14 +589,8 @@ namespace AgyDesktopPetExtension
                 IsHitTestVisible = false,
                 RenderTransformOrigin = new System.Windows.Point(0.5, 1.0),
                 RenderTransform = bubbleTransformGroup,
-                CacheMode = new BitmapCache { RenderAtScale = 2.0 },
-                Effect = new DropShadowEffect
-                {
-                    Color = Colors.Black,
-                    BlurRadius = 10,
-                    ShadowDepth = 2,
-                    Opacity = 0.42
-                }
+                CacheMode = null,
+                Effect = bubbleShadow
             };
 
             _sparkleText = new TextBlock
@@ -433,7 +598,7 @@ namespace AgyDesktopPetExtension
                 Text = "✨",
                 FontSize = 15,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(255, 214, 102)),
+                Foreground = FrozenSparkleBrush,
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Top,
                 Margin = new Thickness(68, 42, 0, 0),
@@ -467,7 +632,7 @@ namespace AgyDesktopPetExtension
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Bottom,
                 Margin = new Thickness(0, BubbleHeightReserve, 0, 4),
-                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(1, 0, 0, 0)),
+                Background = FrozenHitTestBrush,
                 RenderTransformOrigin = new System.Windows.Point(0.5, 0.85),
                 RenderTransform = petTransformGroup,
                 Cursor = System.Windows.Input.Cursors.Hand
@@ -519,12 +684,45 @@ namespace AgyDesktopPetExtension
                 HideBubbleAnimated();
             };
 
+            IsVisibleChanged += delegate(object s, DependencyPropertyChangedEventArgs ev)
+            {
+                bool visible = ev.NewValue is bool && (bool)ev.NewValue;
+                if (!visible)
+                {
+                    SetAnimationRunning(false);
+                    ReleaseDecodedFrameMemoryOnHide();
+                }
+                else
+                {
+                    if (_usingCustomFrames && _customImage.Source == null)
+                    {
+                        BitmapSource[] restored = EnsureCustomTrackLoaded("idle");
+                        if (restored != null && restored.Length > 0)
+                        {
+                            _activeCustomTrack = "idle";
+                            _customFrameIndex = 0;
+                            _customFrameAccumMs = 0;
+                            _customImage.Source = restored[0];
+                        }
+                    }
+                    if (!_isSuspended)
+                    {
+                        EnsureActiveAnimationRate();
+                    }
+                }
+            };
+
             Closed += delegate
             {
                 try { _animTimer.Stop(); } catch { }
                 try { _bubbleHideTimer.Stop(); } catch { }
                 CloseActiveMenu();
                 CloseLockBadge();
+                ClearCustomFrameCaches();
+                _gifFrames.Clear();
+                _gifDelaysMs.Clear();
+                _customImage.Source = null;
+                _bubbleBorder.CacheMode = null;
             };
         }
 
@@ -558,11 +756,76 @@ namespace AgyDesktopPetExtension
             return IntPtr.Zero;
         }
 
+        private void SetAnimTimerIntervalMs(int ms)
+        {
+            int clamped = Math.Max(16, Math.Min(500, ms));
+            if (_currentAnimIntervalMs == clamped) return;
+            _currentAnimIntervalMs = clamped;
+            _animTimer.Interval = TimeSpan.FromMilliseconds(clamped);
+        }
+
+        private void EnsureActiveAnimationRate()
+        {
+            _isOccluded = false;
+            if (_currentAnimIntervalMs > 33)
+            {
+                _lastTickMs = 0;
+            }
+            SetAnimTimerIntervalMs(16);
+            if (!_isSuspended && Visibility == Visibility.Visible && !_animTimer.IsEnabled)
+            {
+                _lastTickMs = 0;
+                _animTimer.Start();
+            }
+        }
+
+        private bool CheckFullscreenOcclusionNow()
+        {
+            _lastOcclusionCheckUtc = DateTime.UtcNow;
+            if (_hwnd == IntPtr.Zero || _dragging) return false;
+            IntPtr menuHwnd = IntPtr.Zero;
+            IntPtr badgeHwnd = IntPtr.Zero;
+            try { if (_activeMenuWindow != null) menuHwnd = new WindowInteropHelper(_activeMenuWindow).Handle; } catch { }
+            try { if (_lockBadgeWindow != null) badgeHwnd = new WindowInteropHelper(_lockBadgeWindow).Handle; } catch { }
+            return PetNative.IsWindowOccludedByFullscreen(_hwnd, menuHwnd, badgeHwnd);
+        }
+
+        public void RefreshAnimationState()
+        {
+            if (_isSuspended || Visibility != Visibility.Visible)
+            {
+                SetAnimationRunning(false);
+                return;
+            }
+            bool occluded = CheckFullscreenOcclusionNow();
+            if (occluded)
+            {
+                if (!_isOccluded)
+                {
+                    _isOccluded = true;
+                    SetAnimationRunning(false);
+                    EvictNonIdleCustomTracks();
+                }
+                return;
+            }
+            if (_isOccluded || !_animTimer.IsEnabled)
+            {
+                _isOccluded = false;
+                _lastTickMs = 0;
+                SetAnimTimerIntervalMs(16);
+                SetAnimationRunning(true);
+            }
+        }
+
         public void SetAnimationRunning(bool run)
         {
             if (run)
             {
-                if (!_animTimer.IsEnabled) _animTimer.Start();
+                if (!_isSuspended && Visibility == Visibility.Visible && !_animTimer.IsEnabled)
+                {
+                    _lastTickMs = 0;
+                    _animTimer.Start();
+                }
             }
             else
             {
@@ -572,9 +835,11 @@ namespace AgyDesktopPetExtension
 
         public void PauseForSystemSuspend()
         {
+            _isSuspended = true;
             SetAnimationRunning(false);
             CloseActiveMenu();
             CloseLockBadge();
+            EvictNonIdleCustomTracks();
             if (_dragging)
             {
                 _dragging = false;
@@ -585,11 +850,13 @@ namespace AgyDesktopPetExtension
 
         public void ResumeFromSystemSuspend()
         {
+            _isSuspended = false;
+            _isOccluded = false;
             _lastTickMs = 0;
             ReclampToScreen();
             if (Visibility == Visibility.Visible)
             {
-                SetAnimationRunning(true);
+                EnsureActiveAnimationRate();
             }
         }
 
@@ -661,11 +928,22 @@ namespace AgyDesktopPetExtension
             System.Windows.Media.Color accent = ParseColorOrDefault(_accentHex, System.Windows.Media.Color.FromRgb(91, 140, 255));
             System.Windows.Media.Color bubbleCol = ParseColorOrDefault(_theme != null ? _theme.bubble : "#212533", System.Windows.Media.Color.FromRgb(22, 25, 36));
             bool lightTheme = ((0.299 * bubbleCol.R + 0.587 * bubbleCol.G + 0.114 * bubbleCol.B) / 255.0) >= 0.58;
-            _bubbleBorder.Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(236, bubbleCol.R, bubbleCol.G, bubbleCol.B));
-            _bubbleBorder.BorderBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(150, accent.R, accent.G, accent.B));
-            _bubbleText.Foreground = new SolidColorBrush(lightTheme
-                ? System.Windows.Media.Color.FromRgb(24, 28, 38)
-                : System.Windows.Media.Color.FromRgb(242, 244, 250));
+            string bubbleThemeKey = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:X2}{1:X2}{2:X2}|{3:X2}{4:X2}{5:X2}|{6}",
+                bubbleCol.R, bubbleCol.G, bubbleCol.B,
+                accent.R, accent.G, accent.B,
+                lightTheme ? "1" : "0");
+            if (!string.Equals(bubbleThemeKey, _cachedBubbleThemeKey, StringComparison.Ordinal))
+            {
+                _cachedBubbleThemeKey = bubbleThemeKey;
+                _cachedBubbleBgBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(236, bubbleCol.R, bubbleCol.G, bubbleCol.B));
+                _cachedBubbleBorderBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(150, accent.R, accent.G, accent.B));
+                _cachedBubbleFgBrush = lightTheme ? FrozenLightTextBrush : FrozenDarkTextBrush;
+                _bubbleBorder.Background = _cachedBubbleBgBrush;
+                _bubbleBorder.BorderBrush = _cachedBubbleBorderBrush;
+                _bubbleText.Foreground = _cachedBubbleFgBrush;
+            }
 
             bool isCustomFrames = _petConfig.activeCustomPet != null &&
                 string.Equals(_petConfig.activeCustomPet.kind, "frames", StringComparison.OrdinalIgnoreCase) &&
@@ -682,6 +960,7 @@ namespace AgyDesktopPetExtension
                 _gifFrames.Clear();
                 _gifDelaysMs.Clear();
                 _loadedImagePath = "";
+                _loadedImageDesiredPx = 0;
                 LoadCustomFramesIfNeeded(_petConfig.activeCustomPet, _petConfig.petsDir);
                 _vectorCanvas.Visibility = Visibility.Collapsed;
                 _customImage.Visibility = Visibility.Visible;
@@ -690,7 +969,7 @@ namespace AgyDesktopPetExtension
             else if (isCustomImage)
             {
                 _usingCustomFrames = false;
-                _customTrackBitmaps.Clear();
+                ClearCustomFrameCaches();
                 _loadedFramesSig = "";
                 LoadCustomImageIfNeeded(_petConfig.customImagePath);
                 _vectorCanvas.Visibility = Visibility.Collapsed;
@@ -700,11 +979,12 @@ namespace AgyDesktopPetExtension
             else
             {
                 _usingCustomFrames = false;
-                _customTrackBitmaps.Clear();
+                ClearCustomFrameCaches();
                 _loadedFramesSig = "";
                 _gifFrames.Clear();
                 _gifDelaysMs.Clear();
                 _loadedImagePath = "";
+                _loadedImageDesiredPx = 0;
                 _customImage.Source = null;
                 _customImage.Visibility = Visibility.Collapsed;
                 _vectorCanvas.Visibility = Visibility.Visible;
@@ -756,6 +1036,10 @@ namespace AgyDesktopPetExtension
             if (!string.Equals(curState, _lastAutoAgentState, StringComparison.Ordinal))
             {
                 _lastAutoAgentState = curState;
+                if (curState != "idle" && !_isOccluded)
+                {
+                    EnsureActiveAnimationRate();
+                }
                 if (_petConfig.showSpeechBubble && !newTurnArrived && !templateChanged)
                 {
                     if (curState == "running")
@@ -765,6 +1049,7 @@ namespace AgyDesktopPetExtension
                     else if (curState == "unread")
                     {
                         _hopRemaining = 0.7;
+                        EnsureActiveAnimationRate();
                         ShowBubble(RenderBubbleTemplate(curTpl), 5.8, true);
                     }
                 }
@@ -1181,19 +1466,81 @@ namespace AgyDesktopPetExtension
             outTop = Math.Max(vTop, Math.Min(vBottom - Height * 0.85, top));
         }
 
-        private static BitmapSource LoadSingleFrameBitmap(string imgPath)
+        private int GetDesiredSpritePixelWidth()
+        {
+            double scale = Math.Max(0.6, Math.Min(5.0, (_petConfig != null ? _petConfig.size : 100) / 100.0));
+            double dpi = _hwnd != IntPtr.Zero ? PetNative.GetWindowDpiScale(_hwnd) : PetNative.GetPrimaryDpiScale();
+            if (dpi <= 0.5) dpi = 1.0;
+            int desiredDisplayPx = (int)Math.Ceiling((BaseStageSize - 10.0) * scale * dpi);
+            return Math.Max(128, Math.Min(512, desiredDisplayPx));
+        }
+
+        private static bool TryProbeImageDimensions(string imgPath, out int srcWidth, out int srcHeight)
+        {
+            srcWidth = 0;
+            srcHeight = 0;
+            try
+            {
+                if (string.IsNullOrEmpty(imgPath) || !File.Exists(imgPath)) return false;
+                using (var fs = new FileStream(imgPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    BitmapDecoder decoder = BitmapDecoder.Create(
+                        fs,
+                        BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreColorProfile,
+                        BitmapCacheOption.None);
+                    if (decoder != null && decoder.Frames != null && decoder.Frames.Count > 0)
+                    {
+                        BitmapFrame frame = decoder.Frames[0];
+                        srcWidth = frame.PixelWidth;
+                        srcHeight = frame.PixelHeight;
+                        return srcWidth > 0 && srcHeight > 0;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static BitmapSource LoadSingleFrameBitmap(string imgPath, int desiredDisplayPx)
         {
             try
             {
                 if (string.IsNullOrEmpty(imgPath) || !File.Exists(imgPath)) return null;
-                byte[] bytes = File.ReadAllBytes(imgPath);
-                using (var ms = new MemoryStream(bytes))
+                int clampedDesired = Math.Max(128, Math.Min(512, desiredDisplayPx));
+                int srcWidth;
+                int srcHeight;
+                bool probed = TryProbeImageDimensions(imgPath, out srcWidth, out srcHeight);
+
+                using (var fs = new FileStream(imgPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                 {
                     var bmp = new BitmapImage();
                     bmp.BeginInit();
                     bmp.CacheOption = BitmapCacheOption.OnLoad;
-                    bmp.DecodePixelWidth = 512;
-                    bmp.StreamSource = ms;
+                    bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+                    if (probed)
+                    {
+                        if (srcWidth >= srcHeight)
+                        {
+                            int targetWidth = Math.Min(srcWidth, Math.Max(128, Math.Min(512, desiredDisplayPx)));
+                            if (targetWidth < srcWidth)
+                            {
+                                bmp.DecodePixelWidth = targetWidth;
+                            }
+                        }
+                        else
+                        {
+                            int targetHeight = Math.Min(srcHeight, clampedDesired);
+                            if (targetHeight < srcHeight)
+                            {
+                                bmp.DecodePixelHeight = targetHeight;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        bmp.DecodePixelWidth = clampedDesired;
+                    }
+                    bmp.StreamSource = fs;
                     bmp.EndInit();
                     bmp.Freeze();
                     return bmp;
@@ -1202,12 +1549,163 @@ namespace AgyDesktopPetExtension
             catch { return null; }
         }
 
+        private static BitmapSource MaterializeCompactFrame(BitmapSource source, int maxDim)
+        {
+            if (source == null) return null;
+            int srcW = source.PixelWidth;
+            int srcH = source.PixelHeight;
+            if (srcW <= 0 || srcH <= 0) return null;
+
+            BitmapSource working = source;
+            int clampedMax = Math.Max(128, Math.Min(512, maxDim));
+            if (srcW > clampedMax || srcH > clampedMax)
+            {
+                double ratio = Math.Min((double)clampedMax / srcW, (double)clampedMax / srcH);
+                if (source.Format != PixelFormats.Pbgra32 && source.Format != PixelFormats.Bgra32)
+                {
+                    var converted = new FormatConvertedBitmap();
+                    converted.BeginInit();
+                    converted.Source = source;
+                    converted.DestinationFormat = PixelFormats.Pbgra32;
+                    converted.EndInit();
+                    working = converted;
+                }
+                var scaled = new TransformedBitmap();
+                scaled.BeginInit();
+                scaled.Source = working;
+                scaled.Transform = new ScaleTransform(ratio, ratio);
+                scaled.EndInit();
+                working = scaled;
+            }
+
+            int w = Math.Max(1, working.PixelWidth);
+            int h = Math.Max(1, working.PixelHeight);
+            int bpp = Math.Max(1, working.Format.BitsPerPixel);
+            int stride = ((w * bpp + 31) / 32) * 4;
+            byte[] pixels = new byte[stride * h];
+            working.CopyPixels(pixels, stride, 0);
+            BitmapSource standalone = BitmapSource.Create(
+                w, h,
+                working.DpiX > 0 ? working.DpiX : 96.0,
+                working.DpiY > 0 ? working.DpiY : 96.0,
+                working.Format,
+                working.Palette,
+                pixels,
+                stride);
+            standalone.Freeze();
+            return standalone;
+        }
+
+        private void ClearCustomFrameCaches()
+        {
+            _customTrackPaths.Clear();
+            _customTrackBitmaps.Clear();
+            _customTrackLru.Clear();
+        }
+
+        private void EvictNonIdleCustomTracks()
+        {
+            if (_customTrackBitmaps.Count <= 1) return;
+            var toRemove = new List<string>();
+            foreach (string key in _customTrackBitmaps.Keys)
+            {
+                if (!string.Equals(key, "idle", StringComparison.Ordinal))
+                {
+                    toRemove.Add(key);
+                }
+            }
+            for (int i = 0; i < toRemove.Count; i++)
+            {
+                _customTrackBitmaps.Remove(toRemove[i]);
+                _customTrackLru.Remove(toRemove[i]);
+            }
+        }
+
+        private void ReleaseDecodedFrameMemoryOnHide()
+        {
+            if (_customTrackBitmaps.Count > 0)
+            {
+                _customTrackBitmaps.Clear();
+                _customTrackLru.Clear();
+                if (_usingCustomFrames)
+                {
+                    _customImage.Source = null;
+                }
+            }
+        }
+
+        private bool HasCustomTrack(string trackName)
+        {
+            List<string> paths;
+            return _customTrackPaths.TryGetValue(trackName, out paths) && paths != null && paths.Count > 0;
+        }
+
+        private void TouchCustomTrackLru(string trackName)
+        {
+            _customTrackLru.Remove(trackName);
+            _customTrackLru.AddFirst(trackName);
+        }
+
+        private BitmapSource[] EnsureCustomTrackLoaded(string trackName)
+        {
+            if (string.IsNullOrEmpty(trackName)) return null;
+            BitmapSource[] cached;
+            if (_customTrackBitmaps.TryGetValue(trackName, out cached) && cached != null && cached.Length > 0)
+            {
+                TouchCustomTrackLru(trackName);
+                return cached;
+            }
+
+            List<string> paths;
+            if (!_customTrackPaths.TryGetValue(trackName, out paths) || paths == null || paths.Count == 0)
+            {
+                return null;
+            }
+
+            var decoded = new List<BitmapSource>(paths.Count);
+            for (int i = 0; i < paths.Count; i++)
+            {
+                BitmapSource bmp = LoadSingleFrameBitmap(paths[i], _loadedFrameDesiredPx);
+                if (bmp != null) decoded.Add(bmp);
+            }
+            if (decoded.Count == 0) return null;
+
+            BitmapSource[] arr = decoded.ToArray();
+            _customTrackBitmaps[trackName] = arr;
+            TouchCustomTrackLru(trackName);
+
+            // Keep bounded LRU of tracks (current track + pinned "idle" track)
+            while (_customTrackBitmaps.Count > MaxCachedCustomTracks && _customTrackLru.Count > 0)
+            {
+                LinkedListNode<string> node = _customTrackLru.Last;
+                string evictKey = null;
+                while (node != null)
+                {
+                    string candidate = node.Value;
+                    if (!string.Equals(candidate, "idle", StringComparison.Ordinal) &&
+                        !string.Equals(candidate, trackName, StringComparison.Ordinal))
+                    {
+                        evictKey = candidate;
+                        break;
+                    }
+                    node = node.Previous;
+                }
+                if (evictKey == null) break;
+                _customTrackBitmaps.Remove(evictKey);
+                _customTrackLru.Remove(evictKey);
+            }
+
+            return arr;
+        }
+
         private void LoadCustomFramesIfNeeded(CustomPetEntry entry, string petsDir)
         {
             if (entry == null || string.IsNullOrEmpty(petsDir)) return;
             _customFramesFps = Math.Max(1, Math.Min(30, entry.fps > 0 ? entry.fps : 8));
+            int desiredPx = GetDesiredSpritePixelWidth();
+
             var sb = new StringBuilder();
-            sb.Append(entry.id).Append('|').Append(_customFramesFps);
+            sb.Append(entry.id).Append('|').Append(_customFramesFps).Append('|').Append(desiredPx);
             if (entry.frames != null)
             {
                 for (int i = 0; i < entry.frames.Count; i++) sb.Append('|').Append(entry.frames[i].filename);
@@ -1226,24 +1724,31 @@ namespace AgyDesktopPetExtension
                 }
             }
             string sig = sb.ToString();
-            if (string.Equals(sig, _loadedFramesSig, StringComparison.Ordinal) && _customTrackBitmaps.ContainsKey("idle"))
+            if (string.Equals(sig, _loadedFramesSig, StringComparison.Ordinal) && HasCustomTrack("idle"))
             {
+                if (_customImage.Source == null)
+                {
+                    BitmapSource[] idleReady = EnsureCustomTrackLoaded("idle");
+                    if (idleReady != null && idleReady.Length > 0) _customImage.Source = idleReady[0];
+                }
                 return;
             }
 
-            _customTrackBitmaps.Clear();
-            var idleBitmaps = new List<BitmapSource>();
+            ClearCustomFrameCaches();
+            _loadedFrameDesiredPx = desiredPx;
+
+            // Store lightweight frame path metadata for all tracks; decode lazily per-track on demand
+            var idlePaths = new List<string>();
             if (entry.frames != null)
             {
                 for (int i = 0; i < entry.frames.Count; i++)
                 {
                     string fname = System.IO.Path.GetFileName(entry.frames[i].filename ?? "");
                     if (string.IsNullOrEmpty(fname)) continue;
-                    BitmapSource bmp = LoadSingleFrameBitmap(System.IO.Path.Combine(petsDir, fname));
-                    if (bmp != null) idleBitmaps.Add(bmp);
+                    idlePaths.Add(System.IO.Path.Combine(petsDir, fname));
                 }
             }
-            _customTrackBitmaps["idle"] = idleBitmaps;
+            if (idlePaths.Count > 0) _customTrackPaths["idle"] = idlePaths;
 
             if (entry.stateFrames != null)
             {
@@ -1252,15 +1757,14 @@ namespace AgyDesktopPetExtension
                 {
                     List<CustomPetFrameRef> list;
                     if (!entry.stateFrames.TryGetValue(tracks[t], out list) || list == null || list.Count == 0) continue;
-                    var trackBitmaps = new List<BitmapSource>();
+                    var trackPaths = new List<string>(list.Count);
                     for (int i = 0; i < list.Count; i++)
                     {
                         string fname = System.IO.Path.GetFileName(list[i].filename ?? "");
                         if (string.IsNullOrEmpty(fname)) continue;
-                        BitmapSource bmp = LoadSingleFrameBitmap(System.IO.Path.Combine(petsDir, fname));
-                        if (bmp != null) trackBitmaps.Add(bmp);
+                        trackPaths.Add(System.IO.Path.Combine(petsDir, fname));
                     }
-                    if (trackBitmaps.Count > 0) _customTrackBitmaps[tracks[t]] = trackBitmaps;
+                    if (trackPaths.Count > 0) _customTrackPaths[tracks[t]] = trackPaths;
                 }
             }
 
@@ -1268,7 +1772,9 @@ namespace AgyDesktopPetExtension
             _activeCustomTrack = "idle";
             _customFrameIndex = 0;
             _customFrameAccumMs = 0;
-            if (idleBitmaps.Count > 0) _customImage.Source = idleBitmaps[0];
+
+            BitmapSource[] idleBitmaps = EnsureCustomTrackLoaded("idle");
+            if (idleBitmaps != null && idleBitmaps.Length > 0) _customImage.Source = idleBitmaps[0];
         }
 
         private void LoadCustomImageIfNeeded(string imgPath)
@@ -1276,8 +1782,10 @@ namespace AgyDesktopPetExtension
             try
             {
                 var fi = new FileInfo(imgPath);
+                int desiredPx = GetDesiredSpritePixelWidth();
                 if (string.Equals(_loadedImagePath, imgPath, StringComparison.OrdinalIgnoreCase) &&
                     fi.LastWriteTimeUtc == _loadedImageMtimeUtc &&
+                    _loadedImageDesiredPx == desiredPx &&
                     _customImage.Source != null)
                 {
                     return;
@@ -1290,16 +1798,13 @@ namespace AgyDesktopPetExtension
                 string ext = System.IO.Path.GetExtension(imgPath).ToLowerInvariant();
                 if (ext == ".gif")
                 {
-                    byte[] bytes = File.ReadAllBytes(imgPath);
-                    using (var ms = new MemoryStream(bytes))
+                    using (var fs = new FileStream(imgPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                     {
-                        var decoder = new GifBitmapDecoder(ms, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                        var decoder = new GifBitmapDecoder(fs, BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
                         int maxFrames = Math.Min(decoder.Frames.Count, 90);
                         for (int i = 0; i < maxFrames; i++)
                         {
                             BitmapFrame frame = decoder.Frames[i];
-                            frame.Freeze();
-                            _gifFrames.Add(frame);
                             int delayMs = 90;
                             try
                             {
@@ -1311,19 +1816,25 @@ namespace AgyDesktopPetExtension
                                 }
                             }
                             catch { }
-                            _gifDelaysMs.Add(delayMs);
+                            BitmapSource compact = MaterializeCompactFrame(frame, desiredPx);
+                            if (compact != null)
+                            {
+                                _gifFrames.Add(compact);
+                                _gifDelaysMs.Add(delayMs);
+                            }
                         }
                     }
                     if (_gifFrames.Count > 0) _customImage.Source = _gifFrames[0];
                 }
                 else
                 {
-                    BitmapSource bmp = LoadSingleFrameBitmap(imgPath);
+                    BitmapSource bmp = LoadSingleFrameBitmap(imgPath, desiredPx);
                     if (bmp != null) _customImage.Source = bmp;
                 }
 
                 _loadedImagePath = imgPath;
                 _loadedImageMtimeUtc = fi.LastWriteTimeUtc;
+                _loadedImageDesiredPx = desiredPx;
             }
             catch { }
         }
@@ -1368,9 +1879,10 @@ namespace AgyDesktopPetExtension
             _moodBadgeSleep = null;
             _mechaFaceText = null;
 
-            var accentBrush = new SolidColorBrush(accent);
-            var softGlow = new DropShadowEffect { Color = accent, BlurRadius = 14, ShadowDepth = 0, Opacity = 0.45 };
-            var groundShadow = new Ellipse { Width = 64, Height = 12, Fill = new SolidColorBrush(System.Windows.Media.Color.FromArgb(72, 0, 0, 0)) };
+            var accentBrush = CreateFrozenBrush(accent);
+            var softGlow = new DropShadowEffect { Color = accent, BlurRadius = 12, ShadowDepth = 0, Opacity = 0.42, RenderingBias = RenderingBias.Performance };
+            softGlow.Freeze();
+            var groundShadow = new Ellipse { Width = 64, Height = 12, Fill = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(72, 0, 0, 0)) };
             Canvas.SetLeft(groundShadow, 24);
             Canvas.SetTop(groundShadow, 95);
             _vectorCanvas.Children.Add(groundShadow);
@@ -1385,11 +1897,11 @@ namespace AgyDesktopPetExtension
 
         private void BuildNekoPet(System.Windows.Media.Color accent, SolidColorBrush accentBrush, DropShadowEffect glow)
         {
-            var bodyBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(32, 35, 48));
-            var outlineBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(200, accent.R, accent.G, accent.B));
-            var innerEarBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(236, 134, 166));
-            var cheekBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(115, 244, 138, 170));
-            var eyeBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(250, 212, 102));
+            var bodyBrush = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(32, 35, 48));
+            var outlineBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(200, accent.R, accent.G, accent.B));
+            var innerEarBrush = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(236, 134, 166));
+            var cheekBrush = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(115, 244, 138, 170));
+            var eyeBrush = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(250, 212, 102));
 
             _tailRotate = new RotateTransform(0, 80, 78);
             var tail = MakePath("M 78,80 C 96,78 103,60 95,48 C 91,42 84,48 88,54 C 92,60 88,70 76,73", null, bodyBrush, 7.5);
@@ -1437,8 +1949,8 @@ namespace AgyDesktopPetExtension
             _vectorCanvas.Children.Add(blushR);
 
             _vectorCanvas.Children.Add(MakePath("M 54,51 L 58,51 L 56,53.5 Z", innerEarBrush, null, 0));
-            _vectorCanvas.Children.Add(MakePath("M 51,55 Q 53.5,58 56,55 Q 58.5,58 61,55", null, new SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 224, 236)), 1.4));
-            _vectorCanvas.Children.Add(MakePath("M 22,47 L 31,48 M 21,52 L 31,52 M 81,48 L 90,47 M 81,52 L 91,52", null, new SolidColorBrush(System.Windows.Media.Color.FromArgb(145, 220, 226, 240)), 1.2));
+            _vectorCanvas.Children.Add(MakePath("M 51,55 Q 53.5,58 56,55 Q 58.5,58 61,55", null, CreateFrozenBrush(System.Windows.Media.Color.FromRgb(220, 224, 236)), 1.4));
+            _vectorCanvas.Children.Add(MakePath("M 22,47 L 31,48 M 21,52 L 31,52 M 81,48 L 90,47 M 81,52 L 91,52", null, CreateFrozenBrush(System.Windows.Media.Color.FromArgb(145, 220, 226, 240)), 1.2));
 
             var pawL = new Ellipse { Width = 13, Height = 9, Fill = bodyBrush, Stroke = outlineBrush, StrokeThickness = 1.2 };
             Canvas.SetLeft(pawL, 38); Canvas.SetTop(pawL, 88);
@@ -1459,6 +1971,7 @@ namespace AgyDesktopPetExtension
                 System.Windows.Media.Color.FromArgb(245, 240, 246, 255),
                 System.Windows.Media.Color.FromArgb(220, (byte)((accent.R + 210) / 2), (byte)((accent.G + 215) / 2), (byte)((accent.B + 235) / 2)),
                 90.0);
+            ghostFill.Freeze();
             var body = MakePath("M 26,56 C 26,28 86,28 86,56 L 86,87 C 81,93 74,84 68,90 C 62,95 56,85 50,90 C 44,95 38,84 32,90 C 28,93 26,89 26,87 Z", ghostFill, accentBrush, 2.0);
             body.Effect = glow;
             _vectorCanvas.Children.Add(body);
@@ -1466,7 +1979,7 @@ namespace AgyDesktopPetExtension
             _vectorCanvas.Children.Add(MakePath("M 26,59 Q 17,64 23,71", null, accentBrush, 3.0));
             _vectorCanvas.Children.Add(MakePath("M 86,59 Q 95,64 89,71", null, accentBrush, 3.0));
 
-            var darkEye = new SolidColorBrush(System.Windows.Media.Color.FromRgb(26, 30, 44));
+            var darkEye = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(26, 30, 44));
             _eyeLeftScale = new ScaleTransform(1, 1, 5.5, 6.5);
             var eyeL = new Ellipse { Width = 11, Height = 13, Fill = darkEye, RenderTransform = _eyeLeftScale };
             Canvas.SetLeft(eyeL, 40); Canvas.SetTop(eyeL, 45);
@@ -1483,7 +1996,7 @@ namespace AgyDesktopPetExtension
             Canvas.SetLeft(sparkR, 65); Canvas.SetTop(sparkR, 47);
             _vectorCanvas.Children.Add(sparkR);
 
-            var cheek = new SolidColorBrush(System.Windows.Media.Color.FromArgb(115, 255, 130, 175));
+            var cheek = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(115, 255, 130, 175));
             var cL = new Ellipse { Width = 9, Height = 5, Fill = cheek };
             Canvas.SetLeft(cL, 32); Canvas.SetTop(cL, 58);
             _vectorCanvas.Children.Add(cL);
@@ -1499,7 +2012,8 @@ namespace AgyDesktopPetExtension
                 System.Windows.Media.Color.FromRgb(236, 240, 248),
                 System.Windows.Media.Color.FromRgb(192, 200, 218),
                 90.0);
-            var darkTrim = new SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 34, 48));
+            shellBrush.Freeze();
+            var darkTrim = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(30, 34, 48));
 
             _tailRotate = new RotateTransform(0, 56, 26);
             var antenna = MakePath("M 56,26 L 56,14", null, darkTrim, 3.0);
@@ -1509,7 +2023,7 @@ namespace AgyDesktopPetExtension
             Canvas.SetLeft(orb, 51); Canvas.SetTop(orb, 7);
             _vectorCanvas.Children.Add(orb);
 
-            var thruster = new Ellipse { Width = 34, Height = 8, Fill = new SolidColorBrush(System.Windows.Media.Color.FromArgb(145, accent.R, accent.G, accent.B)) };
+            var thruster = new Ellipse { Width = 34, Height = 8, Fill = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(145, accent.R, accent.G, accent.B)) };
             Canvas.SetLeft(thruster, 39); Canvas.SetTop(thruster, 89);
             _vectorCanvas.Children.Add(thruster);
 
@@ -1548,12 +2062,12 @@ namespace AgyDesktopPetExtension
             _vectorCanvas.Children.Add(runTxt);
             _moodBadgeRunning = runTxt;
 
-            var unreadTxt = new TextBlock { Text = "★", FontSize = 16, Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(42, 208, 126)), Visibility = Visibility.Collapsed };
+            var unreadTxt = new TextBlock { Text = "★", FontSize = 16, Foreground = CreateFrozenBrush(System.Windows.Media.Color.FromRgb(42, 208, 126)), Visibility = Visibility.Collapsed };
             Canvas.SetLeft(unreadTxt, 84); Canvas.SetTop(unreadTxt, 12);
             _vectorCanvas.Children.Add(unreadTxt);
             _moodBadgeUnread = unreadTxt;
 
-            var sleepTxt = new TextBlock { Text = "Zzz", FontSize = 11, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(System.Windows.Media.Color.FromArgb(200, 185, 195, 225)), Visibility = Visibility.Collapsed };
+            var sleepTxt = new TextBlock { Text = "Zzz", FontSize = 11, FontWeight = FontWeights.Bold, Foreground = CreateFrozenBrush(System.Windows.Media.Color.FromArgb(200, 185, 195, 225)), Visibility = Visibility.Collapsed };
             Canvas.SetLeft(sleepTxt, 80); Canvas.SetTop(sleepTxt, 12);
             _vectorCanvas.Children.Add(sleepTxt);
             _moodBadgeSleep = sleepTxt;
@@ -1616,6 +2130,7 @@ namespace AgyDesktopPetExtension
                 _wanderTargetY = candY;
                 _wanderFacing = candX < Left ? -1.0 : 1.0;
                 _wandering = true;
+                EnsureActiveAnimationRate();
                 return;
             }
 
@@ -1623,7 +2138,7 @@ namespace AgyDesktopPetExtension
             double dy = _wanderTargetY - Top;
             double rem = Math.Sqrt(dx * dx + dy * dy);
             const double walkSpeedPxPerSec = 66.0;
-            double step = walkSpeedPxPerSec * dt;
+            double step = walkSpeedPxPerSec * Math.Min(dt, 0.05);
             if (rem <= step + 1.5)
             {
                 Left = Math.Round(_wanderTargetX);
@@ -1760,9 +2275,76 @@ namespace AgyDesktopPetExtension
             badge.Top = Math.Round(by);
         }
 
+        private int ComputeDesiredAnimIntervalMs(string agentState, bool sleepy, int activeTrackFrameCount)
+        {
+            bool hasActivePhysics =
+                _dragging ||
+                _wandering ||
+                _hopRemaining > 0.0 ||
+                _landBounceRemaining > 0.0 ||
+                _tokenBounceRemaining > 0.0 ||
+                _interactAnimRemaining > 0.0 ||
+                Math.Abs(_dragTiltAngle) > 0.35 ||
+                _unlockCelebrationRemaining > 0.0 ||
+                (_sparkleText != null && _sparkleText.Visibility == Visibility.Visible) ||
+                (_lockBadgeWindow != null && _lockBadgeWindow.IsShowing);
+
+            if (hasActivePhysics)
+            {
+                return 16;
+            }
+
+            if (_customImage.Visibility == Visibility.Visible)
+            {
+                if (_usingCustomFrames)
+                {
+                    if (activeTrackFrameCount <= 1)
+                    {
+                        return sleepy ? 400 : (agentState == "idle" ? 125 : 50);
+                    }
+                    int frameMs = (int)Math.Round(1000.0 / Math.Max(1, _customFramesFps));
+                    if (agentState == "running" || agentState == "unread")
+                    {
+                        return Math.Max(16, Math.Min(33, frameMs));
+                    }
+                    return sleepy ? Math.Max(66, Math.Min(125, frameMs)) : Math.Max(16, Math.Min(66, frameMs));
+                }
+                if (_gifFrames.Count > 1)
+                {
+                    int curDelay = (_gifFrameIndex >= 0 && _gifFrameIndex < _gifDelaysMs.Count) ? _gifDelaysMs[_gifFrameIndex] : 90;
+                    if (agentState == "running" || agentState == "unread")
+                    {
+                        return Math.Max(16, Math.Min(50, curDelay / 2));
+                    }
+                    return sleepy ? Math.Max(50, Math.Min(125, curDelay)) : Math.Max(33, Math.Min(80, curDelay / 2));
+                }
+                if (agentState == "running" || agentState == "unread") return 33;
+                return sleepy ? 400 : 125;
+            }
+
+            if (agentState == "running" || agentState == "unread") return 16;
+            return sleepy ? 200 : 50;
+        }
+
         private void OnAnimTick(object sender, EventArgs e)
         {
-            if (Visibility != Visibility.Visible) return;
+            if (_isSuspended || Visibility != Visibility.Visible)
+            {
+                SetAnimationRunning(false);
+                return;
+            }
+
+            if (!_dragging && (DateTime.UtcNow - _lastOcclusionCheckUtc).TotalMilliseconds >= 600.0)
+            {
+                if (CheckFullscreenOcclusionNow())
+                {
+                    _isOccluded = true;
+                    SetAnimationRunning(false);
+                    EvictNonIdleCustomTracks();
+                    return;
+                }
+            }
+
             if (!_animClock.IsRunning)
             {
                 _animClock.Start();
@@ -1772,7 +2354,7 @@ namespace AgyDesktopPetExtension
             double dt = (_lastTickMs > 0) ? ((nowMs - _lastTickMs) / 1000.0) : 0.016;
             _lastTickMs = nowMs;
             if (dt < 0.004) dt = 0.004;
-            if (dt > 0.05) dt = 0.05;
+            if (dt > 0.5) dt = 0.5;
             double dtMs = dt * 1000.0;
 
             string agentState = ResolveAgentState();
@@ -1784,39 +2366,41 @@ namespace AgyDesktopPetExtension
             double speedMult = agentState == "running" ? 2.1 : (agentState == "unread" ? 1.5 : (sleepy ? 0.55 : 1.0));
             _phase += dt * 2.6 * speedMult;
 
+            int activeTrackFrameCount = 0;
             if (_customImage.Visibility == Visibility.Visible && _usingCustomFrames)
             {
                 if (_interactAnimRemaining > 0) _interactAnimRemaining = Math.Max(0.0, _interactAnimRemaining - dt);
                 string desiredTrack = "idle";
-                if (_dragging && _customTrackBitmaps.ContainsKey("drag")) desiredTrack = "drag";
-                else if (_interactAnimRemaining > 0 && _customTrackBitmaps.ContainsKey("interact")) desiredTrack = "interact";
-                else if (_wandering && _customTrackBitmaps.ContainsKey("walk")) desiredTrack = "walk";
-                else if (agentState == "running" && _customTrackBitmaps.ContainsKey("running")) desiredTrack = "running";
-                else if (agentState == "unread" && _customTrackBitmaps.ContainsKey("unread")) desiredTrack = "unread";
+                if (_dragging && HasCustomTrack("drag")) desiredTrack = "drag";
+                else if (_interactAnimRemaining > 0 && HasCustomTrack("interact")) desiredTrack = "interact";
+                else if (_wandering && HasCustomTrack("walk")) desiredTrack = "walk";
+                else if (agentState == "running" && HasCustomTrack("running")) desiredTrack = "running";
+                else if (agentState == "unread" && HasCustomTrack("unread")) desiredTrack = "unread";
 
-                List<BitmapSource> trackFrames;
-                if (!_customTrackBitmaps.TryGetValue(desiredTrack, out trackFrames) || trackFrames == null || trackFrames.Count == 0)
+                BitmapSource[] trackFrames = EnsureCustomTrackLoaded(desiredTrack);
+                if (trackFrames == null || trackFrames.Length == 0)
                 {
-                    _customTrackBitmaps.TryGetValue("idle", out trackFrames);
+                    trackFrames = EnsureCustomTrackLoaded("idle");
                     desiredTrack = "idle";
                 }
-                if (trackFrames != null && trackFrames.Count > 0)
+                if (trackFrames != null && trackFrames.Length > 0)
                 {
-                    if (!string.Equals(desiredTrack, _activeCustomTrack, StringComparison.Ordinal))
+                    activeTrackFrameCount = trackFrames.Length;
+                    if (!string.Equals(desiredTrack, _activeCustomTrack, StringComparison.Ordinal) || _customImage.Source == null)
                     {
                         _activeCustomTrack = desiredTrack;
                         _customFrameIndex = 0;
                         _customFrameAccumMs = 0;
                         _customImage.Source = trackFrames[0];
                     }
-                    else if (trackFrames.Count > 1)
+                    else if (trackFrames.Length > 1)
                     {
                         double frameIntervalMs = 1000.0 / Math.Max(1, _customFramesFps);
                         _customFrameAccumMs += dtMs;
                         if (_customFrameAccumMs >= frameIntervalMs)
                         {
                             _customFrameAccumMs %= frameIntervalMs;
-                            _customFrameIndex = (_customFrameIndex + 1) % trackFrames.Count;
+                            _customFrameIndex = (_customFrameIndex + 1) % trackFrames.Length;
                             _customImage.Source = trackFrames[_customFrameIndex];
                         }
                     }
@@ -1828,7 +2412,7 @@ namespace AgyDesktopPetExtension
                 int curDelay = (_gifFrameIndex < _gifDelaysMs.Count) ? _gifDelaysMs[_gifFrameIndex] : 90;
                 if (_gifAccumMs >= curDelay)
                 {
-                    _gifAccumMs -= curDelay;
+                    _gifAccumMs %= Math.Max(30, curDelay);
                     _gifFrameIndex = (_gifFrameIndex + 1) % _gifFrames.Count;
                     _customImage.Source = _gifFrames[_gifFrameIndex];
                 }
@@ -1947,6 +2531,8 @@ namespace AgyDesktopPetExtension
                     _sparkleText.Opacity = sp < 0.65 ? 1.0 : Math.Max(0.0, 1.0 - (sp - 0.65) / 0.35);
                 }
             }
+
+            SetAnimTimerIntervalMs(ComputeDesiredAnimIntervalMs(agentState, sleepy, activeTrackFrameCount));
         }
 
         private void SetBubbleExtraHeight(double extra)
@@ -1972,6 +2558,7 @@ namespace AgyDesktopPetExtension
             _bubbleScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
             _bubbleTranslate.BeginAnimation(TranslateTransform.YProperty, null);
             _bubbleBorder.Visibility = Visibility.Collapsed;
+            _bubbleBorder.CacheMode = null;
             SetBubbleExtraHeight(0.0);
         }
 
@@ -1988,6 +2575,7 @@ namespace AgyDesktopPetExtension
                 if (_bubbleAnimGen == gen)
                 {
                     _bubbleBorder.Visibility = Visibility.Collapsed;
+                    _bubbleBorder.CacheMode = null;
                     SetBubbleExtraHeight(0.0);
                 }
             };
@@ -2011,6 +2599,7 @@ namespace AgyDesktopPetExtension
             bool multiline = text.IndexOf('\n') >= 0;
             _bubbleText.TextAlignment = multiline ? TextAlignment.Left : TextAlignment.Center;
             _bubbleText.Text = text;
+            _bubbleBorder.CacheMode = _bubbleCacheMode;
             _bubbleBorder.Visibility = Visibility.Visible;
 
             if (multiline)
@@ -2054,6 +2643,7 @@ namespace AgyDesktopPetExtension
             {
                 _tokenBounceRemaining = 0.36;
                 TriggerSparkle("⚡");
+                EnsureActiveAnimationRate();
             }
         }
 
@@ -2064,6 +2654,7 @@ namespace AgyDesktopPetExtension
             _wanderCooldownSec = 9.0 + _rng.NextDouble() * 8.0;
             _hopRemaining = 0.58;
             _interactAnimRemaining = 1.6;
+            EnsureActiveAnimationRate();
             string[] sparkles = new string[] { "✨", "♥", "★" };
             TriggerSparkle(sparkles[_rng.Next(sparkles.Length)]);
             if (!_petConfig.showSpeechBubble) return;
@@ -2079,6 +2670,7 @@ namespace AgyDesktopPetExtension
             _lastInteractUtc = DateTime.UtcNow;
             CloseActiveMenu();
             _wandering = false;
+            EnsureActiveAnimationRate();
             if (e.ClickCount >= 2)
             {
                 int pct = _telemetry != null ? _telemetry.percent : 0;
@@ -3870,6 +4462,7 @@ namespace AgyDesktopPetExtension
                 pollTick++;
                 if (!CheckHostLiveness()) return;
                 CheckFiles();
+                if (_petWindow != null) _petWindow.RefreshAnimationState();
                 if (!startupTrimmed && pollTick >= 5)
                 {
                     startupTrimmed = true;

@@ -8,6 +8,8 @@
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const POLL_INTERVAL_MS = 2000;
+const LOCAL_IMAGE_CACHE_MAX = 16;
+const COMPOSER_DRAFT_MAX_SESSIONS = 12;
 
 const PROTOCOL_PRESETS = {
   openai: {
@@ -1172,6 +1174,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
   const expandedGroupState = new Map();
   const localImageUrlCache = new Map();
   const createdObjectUrls = new Set();
+  let lastRenderedConfigSig = "";
+  let lastRenderedListSig = "";
+  let lastRenderedGraphSig = "";
   let lastRenderedTimelineKey = "";
   let lastRenderedTimelineSig = "";
 
@@ -1264,12 +1269,47 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     }
   };
 
+  const getAttachmentBase64 = (att) => {
+    if (!att) return "";
+    if (att.base64) return att.base64;
+    if (typeof att.dataUrl === "string") {
+      const comma = att.dataUrl.indexOf(",");
+      return comma >= 0 ? att.dataUrl.slice(comma + 1) : "";
+    }
+    return "";
+  };
+
+  const getAttachmentDataUrl = (att) => {
+    if (!att) return "";
+    const b64 = getAttachmentBase64(att);
+    if (!b64) return "";
+    return `data:${att.mime || "image/png"};base64,${b64}`;
+  };
+
   const saveCurrentComposerDraft = () => {
     if (!composerCurrentSessionId || !madComposerInput) return;
+    const text = String(madComposerInput.value || "");
+    if (!text && composerAttachments.length === 0) {
+      composerDraftBySession.delete(composerCurrentSessionId);
+      return;
+    }
+    // Store one canonical base64 representation per attachment and maintain bounded LRU sessions
+    composerDraftBySession.delete(composerCurrentSessionId);
     composerDraftBySession.set(composerCurrentSessionId, {
-      text: String(madComposerInput.value || ""),
-      attachments: [...composerAttachments],
+      text,
+      attachments: composerAttachments.map((att) => ({
+        id: att.id,
+        name: att.name,
+        mime: att.mime,
+        size: att.size,
+        base64: getAttachmentBase64(att),
+      })),
     });
+    while (composerDraftBySession.size > COMPOSER_DRAFT_MAX_SESSIONS) {
+      const oldestSessionId = composerDraftBySession.keys().next().value;
+      if (oldestSessionId === undefined) break;
+      composerDraftBySession.delete(oldestSessionId);
+    }
   };
 
   const updateComposerCommandChip = () => {
@@ -1322,11 +1362,11 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
       thumbBtn.title = `点击大图预览：${att.name}`;
       const img = document.createElement("img");
       img.className = "mad-attach-thumb";
-      img.src = att.dataUrl;
+      img.src = getAttachmentDataUrl(att);
       img.alt = att.name || "附件图片";
       thumbBtn.appendChild(img);
       thumbBtn.addEventListener("click", () => {
-        openWebviewLightbox({ url: att.dataUrl, label: att.name || `图片 ${idx + 1}` });
+        openWebviewLightbox({ url: getAttachmentDataUrl(att), label: att.name || `图片 ${idx + 1}` });
       });
 
       const removeBtn = document.createElement("button");
@@ -1513,7 +1553,6 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
           mime,
           size: Number(file.size || 0),
           base64,
-          dataUrl,
         });
         saveCurrentComposerDraft();
         renderComposerAttachments();
@@ -1541,6 +1580,10 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
       saveCurrentComposerDraft();
       composerCurrentSessionId = targetSessionId;
       const savedDraft = composerDraftBySession.get(targetSessionId);
+      if (savedDraft) {
+        composerDraftBySession.delete(targetSessionId);
+        composerDraftBySession.set(targetSessionId, savedDraft);
+      }
       if (madComposerInput) {
         madComposerInput.value = savedDraft ? savedDraft.text : "";
         autoResizeComposerInput();
@@ -1570,7 +1613,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     const payloadImages = composerAttachments.map((att) => ({
       name: att.name,
       mime: att.mime,
-      base64: att.base64,
+      base64: getAttachmentBase64(att),
     }));
 
     try {
@@ -1665,28 +1708,52 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     }
   };
 
+  const revokeObjectUrlSafe = (url) => {
+    if (!url || !createdObjectUrls.has(url)) return;
+    createdObjectUrls.delete(url);
+    if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {}
+    }
+  };
+
+  const evictLocalImageEntry = (key) => {
+    if (!localImageUrlCache.has(key)) return;
+    const oldPromise = localImageUrlCache.get(key);
+    localImageUrlCache.delete(key);
+    Promise.resolve(oldPromise).then((oldUrl) => revokeObjectUrlSafe(oldUrl));
+  };
+
+  const clearLocalImageCache = ({ keepKeys = null } = {}) => {
+    const keep = keepKeys instanceof Set ? keepKeys : null;
+    for (const key of Array.from(localImageUrlCache.keys())) {
+      if (keep && keep.has(key)) continue;
+      evictLocalImageEntry(key);
+    }
+    if (!keep) {
+      for (const u of Array.from(createdObjectUrls)) {
+        revokeObjectUrlSafe(u);
+      }
+    }
+  };
+
   const loadLocalImage = (rawTarget) => {
     const key = String(rawTarget || "").trim();
     if (!key || typeof apiFetch !== "function") {
       return Promise.resolve("");
     }
     if (localImageUrlCache.has(key)) {
-      return localImageUrlCache.get(key);
+      const cached = localImageUrlCache.get(key);
+      // Maintain true LRU recency order
+      localImageUrlCache.delete(key);
+      localImageUrlCache.set(key, cached);
+      return cached;
     }
-    if (localImageUrlCache.size >= 48) {
+    while (localImageUrlCache.size >= LOCAL_IMAGE_CACHE_MAX) {
       const oldestKey = localImageUrlCache.keys().next().value;
-      if (oldestKey !== undefined) {
-        const oldPromise = localImageUrlCache.get(oldestKey);
-        localImageUrlCache.delete(oldestKey);
-        Promise.resolve(oldPromise).then((oldUrl) => {
-          if (oldUrl && createdObjectUrls.has(oldUrl)) {
-            createdObjectUrls.delete(oldUrl);
-            try {
-              URL.revokeObjectURL(oldUrl);
-            } catch {}
-          }
-        });
-      }
+      if (oldestKey === undefined) break;
+      evictLocalImageEntry(oldestKey);
     }
     const req = Promise.resolve()
       .then(async () => {
@@ -1832,7 +1899,76 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     cleanups.push(() => el.removeEventListener(evt, fn, opts));
   };
 
+  const buildConfigSignature = (cfg) => {
+    const c = cfg || {};
+    const tp = c.thirdParty || {};
+    const models = Array.isArray(tp.fetchedModels) ? tp.fetchedModels.join(",") : "";
+    return [
+      Boolean(c.enabled),
+      c.source || "self",
+      c.frequency || "1m",
+      c.thinking || "low",
+      tp.protocol || "openai",
+      tp.baseUrl || "",
+      Boolean(tp.hasApiKey),
+      tp.apiKeyMasked || "",
+      tp.selectedModel || "",
+      models,
+    ].join("|");
+  };
+
+  const buildSessionsListSignature = (sessions, selId, activeCount, unreadCount, isFallbackRecent) => {
+    const parts = [
+      String(selId || ""),
+      String(activeCount),
+      String(unreadCount),
+      isFallbackRecent ? "1" : "0",
+      String(sessions.length),
+    ];
+    for (let i = 0; i < sessions.length; i += 1) {
+      const s = sessions[i];
+      parts.push(
+        `${s.id}\x1f${s.status || ""}\x1f${s.isRead ? 1 : 0}\x1f${s.isFavorite ? 1 : 0}\x1f${s.subAgentCount || 0}\x1f${s.project || ""}\x1f${s.name || ""}\x1f${s.tag || ""}\x1f${s.progress ?? 0}`
+      );
+    }
+    return parts.join("\x1e");
+  };
+
+  const buildWorkspaceGraphSignature = (session) => {
+    if (!session) return "__empty__";
+    const m = session.master;
+    const subs = Array.isArray(session.subs) ? session.subs : [];
+    const edges = Array.isArray(session.edges) ? session.edges : [];
+    const parts = [
+      String(session.id || ""),
+      String(session.status || ""),
+      session.isRead ? "1" : "0",
+      String(session.progress ?? 0),
+      String(session.summaryText || ""),
+      String(session.goal || ""),
+      String(session.name || ""),
+      String(session.project || ""),
+      m
+        ? `${m.id}\x1f${m.name || ""}\x1f${m.stateKind || ""}\x1f${m.stateLabel || ""}\x1f${m.progress ?? 0}\x1f${m.task || ""}`
+        : "",
+      String(subs.length),
+    ];
+    for (let i = 0; i < subs.length; i += 1) {
+      const sub = subs[i];
+      parts.push(
+        `${sub.id}\x1f${sub.name || ""}\x1f${sub.stateKind || ""}\x1f${sub.stateLabel || ""}\x1f${sub.progress ?? 0}\x1f${sub.task || ""}`
+      );
+    }
+    parts.push(String(edges.length));
+    for (let i = 0; i < edges.length; i += 1) {
+      const e = edges[i];
+      parts.push(`${e.type || ""}\x1f${e.from || ""}\x1f${e.to || ""}\x1f${e.dir || ""}\x1f${e.lane || 0}\x1f${e.live ? 1 : 0}`);
+    }
+    return parts.join("\x1e");
+  };
+
   const renderConfigRow = () => {
+    lastRenderedConfigSig = buildConfigSignature(configState);
     const isEnabled = Boolean(configState.enabled);
     const isThirdParty = configState.source === "thirdparty";
     const tp = configState.thirdParty || {};
@@ -2090,6 +2226,48 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     if (!madTimelineEl || !agent || !session) return;
     const journey = agent.journey || {};
 
+    const steps =
+      Array.isArray(journey.steps) && journey.steps.length > 0
+        ? journey.steps
+        : [{ type: "msg", text: agent.task || "等待下一步输出…" }];
+
+    const timelineKey = `${session.id}:${agent.id}`;
+    const lastStep = steps[steps.length - 1];
+    let totalTextLen = 0;
+    let totalItemCount = 0;
+    for (let i = 0; i < steps.length; i += 1) {
+      const st = steps[i];
+      if (typeof st?.text === "string") totalTextLen += st.text.length;
+      if (Array.isArray(st?.items)) totalItemCount += st.items.length;
+    }
+    const timelineSig = [
+      timelineKey,
+      isMaster ? "1" : "0",
+      agent.name || "",
+      agent.stateKind || "",
+      agent.stateLabel || "",
+      agent.progress ?? "",
+      session.project || "",
+      session.name || "",
+      journey.brief || "",
+      journey.duration || "",
+      journey.foot || "",
+      steps.length,
+      totalTextLen,
+      totalItemCount,
+      lastStep?.type || "",
+      lastStep?.id || "",
+      lastStep?.statusTag || "",
+      lastStep?.progressPct ?? "",
+      lastStep?.text || "",
+      Array.isArray(lastStep?.images) ? lastStep.images.length : 0,
+      Array.isArray(lastStep?.items) ? lastStep.items.length : 0,
+    ].join("|");
+
+    if (preserveScroll && timelineKey === lastRenderedTimelineKey && timelineSig === lastRenderedTimelineSig) {
+      return;
+    }
+
     if (madRoleBadgeEl) {
       madRoleBadgeEl.textContent = isMaster ? "主 Agent" : "次 Agent";
       madRoleBadgeEl.className = `mad-role-badge${isMaster ? "" : " is-sub"}`;
@@ -2109,33 +2287,6 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     }
     if (madDurationEl) {
       madDurationEl.textContent = `${journey.duration || ""} · 进度 ${agent.progress}%`;
-    }
-
-    const steps =
-      Array.isArray(journey.steps) && journey.steps.length > 0
-        ? journey.steps
-        : [{ type: "msg", text: agent.task || "等待下一步输出…" }];
-
-    const timelineKey = `${session.id}:${agent.id}`;
-    const lastStep = steps[steps.length - 1];
-    const timelineSig = [
-      timelineKey,
-      agent.stateKind || "",
-      journey.brief || "",
-      journey.duration || "",
-      journey.foot || "",
-      steps.length,
-      lastStep?.type || "",
-      lastStep?.id || "",
-      lastStep?.statusTag || "",
-      lastStep?.progressPct ?? "",
-      lastStep?.text || "",
-      Array.isArray(lastStep?.images) ? lastStep.images.length : 0,
-      Array.isArray(lastStep?.items) ? lastStep.items.length : 0,
-    ].join("|");
-
-    if (preserveScroll && timelineKey === lastRenderedTimelineKey && timelineSig === lastRenderedTimelineSig) {
-      return;
     }
 
     const prevScrollTop = Number(madTimelineEl.scrollTop || 0);
@@ -2439,17 +2590,24 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
   };
 
   const bindNodeInteraction = (btn, agent, isMaster, session) => {
+    const agentId = agent.id;
     btn.title = `点击查看「${agent.name}」的执行历程`;
-    btn.addEventListener("click", () => openAgentDetail(agent, isMaster, session));
+    btn.addEventListener("click", () => {
+      const liveSession = activeDetailSession || session;
+      const liveAgent = isMaster
+        ? liveSession?.master || agent
+        : (liveSession?.subs || []).find((sub) => sub.id === agentId) || agent;
+      openAgentDetail(liveAgent, isMaster, liveSession);
+    });
     btn.addEventListener("mouseenter", () => {
-      hoveredAgentId = agent.id;
+      hoveredAgentId = agentId;
       updateEdgeFocus();
     });
     btn.addEventListener("mouseleave", () => {
       hoveredAgentId = null;
       updateEdgeFocus();
     });
-    nodeElMap.set(agent.id, btn);
+    nodeElMap.set(agentId, btn);
   };
 
   const createMasterNodeEl = (master, session) => {
@@ -2633,8 +2791,11 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     const allowConfigHydrate =
       configSaveInFlight === 0 && (reqCfgSeq === null || reqCfgSeq === configMutationSeq);
     if (snap.config && allowConfigHydrate) {
+      const nextConfigSig = buildConfigSignature(snap.config);
       configState = snap.config;
-      renderConfigRow();
+      if (nextConfigSig !== lastRenderedConfigSig) {
+        renderConfigRow();
+      }
     }
     const allowFavoriteHydrate =
       favoriteSaveInFlight === 0 && (reqFavSeq === null || reqFavSeq === favoriteMutationSeq);
@@ -2659,181 +2820,201 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
     const unreadCount = Number(snap.unreadCount || 0);
     const favCount = sessions.filter((item) => Boolean(item.isFavorite)).length;
 
-    if (totalCountEl) totalCountEl.textContent = String(sessions.length);
-    if (summaryEl) {
-      if (favCount > 0) {
-        summaryEl.textContent =
-          activeCount > 0 || unreadCount > 0
-            ? `${favCount} 常用置顶 · ${activeCount} 运行中 · ${unreadCount} 任务结束未读`
-            : `${favCount} 常用置顶 · 无运行中/未读`;
-      } else {
-        summaryEl.textContent = snap.isFallbackRecent
-          ? `当前无活动/未读 · 显示最近 ${sessions.length} 条会话`
-          : `${activeCount} 运行中 · ${unreadCount} 任务结束未读`;
+    const nextListSig = buildSessionsListSignature(
+      sessions,
+      selectedSessionId,
+      activeCount,
+      unreadCount,
+      snap.isFallbackRecent
+    );
+    if (nextListSig !== lastRenderedListSig) {
+      lastRenderedListSig = nextListSig;
+      if (totalCountEl) totalCountEl.textContent = String(sessions.length);
+      if (summaryEl) {
+        if (favCount > 0) {
+          summaryEl.textContent =
+            activeCount > 0 || unreadCount > 0
+              ? `${favCount} 常用置顶 · ${activeCount} 运行中 · ${unreadCount} 任务结束未读`
+              : `${favCount} 常用置顶 · 无运行中/未读`;
+        } else {
+          summaryEl.textContent = snap.isFallbackRecent
+            ? `当前无活动/未读 · 显示最近 ${sessions.length} 条会话`
+            : `${activeCount} 运行中 · ${unreadCount} 任务结束未读`;
+        }
       }
-    }
 
-    if (listEl) {
-      listEl.textContent = "";
-      if (sessions.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "mastery-empty-tip";
-        empty.textContent = "暂无可追踪会话，发起任意对话后将自动显示";
-        listEl.appendChild(empty);
-      } else {
-        const hasNonFav = sessions.some((item) => !item.isFavorite);
-        let lastFavIndex = -1;
-        if (hasNonFav) {
-          sessions.forEach((item, idx) => {
-            if (item.isFavorite) lastFavIndex = idx;
+      if (listEl) {
+        listEl.textContent = "";
+        if (sessions.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "mastery-empty-tip";
+          empty.textContent = "暂无可追踪会话，发起任意对话后将自动显示";
+          listEl.appendChild(empty);
+        } else {
+          const hasNonFav = sessions.some((item) => !item.isFavorite);
+          let lastFavIndex = -1;
+          if (hasNonFav) {
+            sessions.forEach((item, idx) => {
+              if (item.isFavorite) lastFavIndex = idx;
+            });
+          }
+
+          sessions.forEach((s, idx) => {
+            const isSelected = s.id === selectedSessionId;
+            const isFav = Boolean(s.isFavorite);
+            const isFavDivider = idx === lastFavIndex;
+            const rowStatus = s.status === "active" ? "active" : s.status === "done" || s.isRead ? "done" : "unread";
+            const rowMod = `is-${rowStatus}`;
+
+            const row = document.createElement("div");
+            row.className = `mv-f-row ${rowMod}${isSelected ? " is-selected" : ""}${isFav ? " is-favorite" : ""}${isFavDivider ? " is-fav-divider" : ""}`;
+            row.setAttribute("role", "option");
+            row.setAttribute("tabindex", "0");
+            row.setAttribute("aria-selected", String(isSelected));
+            row.title = `${isFav ? "★ 常用置顶 · " : ""}${s.project} / ${s.name} · ${s.tag} (主 Agent 进度 ${s.progress}%)`;
+
+            const lamp = document.createElement("span");
+            lamp.className = `mv-f-lamp ${rowMod}`;
+
+            const favBtn = document.createElement("button");
+            favBtn.type = "button";
+            favBtn.className = `mv-f-fav-btn${isFav ? " is-favorited" : ""}`;
+            favBtn.setAttribute("aria-label", isFav ? "取消常用会话" : "设为常用会话并置顶");
+            favBtn.setAttribute("aria-pressed", String(isFav));
+            favBtn.title = isFav ? "点击取消常用会话" : "点击设为常用会话（始终置顶）";
+            favBtn.appendChild(buildStarIconSvg(isFav));
+            favBtn.addEventListener("click", (e) => {
+              e.stopPropagation();
+              void toggleFavoriteSession(s);
+            });
+
+            const subCount = document.createElement("span");
+            subCount.className = `mv-f-subcount${s.subAgentCount === 0 ? " is-zero" : ""}`;
+            subCount.textContent = String(s.subAgentCount || 0);
+            subCount.title =
+              s.subAgentCount > 0
+                ? `当前运行中子 Agent：${s.subAgentCount} 个`
+                : "当前无运行中的子 Agent";
+
+            const proj = document.createElement("span");
+            proj.className = "mv-f-proj";
+            proj.textContent = `[${s.project}]`;
+
+            const name = document.createElement("span");
+            name.className = "mv-f-name";
+            name.textContent = s.name;
+
+            const status = document.createElement("span");
+            status.className = `mv-f-status${rowStatus === "active" ? "" : ` ${rowMod}`}`;
+            status.textContent = s.tag;
+
+            const ring = createProgressRing(s.progress, rowStatus, 15);
+
+            const cursor = document.createElement("span");
+            cursor.className = "mv-f-cursor";
+            cursor.textContent = isSelected ? "◀" : "";
+
+            row.appendChild(lamp);
+            row.appendChild(favBtn);
+            row.appendChild(subCount);
+            row.appendChild(proj);
+            row.appendChild(name);
+            row.appendChild(status);
+            row.appendChild(ring);
+            row.appendChild(cursor);
+
+            const selectRow = () => {
+              if (selectedSessionId === s.id && !detailAgentKey) return;
+              selectionSeq += 1;
+              selectedSessionId = s.id;
+              hoveredAgentId = null;
+              if (detailAgentKey) closeAgentDetail();
+              void refreshMastery({ force: true });
+            };
+
+            row.addEventListener("click", selectRow);
+            row.addEventListener("keydown", (e) => {
+              if (e.target && e.target.closest?.(".mv-f-fav-btn")) return;
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                selectRow();
+              }
+            });
+
+            listEl.appendChild(row);
           });
         }
-
-        sessions.forEach((s, idx) => {
-          const isSelected = s.id === selectedSessionId;
-          const isFav = Boolean(s.isFavorite);
-          const isFavDivider = idx === lastFavIndex;
-          const rowStatus = s.status === "active" ? "active" : s.status === "done" || s.isRead ? "done" : "unread";
-          const rowMod = `is-${rowStatus}`;
-
-          const row = document.createElement("div");
-          row.className = `mv-f-row ${rowMod}${isSelected ? " is-selected" : ""}${isFav ? " is-favorite" : ""}${isFavDivider ? " is-fav-divider" : ""}`;
-          row.setAttribute("role", "option");
-          row.setAttribute("tabindex", "0");
-          row.setAttribute("aria-selected", String(isSelected));
-          row.title = `${isFav ? "★ 常用置顶 · " : ""}${s.project} / ${s.name} · ${s.tag} (主 Agent 进度 ${s.progress}%)`;
-
-          const lamp = document.createElement("span");
-          lamp.className = `mv-f-lamp ${rowMod}`;
-
-          const favBtn = document.createElement("button");
-          favBtn.type = "button";
-          favBtn.className = `mv-f-fav-btn${isFav ? " is-favorited" : ""}`;
-          favBtn.setAttribute("aria-label", isFav ? "取消常用会话" : "设为常用会话并置顶");
-          favBtn.setAttribute("aria-pressed", String(isFav));
-          favBtn.title = isFav ? "点击取消常用会话" : "点击设为常用会话（始终置顶）";
-          favBtn.appendChild(buildStarIconSvg(isFav));
-          favBtn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            void toggleFavoriteSession(s);
-          });
-
-          const subCount = document.createElement("span");
-          subCount.className = `mv-f-subcount${s.subAgentCount === 0 ? " is-zero" : ""}`;
-          subCount.textContent = String(s.subAgentCount || 0);
-          subCount.title =
-            s.subAgentCount > 0
-              ? `当前运行中子 Agent：${s.subAgentCount} 个`
-              : "当前无运行中的子 Agent";
-
-          const proj = document.createElement("span");
-          proj.className = "mv-f-proj";
-          proj.textContent = `[${s.project}]`;
-
-          const name = document.createElement("span");
-          name.className = "mv-f-name";
-          name.textContent = s.name;
-
-          const status = document.createElement("span");
-          status.className = `mv-f-status${rowStatus === "active" ? "" : ` ${rowMod}`}`;
-          status.textContent = s.tag;
-
-          const ring = createProgressRing(s.progress, rowStatus, 15);
-
-          const cursor = document.createElement("span");
-          cursor.className = "mv-f-cursor";
-          cursor.textContent = isSelected ? "◀" : "";
-
-          row.appendChild(lamp);
-          row.appendChild(favBtn);
-          row.appendChild(subCount);
-          row.appendChild(proj);
-          row.appendChild(name);
-          row.appendChild(status);
-          row.appendChild(ring);
-          row.appendChild(cursor);
-
-          const selectRow = () => {
-            if (selectedSessionId === s.id && !detailAgentKey) return;
-            selectionSeq += 1;
-            selectedSessionId = s.id;
-            hoveredAgentId = null;
-            if (detailAgentKey) closeAgentDetail();
-            void refreshMastery({ force: true });
-          };
-
-          row.addEventListener("click", selectRow);
-          row.addEventListener("keydown", (e) => {
-            if (e.target && e.target.closest?.(".mv-f-fav-btn")) return;
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              selectRow();
-            }
-          });
-
-          listEl.appendChild(row);
-        });
       }
     }
 
     const session = snap.detailSession;
     activeDetailSession = session || null;
+    const nextGraphSig = buildWorkspaceGraphSignature(session);
+    const graphChanged = nextGraphSig !== lastRenderedGraphSig;
+
     if (!session) {
-      if (overviewPctEl) overviewPctEl.textContent = "0%";
-      if (overviewSummaryEl) overviewSummaryEl.textContent = "等待活动会话";
-      if (overviewJumpBtn) overviewJumpBtn.hidden = true;
-      if (madJumpSessionBtn) madJumpSessionBtn.hidden = true;
-      if (totalFillBarEl) totalFillBarEl.style.width = "0%";
-      if (overviewGoalEl) overviewGoalEl.textContent = "";
-      if (colMasterEl) colMasterEl.textContent = "";
-      if (colSubsEl) colSubsEl.textContent = "";
-      if (graphSvgEl) graphSvgEl.textContent = "";
+      if (graphChanged) {
+        lastRenderedGraphSig = nextGraphSig;
+        if (overviewPctEl) overviewPctEl.textContent = "0%";
+        if (overviewSummaryEl) overviewSummaryEl.textContent = "等待活动会话";
+        if (overviewJumpBtn) overviewJumpBtn.hidden = true;
+        if (madJumpSessionBtn) madJumpSessionBtn.hidden = true;
+        if (totalFillBarEl) totalFillBarEl.style.width = "0%";
+        if (overviewGoalEl) overviewGoalEl.textContent = "";
+        if (colMasterEl) colMasterEl.textContent = "";
+        if (colSubsEl) colSubsEl.textContent = "";
+        if (graphSvgEl) graphSvgEl.textContent = "";
+        nodeElMap.clear();
+      }
       return;
     }
 
-    const isDone = session.status === "done" || Boolean(session.isRead);
-    const isUnread = session.status !== "active" && !isDone;
-    const masterProgress = session.master ? session.master.progress : session.progress;
+    if (graphChanged) {
+      lastRenderedGraphSig = nextGraphSig;
+      const isDone = session.status === "done" || Boolean(session.isRead);
+      const isUnread = session.status !== "active" && !isDone;
+      const masterProgress = session.master ? session.master.progress : session.progress;
 
-    if (overviewPctEl) {
-      overviewPctEl.textContent = `${masterProgress}%`;
-      overviewPctEl.classList.toggle("is-unread", isUnread);
-      overviewPctEl.classList.toggle("is-done", isDone);
-    }
-    if (overviewSummaryEl) {
-      overviewSummaryEl.textContent = session.summaryText || "";
-    }
-    if (overviewJumpBtn) {
-      overviewJumpBtn.hidden = !session.id;
-      overviewJumpBtn.title = `在 Antigravity 中跳转到会话：[${session.project}] ${session.name}`;
-    }
-    if (totalFillBarEl) {
-      totalFillBarEl.style.width = `${masterProgress}%`;
-      totalFillBarEl.classList.toggle("is-unread", isUnread);
-      totalFillBarEl.classList.toggle("is-done", isDone);
-    }
-    if (overviewGoalEl) {
-      overviewGoalEl.textContent = `当前目标：${session.goal || session.name}`;
-      overviewGoalEl.title = session.goal || session.name;
-    }
-
-    nodeElMap.clear();
-    if (colMasterEl) {
-      colMasterEl.textContent = "";
-      if (session.master) {
-        colMasterEl.appendChild(createMasterNodeEl(session.master, session));
+      if (overviewPctEl) {
+        overviewPctEl.textContent = `${masterProgress}%`;
+        overviewPctEl.classList.toggle("is-unread", isUnread);
+        overviewPctEl.classList.toggle("is-done", isDone);
       }
-    }
-    if (colSubsEl) {
-      colSubsEl.textContent = "";
-      const subs = Array.isArray(session.subs) ? session.subs : [];
-      if (subs.length === 0) {
-        const solo = document.createElement("div");
-        solo.className = "mastery-solo-note";
-        solo.textContent = "当前为单 Agent 独立执行（无派生子 Agent），点击左侧「主 Agent」查看完整类 Codex 历程";
-        colSubsEl.appendChild(solo);
-      } else {
-        subs.forEach((sub) => colSubsEl.appendChild(createSubNodeEl(sub, session)));
+      if (overviewSummaryEl) {
+        overviewSummaryEl.textContent = session.summaryText || "";
+      }
+      if (overviewJumpBtn) {
+        overviewJumpBtn.hidden = !session.id;
+        overviewJumpBtn.title = `在 Antigravity 中跳转到会话：[${session.project}] ${session.name}`;
+      }
+      if (totalFillBarEl) {
+        totalFillBarEl.style.width = `${masterProgress}%`;
+        totalFillBarEl.classList.toggle("is-unread", isUnread);
+        totalFillBarEl.classList.toggle("is-done", isDone);
+      }
+      if (overviewGoalEl) {
+        overviewGoalEl.textContent = `当前目标：${session.goal || session.name}`;
+        overviewGoalEl.title = session.goal || session.name;
+      }
+
+      nodeElMap.clear();
+      if (colMasterEl) {
+        colMasterEl.textContent = "";
+        if (session.master) {
+          colMasterEl.appendChild(createMasterNodeEl(session.master, session));
+        }
+      }
+      if (colSubsEl) {
+        colSubsEl.textContent = "";
+        const subs = Array.isArray(session.subs) ? session.subs : [];
+        if (subs.length === 0) {
+          const solo = document.createElement("div");
+          solo.className = "mastery-solo-note";
+          solo.textContent = "当前为单 Agent 独立执行（无派生子 Agent），点击左侧「主 Agent」查看完整类 Codex 历程";
+          colSubsEl.appendChild(solo);
+        } else {
+          subs.forEach((sub) => colSubsEl.appendChild(createSubNodeEl(sub, session)));
+        }
       }
     }
 
@@ -2849,7 +3030,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
           preserveScroll: true,
         });
       }
-    } else if (typeof requestAnimationFrame === "function") {
+    } else if (graphChanged && typeof requestAnimationFrame === "function") {
       requestAnimationFrame(() => drawGraphEdges());
     }
   };
@@ -3450,6 +3631,7 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
 
   return {
     setTabActive(active) {
+      const wasActive = tabActive;
       tabActive = Boolean(active);
       if (tabActive) {
         void refreshMastery();
@@ -3459,12 +3641,35 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
         }
       } else {
         stopPolling();
+        if (wasActive) {
+          clearLocalImageCache();
+        }
       }
     },
     refresh(opts) {
       if (tabActive) {
-        void refreshMastery(opts);
+        return refreshMastery(opts);
       }
+      return undefined;
+    },
+    loadLocalImage,
+    clearImageCache(opts) {
+      clearLocalImageCache(opts);
+    },
+    getCacheStats() {
+      return {
+        imageCacheSize: localImageUrlCache.size,
+        imageCacheMax: LOCAL_IMAGE_CACHE_MAX,
+        imageCacheKeys: Array.from(localImageUrlCache.keys()),
+        composerDraftCount: composerDraftBySession.size,
+        composerDraftMax: COMPOSER_DRAFT_MAX_SESSIONS,
+        composerDraftKeys: Array.from(composerDraftBySession.keys()),
+        composerDrafts: Array.from(composerDraftBySession.entries()).map(([id, d]) => ({
+          id,
+          text: d.text,
+          attachments: d.attachments,
+        })),
+      };
     },
     setTranslator() {},
     destroy() {
@@ -3474,15 +3679,9 @@ export function createMasteryHub({ apiFetch, onSelectConversation, onFavoritesCh
       resizeObserver?.disconnect?.();
       cleanups.forEach((fn) => fn());
       cleanups.length = 0;
-      localImageUrlCache.clear();
-      if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
-        createdObjectUrls.forEach((u) => {
-          try {
-            URL.revokeObjectURL(u);
-          } catch {}
-        });
-      }
-      createdObjectUrls.clear();
+      clearLocalImageCache();
+      composerDraftBySession.clear();
+      composerAttachments = [];
     },
   };
 }

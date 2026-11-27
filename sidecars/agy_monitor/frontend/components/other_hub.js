@@ -46,7 +46,7 @@ async function copyTextSafe(text) {
   }
 }
 
-export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onToast } = {}) {
+export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onLiteModeChange, onToast } = {}) {
   const toggleInput = document.getElementById("otherQuotaToggle");
   const statusBadgeEl = document.getElementById("otherQuotaStatusBadge");
   const channelValEl = document.getElementById("otherQuotaChannelVal");
@@ -57,15 +57,22 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onToast } = 
   const slCopyBtn = document.getElementById("otherStatusLineCopyBtn");
   const slCmdInput = document.getElementById("otherStatusLineCmdInput");
   const quotaCardEl = document.getElementById("otherQuotaMasterCard");
+  const liteCardEl = document.getElementById("otherLiteModeCard");
+  const liteToggleInput = document.getElementById("otherLiteModeToggle");
+  const liteBadgeEl = document.getElementById("otherLiteModeBadge");
+  const liteEffectValEl = document.getElementById("otherLiteEffectVal");
+  const liteCostValEl = document.getElementById("otherLiteCostVal");
 
   let translator = t;
   let busyToggle = false;
+  let busyLite = false;
   let busySl = false;
   let destroyed = false;
   const cleanups = [];
 
   const state = {
     quotaQueryEnabled: true,
+    liteMode: false,
     compliance: {
       quotaQueryEnabled: true,
       activeSource: "official_local_ls",
@@ -172,6 +179,33 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onToast } = 
     if (slCopyBtn) {
       slCopyBtn.disabled = !slashCmd;
     }
+
+    const liteEnabled = Boolean(state.liteMode);
+    if (liteToggleInput) {
+      liteToggleInput.checked = liteEnabled;
+      liteToggleInput.disabled = busyLite;
+      liteToggleInput.setAttribute("aria-checked", String(liteEnabled));
+    }
+    if (liteCardEl) {
+      liteCardEl.classList.toggle("is-lite-active", liteEnabled);
+    }
+    if (liteBadgeEl) {
+      liteBadgeEl.className = `other-status-pill ${liteEnabled ? "is-on" : "is-muted"}`;
+      liteBadgeEl.textContent = liteEnabled
+        ? tr("other.liteBadgeOn", "已开启 · 省显存")
+        : tr("other.liteBadgeOff", "已关闭 · 标准视觉");
+    }
+    if (liteEffectValEl) {
+      liteEffectValEl.textContent = liteEnabled
+        ? tr("other.liteEffectOn", "已关闭模糊与装饰动效")
+        : tr("other.liteEffectOff", "完整毛玻璃与动效");
+    }
+    if (liteCostValEl) {
+      liteCostValEl.className = `other-meta-value${liteEnabled ? " is-safe" : ""}`;
+      liteCostValEl.textContent = liteEnabled
+        ? tr("other.liteCostOn", "低显存合成已激活")
+        : tr("other.liteCostOff", "未启用（默认画质）");
+    }
   }
 
   async function handleToggleQuota() {
@@ -253,10 +287,46 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onToast } = 
     );
   }
 
+  async function handleToggleLiteMode() {
+    if (!liteToggleInput || busyLite || destroyed) return;
+    const nextEnabled = Boolean(liteToggleInput.checked);
+    busyLite = true;
+    render();
+
+    try {
+      const res = await requestJson("/api/preferences/lite-mode", {
+        method: "POST",
+        body: JSON.stringify({ enabled: nextEnabled }),
+      });
+      if (destroyed) return;
+      state.liteMode = Boolean(res?.liteMode ?? nextEnabled);
+      onLiteModeChange?.(state.liteMode);
+      onToast?.(
+        state.liteMode
+          ? tr("other.toastLiteEnabled", "已开启轻量省显存模式，侧边栏与宿主已同步降耗")
+          : tr("other.toastLiteDisabled", "已关闭轻量省显存模式，恢复完整视觉效果"),
+        "success"
+      );
+    } catch (err) {
+      if (destroyed) return;
+      // Roll back checkbox to persisted state
+      render();
+      onToast?.(err?.message || tr("other.toastLiteFailed", "切换轻量省显存模式失败"), "error");
+    } finally {
+      busyLite = false;
+      render();
+    }
+  }
+
   if (toggleInput) {
     const onChange = () => void handleToggleQuota();
     toggleInput.addEventListener("change", onChange);
     cleanups.push(() => toggleInput.removeEventListener("change", onChange));
+  }
+  if (liteToggleInput) {
+    const onLiteChange = () => void handleToggleLiteMode();
+    liteToggleInput.addEventListener("change", onLiteChange);
+    cleanups.push(() => liteToggleInput.removeEventListener("change", onLiteChange));
   }
   if (slInstallBtn) {
     const onInstallClick = () => void handleStatusLineToggle();
@@ -280,6 +350,7 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onToast } = 
       if (prefs.quotaCompliance && typeof prefs.quotaCompliance === "object") {
         state.compliance = prefs.quotaCompliance;
       }
+      state.liteMode = Boolean(prefs.liteMode);
       render();
     },
     setQuotaEnabled(enabled, compliance = null) {
@@ -287,6 +358,10 @@ export function createOtherHub({ apiFetch, t, onQuotaEnabledChange, onToast } = 
       if (compliance && typeof compliance === "object") {
         state.compliance = compliance;
       }
+      render();
+    },
+    setLiteMode(enabled) {
+      state.liteMode = Boolean(enabled);
       render();
     },
     setTranslator(nextT) {

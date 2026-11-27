@@ -1124,6 +1124,48 @@
             </div>
           </section>
 
+          <!-- 模块二：轻量省显存模式（可选开关，默认关闭） -->
+          <section class="other-card" id="otherLiteModeCard" aria-label="轻量省显存模式" data-i18n-aria="other.liteAriaLabel">
+            <div class="other-card-head">
+              <div class="other-card-title-group">
+                <span class="other-card-title" data-i18n="other.liteTitle">轻量省显存模式</span>
+                <span class="other-card-sub" data-i18n="other.liteSub">默认关闭 · 禁用毛玻璃模糊、壁纸遮罩与装饰动效，降低显存与内存占用</span>
+              </div>
+              <div class="other-card-controls">
+                <span class="other-status-pill is-muted" id="otherLiteModeBadge" data-i18n="other.liteBadgeOff">已关闭 · 标准视觉</span>
+                <label class="other-switch">
+                  <input
+                    type="checkbox"
+                    id="otherLiteModeToggle"
+                    aria-checked="false"
+                    aria-label="开启或关闭轻量省显存模式"
+                    data-i18n-aria="other.liteToggleAria"
+                  />
+                  <span class="other-switch-slider" aria-hidden="true"></span>
+                </label>
+              </div>
+            </div>
+
+            <p class="other-card-desc" data-i18n="other.liteDesc">
+              开启后将同步关闭侧边栏与 Antigravity 宿主窗口中的 backdrop-filter 毛玻璃模糊、粘贴壁纸遮罩以及非必要装饰动效，替换为清爽高不透明实色表面，显著降低 GPU 显存与 RAM 占用；关闭后即刻恢复完整视觉质感。
+            </p>
+
+            <div class="other-meta-grid">
+              <div class="other-meta-item">
+                <span class="other-meta-label" data-i18n="other.liteEffectLabel">视觉策略</span>
+                <span class="other-meta-value" id="otherLiteEffectVal" data-i18n="other.liteEffectOff">完整毛玻璃与动效</span>
+              </div>
+              <div class="other-meta-item">
+                <span class="other-meta-label" data-i18n="other.liteScopeLabel">生效范围</span>
+                <span class="other-meta-value" id="otherLiteScopeVal" data-i18n="other.liteScopeVal">侧边栏面板 · Antigravity 宿主</span>
+              </div>
+              <div class="other-meta-item">
+                <span class="other-meta-label" data-i18n="other.liteCostLabel">显存优化</span>
+                <span class="other-meta-value" id="otherLiteCostVal" data-i18n="other.liteCostOff">未启用（默认画质）</span>
+              </div>
+            </div>
+          </section>
+
           <!-- 模块二：官方 Antigravity CLI statusLine 零请求桥接 -->
           <section class="other-card" aria-label="官方 CLI statusLine 回调配置">
             <div class="other-card-head">

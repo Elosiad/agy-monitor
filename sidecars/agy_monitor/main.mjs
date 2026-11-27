@@ -2,17 +2,17 @@
  * Antigravity Monitor Sidecar entry point.
  *
  * Hosts the AUX_PANE Web UI, serves verified static/image assets, isolates
- * JSONL transcript indexing in a background scan_worker child process, and
+ * JSONL transcript indexing in a background scan_worker worker thread, and
  * delegates persistence/telemetry/security logic to backend/* modules.
  */
 
-import { fork } from 'node:child_process';
 import crypto from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 
 import {
   applyRulesPreset,
@@ -26,7 +26,9 @@ import {
   getBackdropStatus,
   restoreHostOpacityFallback,
 } from './backend/backdrop_manager.mjs';
+import * as cdpBridgeMod from './backend/cdp_theme_bridge.mjs';
 import { createCdpThemeBridge, ensureCdpLauncher } from './backend/cdp_theme_bridge.mjs';
+import * as hudInjectorMod from './backend/hud_injector.mjs';
 import {
   inspectNativeHudState,
   installNativeHud,
@@ -39,6 +41,7 @@ import { buildFrontendBundle } from './backend/bundle_builder.mjs';
 import {
   buildMasterySnapshot,
   openLocalPathTarget,
+  pruneCompactProgressCache,
   queryCompactSessionProgress,
   resolveLocalTargetPath,
 } from './backend/mastery.mjs';
@@ -612,7 +615,7 @@ async function readPinnedBubbleSessionIds(paths) {
   }
 }
 
-function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient = null) {
+export function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient = null) {
   let lastSig = '';
   let inFlight = false;
   let queued = false;
@@ -620,8 +623,8 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
   let lastHostConvAtMs = 0;
   let lastQuotaSnapshot = null;
   let lastSessionProgress = [];
-  let lastProgressCacheKey = '';
-  let lastProgressAtMs = 0;
+  const progressCacheByConvId = new Map();
+  let lastProgressCandidateIds = new Set();
   let lastWrittenTelemetry = null;
   let lastWrittenOpts = null;
 
@@ -650,24 +653,42 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
 
   const resolveSessionProgress = async (sessionsHub) => {
     const extraIds = await readPinnedBubbleSessionIds(paths);
-    const keyParts = [
-      ...(sessionsHub?.active || []).map((s) => `a:${s.id}:${s.modifiedMs || 0}`),
-      ...(sessionsHub?.waiting || []).map((s) => `w:${s.id}:${s.modifiedMs || 0}`),
-      ...(sessionsHub?.unread || []).map((s) => `u:${s.id}:${s.modifiedMs || 0}`),
-      ...extraIds.map((id) => `p:${id}`),
-    ];
-    const cacheKey = keyParts.join('|');
-    const now = Date.now();
-    if (cacheKey === lastProgressCacheKey && now - lastProgressAtMs < 1500) {
-      return lastSessionProgress;
+    const candidateIds = new Set();
+    for (const list of [sessionsHub?.active, sessionsHub?.waiting, sessionsHub?.unread]) {
+      if (!Array.isArray(list)) continue;
+      for (const s of list) {
+        if (s?.id) candidateIds.add(String(s.id));
+      }
     }
-    const next = await queryCompactSessionProgress(paths, sessionsHub, { extraIds, maxItems: 16, nowMs: now }).catch(
-      () => lastSessionProgress,
-    );
+    for (const id of extraIds) {
+      if (id) candidateIds.add(String(id));
+    }
+    lastProgressCandidateIds = candidateIds;
+
+    const now = Date.now();
+    const next = await queryCompactSessionProgress(paths, sessionsHub, {
+      extraIds,
+      maxItems: 16,
+      nowMs: now,
+      cache: progressCacheByConvId,
+      maxCacheEntries: 64,
+    }).catch(() => lastSessionProgress);
     lastSessionProgress = Array.isArray(next) ? next : [];
-    lastProgressCacheKey = cacheKey;
-    lastProgressAtMs = now;
     return lastSessionProgress;
+  };
+
+  const pruneProgressCache = ({ clearAll = false, nowMs = Date.now() } = {}) => {
+    if (clearAll) {
+      const removed = progressCacheByConvId.size;
+      progressCacheByConvId.clear();
+      return removed;
+    }
+    return pruneCompactProgressCache(progressCacheByConvId, {
+      keepIds: lastProgressCandidateIds,
+      maxEntries: 64,
+      maxAgeMs: 5 * 60_000,
+      nowMs,
+    });
   };
 
   let writeChain = Promise.resolve();
@@ -695,6 +716,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
       const rt = forceEmpty ? {} : (telemetry?.runtimeTelemetry || {});
       const prefsForHud = await store?.getPrefs?.().catch(() => null);
       const quotaQueryEnabled = prefsForHud?.quotaQueryEnabled !== false;
+      const liteMode = Boolean(prefsForHud?.liteMode);
       const cap = Number(pie.windowCap) || Number(prefsForHud?.windowCap) || 512000;
       const used = forceEmpty ? 0 : Math.max(0, Math.round(Number(pie.totalUsed) || 0));
       const percent = cap > 0 ? Math.max(0, Math.round((used / cap) * 100)) : 0;
@@ -768,6 +790,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
         unreadSessionCount: lastUnreadSessionCount,
         agentState,
         quotaQueryEnabled,
+        liteMode,
         quotaGemini5h,
         quotaGeminiWeekly,
         quotaClaude5h,
@@ -794,7 +817,7 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
         .map((s) => `${s.id}:${s.status}:${s.progress}:${s.content}`)
         .join(',');
       const quotaSig = `${quotaQueryEnabled ? 1 : 0}:${quotaGemini5h ?? ''}:${q?.gemini5hResetMs ?? ''}:${quotaGeminiWeekly ?? ''}:${q?.geminiWeeklyResetMs ?? ''}:${quotaClaude5h ?? ''}:${q?.claude5hResetMs ?? ''}:${quotaClaudeWeekly ?? ''}:${q?.claudeWeeklyResetMs ?? ''}`;
-      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${spSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
+      const sig = `${activeConvId}|${percent}|${used}|${cap}|${tokPerSec ?? ''}|${latestInputTokens}|${latestOutputTokens}|${latestStepAtMs}|${cacheHitPct ?? ''}|${upstreamModelId}|${upstreamModelStatus}|${lastActiveSessionCount}|${lastUnreadSessionCount}|${quotaSig}|${liteMode ? 1 : 0}|${spSig}|${payload.cdpHudActive ? 1 : 0}|${sessionsSig}`;
       if (sig === lastSig) return;
 
       try {
@@ -929,6 +952,73 @@ function createHudTelemetryPublisher(paths, store, cdpBridge = null, quotaClient
     getQuotaSnapshot,
     resolveSessionProgress,
     getSessionProgressSnapshot,
+    pruneProgressCache,
+    getProgressCacheSize: () => progressCacheByConvId.size,
+  };
+}
+
+async function collectKnownBrainConvIds(brainDir) {
+  if (!brainDir) return null;
+  try {
+    const entries = await fs.readdir(brainDir, { withFileTypes: true });
+    const ids = new Set();
+    for (const ent of entries) {
+      if (ent.isDirectory() && !ent.name.startsWith('.')) {
+        ids.add(ent.name);
+      }
+    }
+    return ids.size > 0 ? ids : null;
+  } catch {
+    return null;
+  }
+}
+
+function createInternalShrinkHandler({
+  paths,
+  store,
+  hud,
+  cdp,
+  accounts,
+  shrinkWorkerMemory,
+  hudInjectorModule = hudInjectorMod,
+  cdpBridgeModule = cdpBridgeMod,
+} = {}) {
+  return async () => {
+    clearTelemetryTransientCaches();
+    try {
+      hudInjectorModule?.clearHudInjectorCaches?.();
+    } catch {
+      // Ignore optional HUD injector cache-clear error
+    }
+    try {
+      cdpBridgeModule?.clearCdpBridgeCaches?.();
+      cdp?.clearCaches?.();
+    } catch {
+      // Ignore optional CDP bridge cache-clear error
+    }
+    try {
+      hud?.pruneProgressCache?.();
+    } catch {
+      // Ignore progress cache prune error
+    }
+    try {
+      accounts?.pruneTransientCaches?.();
+    } catch {
+      // Ignore accounts cache prune error
+    }
+    try {
+      shrinkWorkerMemory?.();
+    } catch {
+      // Ignore worker shrink error
+    }
+    if (typeof store?.pruneSessionsMeta === 'function') {
+      try {
+        const knownConvIds = await collectKnownBrainConvIds(paths?.brainDir);
+        await store.pruneSessionsMeta({ knownConvIds });
+      } catch {
+        // Non-fatal sessions_meta maintenance error
+      }
+    }
   };
 }
 
@@ -951,6 +1041,8 @@ export function createMonitorHandlers({
   memoryDriver = null,
   getWorkerPid = null,
   shrinkWorkerMemory = null,
+  hudInjectorModule = hudInjectorMod,
+  cdpBridgeModule = cdpBridgeMod,
 } = {}) {
   const resolvedPaths = paths || resolvePaths();
   const store = storage || createStorage(resolvedPaths);
@@ -965,21 +1057,6 @@ export function createMonitorHandlers({
   };
   const quota = quotaClient || createQuotaClient({ paths: resolvedPaths, isEnabled: isQuotaEnabledFn });
   const hud = hudPublisher || createHudTelemetryPublisher(resolvedPaths, store, cdp, quota);
-  const memory =
-    memoryManager ||
-    createMemoryManager({
-      paths: resolvedPaths,
-      storage: store,
-      getExtraPids: () => {
-        const wPid = typeof getWorkerPid === 'function' ? getWorkerPid() : 0;
-        return wPid > 0 ? [process.pid, wPid] : [process.pid];
-      },
-      onShrinkInternal: () => {
-        clearTelemetryTransientCaches();
-        shrinkWorkerMemory?.();
-      },
-      driver: memoryDriver,
-    });
   const accounts =
     accountManager ||
     createAccountManager({
@@ -995,6 +1072,27 @@ export function createMonitorHandlers({
           : [];
       },
       driver: accountDriver,
+    });
+  const memory =
+    memoryManager ||
+    createMemoryManager({
+      paths: resolvedPaths,
+      storage: store,
+      getExtraPids: () => {
+        const wPid = typeof getWorkerPid === 'function' ? getWorkerPid() : 0;
+        return wPid > 0 ? [process.pid, wPid] : [process.pid];
+      },
+      onShrinkInternal: createInternalShrinkHandler({
+        paths: resolvedPaths,
+        store,
+        hud,
+        cdp,
+        accounts,
+        shrinkWorkerMemory,
+        hudInjectorModule,
+        cdpBridgeModule,
+      }),
+      driver: memoryDriver,
     });
   const masterySummarizer = createMasterySummarizer(resolvedPaths, store);
   const consoleViewports = new Map();
@@ -1260,7 +1358,9 @@ export function createMonitorHandlers({
       return { unchanged: true, etag };
     }
 
-    const quotaQueryEnabled = await isQuotaEnabledFn();
+    const snapPrefs = await store.getPrefs().catch(() => null);
+    const quotaQueryEnabled = snapPrefs ? snapPrefs.quotaQueryEnabled !== false : await isQuotaEnabledFn();
+    const liteMode = Boolean(snapPrefs?.liteMode);
 
     return {
       unchanged: false,
@@ -1273,6 +1373,7 @@ export function createMonitorHandlers({
       sessionProgress,
       runtimeTelemetry: telemetry.runtimeTelemetry,
       quotaQueryEnabled,
+      liteMode,
       quota: quotaQueryEnabled ? (hud.getQuotaSnapshot?.() || null) : null,
       availableModels,
     };
@@ -1391,6 +1492,26 @@ export function createMonitorHandlers({
     };
   });
 
+  register('POST', '/api/preferences/lite-mode', async (data = {}) => {
+    const rawEnabled = data.enabled !== undefined ? data.enabled : data.liteMode;
+    const enabled = rawEnabled === true || rawEnabled === 'true' || rawEnabled === 1;
+    const updatedPrefs = await store.updatePrefs({ liteMode: enabled });
+    const liteMode = Boolean(updatedPrefs.liteMode);
+    const themes = await store.getThemes();
+    const themesWithLite = { ...themes, liteMode };
+    const stageFn = hudInjectorModule?.stageLiveHudAssets || stageLiveHudAssets;
+    await stageFn(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
+    const cdpStatus = await cdp
+      .sync(themesWithLite, { hostLanguage: updatedPrefs.language, liteMode })
+      .catch(() => cdp.getStatus(themesWithLite));
+    void hud.refreshFromDb?.();
+    return {
+      ok: true,
+      liteMode,
+      cdp: cdpStatus,
+    };
+  });
+
   register('POST', '/api/quota/statusline/install', async () => {
     const res = await installOfficialStatusLineHook(resolvedPaths);
     if (!res.ok) {
@@ -1478,6 +1599,7 @@ export function createMonitorHandlers({
       windowCap: prefs.windowCap,
       activePromptId: prefs.activePromptId,
       quotaQueryEnabled,
+      liteMode: Boolean(prefs.liteMode),
       quotaCompliance,
       prompts: [...BUILTIN_PRESETS, ...customPresets],
       themeState: {
@@ -1989,6 +2111,8 @@ export function createMonitorHandlers({
       getBackdropStatus(resolvedPaths, themes),
       inspectNativeHudState(resolvedPaths),
     ]);
+    const liteMode = Boolean(prefs.liteMode);
+    const themesWithLite = { ...themes, liteMode };
     const wantCdp =
       themes.hostThemeMode === 'cdp' ||
       ((themes.hostThemeMode === 'inject' || !themes.hostThemeMode) &&
@@ -1996,8 +2120,8 @@ export function createMonitorHandlers({
         !nativeHud.heartbeat?.wallpaperAlive) ||
       (themes.hudEnabled !== false && themes.hudInjectionMode !== 'uia');
     const cdpStatus = wantCdp
-      ? await cdp.sync(themes, { hostLanguage: prefs.language })
-      : cdp.getStatus(themes);
+      ? await cdp.sync(themesWithLite, { hostLanguage: prefs.language, liteMode })
+      : cdp.getStatus(themesWithLite);
     return {
       ok: true,
       status: {
@@ -2053,12 +2177,20 @@ export function createMonitorHandlers({
       Object.keys(patch).length > 0 ? store.saveThemes(patch) : store.getThemes(),
       store.getPrefs(),
     ]);
-    await stageLiveWallpaperCss(resolvedPaths, themes).catch(() => {});
+    const liteMode = Boolean(prefs.liteMode);
+    const themesWithLite = { ...themes, liteMode };
+    await stageLiveWallpaperCss(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
 
     let actionResult = { ok: true };
     if (action === 'install' || (action === 'config' && themes.hudEnabled !== false && themes.hudInjectionMode === 'asar')) {
-      actionResult = await installNativeHud(resolvedPaths, { force: action === 'install' });
-      const cdpStatus = await cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes));
+      actionResult = await installNativeHud(resolvedPaths, {
+        force: action === 'install',
+        liteMode,
+        themes: themesWithLite,
+      });
+      const cdpStatus = await cdp
+        .sync(themesWithLite, { hostLanguage: prefs.language, liteMode })
+        .catch(() => cdp.getStatus(themesWithLite));
       void hud.refreshFromDb();
       const nativeHud = actionResult.status || (await inspectNativeHudState(resolvedPaths));
       return {
@@ -2076,7 +2208,9 @@ export function createMonitorHandlers({
 
     if (action === 'restore') {
       actionResult = await restoreStockAsar(resolvedPaths);
-      const cdpStatus = await cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes));
+      const cdpStatus = await cdp
+        .sync(themesWithLite, { hostLanguage: prefs.language, liteMode })
+        .catch(() => cdp.getStatus(themesWithLite));
       void hud.refreshFromDb();
       const nativeHud = actionResult.status || (await inspectNativeHudState(resolvedPaths));
       return {
@@ -2092,9 +2226,11 @@ export function createMonitorHandlers({
 
     if (action === 'hot_inject' || action === 'config') {
       if (themes.hudEnabled !== false && themes.hudInjectionMode !== 'uia') {
-        await stageLiveHudAssets(resolvedPaths, themes).catch(() => {});
+        await stageLiveHudAssets(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
       }
-      const cdpStatus = await cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes));
+      const cdpStatus = await cdp
+        .sync(themesWithLite, { hostLanguage: prefs.language, liteMode })
+        .catch(() => cdp.getStatus(themesWithLite));
       const nativeHud = await inspectNativeHudState(resolvedPaths);
       void hud.refreshFromDb();
       return {
@@ -2151,14 +2287,16 @@ export function createMonitorHandlers({
       Object.keys(patch).length > 0 ? store.saveThemes(patch) : store.getThemes(),
       store.getPrefs(),
     ]);
-    await stageLiveWallpaperCss(resolvedPaths, themes).catch(() => {});
+    const liteMode = Boolean(prefs.liteMode);
+    const themesWithLite = { ...themes, liteMode };
+    await stageLiveWallpaperCss(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
 
     let nativeHudResult = null;
     const isInjectMode = themes.hostThemeMode === 'inject' || !themes.hostThemeMode;
     if ((action === 'inject_sync' || isInjectMode) && themes.backdropEnabled) {
       const st = await inspectNativeHudState(resolvedPaths).catch(() => null);
       if (st && st.supported && st.asarExists && (st.state === 'stock' || st.state === 'outdated')) {
-        nativeHudResult = await installNativeHud(resolvedPaths).catch(() => null);
+        nativeHudResult = await installNativeHud(resolvedPaths, { liteMode, themes: themesWithLite }).catch(() => null);
       }
     }
 
@@ -2180,7 +2318,7 @@ export function createMonitorHandlers({
 
     const [result, cdpStatus, nativeHud] = await Promise.all([
       handleCompanion(),
-      cdp.sync(themes, { hostLanguage: prefs.language }),
+      cdp.sync(themesWithLite, { hostLanguage: prefs.language, liteMode }),
       nativeHudResult?.status ? Promise.resolve(nativeHudResult.status) : inspectNativeHudState(resolvedPaths),
     ]);
     void hud.refreshFromDb();
@@ -2213,12 +2351,14 @@ export function createMonitorHandlers({
         themes = created.themes;
       }
 
-      await stageLiveWallpaperCss(resolvedPaths, themes).catch(() => {});
-
       const [prefs, initialBdStatus] = await Promise.all([
         store.getPrefs(),
         getBackdropStatus(resolvedPaths, themes),
       ]);
+      const liteMode = Boolean(prefs.liteMode);
+      const themesWithLite = { ...themes, liteMode };
+      await stageLiveWallpaperCss(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
+
       let backdropStatus = initialBdStatus;
       const wantRunning = Boolean(
         (themes.backdropEnabled && themes.activeWallpaperId && themes.hostThemeMode === 'backdrop') ||
@@ -2232,7 +2372,9 @@ export function createMonitorHandlers({
       }
 
       const [cdpStatus, nativeHud] = await Promise.all([
-        cdp.sync(themes, { hostLanguage: prefs.language }).catch(() => cdp.getStatus(themes)),
+        cdp
+          .sync(themesWithLite, { hostLanguage: prefs.language, liteMode })
+          .catch(() => cdp.getStatus(themesWithLite)),
         inspectNativeHudState(resolvedPaths).catch(() => null),
       ]);
       const seedsPreview = buildHostThemeSeedsPreview(themes.colors);
@@ -2299,8 +2441,11 @@ export function createMonitorHandlers({
         base64: check.base64,
         ...(thumbPayload || {}),
       });
-      await stageLiveWallpaperCss(resolvedPaths, saved.themes).catch(() => {});
-      void store.getPrefs().then((prefs) => cdp.sync(saved.themes, { hostLanguage: prefs.language })).catch(() => {});
+      const prefs = await store.getPrefs().catch(() => ({}));
+      const liteMode = Boolean(prefs?.liteMode);
+      const themesWithLite = { ...saved.themes, liteMode };
+      await stageLiveWallpaperCss(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
+      void cdp.sync(themesWithLite, { hostLanguage: prefs?.language, liteMode }).catch(() => {});
       return { ok: true, wallpaper: saved.wallpaper, themeState: saved.themes };
     } catch (err) {
       return errorResponse(ResponseCtor, mapStorageErrorStatus(err), err);
@@ -2314,8 +2459,11 @@ export function createMonitorHandlers({
     }
     try {
       const res = await store.deleteCustomWallpaperFile(wallpaperId);
-      await stageLiveWallpaperCss(resolvedPaths, res.themes).catch(() => {});
-      void store.getPrefs().then((prefs) => cdp.sync(res.themes, { hostLanguage: prefs.language })).catch(() => {});
+      const prefs = await store.getPrefs().catch(() => ({}));
+      const liteMode = Boolean(prefs?.liteMode);
+      const themesWithLite = { ...res.themes, liteMode };
+      await stageLiveWallpaperCss(resolvedPaths, themesWithLite, { liteMode }).catch(() => {});
+      void cdp.sync(themesWithLite, { hostLanguage: prefs?.language, liteMode }).catch(() => {});
       return { ok: true, themeState: res.themes };
     } catch (err) {
       return errorResponse(ResponseCtor, mapStorageErrorStatus(err), err);
@@ -2327,9 +2475,13 @@ export function createMonitorHandlers({
     if (!VALID_LANGUAGES.has(language)) {
       return errorResponse(ResponseCtor, 400, '不支持的语言代码，仅支持 zh-CN 或 en');
     }
-    await store.updatePrefs({ language });
+    const updatedPrefs = await store.updatePrefs({ language });
     const themes = await store.getThemes();
-    const cdpStatus = await cdp.syncHostLanguage(language, themes).catch(() => cdp.getStatus(themes));
+    const liteMode = Boolean(updatedPrefs?.liteMode);
+    const themesWithLite = { ...themes, liteMode };
+    const cdpStatus = await cdp
+      .syncHostLanguage(language, themesWithLite, { liteMode })
+      .catch(() => cdp.getStatus(themesWithLite));
     return { ok: true, language, cdp: cdpStatus };
   });
 
@@ -2700,37 +2852,28 @@ export function createMonitorHandlers({
 }
 
 function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {}) {
-  let child = null;
+  let worker = null;
   let stopped = false;
   let restartTimer = null;
   let backoffMs = 500;
 
   const launch = () => {
     if (stopped) return;
-    child = fork(WORKER_PATH, [], {
+    worker = new Worker(WORKER_PATH, {
       execArgv: [],
-      env: {
-        ...process.env,
-        AGY_MONITOR_BRAIN_DIR: paths.brainDir,
-        AGY_MONITOR_CONVERSATIONS_DIR: paths.conversationsDir,
-        AGY_MONITOR_CACHE_DB: paths.cacheDbPath,
-        AGY_MONITOR_SCAN_INTERVAL_MS: String(scanIntervalMs),
+      workerData: {
+        isScanWorker: true,
+        brainDir: paths.brainDir,
+        conversationsDir: paths.conversationsDir,
+        cacheDbPath: paths.cacheDbPath,
+        scanIntervalMs,
       },
-      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
 
-    child.stdout?.on('data', (buf) => {
-      const line = buf.toString('utf8').trim();
-      if (line) console.log(`[scan_worker] ${line}`);
+    worker.on('error', (err) => {
+      console.error(`[scan_worker] thread error: ${err?.message || err}`);
     });
-    child.stderr?.on('data', (buf) => {
-      const line = buf.toString('utf8').trim();
-      if (line) console.error(`[scan_worker] ${line}`);
-    });
-    child.on('error', (err) => {
-      console.error(`[scan_worker] process error: ${err?.message || err}`);
-    });
-    child.on('message', (msg) => {
+    worker.on('message', (msg) => {
       if (msg?.type === 'updated') {
         backoffMs = 500;
         onUpdated?.(msg);
@@ -2738,10 +2881,10 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {})
         console.error(`[scan_worker] ${msg.message || 'unknown worker error'}`);
       }
     });
-    child.on('exit', (code, signal) => {
-      child = null;
+    worker.on('exit', (code) => {
+      worker = null;
       if (stopped) return;
-      console.warn(`[scan_worker] exited (code=${code}, signal=${signal}); restarting in ${backoffMs}ms`);
+      console.warn(`[scan_worker] exited (code=${code}); restarting in ${backoffMs}ms`);
       restartTimer = setTimeout(() => {
         backoffMs = Math.min(backoffMs * 2, 10000);
         launch();
@@ -2754,23 +2897,24 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {})
 
   return {
     getPid() {
-      return child && Number.isInteger(child.pid) ? child.pid : 0;
+      // Runs inside a Worker thread in the current Node process (zero extra child process PID)
+      return 0;
     },
     shrinkMemory() {
-      if (child && child.connected) {
+      if (worker) {
         try {
-          child.send({ type: 'shrink' });
+          worker.postMessage({ type: 'shrink' });
         } catch {
-          // Ignore transient IPC disconnect while worker restarts
+          // Ignore transient worker disconnect while restarting
         }
       }
     },
     rescan() {
-      if (child && child.connected) {
+      if (worker) {
         try {
-          child.send({ type: 'rescan', forceNotify: true });
+          worker.postMessage({ type: 'rescan', forceNotify: true });
         } catch {
-          // Ignore transient IPC disconnect while worker restarts
+          // Ignore transient worker disconnect while restarting
         }
       }
     },
@@ -2780,32 +2924,28 @@ function spawnWorkerSupervisor(paths, { scanIntervalMs = 2000, onUpdated } = {})
         clearTimeout(restartTimer);
         restartTimer = null;
       }
-      if (!child) return;
-      const proc = child;
+      if (!worker) return;
+      const active = worker;
       await new Promise((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          resolve();
+        };
         const timeout = setTimeout(() => {
-          try {
-            proc.kill('SIGKILL');
-          } catch {
-            // ignore kill error
-          }
-          resolve();
+          void active.terminate().catch(() => {}).finally(done);
         }, 2000);
-        proc.once('exit', () => {
-          clearTimeout(timeout);
-          resolve();
-        });
+        timeout.unref?.();
+        active.once('exit', done);
         try {
-          if (proc.connected) {
-            proc.send({ type: 'shutdown' });
-          } else {
-            proc.kill('SIGTERM');
-          }
+          active.postMessage({ type: 'shutdown' });
         } catch {
-          clearTimeout(timeout);
-          resolve();
+          void active.terminate().catch(() => {}).finally(done);
         }
       });
+      worker = null;
     },
   };
 }
@@ -2903,10 +3043,14 @@ export async function startSidecarServer({
       const wPid = worker.getPid?.() || 0;
       return wPid > 0 ? [process.pid, wPid] : [process.pid];
     },
-    onShrinkInternal: () => {
-      clearTelemetryTransientCaches();
-      worker.shrinkMemory?.();
-    },
+    onShrinkInternal: createInternalShrinkHandler({
+      paths,
+      store: storage,
+      hud: hudPublisher,
+      cdp: cdpBridge,
+      accounts: sharedAccountManager,
+      shrinkWorkerMemory: () => worker.shrinkMemory?.(),
+    }),
   });
 
   const routes = createMonitorHandlers({
@@ -2985,6 +3129,8 @@ export async function startSidecarServer({
     nativeHudWatchdogBusy = true;
     try {
       const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
+      const liteMode = Boolean(prefs.liteMode);
+      const themesWithLite = { ...themes, liteMode };
       const hudEnabled = themes.hudEnabled !== false;
       const mode = themes.hudInjectionMode || 'asar';
       const autoReinject = themes.hudAutoReinject !== false;
@@ -2995,7 +3141,7 @@ export async function startSidecarServer({
           (themes.hostThemeMode === 'inject' || !themes.hostThemeMode),
       );
 
-      await stageLiveHudAssets(paths, themes).catch(() => {});
+      await stageLiveHudAssets(paths, themesWithLite, { liteMode }).catch(() => {});
       if (!wantNativeHud && !wantNativeWallpaper) {
         return;
       }
@@ -3005,7 +3151,7 @@ export async function startSidecarServer({
         if (st && st.supported && st.asarExists && (st.state === 'stock' || st.state === 'outdated')) {
           const now = Date.now();
           if (now - lastAsarLockRetryMs >= 60_000) {
-            const res = await installNativeHud(paths).catch(() => null);
+            const res = await installNativeHud(paths, { liteMode, themes: themesWithLite }).catch(() => null);
             if (!res?.diskWritten) {
               lastAsarLockRetryMs = now;
             }
@@ -3016,9 +3162,11 @@ export async function startSidecarServer({
       const hb = readNativeHudHeartbeat(paths);
       const needHudHotInject = wantNativeHud && autoReinject && !hb.alive && !cdpBridge.isHudInjected();
       const needWpHotInject =
-        wantNativeWallpaper && autoReinject && !hb.wallpaperAlive && !cdpBridge.getStatus(themes).styleApplied;
+        wantNativeWallpaper && autoReinject && !hb.wallpaperAlive && !cdpBridge.getStatus(themesWithLite).styleApplied;
       if (needHudHotInject || needWpHotInject) {
-        await cdpBridge.sync(themes, { hostLanguage: prefs.language, keepConnectedPort: true }).catch(() => {});
+        await cdpBridge
+          .sync(themesWithLite, { hostLanguage: prefs.language, liteMode, keepConnectedPort: true })
+          .catch(() => {});
         if (needHudHotInject) {
           await hudPublisher.refreshFromDb().catch(() => {});
         }
@@ -3079,9 +3227,11 @@ export async function startSidecarServer({
         await ensureBackdropAssets(paths);
         await ensureAccountTool(paths).catch(() => {});
         const [themes, prefs] = await Promise.all([storage.getThemes(), storage.getPrefs()]);
+        const liteMode = Boolean(prefs.liteMode);
+        const themesWithLite = { ...themes, liteMode };
         await ensureCdpLauncher(paths, themes.cdpPort);
         await ensureNativeHudHealthy();
-        await cdpBridge.sync(themes, { hostLanguage: prefs.language, probeForLang: true });
+        await cdpBridge.sync(themesWithLite, { hostLanguage: prefs.language, liteMode, probeForLang: true });
         await hudPublisher.refreshFromDb();
         await ensureCompanionHealthy();
       } catch {

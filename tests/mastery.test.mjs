@@ -6,15 +6,19 @@ import path from 'node:path';
 
 import { evaluateMasteryHook } from '../hooks/mastery_summary_hook.mjs';
 import {
+  COMPACT_TRANSCRIPT_TAIL_BYTES,
   buildMasterySnapshot,
   classifyToolCall,
   openLocalPathTarget,
   parseAgentJourney,
   parseProgressTag,
+  pruneCompactProgressCache,
+  queryCompactSessionProgress,
   resolveLocalTargetPath,
   sanitizeTimelineMarkdown,
   stripMarkdownForPlainLine,
 } from '../sidecars/agy_monitor/backend/mastery.mjs';
+import { createHudTelemetryPublisher } from '../sidecars/agy_monitor/main.mjs';
 import { resolvePaths } from '../sidecars/agy_monitor/backend/paths.mjs';
 import { createStorage } from '../sidecars/agy_monitor/backend/storage.mjs';
 
@@ -634,4 +638,136 @@ test('buildMasterySnapshot always pins favorite sessions at top in saved order a
   assert.equal(idleSnap.sessions[0].isFavorite, true);
   assert.equal(idleSnap.sessions[1].isFavorite, false);
   assert.equal(idleSnap.favoriteCount, 1);
+});
+
+test('queryCompactSessionProgress uses per-convId LRU cache, skips unchanged files, and uses 128 KB compact window with fallback', async (t) => {
+  const { paths, storage } = makeTempEnv(t);
+  const nowMs = Date.parse('2026-11-27T04:00:00Z');
+
+  const writeTr = (convId, lines) => {
+    const dir = path.join(paths.brainDir, convId, '.system_generated', 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    const fp = path.join(dir, 'transcript.jsonl');
+    fs.writeFileSync(fp, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+    return fp;
+  };
+
+  // 1. Per-convId caching: only changed convId is re-read
+  const trA = writeTr('conv-cache-a', [
+    { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:59:00Z', content: '[AGY_PROGRESS|25%|阶段一处理] 正在做A' },
+  ]);
+  const trB = writeTr('conv-cache-b', [
+    { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:59:10Z', content: '[AGY_PROGRESS|30%|阶段一开始] 正在做B' },
+  ]);
+  const fixedSec = 1795751000;
+  fs.utimesSync(trA, fixedSec, fixedSec);
+
+  const cache = new Map();
+  const hub = {
+    active: [
+      { id: 'conv-cache-a', title: '任务A', modifiedMs: nowMs - 2000 },
+      { id: 'conv-cache-b', title: '任务B', modifiedMs: nowMs - 1000 },
+    ],
+    waiting: [],
+    unread: [],
+  };
+
+  const pass1 = await queryCompactSessionProgress(paths, hub, { nowMs, cache, maxCacheEntries: 3 });
+  assert.equal(pass1.length, 2);
+  assert.equal(pass1[0].progress, 25);
+  assert.equal(pass1[1].progress, 30);
+  assert.equal(cache.size, 2);
+
+  // Overwrite conv-cache-a with exact same byte size & preserved exact-second mtime -> cache hit MUST skip disk read
+  const origA = fs.readFileSync(trA, 'utf8');
+  const stealthA = origA.replace('25%', '99%');
+  assert.equal(Buffer.byteLength(stealthA, 'utf8'), Buffer.byteLength(origA, 'utf8'));
+  fs.writeFileSync(trA, stealthA, 'utf8');
+  fs.utimesSync(trA, fixedSec, fixedSec);
+
+  // Modify conv-cache-b genuinely (new size + mtime) -> ONLY conv-cache-b re-reads
+  fs.appendFileSync(
+    trB,
+    JSON.stringify({ step_index: 2, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:59:50Z', content: '[AGY_PROGRESS|80%|已完成核心] B已更新' }) + '\n',
+    'utf8',
+  );
+
+  const pass2 = await queryCompactSessionProgress(paths, hub, { nowMs: nowMs + 500, cache, maxCacheEntries: 3 });
+  assert.equal(pass2[0].progress, 25, 'Unchanged convId must hit per-convId cache without re-reading disk');
+  assert.equal(pass2[1].progress, 80, 'Changed convId must re-read and return fresh progress');
+
+  // 2. LRU bounding: adding 3 more sessions evicts oldest beyond maxCacheEntries=3
+  for (const id of ['conv-lru-1', 'conv-lru-2', 'conv-lru-3']) {
+    writeTr(id, [{ step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:59:55Z', content: '[AGY_PROGRESS|50%|推进中] ok' }]);
+  }
+  await queryCompactSessionProgress(
+    paths,
+    {
+      active: [
+        { id: 'conv-lru-1', title: 'L1', modifiedMs: nowMs },
+        { id: 'conv-lru-2', title: 'L2', modifiedMs: nowMs },
+        { id: 'conv-lru-3', title: 'L3', modifiedMs: nowMs },
+      ],
+      waiting: [],
+      unread: [],
+    },
+    { nowMs: nowMs + 1000, cache, maxCacheEntries: 3 },
+  );
+  assert.equal(cache.size, 3);
+  assert.equal(cache.has('conv-cache-a'), false, 'Oldest LRU entry must be evicted');
+  assert.equal(cache.has('conv-lru-3'), true);
+
+  // 3. pruneCompactProgressCache removes entries outside keepIds
+  const removed = pruneCompactProgressCache(cache, { keepIds: ['conv-lru-3'], nowMs: nowMs + 2000 });
+  assert.equal(removed, 2);
+  assert.equal(cache.size, 1);
+
+  // 4. Compact 128 KB tail window fast path vs automatic fallback to 1.5 MB when tail has huge tool output
+  assert.equal(COMPACT_TRANSCRIPT_TAIL_BYTES, 128 * 1024);
+  const padPayload = 'x'.repeat(20_000);
+  const fastLines = [
+    { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:50:00Z', content: '[AGY_PROGRESS|12%|旧阶段] 早期' },
+    ...Array.from({ length: 8 }, (_, i) => ({ step_index: i + 2, type: 'GENERIC', created_at: '2026-11-27T03:55:00Z', content: padPayload })),
+    { step_index: 10, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:59:00Z', content: '[AGY_PROGRESS|88%|尾窗口直出] 最新进展' },
+  ];
+  writeTr('conv-compact-fast', fastLines);
+  const fastRes = await queryCompactSessionProgress(
+    paths,
+    { active: [{ id: 'conv-compact-fast', title: 'Fast', modifiedMs: nowMs }], waiting: [], unread: [] },
+    { nowMs },
+  );
+  assert.equal(fastRes[0].progress, 88);
+  assert.equal(fastRes[0].tag, '尾窗口直出');
+
+  const fallbackLines = [
+    { step_index: 1, type: 'PLANNER_RESPONSE', created_at: '2026-11-27T03:50:00Z', content: '[AGY_PROGRESS|55%|回退大窗口] 大输出前的进展' },
+    ...Array.from({ length: 8 }, (_, i) => ({ step_index: i + 2, type: 'GENERIC', created_at: '2026-11-27T03:59:00Z', content: padPayload })),
+  ];
+  const trFallback = writeTr('conv-compact-fallback', fallbackLines);
+  assert.ok(fs.statSync(trFallback).size > COMPACT_TRANSCRIPT_TAIL_BYTES);
+  const fallbackRes = await queryCompactSessionProgress(
+    paths,
+    { active: [{ id: 'conv-compact-fallback', title: 'Fallback', modifiedMs: nowMs }], waiting: [], unread: [] },
+    { nowMs },
+  );
+  assert.equal(fallbackRes[0].progress, 55);
+  assert.equal(fallbackRes[0].tag, '回退大窗口');
+
+  // 5. createHudTelemetryPublisher.resolveSessionProgress + pruneProgressCache integration
+  const pub = createHudTelemetryPublisher(paths, storage);
+  const p1 = await pub.resolveSessionProgress({
+    active: [{ id: 'conv-compact-fast', title: 'Fast', modifiedMs: nowMs }],
+    waiting: [],
+    unread: [],
+  });
+  assert.equal(p1[0].progress, 88);
+  assert.equal(pub.getProgressCacheSize(), 1);
+  await pub.resolveSessionProgress({
+    active: [{ id: 'conv-compact-fallback', title: 'Fallback', modifiedMs: nowMs }],
+    waiting: [],
+    unread: [],
+  });
+  assert.equal(pub.getProgressCacheSize(), 2);
+  pub.pruneProgressCache();
+  assert.equal(pub.getProgressCacheSize(), 1, 'pruneProgressCache drops sessions no longer in active candidate set');
 });

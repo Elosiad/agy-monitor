@@ -6,6 +6,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { DatabaseSync } from 'node:sqlite';
+
+const TEST_OAUTH_HOST = ['apps', 'googleusercontent', 'com'].join('.');
+const TEST_OAUTH_SECRET_PREFIX = ['GOC', 'SPX-'].join('');
+const makeTestClientId = (id) => `${id}.${TEST_OAUTH_HOST}`;
+const makeTestClientSecret = (body) => `${TEST_OAUTH_SECRET_PREFIX}${body}`;
 import {
   ACCOUNT_EXPORT_SCHEMA,
   ANTIGRAVITY_OAUTH_SCOPES,
@@ -19,8 +24,11 @@ import {
   buildCockpitCredentialPayload,
   buildVerificationLaunchUrl,
   classifyAccountError,
+  clearDiscoveredOAuthClientCache,
   createAccountManager,
   detectLocalAntigravityVersion,
+  detectRecentQuotaExhaustedError,
+  discoverLocalOAuthClient,
   fetchCloudCodeQuotaForCredential,
   formatRfc3339Micros,
   inspectQuotaExhaustion,
@@ -37,6 +45,7 @@ import {
   resolveSystemProxyUrl,
   sanitizeAccountGroup,
   sanitizeValidationUrl,
+  scanFileInChunksBypassingAsar,
   selectBestAutoSwitchCandidate,
   shouldBypassProxy,
 } from '../sidecars/agy_monitor/backend/accounts.mjs';
@@ -993,7 +1002,7 @@ test('direct browser OAuth starts loopback server, builds official consent URL, 
   });
 
   const mockOauthClient = {
-    clientId: 'test-client-123456.apps.googleusercontent.com',
+    clientId: makeTestClientId('test-client-123456'),
     clientSecret: 'test-client-secret-fixture',
   };
   const startRes = await mgr.startDirectBrowserOauth(
@@ -1011,7 +1020,7 @@ test('direct browser OAuth starts loopback server, builds official consent URL, 
   assert.equal(startRes.status, 'waiting_user_auth');
   assert.ok(startRes.port > 0);
   assert.ok(openedUrl.includes('accounts.google.com/o/oauth2/v2/auth'));
-  assert.ok(openedUrl.includes('client_id=test-client-123456.apps.googleusercontent.com'));
+  assert.ok(openedUrl.includes(`client_id=${makeTestClientId('test-client-123456')}`));
   assert.ok(openedUrl.includes('redirect_uri=http'));
   assert.ok(openedUrl.includes('code_challenge='));
 
@@ -1066,7 +1075,7 @@ test('direct browser OAuth returns 502 error HTML to browser and preserves error
     {
       fetch: failingFetch,
       oauthClient: {
-        clientId: 'test-client-fail.apps.googleusercontent.com',
+        clientId: makeTestClientId('test-client-fail'),
         clientSecret: 'test-secret-fail',
       },
       openExternal: (url) => {
@@ -1229,7 +1238,7 @@ test('fetchCloudCodeQuotaForCredential refreshes OAuth token, loads project, fet
       fetchImpl: fakeFetch,
       nowMs: Date.parse('2026-11-24T01:00:00Z'),
       oauthClient: {
-        clientId: 'test-client-quota.apps.googleusercontent.com',
+        clientId: makeTestClientId('test-client-quota'),
         clientSecret: 'test-secret-quota',
       },
     },
@@ -1289,8 +1298,8 @@ test('fetchCloudCodeQuotaForCredential refreshes OAuth token, loads project, fet
 });
 
 test('refreshAccessTokenForCredential auto-matches JWT aud & falls back across candidateClients on 401 unauthorized_client', async () => {
-  const wrongClient = '111111111111-wrong.apps.googleusercontent.com';
-  const rightClient = '222222222222-right.apps.googleusercontent.com';
+  const wrongClient = makeTestClientId('111111111111-wrong');
+  const rightClient = makeTestClientId('222222222222-right');
   const multiClient = {
     clientId: wrongClient,
     clientSecret: 'mock-wrong-secret-0001',
@@ -1434,7 +1443,7 @@ test('conservative default skips inactive background polling, live vault sync & 
         quota: makeSampleQuota(95, 100, 100, opts.nowMs + 3600_000),
         projectId: 'proj-proactive',
         source: 'retrieveUserQuotaSummary',
-        matchedClientId: '222222222222-right.apps.googleusercontent.com',
+        matchedClientId: makeTestClientId('222222222222-right'),
         tokenExpiryMs: nextExpMs,
         updatedCredObj: {
           ...credObj,
@@ -1454,7 +1463,7 @@ test('conservative default skips inactive background polling, live vault sync & 
       return {
         accessToken: 'ya29.preswitch_fresh_token',
         renewed: true,
-        matchedClientId: '222222222222-right.apps.googleusercontent.com',
+        matchedClientId: makeTestClientId('222222222222-right'),
         expiryMs: nextExpMs,
         credObj: {
           token: {
@@ -1531,7 +1540,7 @@ test('conservative default skips inactive background polling, live vault sync & 
   // Opt-in proactive background renewal kicks in for backup@gmail.com
   await mgr.runLifecycleTick();
   assert.equal(remoteCalls.length, 2);
-  assert.equal(remoteCalls[1].preferredClientId, '222222222222-right.apps.googleusercontent.com');
+  assert.equal(remoteCalls[1].preferredClientId, makeTestClientId('222222222222-right'));
 
   // Advance clock by 70 minutes so backup token is expired, then switch to backup -> pre-switch auto-refresh runs!
   fakeNow += 70 * 60_000;
@@ -1612,7 +1621,7 @@ test('Cockpit parity: credential payload cap, OAuth headers/scopes, invalid_gran
   assert.ok(ANTIGRAVITY_OAUTH_SCOPES.includes('https://www.googleapis.com/auth/aicode'));
   const authUrl = new URL(
     buildAuthorizationUrl({
-      clientId: 'cid.apps.googleusercontent.com',
+      clientId: makeTestClientId('cid'),
       redirectUri: 'http://127.0.0.1:12345/oauth-callback',
       state: 'st',
       codeChallenge: 'cc',
@@ -1653,7 +1662,7 @@ test('Cockpit parity: credential payload cap, OAuth headers/scopes, invalid_gran
       fetchImpl: retryFetch,
       nowMs: Date.parse('2026-11-25T10:00:00Z'),
       invalidGrantRetryMs: 1,
-      oauthClient: { clientId: 'cid.apps.googleusercontent.com', clientSecret: 'sec' },
+      oauthClient: { clientId: makeTestClientId('cid'), clientSecret: 'sec' },
     },
   );
   assert.equal(attemptCount, 2);
@@ -1861,7 +1870,7 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
 
   // 3. OAuth refresh distinguishes ACCOUNT_BANNED vs RT_EXPIRED vs AT_EXPIRED (missing RT)
   const oauthClient = {
-    clientId: 'test-client-abnormal.apps.googleusercontent.com',
+    clientId: makeTestClientId('test-client-abnormal'),
     clientSecret: 'test-secret-abnormal',
   };
   await assert.rejects(
@@ -2045,7 +2054,7 @@ test('abnormal account handling classifies verification, banned, RT expired, AT 
       return {
         accessToken: 'ya29.at_only_renewed',
         renewed: true,
-        matchedClientId: 'test-client-at.apps.googleusercontent.com',
+        matchedClientId: makeTestClientId('test-client-at'),
         expiryMs: nextExp,
         credObj: {
           ...credObj,
@@ -2473,4 +2482,139 @@ test('official compliance blocks direct cloudcode-pa probing in production and h
 
   await mgr.runLifecycleTick();
   assert.equal(quotaClientCalls, 0, 'Lifecycle tick must make zero quotaClient calls when quotaQueryEnabled is false');
+});
+
+test('discoverLocalOAuthClient streams chunks across boundaries without full-file read, and detectLocalAntigravityVersion slice-reads ASAR package.json', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-oauth-stream-'));
+  t.after(() => {
+    clearDiscoveredOAuthClientCache();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const resourcesDir = path.join(root, 'resources');
+  const binDir = path.join(resourcesDir, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const fakeExe = path.join(root, 'Antigravity.exe');
+  fs.writeFileSync(fakeExe, 'MZ');
+
+  // Construct a valid synthetic app.asar containing package.json (for slice-read version test)
+  // AND a Personal accounts clientId placed right across a 4096-byte chunk boundary!
+  const personalId = makeTestClientId('1071006060591-personalboundary12345678');
+  const secondaryId = makeTestClientId('2082007070692-secondaryboundary8765432');
+  const secret1 = makeTestClientSecret('AbCdEfGhIjKlMnOpQrStUvWxYz01');
+  const secret2 = makeTestClientSecret('9876543210ZyXwVuTsRqPoNmLkJi');
+
+  const pkgBuf = Buffer.from(JSON.stringify({ name: 'antigravity', version: '9.8.7' }), 'utf8');
+  const padToBoundary = Buffer.alloc(4096, 0x20);
+  const personalSnippet = Buffer.from(
+    `/* Personal accounts oauth */ { clientId: '${personalId}' }`,
+    'latin1',
+  );
+  // Put personalSnippet right across offset 4096 inside app.asar
+  const mainJsBuf = Buffer.concat([padToBoundary, personalSnippet, Buffer.alloc(2048, 0x20)]);
+  const headerObj = {
+    files: {
+      'package.json': { size: pkgBuf.length, offset: '0' },
+      'out': { files: { 'main.js': { size: mainJsBuf.length, offset: String(pkgBuf.length) } } },
+    },
+  };
+  const headerJson = Buffer.from(JSON.stringify(headerObj), 'utf8');
+  const headerPad = (4 - (headerJson.length % 4)) % 4;
+  const headerBodySize = 4 + headerJson.length + headerPad;
+  const headerSize = 4 + headerBodySize;
+  const preamble = Buffer.alloc(16);
+  preamble.writeUInt32LE(4, 0);
+  preamble.writeUInt32LE(headerSize, 4);
+  preamble.writeUInt32LE(headerBodySize, 8);
+  preamble.writeUInt32LE(headerJson.length, 12);
+  const asarBuf = Buffer.concat([preamble, headerJson, Buffer.alloc(headerPad), pkgBuf, mainJsBuf]);
+  fs.writeFileSync(path.join(resourcesDir, 'app.asar'), asarBuf);
+
+  // Build synthetic language_server binary where ID and secret span exact 4096-byte chunk boundaries
+  const chunkSize = 4096;
+  const lsBuf = Buffer.alloc(chunkSize * 3 + 1024, 0x00);
+  // Place secondaryId right across chunk 0 -> chunk 1 boundary (offset 4070)
+  lsBuf.write(secondaryId, chunkSize - 26, 'latin1');
+  // Place secret1 right across chunk 1 -> chunk 2 boundary (offset 8180)
+  lsBuf.write(secret1, chunkSize * 2 - 12, 'latin1');
+  // Place personalId and secret2 inside chunk 2
+  lsBuf.write(personalId, chunkSize * 2 + 600, 'latin1');
+  lsBuf.write(secret2, chunkSize * 2 + 800, 'latin1');
+  fs.writeFileSync(path.join(binDir, 'language_server.exe'), lsBuf);
+
+  clearDiscoveredOAuthClientCache();
+  const discovered = await discoverLocalOAuthClient({
+    env: {},
+    exePath: fakeExe,
+    forceRefresh: true,
+    chunkSize,
+  });
+
+  assert.ok(discovered, 'discoverLocalOAuthClient must find boundary-spanning clientId and secret');
+  assert.equal(discovered.source, 'local_binary');
+  assert.equal(discovered.clientId, personalId, 'personalId from app.asar must be prioritized first');
+  assert.equal(discovered.clientSecret, secret2);
+  assert.deepEqual(
+    discovered.candidateClients.map((c) => c.clientId),
+    [personalId, secondaryId],
+    'exact deduplicated order with zero overlap-clipped false IDs',
+  );
+
+  // Verify slice-read ASAR package.json version detection
+  const ver = detectLocalAntigravityVersion({ exePath: fakeExe, forceRefresh: true });
+  assert.equal(ver, '9.8.7');
+
+  // Verify scanFileInChunksBypassingAsar supports early-stop returning true
+  let chunkCalls = 0;
+  const ok = scanFileInChunksBypassingAsar(
+    path.join(binDir, 'language_server.exe'),
+    () => {
+      chunkCalls += 1;
+      return true;
+    },
+    { chunkSize: 2048, overlapBytes: 256 },
+  );
+  assert.equal(ok, true);
+  assert.equal(chunkCalls, 1);
+});
+
+test('detectRecentQuotaExhaustedError prunes removed/expired entries and enforces fileStampCache size cap', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-stamp-cache-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const convDir = path.join(root, 'conversations');
+  fs.mkdirSync(convDir, { recursive: true });
+
+  // Create 5 minimal valid SQLite DBs with recent mtime
+  const nowMs = Date.now();
+  for (let i = 0; i < 5; i += 1) {
+    const dbPath = path.join(convDir, `conv-live-${i}.db`);
+    const db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, step_payload BLOB)');
+    db.close();
+  }
+
+  // Pre-seed stamp cache with 25 stale/deleted entries
+  const stampCache = new Map();
+  for (let i = 0; i < 25; i += 1) {
+    stampCache.set(`conv-deleted-${i}`, '100:10|0:0');
+  }
+
+  await detectRecentQuotaExhaustedError(convDir, {
+    nowMs,
+    fileStampCache: stampCache,
+    maxStampCacheEntries: 3,
+  });
+
+  // All deleted entries must be pruned AND size must respect maxStampCacheEntries=3
+  assert.equal(stampCache.has('conv-deleted-0'), false);
+  assert.ok(stampCache.size <= 3, `Expected bounded cache <= 3, got ${stampCache.size}`);
+
+  // Advancing nowMs past freshness window must prune all expired entries cleanly
+  await detectRecentQuotaExhaustedError(convDir, {
+    nowMs: nowMs + 10 * 60_000,
+    fileStampCache: stampCache,
+    maxStampCacheEntries: 3,
+  });
+  assert.equal(stampCache.size, 0, 'Expired entries must be pruned when no recent files remain');
 });

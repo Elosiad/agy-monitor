@@ -155,6 +155,7 @@ function defaultPrefs() {
     activePromptId: 'official',
     followLatestSession: true,
     quotaQueryEnabled: true,
+    liteMode: false,
     memoryGuard: {
       autoTrimEnabled: true,
       thresholdMb: 1800,
@@ -552,6 +553,10 @@ export function createStorage(paths) {
         typeof raw.quotaQueryEnabled === 'boolean'
           ? raw.quotaQueryEnabled
           : base.quotaQueryEnabled,
+      liteMode:
+        typeof raw.liteMode === 'boolean'
+          ? raw.liteMode
+          : base.liteMode,
       memoryGuard,
     };
   }
@@ -888,6 +893,111 @@ export function createStorage(paths) {
         const next = normalizeSessionsMeta(draft, current.firstTrackWatermarkMs);
         await atomicWriteJson(paths.sessionsMetaFile, next);
         return next;
+      });
+    },
+
+    async pruneSessionsMeta({
+      knownConvIds = null,
+      maxSeenConvs = 300,
+      maxSeenAgents = 400,
+      maxAgeMs = 90 * 24 * 3600 * 1000,
+      orphanGraceMs = 3600 * 1000,
+      nowMs = Date.now(),
+    } = {}) {
+      return enqueue('sessionsMeta', async () => {
+        const { exists, data } = await readJsonSafe(paths.sessionsMetaFile);
+        if (!exists || !data || typeof data !== 'object') {
+          return {
+            pruned: false,
+            removedConvs: 0,
+            removedAgents: 0,
+            removedFavoriteTitles: 0,
+          };
+        }
+        const current = normalizeSessionsMeta(data);
+        const favoriteSet = new Set(current.favoriteIds);
+        const knownSet =
+          knownConvIds instanceof Set && knownConvIds.size > 0
+            ? knownConvIds
+            : Array.isArray(knownConvIds) && knownConvIds.length > 0
+              ? new Set(knownConvIds.map(String))
+              : null;
+
+        const cutoffAgeMs = maxAgeMs > 0 ? nowMs - maxAgeMs : 0;
+        const orphanCutoffMs = orphanGraceMs > 0 ? nowMs - orphanGraceMs : Infinity;
+
+        const nextFavoriteTitles = {};
+        let removedFavoriteTitles = 0;
+        for (const [k, v] of Object.entries(current.favoriteTitles || {})) {
+          if (favoriteSet.has(k)) {
+            nextFavoriteTitles[k] = v;
+          } else {
+            removedFavoriteTitles += 1;
+          }
+        }
+
+        const pruneTimestampMap = (rawMap, maxEntries, protectFavorites) => {
+          const entries = Object.entries(rawMap || {});
+          const kept = [];
+          let removed = 0;
+          for (const [id, tsRaw] of entries) {
+            const ts = Number(tsRaw) || 0;
+            const isFav = protectFavorites && favoriteSet.has(id);
+            if (!isFav) {
+              if (cutoffAgeMs > 0 && ts > 0 && ts < cutoffAgeMs) {
+                removed += 1;
+                continue;
+              }
+              if (knownSet && !knownSet.has(id) && ts < orphanCutoffMs) {
+                removed += 1;
+                continue;
+              }
+            }
+            kept.push([id, ts, isFav]);
+          }
+          const cap = Math.max(1, Math.trunc(maxEntries));
+          if (kept.length > cap) {
+            const favEntries = kept.filter((e) => e[2]);
+            const nonFavEntries = kept.filter((e) => !e[2]).sort((a, b) => b[1] - a[1]);
+            const nonFavBudget = Math.max(0, cap - favEntries.length);
+            const trimmedNonFav = nonFavEntries.slice(0, nonFavBudget);
+            removed += nonFavEntries.length - trimmedNonFav.length;
+            kept.length = 0;
+            kept.push(...favEntries, ...trimmedNonFav);
+          }
+          const nextMap = {};
+          for (const [id, ts] of kept) {
+            nextMap[id] = ts;
+          }
+          return { nextMap, removed };
+        };
+
+        const convRes = pruneTimestampMap(current.lastSeenModifiedMs, maxSeenConvs, true);
+        const agentRes = pruneTimestampMap(current.lastSeenByAgent, maxSeenAgents, false);
+        const totalRemoved = convRes.removed + agentRes.removed + removedFavoriteTitles;
+        if (totalRemoved <= 0) {
+          return {
+            pruned: false,
+            removedConvs: 0,
+            removedAgents: 0,
+            removedFavoriteTitles: 0,
+          };
+        }
+
+        const next = {
+          ...current,
+          favoriteTitles: nextFavoriteTitles,
+          lastSeenModifiedMs: convRes.nextMap,
+          lastSeenByConv: { ...convRes.nextMap },
+          lastSeenByAgent: agentRes.nextMap,
+        };
+        await atomicWriteJson(paths.sessionsMetaFile, next);
+        return {
+          pruned: true,
+          removedConvs: convRes.removed,
+          removedAgents: agentRes.removed,
+          removedFavoriteTitles,
+        };
       });
     },
 
